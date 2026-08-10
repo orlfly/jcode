@@ -326,6 +326,70 @@ pub fn cascade_retrieve(
 
 ---
 
+## Instance-Layer Metadata (enterprise-ontology inspired)
+
+Every memory node is now treated as an *instance* with provenance, lifecycle status,
+identity keys and aliases. This mirrors the `ontology.instances.jsonl` layer from
+enterprise-ontology and makes the graph auditable and governs destructive operations.
+
+### Provenance
+
+```rust
+pub struct ProvenanceRecord {
+    pub source: String,               // e.g. session id, file, tool name
+    pub locator: Option<String>,      // e.g. "sheet=...,row=..."
+    pub method: ExtractionMethod,     // user_stated / structured_mapping / llm_extraction / ...
+    pub extracted_at: DateTime<Utc>,
+    pub confidence: f32,              // 0.0-1.0
+}
+```
+
+- `user_stated` and `structured_mapping` are authoritative.
+- `llm_extraction` and `rule_extraction` require `confidence >= 0.7` to be admissible.
+- Low-confidence extractions should be routed to a pending-confirmation queue rather than committed silently.
+
+### Lifecycle status
+
+```rust
+pub enum MemoryStatus {
+    Active,    // Retrievable by default
+    Expired,   // Past effective window; kept for history
+    Archived,  // Soft-deleted; may be physically removed after two major bumps
+    Disputed,  // Conflicting information; requires resolution
+}
+```
+
+Memories also carry `effective_from` / `effective_to` windows and `deprecated` flags.
+Retrieval (`active_memories`, `cascade_retrieve`) only returns instances that are
+`Active`, not deprecated, and within their effective window.
+
+### Identity and aliases
+
+```rust
+pub struct IdentityMetadata {
+    pub keys: Vec<String>,      // e.g. "postgres"
+    pub aliases: Vec<String>,   // e.g. "postgresql", "psql"
+}
+```
+
+Identity keys and aliases enable entity disambiguation. `MemoryGraph::resolve_identity`
+returns memories whose keys or aliases match a query term.
+
+### Critical data and confirmation gates
+
+Memories can be marked `critical: true`. Operations that touch critical data, overwrite
+authoritative sources, transition status, or affect >20% of a category trigger
+confirmation gates G1-G4 (see `crates/jcode-memory-types/src/actions.rs`).
+
+### Independent validation
+
+`crates/jcode-memory-types/src/validation.rs` provides a standalone `validate_graph`
+function that checks structural invariants (E01), instance consistency (E20-E25), edge
+integrity (E30-E32) and lifecycle consistency (E40-E41). It can be run from unit tests,
+CLI tools, or CI without invoking the full memory agent.
+
+---
+
 ## Memory Entry Schema
 
 ```rust

@@ -311,3 +311,65 @@ fn test_graph_serialization_roundtrip() {
         "Edge count should match after roundtrip"
     );
 }
+
+#[test]
+fn test_archived_memory_excluded_from_active() {
+    use crate::{LifecycleMetadata, MemoryStatus};
+    let mut graph = MemoryGraph::new();
+    let id = graph.add_memory(make_test_memory("active memory"));
+    let archived_id = graph.add_memory(
+        make_test_memory("archived memory").with_lifecycle(LifecycleMetadata::archived("old")),
+    );
+
+    let active: Vec<_> = graph.active_memories().map(|m| m.id.clone()).collect();
+    assert!(active.contains(&id));
+    assert!(!active.contains(&archived_id));
+    assert_eq!(graph.memories.get(&archived_id).unwrap().lifecycle.status, MemoryStatus::Archived);
+}
+
+#[test]
+fn test_cascade_retrieve_skips_non_retrievable_targets() {
+    use crate::LifecycleMetadata;
+    let mut graph = MemoryGraph::new();
+    let id_a = graph.add_memory(make_test_memory("Memory A"));
+    let id_b = graph.add_memory(make_test_memory("Memory B"));
+    let id_c = graph.add_memory(
+        make_test_memory("Memory C").with_lifecycle(LifecycleMetadata::archived("old")),
+    );
+
+    graph.link_memories(&id_a, &id_b, 0.9);
+    graph.link_memories(&id_a, &id_c, 0.9);
+
+    let results = graph.cascade_retrieve(std::slice::from_ref(&id_a), &[1.0], 1, 10);
+    let ids: Vec<_> = results.iter().map(|(id, _)| id.clone()).collect();
+    assert!(ids.contains(&id_a));
+    assert!(ids.contains(&id_b));
+    assert!(!ids.contains(&id_c));
+}
+
+#[test]
+fn test_identity_resolution() {
+    let mut graph = MemoryGraph::new();
+    let id = graph.add_memory(
+        make_test_memory("PostgreSQL usage")
+            .with_identity_key("postgres")
+            .with_alias("postgresql"),
+    );
+    graph.add_memory(make_test_memory("MySQL usage").with_identity_key("mysql"));
+
+    let resolved = graph.resolve_identity("postgresql");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0], id);
+}
+
+#[test]
+fn test_archive_memory_soft_deletes() {
+    use crate::MemoryStatus;
+    let mut graph = MemoryGraph::new();
+    let id = graph.add_memory(make_test_memory("to archive"));
+    graph.archive_memory(&id, "user requested");
+    let m = graph.get_memory(&id).unwrap();
+    assert!(!m.active);
+    assert_eq!(m.lifecycle.status, MemoryStatus::Archived);
+    assert_eq!(m.lifecycle.deprecated_reason.as_deref(), Some("user requested"));
+}

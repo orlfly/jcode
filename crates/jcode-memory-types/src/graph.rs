@@ -355,9 +355,74 @@ impl MemoryGraph {
         self.memories.values()
     }
 
-    /// Get all active memories
+    /// Get all active memories that are retrievable now (status + effective window).
     pub fn active_memories(&self) -> impl Iterator<Item = &MemoryEntry> {
-        self.memories.values().filter(|m| m.active)
+        self.memories.values().filter(|m| m.is_retrievable_now())
+    }
+
+    /// Mark a memory as archived (soft delete).
+    pub fn archive_memory(&mut self, id: &str, reason: impl Into<String>) -> Option<&MemoryEntry> {
+        if let Some(m) = self.memories.get_mut(id) {
+            m.active = false;
+            m.lifecycle.status = crate::MemoryStatus::Archived;
+            m.lifecycle.deprecated_reason = Some(reason.into());
+            m.updated_at = chrono::Utc::now();
+            return Some(m);
+        }
+        None
+    }
+
+    /// Mark a memory as disputed until conflict is resolved.
+    pub fn dispute_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
+        if let Some(m) = self.memories.get_mut(id) {
+            m.lifecycle.status = crate::MemoryStatus::Disputed;
+            m.updated_at = chrono::Utc::now();
+            return Some(m);
+        }
+        None
+    }
+
+    /// Mark a memory as expired (past validity window).
+    pub fn expire_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
+        if let Some(m) = self.memories.get_mut(id) {
+            m.lifecycle.status = crate::MemoryStatus::Expired;
+            m.lifecycle.effective_to = Some(chrono::Utc::now());
+            m.updated_at = chrono::Utc::now();
+            return Some(m);
+        }
+        None
+    }
+
+    /// Deprecate a memory, keeping it for history but hiding it from retrieval.
+    pub fn deprecate_memory(&mut self, id: &str, reason: impl Into<String>) -> Option<&MemoryEntry> {
+        if let Some(m) = self.memories.get_mut(id) {
+            m.lifecycle.deprecated = true;
+            m.lifecycle.deprecated_reason = Some(reason.into());
+            m.updated_at = chrono::Utc::now();
+            return Some(m);
+        }
+        None
+    }
+
+    /// Resolve a memory back to active status.
+    pub fn reactivate_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
+        if let Some(m) = self.memories.get_mut(id) {
+            m.active = true;
+            m.lifecycle.status = crate::MemoryStatus::Active;
+            m.lifecycle.deprecated = false;
+            m.updated_at = chrono::Utc::now();
+            return Some(m);
+        }
+        None
+    }
+
+    /// Find memory IDs matching a query against identity keys or aliases.
+    pub fn resolve_identity(&self, query: &str) -> Vec<&str> {
+        self.memories
+            .values()
+            .filter(|m| m.identity.matches(query))
+            .map(|m| m.id.as_str())
+            .collect()
     }
 
     // ==================== Tag Operations ====================
@@ -602,8 +667,13 @@ impl MemoryGraph {
                         }
                     }
                 }
-                // If target is a memory, add it
+                // If target is a memory, add it only if retrievable
                 else if self.memories.contains_key(target) {
+                    if let Some(mem) = self.memories.get(target) {
+                        if !mem.is_retrievable_now() {
+                            continue;
+                        }
+                    }
                     let existing = results.get(target).copied().unwrap_or(0.0);
                     if new_score > existing {
                         results.insert(target.clone(), new_score);

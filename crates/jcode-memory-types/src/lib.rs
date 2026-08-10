@@ -3,6 +3,23 @@ pub use graph::{
     ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, TagEntry,
 };
 
+pub mod instance;
+pub use instance::{
+    ExtractionMethod, IdentityMetadata, LifecycleMetadata, MemoryStatus, ProvenanceRecord,
+};
+
+pub mod actions;
+pub use actions::{
+    ChangeProposal, ConfirmationGate, MemoryActionSpec, MemoryActionTarget, MemoryEffect,
+    MemoryRole, check_preconditions, evaluate_gates, requires_confirmation,
+};
+
+pub mod validation;
+pub use validation::{
+    Severity, ValidationIssue, ValidationReport, validate_action as validate_memory_action,
+    validate_graph, validate_new_entry,
+};
+
 use std::time::Instant;
 
 /// Represents current memory system activity.
@@ -271,6 +288,18 @@ pub struct MemoryEntry {
     /// Confidence score (0.0-1.0) - decays over time, boosted by use
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// Provenance metadata: source, extraction method, confidence, timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceRecord>,
+    /// Lifecycle metadata: status, effective windows, deprecation.
+    #[serde(default)]
+    pub lifecycle: LifecycleMetadata,
+    /// Critical memories require confirmation for destructive updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub critical: bool,
+    /// Identity keys and aliases for entity disambiguation.
+    #[serde(default)]
+    pub identity: IdentityMetadata,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -328,6 +357,10 @@ impl MemoryEntry {
             embedding: None,
             embedding_model: None,
             confidence: 1.0,
+            provenance: None,
+            lifecycle: LifecycleMetadata::active(),
+            critical: false,
+            identity: IdentityMetadata::empty(),
         }
     }
 
@@ -377,6 +410,56 @@ impl MemoryEntry {
     /// Decay confidence (called when memory was retrieved but not relevant)
     pub fn decay_confidence(&mut self, amount: f32) {
         self.confidence = (self.confidence - amount).max(0.0);
+    }
+
+    pub fn with_provenance(mut self, provenance: ProvenanceRecord) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
+    pub fn with_source_provenance(mut self, source: impl Into<String>, method: ExtractionMethod) -> Self {
+        self.provenance = Some(ProvenanceRecord::new(source, method));
+        self
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: LifecycleMetadata) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub fn with_status(mut self, status: MemoryStatus) -> Self {
+        self.lifecycle.status = status;
+        self
+    }
+
+    pub fn with_critical(mut self, critical: bool) -> Self {
+        self.critical = critical;
+        self
+    }
+
+    pub fn with_identity(mut self, identity: IdentityMetadata) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn with_identity_key(mut self, key: impl Into<String>) -> Self {
+        self.identity.keys.push(key.into());
+        self
+    }
+
+    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
+        self.identity.aliases.push(alias.into());
+        self
+    }
+
+    /// Whether this memory is retrievable given its lifecycle status and effective window.
+    pub fn is_retrievable_now(&self) -> bool {
+        self.active && self.lifecycle.is_retrievable_now()
+    }
+
+    /// Whether this memory is a terminal / soft-deleted instance.
+    pub fn is_terminal(&self) -> bool {
+        self.lifecycle.status.is_terminal()
     }
 
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
