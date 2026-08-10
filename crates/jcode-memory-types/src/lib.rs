@@ -222,6 +222,7 @@ pub enum MemoryEventKind {
 // Persistent memory model and pure search helpers.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// Trust levels for memories
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -420,6 +421,16 @@ impl MemoryEntry {
     pub fn with_source_provenance(mut self, source: impl Into<String>, method: ExtractionMethod) -> Self {
         self.provenance = Some(ProvenanceRecord::new(source, method));
         self
+    }
+
+    /// Effective provenance for validation and conflict resolution.
+    /// Missing provenance is treated as the mem-plugin default heuristic
+    /// (`method=user_stated`, `confidence=0.5`) so legacy data remains usable.
+    pub fn effective_provenance(&self) -> Cow<'_, ProvenanceRecord> {
+        match &self.provenance {
+            Some(p) => Cow::Borrowed(p),
+            None => Cow::Owned(ProvenanceRecord::default_heuristic()),
+        }
     }
 
     pub fn with_lifecycle(mut self, lifecycle: LifecycleMetadata) -> Self {

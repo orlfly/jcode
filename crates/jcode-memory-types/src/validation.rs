@@ -128,39 +128,35 @@ fn validate_instances(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
             ));
         }
 
-        // E21: provenance missing or inadmissible.
-        if memory.provenance.is_none() {
-            issues.push(ValidationIssue::warning(
-                "E21",
-                "Memory has no provenance record".to_string(),
+        // E21/E22: provenance admissibility. Missing provenance falls back to
+        // the mem-plugin default heuristic (user_stated, 0.5) so legacy data is
+        // not treated as invalid; only explicitly low-confidence extractions error.
+        let prov = memory.effective_provenance();
+        if !prov.is_admissible() {
+            issues.push(ValidationIssue::error(
+                "E22",
+                format!(
+                    "Provenance confidence {:.2} is below method admission threshold {:.2}",
+                    prov.confidence,
+                    prov.method.admission_threshold()
+                ),
                 Some(id.clone()),
             ));
-        } else if let Some(prov) = &memory.provenance {
-            if !prov.is_admissible() {
-                issues.push(ValidationIssue::error(
-                    "E22",
-                    format!(
-                        "Provenance confidence {:.2} is below method admission threshold {:.2}",
-                        prov.confidence,
-                        prov.method.admission_threshold()
-                    ),
-                    Some(id.clone()),
-                ));
-            }
-            if prov.confidence < 0.0 || prov.confidence > 1.0 {
-                issues.push(ValidationIssue::error(
-                    "E23",
-                    format!("Provenance confidence {:.2} is outside [0,1]", prov.confidence),
-                    Some(id.clone()),
-                ));
-            }
+        }
+        if prov.confidence < 0.0 || prov.confidence > 1.0 {
+            issues.push(ValidationIssue::error(
+                "E23",
+                format!("Provenance confidence {:.2} is outside [0,1]", prov.confidence),
+                Some(id.clone()),
+            ));
         }
 
-        // E24: critical memory must have provenance.
+        // E24: critical memory must have explicit provenance (default heuristic
+        // is acceptable, but callers should annotate critical data).
         if memory.critical && memory.provenance.is_none() {
-            issues.push(ValidationIssue::error(
+            issues.push(ValidationIssue::warning(
                 "E24",
-                "Critical memory is missing provenance".to_string(),
+                "Critical memory uses default heuristic provenance; prefer explicit source".to_string(),
                 Some(id.clone()),
             ));
         }
@@ -293,20 +289,17 @@ pub fn validate_new_entry(entry: &MemoryEntry) -> Result<(), Vec<ValidationIssue
     if entry.content.trim().is_empty() {
         issues.push(ValidationIssue::error("E20", "Memory content is empty", Some(entry.id.clone())));
     }
-    if let Some(prov) = &entry.provenance {
-        if !prov.is_admissible() {
-            issues.push(ValidationIssue::error(
-                "E22",
-                format!(
-                    "Provenance confidence {:.2} below admission threshold {:.2}",
-                    prov.confidence,
-                    prov.method.admission_threshold()
-                ),
-                Some(entry.id.clone()),
-            ));
-        }
-    } else {
-        issues.push(ValidationIssue::warning("E21", "Memory has no provenance record", Some(entry.id.clone())));
+    let prov = entry.effective_provenance();
+    if !prov.is_admissible() {
+        issues.push(ValidationIssue::error(
+            "E22",
+            format!(
+                "Provenance confidence {:.2} below admission threshold {:.2}",
+                prov.confidence,
+                prov.method.admission_threshold()
+            ),
+            Some(entry.id.clone()),
+        ));
     }
     if issues.is_empty() {
         Ok(())
@@ -406,11 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_new_entry_warns_on_missing_provenance() {
+    fn validate_new_entry_allows_missing_provenance_with_heuristic_default() {
         let entry = make_entry("no provenance");
         let res = validate_new_entry(&entry);
-        assert!(res.is_err());
-        assert!(res.unwrap_err().iter().any(|i| i.code == "E21" && i.severity == Severity::Warning));
+        assert!(res.is_ok(), "missing provenance should fall back to user_stated/0.5 heuristic");
     }
 
     #[test]

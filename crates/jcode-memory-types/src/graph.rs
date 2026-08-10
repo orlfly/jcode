@@ -361,11 +361,15 @@ impl MemoryGraph {
     }
 
     /// Mark a memory as archived (soft delete).
+    /// Returns `None` if the memory does not exist or the status transition is illegal.
     pub fn archive_memory(&mut self, id: &str, reason: impl Into<String>) -> Option<&MemoryEntry> {
+        let reason = reason.into();
         if let Some(m) = self.memories.get_mut(id) {
+            if !m.lifecycle.transition_to(crate::MemoryStatus::Archived) {
+                return None;
+            }
             m.active = false;
-            m.lifecycle.status = crate::MemoryStatus::Archived;
-            m.lifecycle.deprecated_reason = Some(reason.into());
+            m.lifecycle.deprecated_reason = Some(reason);
             m.updated_at = chrono::Utc::now();
             return Some(m);
         }
@@ -373,9 +377,12 @@ impl MemoryGraph {
     }
 
     /// Mark a memory as disputed until conflict is resolved.
+    /// Returns `None` if the memory does not exist or the status transition is illegal.
     pub fn dispute_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
         if let Some(m) = self.memories.get_mut(id) {
-            m.lifecycle.status = crate::MemoryStatus::Disputed;
+            if !m.lifecycle.transition_to(crate::MemoryStatus::Disputed) {
+                return None;
+            }
             m.updated_at = chrono::Utc::now();
             return Some(m);
         }
@@ -383,9 +390,12 @@ impl MemoryGraph {
     }
 
     /// Mark a memory as expired (past validity window).
+    /// Returns `None` if the memory does not exist or the status transition is illegal.
     pub fn expire_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
         if let Some(m) = self.memories.get_mut(id) {
-            m.lifecycle.status = crate::MemoryStatus::Expired;
+            if !m.lifecycle.transition_to(crate::MemoryStatus::Expired) {
+                return None;
+            }
             m.lifecycle.effective_to = Some(chrono::Utc::now());
             m.updated_at = chrono::Utc::now();
             return Some(m);
@@ -394,6 +404,7 @@ impl MemoryGraph {
     }
 
     /// Deprecate a memory, keeping it for history but hiding it from retrieval.
+    /// Returns `None` if the memory does not exist.
     pub fn deprecate_memory(&mut self, id: &str, reason: impl Into<String>) -> Option<&MemoryEntry> {
         if let Some(m) = self.memories.get_mut(id) {
             m.lifecycle.deprecated = true;
@@ -405,10 +416,13 @@ impl MemoryGraph {
     }
 
     /// Resolve a memory back to active status.
+    /// Returns `None` if the memory does not exist or the status transition is illegal.
     pub fn reactivate_memory(&mut self, id: &str) -> Option<&MemoryEntry> {
         if let Some(m) = self.memories.get_mut(id) {
+            if !m.lifecycle.transition_to(crate::MemoryStatus::Active) {
+                return None;
+            }
             m.active = true;
-            m.lifecycle.status = crate::MemoryStatus::Active;
             m.lifecycle.deprecated = false;
             m.updated_at = chrono::Utc::now();
             return Some(m);

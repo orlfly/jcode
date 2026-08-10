@@ -96,6 +96,18 @@ impl ProvenanceRecord {
         self
     }
 
+    /// Default heuristic provenance for legacy or unannotated memories.
+    /// Mirrors mem-plugin's DEFAULT_PROVENANCE (method=user_stated, confidence=0.5).
+    pub fn default_heuristic() -> Self {
+        Self {
+            source: String::new(),
+            locator: None,
+            method: ExtractionMethod::UserStated,
+            extracted_at: Utc::now(),
+            confidence: 0.5,
+        }
+    }
+
     /// Whether this provenance meets its own method's quality bar.
     pub fn is_admissible(&self) -> bool {
         self.confidence >= self.method.admission_threshold()
@@ -129,6 +141,28 @@ impl MemoryStatus {
 
     pub fn is_terminal(self) -> bool {
         matches!(self, MemoryStatus::Archived | MemoryStatus::Expired)
+    }
+
+    /// Allowed state-machine transitions per mem-plugin lifecycle-ops.md:
+    /// ACTIVE -> EXPIRED/ARCHIVED/DISPUTED
+    /// EXPIRED -> ACTIVE/ARCHIVED
+    /// ARCHIVED -> ACTIVE
+    /// DISPUTED -> ACTIVE/ARCHIVED
+    pub fn can_transition_to(self, target: MemoryStatus) -> bool {
+        if self == target {
+            return true;
+        }
+        matches!(
+            (self, target),
+            (MemoryStatus::Active, MemoryStatus::Expired)
+                | (MemoryStatus::Active, MemoryStatus::Archived)
+                | (MemoryStatus::Active, MemoryStatus::Disputed)
+                | (MemoryStatus::Expired, MemoryStatus::Active)
+                | (MemoryStatus::Expired, MemoryStatus::Archived)
+                | (MemoryStatus::Archived, MemoryStatus::Active)
+                | (MemoryStatus::Disputed, MemoryStatus::Active)
+                | (MemoryStatus::Disputed, MemoryStatus::Archived)
+        )
     }
 }
 
@@ -250,6 +284,17 @@ impl LifecycleMetadata {
     pub fn is_retrievable_now(&self) -> bool {
         self.status.is_retrievable() && !self.deprecated && self.is_effective_at(Utc::now())
     }
+
+    /// Attempt a state-machine-guarded status transition.
+    /// Returns true when the transition is allowed or the status is unchanged.
+    pub fn transition_to(&mut self, target: MemoryStatus) -> bool {
+        if self.status.can_transition_to(target) {
+            self.status = target;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -293,6 +338,32 @@ mod tests {
 
         let future = LifecycleMetadata::active().with_effective_from(Utc::now() + chrono::Duration::days(1));
         assert!(!future.is_retrievable_now());
+    }
+
+    #[test]
+    fn status_state_machine_matches_mem_plugin() {
+        use MemoryStatus::*;
+        assert!(Active.can_transition_to(Expired));
+        assert!(Active.can_transition_to(Archived));
+        assert!(Active.can_transition_to(Disputed));
+        assert!(Expired.can_transition_to(Active));
+        assert!(Expired.can_transition_to(Archived));
+        assert!(Archived.can_transition_to(Active));
+        assert!(Disputed.can_transition_to(Active));
+        assert!(Disputed.can_transition_to(Archived));
+
+        // Illegal transitions
+        assert!(!Archived.can_transition_to(Expired));
+        assert!(!Archived.can_transition_to(Disputed));
+        assert!(!Expired.can_transition_to(Disputed));
+    }
+
+    #[test]
+    fn default_heuristic_provenance_is_admissible() {
+        let prov = ProvenanceRecord::default_heuristic();
+        assert_eq!(prov.method, ExtractionMethod::UserStated);
+        assert_eq!(prov.confidence, 0.5);
+        assert!(prov.is_admissible());
     }
 
     #[test]

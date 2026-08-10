@@ -347,6 +347,9 @@ pub struct ProvenanceRecord {
 - `user_stated` and `structured_mapping` are authoritative.
 - `llm_extraction` and `rule_extraction` require `confidence >= 0.7` to be admissible.
 - Low-confidence extractions should be routed to a pending-confirmation queue rather than committed silently.
+- Memories without an explicit provenance record are treated as the mem-plugin default heuristic
+  (`method=user_stated`, `confidence=0.5`) via `MemoryEntry::effective_provenance()`, so legacy
+  data remains valid without noisy warnings.
 
 ### Lifecycle status
 
@@ -362,6 +365,11 @@ pub enum MemoryStatus {
 Memories also carry `effective_from` / `effective_to` windows and `deprecated` flags.
 Retrieval (`active_memories`, `cascade_retrieve`) only returns instances that are
 `Active`, not deprecated, and within their effective window.
+
+Status transitions are state-machine guarded (`MemoryStatus::can_transition_to`):
+`Active` -> `Expired`/`Archived`/`Disputed`; `Expired` -> `Active`/`Archived`;
+`Archived` -> `Active`; `Disputed` -> `Active`/`Archived`. Illegal transitions
+are rejected by the graph lifecycle helpers.
 
 ### Identity and aliases
 
