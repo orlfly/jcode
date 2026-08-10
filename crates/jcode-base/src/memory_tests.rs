@@ -445,6 +445,22 @@ fn graph_based_memory_operations() {
     });
 }
 
+#[test]
+fn remember_rejects_inadmissible_provenance() {
+    use crate::memory_types::{ExtractionMethod, ProvenanceRecord};
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new_test();
+        let entry = MemoryEntry::new(MemoryCategory::Fact, "low confidence extraction")
+            .with_provenance(
+                ProvenanceRecord::new("llm", ExtractionMethod::LlmExtraction).with_confidence(0.5),
+            );
+        assert!(
+            manager.remember_project(entry).is_err(),
+            "llm extraction below admission threshold should be rejected"
+        );
+    });
+}
+
 /// #729: test mode short-circuits `project_memory_path()` before the project
 /// directory is consulted, so a manager in test mode cannot see real
 /// project memory no matter what working directory it is given.

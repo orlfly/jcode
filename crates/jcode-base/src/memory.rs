@@ -393,11 +393,13 @@ impl MemoryManager {
     /// Memories above this threshold are considered duplicates and reinforced instead.
     const STORAGE_DEDUP_THRESHOLD: f32 = 0.85;
 
-    pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
-        let mut entry = entry;
-        if self.should_generate_embedding_for_entry(&entry) {
-            entry.ensure_embedding();
-        }
+   pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
+       let mut entry = entry;
+        crate::memory_types::validate_new_entry(&entry)
+            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+       if self.should_generate_embedding_for_entry(&entry) {
+           entry.ensure_embedding();
+       }
 
         let mut graph = self.load_project_graph()?;
 
@@ -428,11 +430,13 @@ impl MemoryManager {
         Ok(id)
     }
 
-    pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
-        let mut entry = entry;
-        if self.should_generate_embedding_for_entry(&entry) {
-            entry.ensure_embedding();
-        }
+   pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
+       let mut entry = entry;
+        crate::memory_types::validate_new_entry(&entry)
+            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+       if self.should_generate_embedding_for_entry(&entry) {
+           entry.ensure_embedding();
+       }
 
         let mut graph = self.load_global_graph()?;
 
@@ -469,22 +473,26 @@ impl MemoryManager {
     /// Insert or update a memory with a stable ID in the project graph.
     /// Preserves existing inbound/outbound graph relationships while refreshing
     /// content and tags.
-    pub fn upsert_project_memory(&self, entry: MemoryEntry) -> Result<String> {
-        let mut graph = self.load_project_graph()?;
-        let id = self.upsert_memory_in_graph(&mut graph, entry);
-        self.save_project_graph(&graph)?;
-        Ok(id)
-    }
+   pub fn upsert_project_memory(&self, entry: MemoryEntry) -> Result<String> {
+        crate::memory_types::validate_new_entry(&entry)
+            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+       let mut graph = self.load_project_graph()?;
+       let id = self.upsert_memory_in_graph(&mut graph, entry);
+       self.save_project_graph(&graph)?;
+       Ok(id)
+   }
 
     /// Insert or update a memory with a stable ID in the global graph.
     /// Preserves existing inbound/outbound graph relationships while refreshing
     /// content and tags.
-    pub fn upsert_global_memory(&self, entry: MemoryEntry) -> Result<String> {
-        let mut graph = self.load_global_graph()?;
-        let id = self.upsert_memory_in_graph(&mut graph, entry);
-        self.save_global_graph(&graph)?;
-        Ok(id)
-    }
+   pub fn upsert_global_memory(&self, entry: MemoryEntry) -> Result<String> {
+        crate::memory_types::validate_new_entry(&entry)
+            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+       let mut graph = self.load_global_graph()?;
+       let id = self.upsert_memory_in_graph(&mut graph, entry);
+       self.save_global_graph(&graph)?;
+       Ok(id)
+   }
 
     fn upsert_memory_in_graph(
         &self,
@@ -1774,26 +1782,44 @@ impl MemoryManager {
         }
     }
 
-    /// Save project memories as a MemoryGraph
-    pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
-        if let Some(path) = self.project_memory_path()? {
-            storage::write_json(&path, graph)?;
-            if !self.test_mode {
-                cache_graph(path, graph);
+   /// Save project memories as a MemoryGraph
+   pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
+       if let Some(path) = self.project_memory_path()? {
+            let report = graph.validate();
+            if !report.is_valid() {
+                crate::logging::info(&format!(
+                    "Memory graph validation found {} error(s) before saving {}: {:?}",
+                    report.errors().len(),
+                    path.display(),
+                    report.errors()
+                ));
             }
-        }
-        Ok(())
-    }
+           storage::write_json(&path, graph)?;
+           if !self.test_mode {
+               cache_graph(path, graph);
+           }
+       }
+       Ok(())
+   }
 
-    /// Save global memories as a MemoryGraph
-    pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
-        let path = self.global_memory_path()?;
-        storage::write_json(&path, graph)?;
-        if !self.test_mode {
-            cache_graph(path, graph);
+   /// Save global memories as a MemoryGraph
+   pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
+       let path = self.global_memory_path()?;
+        let report = graph.validate();
+        if !report.is_valid() {
+            crate::logging::info(&format!(
+                "Memory graph validation found {} error(s) before saving {}: {:?}",
+                report.errors().len(),
+                path.display(),
+                report.errors()
+            ));
         }
-        Ok(())
-    }
+       storage::write_json(&path, graph)?;
+       if !self.test_mode {
+           cache_graph(path, graph);
+       }
+       Ok(())
+   }
 
     /// Add a tag to a memory
     pub fn tag_memory(&self, memory_id: &str, tag: &str) -> Result<()> {
