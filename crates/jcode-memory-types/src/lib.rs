@@ -229,13 +229,24 @@ use std::borrow::Cow;
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TrustLevel {
-    /// User explicitly stated this
-    High,
-    /// Observed from user behavior
-    #[default]
-    Medium,
-    /// Inferred by the agent
-    Low,
+   /// User explicitly stated this
+   High,
+   /// Observed from user behavior
+   #[default]
+   Medium,
+   /// Inferred by the agent
+   Low,
+}
+
+impl TrustLevel {
+    /// Map legacy trust level to a provenance confidence suitable for LLM-extracted memories.
+    pub fn provenance_confidence(self) -> f32 {
+        match self {
+            TrustLevel::High => 0.95,
+            TrustLevel::Medium => 0.80,
+            TrustLevel::Low => 0.70,
+        }
+    }
 }
 
 /// A reinforcement breadcrumb tracking when/where a memory was reinforced

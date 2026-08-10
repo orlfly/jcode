@@ -200,9 +200,14 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
                     _ => crate::memory::TrustLevel::Medium,
                 };
 
+                let confidence = trust.provenance_confidence();
                 let entry = crate::memory::MemoryEntry::new(category, &mem.content)
                     .with_source(&session_id)
-                    .with_trust(trust);
+                    .with_trust(trust)
+                    .with_provenance(
+                        crate::memory::ProvenanceRecord::new(&session_id, crate::memory::ExtractionMethod::LlmExtraction)
+                            .with_confidence(confidence),
+                    );
 
                 if manager.remember_project(entry).is_ok() {
                     stored_count += 1;
@@ -1100,9 +1105,14 @@ impl MemoryAgent {
                             };
 
                         // Create the new memory
+                        let confidence = trust.provenance_confidence();
                         let entry = memory::MemoryEntry::new(category, &mem.content)
                             .with_source("incremental")
-                            .with_trust(trust);
+                            .with_trust(trust)
+                            .with_provenance(
+                                memory::ProvenanceRecord::new("incremental", memory::ExtractionMethod::LlmExtraction)
+                                    .with_confidence(confidence),
+                            );
 
                         match memory_manager.remember_project(entry) {
                             Ok(new_id) => {

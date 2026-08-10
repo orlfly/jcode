@@ -30,8 +30,8 @@ mod pending;
 mod prompt_support;
 
 pub use crate::memory_types::{
-    MemoryCategory, MemoryEntry, MemoryScope, MemoryStore, Reinforcement, TrustLevel,
-    format_relevant_display_prompt, format_relevant_prompt,
+    ExtractionMethod, MemoryCategory, MemoryEntry, MemoryScope, MemoryStore, ProvenanceRecord,
+    Reinforcement, TrustLevel, format_relevant_display_prompt, format_relevant_prompt,
 };
 use crate::memory_types::{
     collect_skill_query_terms, format_entries_for_prompt, memory_matches_search, memory_score,
@@ -1142,9 +1142,14 @@ impl MemoryManager {
                 _ => TrustLevel::Low,
             };
 
+            let confidence = trust.provenance_confidence();
             let entry = MemoryEntry::new(category, memory.content)
                 .with_source(session_id)
-                .with_trust(trust);
+                .with_trust(trust)
+                .with_provenance(
+                    ProvenanceRecord::new(session_id, ExtractionMethod::LlmExtraction)
+                        .with_confidence(confidence),
+                );
 
             // Store in project scope by default
             let id = self.remember_project(entry)?;
