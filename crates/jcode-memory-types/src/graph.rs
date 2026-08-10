@@ -6,7 +6,7 @@
 //! - Various edge types (HasTag, RelatesTo, Supersedes, etc.)
 //! - BFS cascade retrieval through the graph
 
-use crate::{MemoryEntry, MemoryStore};
+use crate::{MemoryEntry, MemoryStore, ValidationReport, validate_graph};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -414,6 +414,11 @@ impl MemoryGraph {
             return Some(m);
         }
         None
+    }
+
+    /// Run the independent graph validator over this graph.
+    pub fn validate(&self) -> ValidationReport {
+        validate_graph(self)
     }
 
     /// Find memory IDs matching a query against identity keys or aliases.
