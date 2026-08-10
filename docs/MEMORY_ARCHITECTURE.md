@@ -1,7 +1,7 @@
 # Memory Architecture Design
 
 > **Status:** Implemented (Core), Planned (Graph-Based Hybrid)
-> **Updated:** 2026-01-27
+> **Updated:** 2026-08-10
 
 Local embeddings + lightweight sidecar (GPT-5.3 Codex Spark) are implemented and running in production. This document describes both the current implementation and the planned graph-based hybrid architecture.
 
@@ -326,133 +326,390 @@ pub fn cascade_retrieve(
 
 ---
 
-## Instance-Layer Metadata (enterprise-ontology inspired)
-
-Every memory node is now treated as an *instance* with provenance, lifecycle status,
-identity keys and aliases. This mirrors the `ontology.instances.jsonl` layer from
-enterprise-ontology and makes the graph auditable and governs destructive operations.
-
-### Provenance
-
-```rust
-pub struct ProvenanceRecord {
-    pub source: String,               // e.g. session id, file, tool name
-    pub locator: Option<String>,      // e.g. "sheet=...,row=..."
-    pub method: ExtractionMethod,     // user_stated / structured_mapping / llm_extraction / ...
-    pub extracted_at: DateTime<Utc>,
-    pub confidence: f32,              // 0.0-1.0
-}
-```
-
-- `user_stated` and `structured_mapping` are authoritative.
-- `llm_extraction` and `rule_extraction` require `confidence >= 0.7` to be admissible.
-- Low-confidence extractions should be routed to a pending-confirmation queue rather than committed silently.
-- Memories without an explicit provenance record are treated as the mem-plugin default heuristic
-  (`method=user_stated`, `confidence=0.5`) via `MemoryEntry::effective_provenance()`, so legacy
-  data remains valid without noisy warnings.
-
-### Lifecycle status
-
-```rust
-pub enum MemoryStatus {
-    Active,    // Retrievable by default
-    Expired,   // Past effective window; kept for history
-    Archived,  // Soft-deleted; may be physically removed after two major bumps
-    Disputed,  // Conflicting information; requires resolution
-}
-```
-
-Memories also carry `effective_from` / `effective_to` windows and `deprecated` flags.
-Retrieval (`active_memories`, `cascade_retrieve`) only returns instances that are
-`Active`, not deprecated, and within their effective window.
-
-Status transitions are state-machine guarded (`MemoryStatus::can_transition_to`):
-`Active` -> `Expired`/`Archived`/`Disputed`; `Expired` -> `Active`/`Archived`;
-`Archived` -> `Active`; `Disputed` -> `Active`/`Archived`. Illegal transitions
-are rejected by the graph lifecycle helpers.
-
-### Identity and aliases
-
-```rust
-pub struct IdentityMetadata {
-    pub keys: Vec<String>,      // e.g. "postgres"
-    pub aliases: Vec<String>,   // e.g. "postgresql", "psql"
-}
-```
-
-Identity keys and aliases enable entity disambiguation. `MemoryGraph::resolve_identity`
-returns memories whose keys or aliases match a query term.
-
-### Critical data and confirmation gates
-
-Memories can be marked `critical: true`. Operations that touch critical data, overwrite
-authoritative sources, transition status, or affect >20% of a category trigger
-confirmation gates G1-G4 (see `crates/jcode-memory-types/src/actions.rs`).
-
-### Independent validation
-
-`crates/jcode-memory-types/src/validation.rs` provides a standalone `validate_graph`
-function that checks structural invariants (E01), instance consistency (E20-E25), edge
-integrity (E30-E32) and lifecycle consistency (E40-E41). It can be run from unit tests,
-CLI tools, or CI without invoking the full memory agent.
-
----
-
-## Memory Entry Schema
+## Memory Entry Schema (current)
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
-    // Identity
+    pub id: String,
+    pub category: MemoryCategory,
+    pub content: String,
+    pub tags: Vec<String>,
+    /// Pre-normalized lowercase search text for content + tags.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub search_text: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub access_count: u32,
+    pub source: Option<String>,
+    pub trust: TrustLevel,
+    pub strength: u32,
+    pub active: bool,
+    pub superseded_by: Option<String>,
+    pub reinforcements: Vec<Reinforcement>,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
+    pub confidence: f32,
+
+    // Instance-layer additions (enterprise-ontology / mem-plugin inspired)
+    pub provenance: Option<ProvenanceRecord>,   // see instance.rs
+    pub lifecycle: LifecycleMetadata,            // see instance.rs
+    pub critical: bool,                          // gates G1–G4
+    pub identity: IdentityMetadata,              // keys + aliases
+}
+```
+
+The legacy `provenance` field shown in the historical schema below is now
+captured by the richer `ProvenanceRecord` struct (see `instance.rs`).
+
+### Historical schema (pre-instance-layer)
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEntry {
     pub id: String,
     pub content: String,
     pub category: MemoryCategory,
-
-    // Classification
-    pub memory_type: MemoryType,  // Fact, Preference, Procedure, Correction
-    pub scope: MemoryScope,       // Global, Project, Session
-
-    // Source tracking
+    pub memory_type: MemoryType,
+    pub scope: MemoryScope,
     pub session_id: Option<String>,
     pub message_range: Option<(u32, u32)>,
     pub file_paths: Vec<String>,
-    pub provenance: Provenance,   // UserStated, Observed, Inferred
-
-    // Lifecycle
+    pub provenance: Provenance,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_accessed: DateTime<Utc>,
     pub access_count: u32,
-    pub strength: u32,            // Consolidation count
-
-    // Trust & status
-    pub confidence: f32,          // 0.0-1.0, decays over time
-    pub trust_score: f32,         // Source-based trust
+    pub strength: u32,
+    pub confidence: f32,
+    pub trust_score: f32,
     pub active: bool,
     pub superseded_by: Option<String>,
-
-    // Embedding
     pub embedding: Option<Vec<f32>>,
 }
+```
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MemoryType {
-    Fact,        // "This project uses PostgreSQL"
-    Preference,  // "User prefers 4-space indentation"
-    Procedure,   // "To deploy: run make deploy"
-    Correction,  // "Don't use deprecated API"
-    Negative,    // "Never commit .env files"
+The new instance-layer fields are all optional or default to safe values so
+existing serialized data loads without migration.
+
+---
+
+## Instance-Layer Model (enterprise-ontology / mem-plugin)
+
+Every memory node is treated as an **instance** with provenance, lifecycle,
+identity and authority metadata. The design mirrors the
+`ontology.instances.jsonl` layer of `enterprise-ontology` and the `M11` instance
+enhancement in `mem-plugin`.
+
+Source files:
+- `crates/jcode-memory-types/src/instance.rs` — data types
+- `crates/jcode-memory-types/src/lib.rs` — `MemoryEntry` builder methods
+
+### 1. Provenance
+
+```rust
+pub struct ProvenanceRecord {
+    pub source: String,                // session id, file, tool name
+    pub locator: Option<String>,       // "sheet=...,row=..."
+    pub method: ExtractionMethod,      // see below
+    pub extracted_at: DateTime<Utc>,
+    pub confidence: f32,               // 0.0-1.0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Provenance {
-    UserStated,     // User explicitly said it
-    UserCorrected,  // User corrected agent behavior
-    Observed,       // Agent observed from behavior
-    Inferred,       // Agent inferred from context
-    Extracted,      // Extracted from session summary
+pub enum ExtractionMethod {
+    UserStated,        // user explicitly stated it
+    StructuredMapping, // mapped from a structured source
+    RuleExtraction,    // extracted by deterministic rule / regex
+    LlmExtraction,     // extracted by an LLM from conversation context
+    RuleInference,     // derived from other memories
 }
 ```
+
+#### Authority ordering
+
+| Method | Rank | Admission threshold |
+|---|---:|---:|
+| `UserStated` | 5 | 0.0 |
+| `StructuredMapping` | 4 | 0.0 |
+| `RuleExtraction` | 3 | 0.7 |
+| `LlmExtraction` | 2 | 0.7 |
+| `RuleInference` | 1 | 0.8 |
+
+`authority_rank` is used by future conflict resolution to compare candidates.
+`admission_threshold` is the minimum `confidence` required for direct
+ingestion; sub-threshold extractions should be routed to a pending-confirmation
+queue.
+
+#### Effective provenance (backward compatibility)
+
+Memories written before the instance-layer redesign have no `provenance`
+record. To avoid noisy "missing provenance" warnings and false validation
+errors, `MemoryEntry::effective_provenance()` returns:
+
+```rust
+fn effective_provenance(&self) -> Cow<'_, ProvenanceRecord> {
+    match &self.provenance {
+        Some(p) => Cow::Borrowed(p),
+        None => Cow::Owned(ProvenanceRecord::default_heuristic()),
+    }
+}
+
+fn default_heuristic() -> ProvenanceRecord {
+    ProvenanceRecord {
+        source: String::new(),
+        method: UserStated,
+        confidence: 0.5,
+        ..Default::default()
+    }
+}
+```
+
+This matches the mem-plugin default (`method=user_stated`, `confidence=0.5`).
+
+### 2. Lifecycle
+
+```rust
+pub struct LifecycleMetadata {
+    pub status: MemoryStatus,
+    pub effective_from: Option<DateTime<Utc>>,
+    pub effective_to: Option<DateTime<Utc>>,
+    pub deprecated: bool,
+    pub deprecated_reason: Option<String>,
+}
+
+pub enum MemoryStatus {
+    Active,    // retrievable by default
+    Expired,   // past validity window; kept for history
+    Archived,  // soft-deleted; may be physically removed after two major bumps
+    Disputed,  // conflicting information; requires resolution
+}
+```
+
+#### State machine
+
+The transition table is enforced by `MemoryStatus::can_transition_to` and
+`LifecycleMetadata::transition_to`. Any transition not listed is rejected.
+
+```
+Active   -> Expired | Archived | Disputed
+Expired  -> Active | Archived
+Archived -> Active
+Disputed -> Active | Archived
+```
+
+#### Effective retrievability
+
+A memory is retrievable only when all three hold:
+
+- `status == Active`
+- `deprecated == false`
+- `now ∈ [effective_from, effective_to)` (open bounds, both optional)
+
+`is_retrievable_now()` combines these checks. `MemoryGraph::active_memories()`
+and `cascade_retrieve()` honor it automatically.
+
+### 3. Identity and aliases
+
+```rust
+pub struct IdentityMetadata {
+    pub keys: Vec<String>,     // canonical names
+    pub aliases: Vec<String>,  // synonyms
+}
+```
+
+Use `keys` for unique identifiers and `aliases` for synonyms. Example:
+
+```rust
+let id = IdentityMetadata::empty()
+    .with_key("postgres")
+    .with_alias("postgresql")
+    .with_alias("psql");
+assert!(id.matches("postgres"));
+assert!(id.matches("postgresql"));
+assert!(!id.matches("mysql"));
+```
+
+`MemoryGraph::resolve_identity(query)` returns the IDs of all memories whose
+keys or aliases match the query, enabling entity disambiguation during
+retrieval and dedup.
+
+### 4. Critical flag
+
+```rust
+pub critical: bool,
+```
+
+When `critical == true`, any mutation that touches the memory triggers the
+**G1 confirmation gate** (see [Action Confirmation Gates](#action-confirmation-gates)).
+Use this sparingly for facts that must not be silently overwritten (e.g. user
+identity, security policies).
+
+---
+
+## Action Confirmation Gates (G1–G4)
+
+Dangerous mutations are routed through confirmation gates before they are
+applied. See `crates/jcode-memory-types/src/actions.rs`.
+
+| Gate | Trigger | Meaning |
+|---|---|---|
+| **G1** | `critical` memory touched | Core information cannot be silently changed |
+| **G2** | Overwriting a memory whose provenance is `user_stated` / `structured_mapping` | Authoritative sources must not be silently replaced |
+| **G3** | Lifecycle status transition (active ↔ archived/expired/disputed) | Structural state changes require approval |
+| **G4** | Same-category batch change exceeding 20% of instances | Whole-batch operations are suspended pending review |
+
+### Action types
+
+```rust
+pub enum MemoryActionKind {
+    Remember,
+    Forget,
+    Update,
+    Archive,
+    MarkDisputed,
+    BatchUpdate,
+}
+```
+
+Each action is wrapped in `MemoryActionSpec` carrying:
+
+- `target: MemoryActionTarget` (single, batch, or by category)
+- `role: MemoryRole` (User / Agent / System)
+- `requires_confirmation` — boolean computed from the gate policy
+- `affected_categories: Vec<MemoryCategory>`
+- preconditions checked by `check_preconditions(...)`
+
+### Policy rules (summary)
+
+- `User` and `System` roles can bypass non-critical gates.
+- `System` role **cannot** bypass G1 (critical data is always gated).
+- `Agent` role is gated by default for any of G1–G4.
+
+A `ChangeProposal` is returned by `evaluate_gates(...)` describing which gates
+fired. Callers must either confirm explicitly (interactive CLI) or route to
+the pending-confirmation queue.
+
+---
+
+## Independent Graph Validation
+
+The graph can be validated without invoking the full memory agent. See
+`crates/jcode-memory-types/src/validation.rs`.
+
+```rust
+pub fn validate_graph(graph: &MemoryGraph) -> ValidationReport;
+pub fn validate_new_entry(entry: &MemoryEntry) -> Result<(), Vec<ValidationIssue>>;
+pub fn validate_action(
+    graph: &MemoryGraph,
+    action: &MemoryActionSpec,
+    source_id: Option<&str>,
+    target_id: Option<&str>,
+) -> Result<(), Vec<ValidationIssue>>;
+```
+
+### Error code catalog
+
+| Code | Severity | Meaning |
+|---|---|---|
+| E01 | Error | Memory ID collision with reserved namespace or empty |
+| E20 | Error | Memory content is empty |
+| E21 | Warning | Memory has no provenance record |
+| E22 | Error | Provenance confidence below method admission threshold |
+| E23 | Error | Provenance confidence outside [0, 1] |
+| E24 | Warning | Critical memory uses heuristic provenance (prefer explicit source) |
+| E25 | Error | Memory `confidence` field outside [0, 1] |
+| E30 | Error | Edge source node does not exist |
+| E31 | Error | Edge target node does not exist |
+| E32 | Error | Self-loop or invalid edge geometry |
+| E40 | Error | `active == true` but `status` is terminal (archived/expired) |
+| E41 | Error | `effective_from >= effective_to` (invalid time window) |
+| A01 | Error | Action precondition failed |
+| W01 | Warning | Orphan tag |
+| W02 | Warning | Memory has no tags |
+| W03 | Warning | Stale memory (not accessed within half-life × 3) |
+
+### Integration points
+
+- `MemoryGraph::validate()` is a convenience wrapper around `validate_graph`.
+- `MemoryManager::save_project_graph` and `save_global_graph` call
+  `graph.validate()` before writing; any error-severity issues are written to
+  the log file (non-fatal, so existing data is not destroyed).
+- `MemoryManager::remember_project`, `remember_global`, `upsert_project_memory`,
+  and `upsert_global_memory` call `validate_new_entry` and reject the
+  `MemoryEntry` when it has an error-severity issue. The errors are converted
+  into `anyhow` errors so callers can handle or surface them.
+- Validators are pure functions and can be run from CI / CLI without a
+  running daemon.
+
+### Example
+
+```rust
+let report = graph.validate();
+if !report.is_valid() {
+    for issue in report.errors() {
+        eprintln!("[{}] {}", issue.code, issue.message);
+    }
+}
+```
+
+---
+
+## LLM Extraction Provenance Propagation
+
+The three LLM-driven extraction paths in `jcode-base` now attach
+`ProvenanceRecord` automatically. Source files:
+- `crates/jcode-base/src/memory.rs` — sidecar extraction
+- `crates/jcode-base/src/memory_agent.rs` — final + incremental extraction
+
+### Confidence mapping
+
+`TrustLevel` is mapped to provenance confidence via
+`TrustLevel::provenance_confidence()`:
+
+| TrustLevel | Provenance confidence |
+|---|---:|
+| `High` | 0.95 |
+| `Medium` | 0.80 |
+| `Low` | 0.70 |
+
+All three call sites attach:
+
+```rust
+ProvenanceRecord::new(source, ExtractionMethod::LlmExtraction)
+    .with_confidence(trust.provenance_confidence())
+```
+
+where `source` is the session id (or `"incremental"` for the incremental
+path).
+
+### Behavior
+
+- `LlmExtraction` with confidence ≥ 0.7 passes the admission threshold and is
+  accepted by `validate_new_entry`.
+- Below-threshold LLM extractions are rejected at the write boundary and
+  return an `anyhow` error to the caller, surfacing the issue in the agent
+  log rather than silently corrupting the graph.
+- Legacy memories without provenance still load (effective-provenance
+  heuristic).
+
+---
+
+## Backward Compatibility
+
+All instance-layer fields are serialized with `#[serde(default, …)]` so
+existing data files load without migration:
+
+| Field | Default when missing |
+|---|---|
+| `provenance` | `None` (resolved to default heuristic) |
+| `lifecycle.status` | `Active` |
+| `lifecycle.deprecated` | `false` |
+| `lifecycle.effective_from/to` | `None` |
+| `critical` | `false` |
+| `identity.keys` / `identity.aliases` | `[]` |
+
+Validation accepts legacy data; only error-severity issues raised by *new*
+fields block writes.
 
 ---
 
@@ -944,4 +1201,4 @@ graph LR
 
 ---
 
-*Last updated: 2026-01-27*
+*Last updated: 2026-08-10*
