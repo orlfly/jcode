@@ -21,6 +21,23 @@ use std::time::{Duration, Instant};
 /// and any other client describe the same failure the same way.
 pub use jcode_sdk::{SocketState, Stage, describe_disconnect, explain};
 
+/// Use the same concise lifecycle vocabulary as the TUI. The API intentionally
+/// carries the daemon's stable wire strings, so this remains tolerant of a new
+/// phase added by a newer daemon.
+fn connection_phase_label(phase: String) -> String {
+    match phase.as_str() {
+        "authenticating" => "refreshing auth".to_string(),
+        "connecting" => "connecting".to_string(),
+        "sending request" => "sending context".to_string(),
+        "waiting for response" => "waiting for response".to_string(),
+        "streaming" => "streaming".to_string(),
+        _ if phase.starts_with("retrying (") && phase.ends_with(')') => {
+            format!("retrying {}", &phase[10..phase.len() - 1])
+        }
+        _ => phase,
+    }
+}
+
 /// UI-facing updates produced by the connection worker.
 #[derive(Debug)]
 pub enum HarnessUpdate {
@@ -87,7 +104,7 @@ pub enum HarnessUpdate {
     /// error card in the conversation.
     ConnectionLost(String),
     /// The daemon's current session list, for the session strip.
-    Sessions(Vec<crate::strip::Entry>),
+    Sessions(Vec<crate::strip::Panel>),
     /// The tail of another session's conversation, for the overview's preview.
     Peek {
         session_id: String,
@@ -140,6 +157,11 @@ impl CommandSender {
             tx,
             new_requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_requested_for_test(&self) -> bool {
+        self.new_requested.load(Ordering::Acquire)
     }
 
     pub fn send(&self, command: Command) -> Result<(), std::sync::mpsc::SendError<Command>> {
@@ -484,14 +506,23 @@ fn run(
         }
     });
 
-    // Session-list polling is independent of the command worker. It may retain
-    // the old client briefly during a new-session handoff, but the replacement
-    // connection is separate and does not wait for this poller to retire.
+    // Session-list polling is independent of the command worker. Give it its
+    // own connection as well as its own thread: the bridge serves requests on
+    // one connection in order, so a list read on a clone of the live client can
+    // otherwise sit in front of a user message (or its streamed events). This
+    // is the same isolation used for transcript previews above.
     std::thread::spawn({
-        let client = client.clone();
         let ui = ui.clone();
         let poll_new_requested = Arc::clone(&new_requested);
         move || {
+            let Ok(client) = JcodeClient::connect(ConnectOptions {
+                client_name: concat!("jcode-desktop2-sessions/", env!("CARGO_PKG_VERSION"))
+                    .to_string(),
+                ensure_runtime: false,
+                ..Default::default()
+            }) else {
+                return;
+            };
             while !client.is_closed() && !poll_new_requested.load(Ordering::Acquire) {
                 match client.list_sessions() {
                     Ok(sessions) => ui.send(HarnessUpdate::Sessions(
@@ -536,6 +567,13 @@ fn run(
             ApiEvent::ReasoningDelta { text, .. } => {
                 ui.send(HarnessUpdate::Activity("thinking".into()));
                 ui.send(HarnessUpdate::Reasoning(text));
+            }
+            ApiEvent::ConnectionPhase { phase, .. } => {
+                // Match the TUI's user-facing vocabulary rather than exposing
+                // the provider protocol's `sending request` wording. These
+                // events arrive before reasoning/text, which is precisely when
+                // a generic "thinking" label otherwise looks hung.
+                ui.send(HarnessUpdate::Activity(connection_phase_label(phase)));
             }
             ApiEvent::ToolStart { call_id, name, .. } => {
                 tool_input.remove(&call_id);
@@ -665,6 +703,32 @@ mod command_sender_tests {
     use super::*;
 
     #[test]
+    fn provider_phases_use_tui_status_labels() {
+        assert_eq!(
+            connection_phase_label("authenticating".into()),
+            "refreshing auth"
+        );
+        assert_eq!(connection_phase_label("connecting".into()), "connecting");
+        assert_eq!(
+            connection_phase_label("sending request".into()),
+            "sending context"
+        );
+        assert_eq!(
+            connection_phase_label("waiting for response".into()),
+            "waiting for response"
+        );
+        assert_eq!(
+            connection_phase_label("retrying (2/4)".into()),
+            "retrying 2/4"
+        );
+        assert_eq!(connection_phase_label("streaming".into()), "streaming");
+        assert_eq!(
+            connection_phase_label("negotiating proxy".into()),
+            "negotiating proxy"
+        );
+    }
+
+    #[test]
     fn new_session_bypasses_an_occupied_command_queue() {
         let (tx, rx) = channel();
         let new_requested = Arc::new(AtomicBool::new(false));
@@ -686,8 +750,8 @@ mod command_sender_tests {
 }
 
 /// A session-list entry, sized for the overview.
-fn to_entry(session: jcode_sdk::SessionInfo) -> crate::strip::Entry {
-    crate::strip::Entry {
+fn to_entry(session: jcode_sdk::SessionInfo) -> crate::strip::Panel {
+    crate::strip::Panel {
         session_id: session.session_id,
         title: session.title,
         working_dir: session.working_dir,

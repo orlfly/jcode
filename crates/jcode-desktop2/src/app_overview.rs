@@ -17,7 +17,7 @@ impl App {
     /// mid-gesture.
     pub(crate) fn overview_field(&self) -> overview::Field {
         overview::layout(
-            &self.model.strip.entries(),
+            &self.model.strips.panels(),
             self.model
                 .overview
                 .focus()
@@ -76,8 +76,8 @@ impl App {
             .into_iter()
             .chain(
                 self.model
-                    .strip
-                    .entries()
+                    .strips
+                    .panels()
                     .into_iter()
                     .map(|entry| entry.session_id),
             )
@@ -95,7 +95,7 @@ impl App {
         if commit
             && let Some(target) = self.model.overview.focus().map(str::to_string)
             && self.model.session_id.as_deref() != Some(target.as_str())
-            && self.model.strip.focus_session(&target)
+            && self.model.strips.focus_session(&target)
         {
             self.attach_focused_session();
         }
@@ -290,6 +290,30 @@ impl App {
         logical_key: &winit::keyboard::Key,
         typed: Option<&str>,
     ) -> bool {
+        // Reload is application chrome rather than overlay input. Resolve it
+        // before an open help card, picker, or overview owns the keyboard.
+        if keymap::resolve(logical_key, self.modifiers) == Some(keymap::Action::ManualReload) {
+            return self.apply(keymap::Action::ManualReload, typed);
+        }
+        // F1 is application help rather than input for whichever picker happens
+        // to be open. Let it rise above existing overlays so it is always a
+        // reliable, discoverable way to ask what the window can do.
+        if !self.model.help_open
+            && keymap::resolve(logical_key, self.modifiers) == Some(keymap::Action::ToggleHelp)
+        {
+            self.apply(keymap::Action::ToggleHelp, typed);
+            self.request_redraw();
+            return true;
+        }
+        if self.model.help_open {
+            if let Some(action) = keymap::resolve_help(logical_key) {
+                self.apply(action, typed);
+            }
+            // The help card is modal. Unknown keys are consumed instead of
+            // leaking into the composer hidden beneath it.
+            self.request_redraw();
+            return true;
+        }
         if self.model.resume.is_open() {
             return self.resume_keydown(logical_key, typed);
         }

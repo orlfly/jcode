@@ -29,6 +29,9 @@ pub enum Action {
     /// Insert the event's text at the cursor.
     Insert,
     Submit,
+    /// Open or close the Desktop2 help overlay. F1 is intentionally unmodified
+    /// so the feature is discoverable without knowing a command first.
+    ToggleHelp,
     /// Newline within the input (Shift+Enter), not a submit.
     InsertNewline,
 
@@ -107,11 +110,13 @@ pub enum Action {
     PanelShrink,
     PanelGrow,
 
-    /// Ctrl+Shift+N: start a fresh session and attach to it. The chord every
-    /// browser and terminal spends on "new window", for the same act: this is
-    /// the only way to add a session from inside the app, so it is bound
-    /// rather than left to the strip, which can only walk what already exists.
+    /// Cmd/Ctrl+T or Ctrl+Shift+N: create a fresh session panel and focus it.
+    /// This is spatially a new tab/panel, never a clear of the current page.
     SessionNew,
+    /// Ctrl+Alt+Space: open the spatial session overview without relying on a
+    /// bare Super event, which Wayland compositors may reserve and never send
+    /// to the focused client.
+    ToggleOverview,
     /// Overview field navigation, while the overview is held open. Spatial
     /// rather than list motion: the field is 2D, so these move to whichever
     /// blob actually lies that way.
@@ -163,10 +168,13 @@ pub enum Action {
     /// action rather than a pointer-only control.
     ToggleModelPicker,
 
-    /// Ctrl+Shift+R: cycle how much of the model's thinking the transcript
-    /// keeps (`current` -> `full` -> `off`). A view choice, so it is a
-    /// keypress rather than a config edit and a restart.
+    /// Cycle how much of the model's thinking the transcript keeps (`current`
+    /// -> `full` -> `off`). This remains available from the settings panel.
     CycleReasoningDisplay,
+
+    /// Ctrl+Shift+R: activate changed application code inside the stable native host.
+    /// Deliberately global, so it works even while an overlay owns the keyboard.
+    ManualReload,
 
     /// Ctrl+plus / Ctrl+minus / Ctrl+0: grow, shrink, or reset the UI zoom.
     /// The browser's chords, because "the text is too small" is a browser-
@@ -213,6 +221,11 @@ pub struct Ported {
 /// Chords ported from the TUI. Adding a row without wiring the chord fails
 /// `tests::every_ported_chord_resolves`.
 pub const PORTED: &[Ported] = &[
+    Ported {
+        chord: "f1",
+        action: Action::ToggleHelp,
+        tui: "/help (Desktop2 overlay)",
+    },
     Ported {
         chord: "enter",
         action: Action::Submit,
@@ -424,9 +437,24 @@ pub const PORTED: &[Ported] = &[
         tui: "light/dark theme",
     },
     Ported {
+        chord: "ctrl+shift+r",
+        action: Action::ManualReload,
+        tui: "desktop: manually reload the activated build",
+    },
+    Ported {
         chord: "ctrl+shift+n",
         action: Action::SessionNew,
         tui: "new session",
+    },
+    Ported {
+        chord: "ctrl+t",
+        action: Action::SessionNew,
+        tui: "new session panel (browser convention)",
+    },
+    Ported {
+        chord: "super+t",
+        action: Action::SessionNew,
+        tui: "new session panel (macOS convention)",
     },
     Ported {
         chord: "ctrl+r",
@@ -709,8 +737,8 @@ pub fn resolve_resume(key: &Key, mods: ModifiersState) -> Option<Action> {
                 return match ch {
                     'r' => Some(Action::ToggleResume),
                     'c' | 'd' | 'g' => Some(Action::ResumeCancel),
-                    'n' => Some(Action::ResumeDown),
-                    'p' => Some(Action::ResumeUp),
+                    'j' | 'n' => Some(Action::ResumeDown),
+                    'k' | 'p' => Some(Action::ResumeUp),
                     _ => None,
                 };
             }
@@ -720,6 +748,14 @@ pub fn resolve_resume(key: &Key, mods: ModifiersState) -> Option<Action> {
         }
         _ => None,
     }
+}
+
+/// Resolve a key while the help card owns the keyboard.
+///
+/// Only its two close chords are live. Returning `None` deliberately swallows
+/// everything else so typing cannot edit a composer obscured by a modal card.
+pub fn resolve_help(key: &Key) -> Option<Action> {
+    matches!(key, Key::Named(NamedKey::Escape | NamedKey::F1)).then_some(Action::ToggleHelp)
 }
 
 /// Resolve a key press to an action. `None` means the key is not bound and
@@ -736,6 +772,8 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
 
     match key {
         Key::Named(named) => match named {
+            NamedKey::F1 => Some(Action::ToggleHelp),
+            NamedKey::Space if ctrl && alt => Some(Action::ToggleOverview),
             // Session-strip motion is checked first: the arrow arms below
             // would otherwise swallow it, and chrome navigation has to be
             // reachable from any editor state.
@@ -848,6 +886,9 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                     '+' | '=' => return Some(Action::ZoomIn),
                     '-' | '_' => return Some(Action::ZoomOut),
                     '0' => return Some(Action::ZoomReset),
+                    // New-tab muscle memory maps directly to a new spatial
+                    // session panel. Shift remains free for reopen-closed-tab.
+                    't' if !shift => return Some(Action::SessionNew),
                     _ => {}
                 }
             }
@@ -864,10 +905,9 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                     // Ctrl+Shift+D: light/dark. Shifted so it cannot collide
                     // with a plain Ctrl+D, which is interrupt-or-quit.
                     'd' => return Some(Action::ToggleTheme),
-                    // Ctrl+Shift+R: how much thinking is shown. Shifted so it
-                    // cannot collide with a future plain Ctrl+R (recovery in
-                    // the TUI), and grouped with the other view chords.
-                    'r' => return Some(Action::CycleReasoningDisplay),
+                    // Ctrl+Shift+R: gracefully adopt the activated desktop
+                    // build. Plain Ctrl+R remains session recovery.
+                    'r' => return Some(Action::ManualReload),
                     // Ctrl+Shift+N: a new session. Shifted so it cannot be hit
                     // by a plain Ctrl+N reflex while typing, and matching the
                     // "new window" chord rather than "new tab": a session is a
@@ -967,6 +1007,7 @@ pub fn parse_chord(chord: &str) -> Option<(Key, ModifiersState)> {
                     "pageup" => Key::Named(NamedKey::PageUp),
                     "pagedown" => Key::Named(NamedKey::PageDown),
                     "tab" => Key::Named(NamedKey::Tab),
+                    "f1" => Key::Named(NamedKey::F1),
                     other if other.chars().count() == 1 => {
                         Key::Character(winit::keyboard::SmolStr::new(other))
                     }
@@ -991,6 +1032,14 @@ mod tests {
     fn unknown_chords_are_rejected_rather_than_guessed() {
         assert!(parse_chord("ctrl+nope").is_none());
         assert!(parse_chord("ctrl").is_none(), "a chord needs a key");
+    }
+
+    #[test]
+    fn resume_picker_supports_ctrl_j_and_k_navigation() {
+        for (chord, action) in [("ctrl+j", Action::ResumeDown), ("ctrl+k", Action::ResumeUp)] {
+            let (key, mods) = parse(chord);
+            assert_eq!(resolve_resume(&key, mods), Some(action), "'{chord}'");
+        }
     }
 
     /// R7: chrome navigation must never cost the user their text motion.

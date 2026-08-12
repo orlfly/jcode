@@ -37,6 +37,23 @@ fn ctrl_m_resolves_to_the_model_picker() {
 }
 
 #[test]
+fn ctrl_alt_space_opens_the_session_overview() {
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    assert_eq!(
+        keymap::resolve(
+            &Key::Named(NamedKey::Space),
+            ModifiersState::CONTROL | ModifiersState::ALT,
+        ),
+        Some(keymap::Action::ToggleOverview)
+    );
+
+    let mut app = app_with("");
+    app.apply(keymap::Action::ToggleOverview, None);
+    assert!(app.model.overview.is_visible());
+}
+
+#[test]
 fn escape_clears_the_input_instead_of_quitting() {
     // The starter quit the app on Escape, silently losing typed work.
     let mut app = app_with("a draft message");
@@ -264,6 +281,62 @@ fn submitting_without_a_session_keeps_the_text_and_says_why() {
         "text was discarded while detached"
     );
     assert!(app.model.notice.is_some(), "no notice explained the no-op");
+}
+
+#[test]
+fn local_help_aliases_work_before_attachment_and_never_reach_the_harness() {
+    for alias in crate::help::ALIASES {
+        let mut app = App::default();
+        app.apply(Action::Insert, Some(alias));
+        app.submit_input();
+        assert!(app.model.help_open, "{alias} did not open help");
+        assert!(
+            app.model.editor.is_empty(),
+            "{alias} stayed in the composer"
+        );
+        assert!(app.model.transcript.is_empty(), "{alias} became a message");
+        assert_eq!(app.model.session_id, None, "test unexpectedly attached");
+    }
+
+    // Repeat while attached to prove interception happens before the outgoing
+    // command path, not merely because an unattached submit is rejected.
+    let mut app = app_with("/commands");
+    let (_updates_tx, updates_rx) = std::sync::mpsc::channel();
+    let (commands_tx, commands_rx) = std::sync::mpsc::channel();
+    app.harness = Some((
+        updates_rx,
+        crate::harness::CommandSender::for_test(commands_tx),
+    ));
+    app.submit_input();
+    assert!(app.model.help_open);
+    assert!(matches!(
+        commands_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn f1_help_is_keyboard_modal_and_escape_or_f1_closes_it() {
+    let mut app = app_with("draft stays put");
+    assert_eq!(
+        keymap::resolve(&Key::Named(NamedKey::F1), ModifiersState::empty()),
+        Some(Action::ToggleHelp)
+    );
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(app.model.help_open);
+
+    assert!(app.key_pressed(&ch('x'), Some("x")));
+    assert_eq!(app.model.editor.text(), "draft stays put");
+    assert!(app.model.help_open, "an unrelated key closed help");
+
+    assert!(app.key_pressed(&Key::Named(NamedKey::Escape), None));
+    assert!(!app.model.help_open);
+    assert_eq!(app.model.editor.text(), "draft stays put");
+
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(app.model.help_open);
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(!app.model.help_open);
 }
 
 /// A conversation long enough to overflow any test region.
@@ -1134,26 +1207,26 @@ fn a_reported_model_reaches_the_model() {
 /// transcript into the new one.
 mod session_strip {
     use super::*;
-    use crate::strip::{Entry, Strip};
+    use crate::strip::{Panel, Strips};
 
     fn app_with_sessions(focused: &str) -> App {
         let mut app = App::default();
         let entries = vec![
-            Entry {
+            Panel {
                 session_id: "s_a1".into(),
                 title: None,
                 working_dir: Some("/home/j/jcode".into()),
                 busy: false,
                 weight: 0.0,
             },
-            Entry {
+            Panel {
                 session_id: "s_a2".into(),
                 title: None,
                 working_dir: Some("/home/j/jcode".into()),
                 busy: false,
                 weight: 0.0,
             },
-            Entry {
+            Panel {
                 session_id: "s_b1".into(),
                 title: None,
                 working_dir: Some("/home/j/site".into()),
@@ -1161,7 +1234,7 @@ mod session_strip {
                 weight: 0.0,
             },
         ];
-        app.model.strip = Strip::build(entries, Some(focused));
+        app.model.strips = Strips::build(entries, Some(focused));
         app.model.session_id = Some(focused.into());
         app
     }
@@ -1241,7 +1314,64 @@ mod session_strip {
         let mut app = app_with_sessions("s_a1");
         app.apply(Action::SessionDown, None);
         assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
-        assert_eq!(app.model.strip.group_index(), 1);
+        assert_eq!(app.model.strips.strip_index(), 1);
+    }
+
+    fn panel_point(app: &App, wanted_strip: usize, wanted_panel: usize) -> (f64, f64) {
+        let (top, bottom) = app.frame.strip().expect("strip missing");
+        crate::strip::layout_items(&app.model.strips, app.frame.left, app.frame.right)
+            .into_iter()
+            .find_map(|item| match item {
+                crate::strip::Item::Panel {
+                    strip,
+                    panel,
+                    x,
+                    width,
+                    ..
+                } if strip == wanted_strip && panel == wanted_panel => {
+                    Some((x + width / 2.0, (top + bottom) / 2.0))
+                }
+                _ => None,
+            })
+            .expect("panel was not laid out")
+    }
+
+    #[test]
+    fn clicking_a_strip_block_switches_to_that_session() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 0, 1);
+
+        app.on_pointer_pressed();
+
+        assert_eq!(app.model.session_id.as_deref(), Some("s_a2"));
+        assert!(app.model.workspace.is_animating());
+    }
+
+    #[test]
+    fn clicking_a_strip_block_in_another_group_switches_workspace() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 1, 0);
+
+        app.on_pointer_pressed();
+
+        assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
+        assert_eq!(
+            app.model.workspace.row_change(),
+            Some(crate::workspace::Direction::Down)
+        );
+    }
+
+    #[test]
+    fn hovering_a_strip_block_uses_the_pointer_cursor() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 0, 1);
+
+        app.update_cursor_icon();
+
+        assert_eq!(app.cursor_icon, winit::window::CursorIcon::Pointer);
     }
 
     /// With one session there is nowhere to go, so the keys must leave the
@@ -1250,8 +1380,8 @@ mod session_strip {
     #[test]
     fn navigation_is_inert_with_a_single_session() {
         let mut app = App::default();
-        app.model.strip = Strip::build(
-            vec![Entry {
+        app.model.strips = Strips::build(
+            vec![Panel {
                 session_id: "solo".into(),
                 title: None,
                 working_dir: Some("/tmp".into()),
@@ -1293,8 +1423,8 @@ mod session_strip {
             "an empty session list still reserved a strip row"
         );
 
-        app.model.strip = Strip::build(
-            vec![Entry {
+        app.model.strips = Strips::build(
+            vec![Panel {
                 session_id: "solo".into(),
                 title: None,
                 working_dir: Some("/tmp".into()),
@@ -1327,23 +1457,23 @@ mod session_strip {
         assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
 
         // A later poll reports the same sessions in the same order.
-        app.model.strip = Strip::build(
+        app.model.strips = Strips::build(
             vec![
-                Entry {
+                Panel {
                     session_id: "s_a1".into(),
                     title: None,
                     working_dir: Some("/home/j/jcode".into()),
                     busy: false,
                     weight: 0.0,
                 },
-                Entry {
+                Panel {
                     session_id: "s_a2".into(),
                     title: None,
                     working_dir: Some("/home/j/jcode".into()),
                     busy: false,
                     weight: 0.0,
                 },
-                Entry {
+                Panel {
                     session_id: "s_b1".into(),
                     title: None,
                     working_dir: Some("/home/j/site".into()),
@@ -1354,7 +1484,7 @@ mod session_strip {
             app.model.session_id.as_deref(),
         );
         assert_eq!(
-            app.model.strip.focused_session(),
+            app.model.strips.focused_session(),
             Some("s_b1"),
             "a refresh moved the highlight off the visible session"
         );
@@ -1498,18 +1628,71 @@ fn ctrl_shift_n_starts_a_new_session() {
     );
 }
 
-/// Starting a session clears the page it is leaving. A transcript carried
-/// across would attribute the old session's output to the new one, which is
-/// the one thing the strip's attach path already refuses to do.
 #[test]
-fn a_new_session_clears_the_page_it_leaves() {
+fn browser_new_tab_shortcuts_start_a_new_session_panel() {
+    assert_eq!(
+        keymap::resolve(&ch('t'), ModifiersState::CONTROL),
+        Some(Action::SessionNew)
+    );
+    assert_eq!(
+        keymap::resolve(&ch('t'), ModifiersState::SUPER),
+        Some(Action::SessionNew)
+    );
+    assert_ne!(
+        keymap::resolve(&ch('t'), ModifiersState::CONTROL | ModifiersState::SHIFT),
+        Some(Action::SessionNew),
+        "Ctrl+Shift+T should remain available for reopen-closed-panel behavior"
+    );
+}
+
+/// Starting a session must leave the current panel visible while creation is
+/// in flight. Once the new id attaches, the live page becomes the new blank
+/// panel and the old transcript remains cached as its spatial neighbor.
+#[test]
+fn a_new_session_preserves_the_old_panel_until_the_new_one_attaches() {
+    use std::sync::mpsc::channel;
+
     let mut app = app_with("a draft");
     app.model
         .transcript
         .append_assistant("previous session output");
+    app.model.session_id = Some("old".into());
+    app.model.working_dir = Some("/work".into());
     app.model.busy = true;
     app.model.scroll = 120.0;
-    app.clear_for_session_change();
+    let before = app.model.transcript.streaming_len();
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    let commands = crate::harness::CommandSender::for_test(commands_tx);
+    app.harness = Some((updates_rx, commands.clone()));
+
+    app.new_session();
+
+    assert!(commands.new_requested_for_test());
+    assert_eq!(app.model.session_id.as_deref(), Some("old"));
+    assert_eq!(app.model.transcript.streaming_len(), before);
+    assert!(app.model.peeks.get("old").is_some());
+
+    // The periodic session poll can beat the create response. Seeing the old
+    // panel again must not finish the transition or blank it.
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Sessions(vec![
+            crate::strip::Panel::new("old", Some("/work")),
+        ]))
+        .unwrap();
+    app.drain_harness_updates();
+    assert!(app.new_session_transition_pending);
+    assert_eq!(app.model.transcript.streaming_len(), before);
+
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Attached {
+            session_id: "new".into(),
+            working_dir: Some("/work".into()),
+        })
+        .unwrap();
+    app.drain_harness_updates();
+
+    assert_eq!(app.model.session_id.as_deref(), Some("new"));
     assert!(!app.model.busy, "the new session inherited a running turn");
     assert_eq!(
         app.model.scroll, 0.0,
@@ -1520,6 +1703,30 @@ fn a_new_session_clears_the_page_it_leaves() {
         0,
         "the new session inherited the old transcript"
     );
+    assert_eq!(app.model.peeks.get("old").unwrap().streaming_len(), before);
+}
+
+#[test]
+fn a_fresh_window_requests_exactly_one_neighboring_panel() {
+    use std::sync::mpsc::channel;
+
+    let mut app = App::default();
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    let commands = crate::harness::CommandSender::for_test(commands_tx);
+    app.harness = Some((updates_rx, commands.clone()));
+
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Attached {
+            session_id: "first".into(),
+            working_dir: Some("/work".into()),
+        })
+        .unwrap();
+    app.drain_harness_updates();
+
+    assert!(commands.new_requested_for_test());
+    assert!(app.new_session_transition_pending);
+    assert!(!app.startup_panel_pending);
 }
 
 /// With no harness there is nothing to create a session on. Clearing the page
@@ -1546,4 +1753,42 @@ fn a_new_session_without_a_connection_keeps_the_page_and_says_why() {
         "a failed session start said nothing: {:?}",
         app.model.notice
     );
+}
+
+/// Session creation crosses two asynchronous boundaries: attach identifies the
+/// new conversation, then the session poll adds its panel. The niri-style slide
+/// must begin at the second boundary, when both panels can actually be drawn.
+#[test]
+fn a_created_session_slides_in_when_its_panel_arrives() {
+    use std::sync::mpsc::channel;
+
+    let mut app = app_with("a draft");
+    app.model.strips = crate::strip::Strips::build(
+        vec![crate::strip::Panel::new("old", Some("/work"))],
+        Some("old"),
+    );
+    app.model.session_id = Some("new".into());
+    app.new_session_transition_pending = true;
+
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    app.harness = Some((
+        updates_rx,
+        crate::harness::CommandSender::for_test(commands_tx),
+    ));
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Sessions(vec![
+            crate::strip::Panel::new("old", Some("/work")),
+            crate::strip::Panel::new("new", Some("/work")),
+        ]))
+        .unwrap();
+
+    app.drain_harness_updates();
+
+    assert_eq!(app.model.strips.focused_session(), Some("new"));
+    assert!(
+        app.model.workspace.is_animating(),
+        "the new panel appeared without a workspace slide"
+    );
+    assert!(!app.new_session_transition_pending);
 }
