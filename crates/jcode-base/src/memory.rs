@@ -18,7 +18,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use jcode_memory_types::{GraphBackend, StoreKey};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1826,6 +1826,58 @@ impl MemoryManager {
 
     // ==================== Graph-Based Operations ====================
 
+    /// Load the legacy JSON project graph for a one-time migration into
+    /// the sqlite backend, if such a graph exists and holds content.
+    fn load_legacy_project_json_for_migration(&self) -> Result<Option<MemoryGraph>> {
+        let Some(path) = self.project_memory_path()? else {
+            return Ok(None);
+        };
+        Self::read_legacy_graph_for_migration(&path)
+    }
+
+    /// Load the legacy JSON global graph for a one-time migration into
+    /// the sqlite backend, if such a graph exists and holds content.
+    fn load_legacy_global_json_for_migration(&self) -> Result<Option<MemoryGraph>> {
+        Self::read_legacy_graph_for_migration(&self.global_memory_path()?)
+    }
+
+    /// Read a legacy JSON graph snapshot for migration. Returns `None`
+    /// when the file is absent, unreadable, or has no content. On a
+    /// successful read the source file is renamed to `*.json.migrated`
+    /// (kept as a backup) so a later empty sqlite store does not
+    /// re-import and resurrect memories the user deletes after switching
+    /// to the sqlite backend.
+    fn read_legacy_graph_for_migration(path: &Path) -> Result<Option<MemoryGraph>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let graph = match storage::read_json::<MemoryGraph>(path) {
+            Ok(g) if g.graph_version == GRAPH_VERSION => g,
+            _ => match storage::read_json::<MemoryStore>(path) {
+                Ok(store) => MemoryGraph::from_legacy_store(store),
+                Err(_) => return Ok(None),
+            },
+        };
+        let has_content = !graph.memories.is_empty()
+            || !graph.tags.is_empty()
+            || !graph.clusters.is_empty()
+            || !graph.edges.is_empty();
+        if !has_content {
+            return Ok(None);
+        }
+        let backup = path.with_extension("json.migrated");
+        if std::fs::rename(path, &backup).is_err() {
+            // Keep the original in place if the rename fails; the
+            // migration still applies from the in-memory graph.
+            crate::logging::info(&format!(
+                "kept legacy JSON at {} (could not rename to {})",
+                path.display(),
+                backup.display()
+            ));
+        }
+        Ok(Some(graph))
+    }
+
     /// Load project memories as a MemoryGraph with automatic migration
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
         // When the sqlite-gvec backend is active, route everything
@@ -1844,6 +1896,24 @@ impl MemoryManager {
             });
             match backend.load(&key) {
                 Ok(mut graph) => {
+                    // One-time migration from the legacy JSON snapshot:
+                    // when switching the default backend to sqlite, an
+                    // empty sqlite store would otherwise hide existing
+                    // JSON memory. Import only when the sqlite store is
+                    // empty and a legacy graph exists; the source file
+                    // is renamed so a later empty store does not
+                    // resurrect memories the user deletes after the
+                    // switch.
+                    if graph.memory_count() == 0
+                        && graph.tags.is_empty()
+                        && graph.clusters.is_empty()
+                        && graph.edges.is_empty()
+                        && let Some(legacy) =
+                            self.load_legacy_project_json_for_migration()?
+                    {
+                        graph = legacy;
+                        let _ = backend.save(&key, &graph);
+                    }
                     if Self::normalize_graph_search_text(&mut graph) {
                         let _ = backend.save(&key, &graph);
                     }
@@ -1937,7 +2007,22 @@ impl MemoryManager {
             };
             let key = StoreKey::new(crate::memory::global_store_key());
             match backend.load(&key) {
-                Ok(graph) => {
+                Ok(mut graph) => {
+                    // One-time migration from the legacy JSON snapshot,
+                    // mirroring the project path above.
+                    if graph.memory_count() == 0
+                        && graph.tags.is_empty()
+                        && graph.clusters.is_empty()
+                        && graph.edges.is_empty()
+                        && let Some(legacy) =
+                            self.load_legacy_global_json_for_migration()?
+                    {
+                        graph = legacy;
+                        let _ = backend.save(&key, &graph);
+                    }
+                    if Self::normalize_graph_search_text(&mut graph) {
+                        let _ = backend.save(&key, &graph);
+                    }
                     if !self.test_mode {
                         cache_graph_for_backend(backend.name(), &key, &graph, 0);
                     }
@@ -2359,10 +2444,10 @@ impl Default for MemoryManager {
 /// Resolved once per process from the `JCODE_MEMORY_BACKEND`
 /// environment variable:
 ///
-/// - `json` (default) — write the entire `MemoryGraph` to a single
-///   atomic JSON snapshot under `~/.jcode/memory/projects/<hash>.json`.
-/// - `sqlite-gvec` — use the SQLite + sqlite-gvec engine
+/// - `sqlite-gvec` (default) — use the SQLite + sqlite-gvec engine
 ///   (`SqliteGvecBackend`). Requires the `sqlite-gvec` Cargo feature.
+/// - `json` — write the entire `MemoryGraph` to a single
+///   atomic JSON snapshot under `~/.jcode/memory/projects/<hash>.json`.
 ///
 /// When the requested backend is unavailable (e.g. SQLite feature not
 /// compiled in, or `SqliteGvecBackend::open_default` failed), the
@@ -2373,13 +2458,14 @@ pub fn active_backend_name() -> &'static str {
     NAME.get_or_init(|| {
         let raw = std::env::var("JCODE_MEMORY_BACKEND").unwrap_or_default();
         match raw.to_lowercase().as_str() {
-            "" | "json" => "json",
+            "" => "sqlite-gvec",
+            "json" => "json",
             "sqlite" | "sqlite-gvec" | "gvec" => "sqlite-gvec",
             other => {
                 crate::logging::warn(&format!(
-                    "JCODE_MEMORY_BACKEND={other:?} is not recognised; falling back to 'json'"
+                    "JCODE_MEMORY_BACKEND={other:?} is not recognised; falling back to 'sqlite-gvec'"
                 ));
-                "json"
+                "sqlite-gvec"
             }
         }
     })
@@ -2417,9 +2503,10 @@ fn try_open_sqlite_backend(_test_dir: bool) -> Option<Arc<dyn GraphBackend>> {
 
 /// Return the active `GraphBackend` for a given `StoreKey`.
 ///
-/// The first call per process initialises a process-wide singleton
-/// (currently the JSON backend); the SQLite backend, when available,
-/// is shared via `Arc` so all threads see the same connection.
+/// The first call per process initialises a process-wide singleton. The
+/// default is the SQLite backend (shared via `Arc` so all threads see
+/// the same connection); when SQLite is unavailable it falls back to the
+/// JSON backend.
 pub fn graph_backend() -> Arc<dyn GraphBackend> {
     use std::sync::OnceLock;
     static BACKEND: OnceLock<Arc<dyn GraphBackend>> = OnceLock::new();

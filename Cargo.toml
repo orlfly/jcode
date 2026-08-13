@@ -237,7 +237,7 @@ tempfile = "3"
 # semantic retrieval, and embedding-backed features work out of the box.
 # Use `JCODE_DEV_FEATURE_PROFILE=minimal` for compile-speed probes that need
 # to skip optional default feature stacks.
-default = ["pdf", "embeddings", "bedrock"]
+default = ["pdf", "embeddings", "bedrock", "sqlite-gvec"]
 dev-bins = ["jcode-tui/dev-bins"]
 jemalloc = [
     "dep:tikv-jemallocator",

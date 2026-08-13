@@ -118,14 +118,14 @@ tempfile = "3"
 qrcode = { version = "0.14.1", default-features = false }
 
 # sqlite-gvec graph + vector engine (vendored submodule).
-# When enabled, exposes SqliteGvecBackend as an alternative to the JSON
-# backend for memory storage. The gvec binding crate pulls in a bundled
-# SQLite (~5MB compiled), so this is opt-in to keep cold builds fast.
+# Exposes SqliteGvecBackend as the default memory storage backend. The
+# gvec binding crate pulls in a bundled SQLite (~5MB compiled), so builds
+# that want to skip it can turn the feature off explicitly.
 gvec = { path = "../../third_party/sqlite-gvec/crates/gvec-bindings", optional = true }
 gvec-core = { path = "../../third_party/sqlite-gvec/crates/gvec-core", optional = true }
 
 [features]
-default = ["embeddings", "bedrock"]
+default = ["embeddings", "bedrock", "sqlite-gvec"]
 # Compiles the in-crate test helpers (storage::lock_test_env,
 # auth::test_sandbox, bus::reset_models_updated_publish_state_for_tests, ...) as
 # `pub` so downstream crates' test targets can reach them. Enabled as a
@@ -146,9 +146,9 @@ embeddings = ["dep:jcode-embedding"]
 # jcode-provider-bedrock (aws-sdk); forward there. Without it the Bedrock
 # provider still compiles but live calls return an explanatory error.
 bedrock = ["jcode-provider-bedrock/aws-sdk"]
-# Enable the SQLite + sqlite-gvec memory backend. Off by default to keep
-# cold builds fast; turn on with `--features sqlite-gvec` once the
-# gvec submodule is initialised.
+# SQLite + sqlite-gvec memory backend. On by default; disable with
+# `--no-default-features` (plus the other desired features) if the bundled
+# SQLite build is not wanted.
 sqlite-gvec = ["dep:gvec", "dep:gvec-core"]
 
 [target.'cfg(windows)'.dependencies]

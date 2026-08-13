@@ -2,16 +2,17 @@
 //!
 //! [`GraphBackend`] is implemented by:
 //!
-//! - [`JsonBackend`]: the legacy JSON-snapshot backend, kept as a
-//!   zero-dependency fallback and as the migration target for existing
-//!   users. This is what `load_project_graph` / `save_project_graph`
-//!   call today, wrapped in a small adapter.
-//!
-//! - [`SqliteGvecBackend`]: a SQLite backend backed by the
+//! - [`SqliteGvecBackend`]: the SQLite backend backed by the
 //!   `sqlite-gvec` graph extension (vendored under `third_party/`).
+//!   This is the default backend selected by `active_backend_name()`.
 //!   Uses gvec's Cypher subset to perform row-level inserts/updates
 //!   inside a single transaction, which avoids the read-modify-write
 //!   amplification of the JSON backend.
+//!
+//! - [`JsonBackend`]: the legacy JSON-snapshot backend, kept as a
+//!   zero-dependency fallback when the `sqlite-gvec` feature is off or
+//!   the SQLite backend cannot be opened, and as a one-time migration
+//!   source for existing JSON memory when sqlite becomes the default.
 
 use crate::storage;
 use anyhow::{Context, Result};

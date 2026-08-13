@@ -512,6 +512,55 @@ fn test_mode_ignores_the_project_dir_and_cannot_see_real_project_memory() {
 }
 
 #[test]
+fn sqlite_default_migrates_legacy_json_graph_once() {
+    // Only meaningful when the sqlite-gvec backend is the active default.
+    // Under the JSON backend this test is vacuous, but it still validates
+    // the routing layer handles a legacy snapshot gracefully.
+    with_temp_home(|_home| {
+        let project_dir = "/tmp/jcode-migrate-project";
+        let manager = MemoryManager::new_test().with_project_dir(project_dir);
+
+        // Seed a legacy JSON graph at the canonical project path.
+        let path = manager
+            .project_memory_path()
+            .expect("test project path")
+            .expect("path present");
+        let mut graph = MemoryGraph::new();
+        let mut entry = MemoryEntry::new(MemoryCategory::Fact, "legacy memory to migrate");
+        entry.id = "legacy-1".into();
+        graph.memories.insert("legacy-1".into(), entry);
+        storage::write_json(&path, &graph).expect("write legacy json");
+
+        let loaded = manager.load_project_graph().expect("load migrates");
+        assert_eq!(loaded.memory_count(), 1, "legacy JSON should migrate into the active backend");
+        assert!(
+            loaded.all_memories().any(|m| m.content.contains("legacy memory")),
+            "migrated memory content should survive"
+        );
+
+        // Source renamed out of the canonical path so a later empty store
+        // does not resurrect memories the user deletes after the switch.
+        assert!(!path.exists(), "legacy JSON should be renamed after migration");
+        assert!(
+            path.with_extension("json.migrated").exists(),
+            "migration backup should be preserved"
+        );
+
+        // Deleting all memories must not resurrect them on the next load.
+        let ids: Vec<String> = loaded.all_memories().map(|m| m.id.clone()).collect();
+        for id in ids {
+            manager.forget(&id).expect("forget migrated memory");
+        }
+        let empty = manager.load_project_graph().expect("reload after delete");
+        assert_eq!(
+            empty.memory_count(),
+            0,
+            "deleted memories must not be resurrected from the migration backup"
+        );
+    });
+}
+
+#[test]
 fn project_memories_are_isolated_by_explicit_project_dir() {
     with_temp_home(|_home| {
         let manager_a = MemoryManager::new().with_project_dir("/tmp/jcode-project-a");
