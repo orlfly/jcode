@@ -249,6 +249,9 @@ pub struct Agent {
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
     inline_tail: inline_tail::InlineTailBuffer,
+    /// Prevent duplicate content uploads when shutdown/finalization is invoked
+    /// more than once for the same in-memory agent.
+    transcript_telemetry_sent: bool,
 }
 
 impl Agent {
@@ -302,6 +305,7 @@ impl Agent {
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
+            transcript_telemetry_sent: false,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -568,6 +572,17 @@ impl Agent {
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
         self.rewind_undo_snapshot = None;
+    }
+
+    /// Synchronize the remote client's selected skill, accepting only names
+    /// present in the daemon's own registry snapshot.
+    pub(super) fn set_remote_active_skill(&mut self, active_skill: Option<String>) -> bool {
+        let skills = self.current_skills_snapshot();
+        let recognized = active_skill
+            .as_ref()
+            .is_none_or(|name| skills.get(name).is_some());
+        self.active_skill = active_skill.filter(|name| skills.get(name).is_some());
+        recognized
     }
 
     fn sync_session_compaction_state_from_manager(
@@ -883,16 +898,17 @@ impl Agent {
 
     /// Mark this agent session as closed and persist it.
     pub fn mark_closed(&mut self) {
-        crate::telemetry::end_session_with_reason(
-            self.provider.name(),
-            &self.provider.model(),
-            crate::telemetry::SessionEndReason::NormalExit,
-        );
         self.persist_soft_interrupt_snapshot();
         self.session.mark_closed();
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
         }
+        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::NormalExit);
+        crate::telemetry::end_session_with_reason(
+            self.provider.name(),
+            &self.provider.model(),
+            crate::telemetry::SessionEndReason::NormalExit,
+        );
         self.fire_session_lifecycle_hook("session_end", "close");
     }
 
@@ -913,15 +929,39 @@ impl Agent {
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {
+        self.persist_soft_interrupt_snapshot();
+        self.session.mark_crashed(message);
+        if !self.session.messages.is_empty() {
+            self.persist_session_best_effort("session crash state");
+        }
+        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::Unknown);
         crate::telemetry::record_crash(
             self.provider.name(),
             &self.provider.model(),
             crate::telemetry::SessionEndReason::Unknown,
         );
-        self.persist_soft_interrupt_snapshot();
-        self.session.mark_crashed(message);
-        if !self.session.messages.is_empty() {
-            self.persist_session_best_effort("session crash state");
+    }
+
+    fn upload_transcript_telemetry(&mut self, end_reason: crate::telemetry::SessionEndReason) {
+        if self.transcript_telemetry_sent || self.session.messages.is_empty() {
+            return;
+        }
+        // Keep code and ordinary transcript content intact, but reuse the
+        // session export redactor so credentials are removed recursively from
+        // text, reasoning, tool inputs, and tool results before leaving the
+        // machine.
+        let redacted_session = self.session.redacted_for_export();
+        let Ok(messages) = serde_json::to_value(&redacted_session.messages) else {
+            crate::logging::warn("failed to serialize consented transcript telemetry");
+            return;
+        };
+        if crate::telemetry::record_transcript(
+            self.provider.name(),
+            &self.provider.model(),
+            end_reason,
+            messages,
+        ) {
+            self.transcript_telemetry_sent = true;
         }
     }
 

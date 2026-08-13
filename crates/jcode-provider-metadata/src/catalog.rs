@@ -31,7 +31,7 @@ pub const ZAI_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_base: "https://api.z.ai/api/coding/paas/v4",
     api_key_env: "ZHIPU_API_KEY",
     env_file: "zai.env",
-    setup_url: "https://docs.z.ai/guides/develop/openai/introduction",
+    setup_url: "https://docs.z.ai/devpack/quick-start",
     default_model: Some("glm-4.5"),
     requires_api_key: true,
 };
@@ -639,7 +639,7 @@ pub const ZAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor 
     auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
     auth_status_method: "API key",
     aliases: &["z.ai", "z-ai", "zai-coding", "zhipu"],
-    menu_detail: "API key",
+    menu_detail: "Coding Plan subscription API key",
     recommended: false,
     target: LoginProviderTarget::OpenAiCompatible(ZAI_PROFILE),
     order: LoginProviderSurfaceOrder::new(Some(7), Some(6), Some(7), Some(6), Some(6)),
@@ -963,17 +963,16 @@ pub const XAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor 
     order: LoginProviderSurfaceOrder::new(Some(33), Some(33), Some(33), Some(33), Some(33)),
 };
 
-/// Grok Build is intentionally a separate identity from `xai`: it delegates
-/// OAuth/token ownership to the installed Grok CLI and never consumes
-/// `XAI_API_KEY`.
+/// Grok Build is intentionally a separate identity from `xai`: Jcode manages
+/// its subscription backend and never consumes `XAI_API_KEY`.
 pub const GROK_BUILD_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "grok-build",
     display_name: "Grok Build",
     auth_kind: LoginProviderAuthKind::Cli,
     auth_state_key: LoginProviderAuthStateKey::GrokBuild,
-    auth_status_method: "Grok CLI cached login",
+    auth_status_method: "Grok Build subscription login",
     aliases: &[],
-    menu_detail: "Grok Build subscription via installed Grok CLI",
+    menu_detail: "Grok Build subscription managed by Jcode",
     recommended: false,
     target: LoginProviderTarget::GrokBuild,
     order: LoginProviderSurfaceOrder::new(Some(100), Some(100), Some(100), Some(100), Some(100)),

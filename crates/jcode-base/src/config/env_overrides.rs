@@ -319,6 +319,11 @@ impl Config {
                 self.features.mermaid = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_CHECK_UPDATES") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.check_updates = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_AUTO_POKE") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.auto_poke = parsed;
@@ -761,6 +766,18 @@ impl Config {
                     self.provider.stream_idle_timeout_secs = parsed;
                 }
             }
+        }
+        if let Ok(v) = std::env::var("JCODE_MAX_RETRIES")
+            && let Ok(parsed) = v.trim().parse::<u32>()
+            && parsed > 0
+        {
+            self.provider.max_retries = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_RETRY_BACKOFF_CAP_SECS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+            && parsed > 0
+        {
+            self.provider.retry_backoff_cap_secs = parsed;
         }
 
         // Copilot premium mode: env var overrides config

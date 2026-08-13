@@ -39,6 +39,44 @@ Events are dual-written to two stores with different jobs:
    high-volume events (see `RETENTION_DAYS`). All the dashboard SQL in this
    repo (`users.sql`, `dau.sql`, `geo.sql`, `health.sql`) reads D1.
 
+Separately consented full transcripts do not enter either firehose or the
+ordinary `events` table. `POST /v1/transcript` writes the JSON body to the
+private `TRANSCRIPTS` R2 bucket and writes metadata to `transcript_uploads`.
+Create the bucket before deployment and configure a 30-day lifecycle deletion:
+
+```bash
+npx wrangler r2 bucket create jcode-consented-transcripts
+npm run migrate:transcript-uploads
+```
+
+The bucket must remain private. Deployment alone does not create the lifecycle
+rule; configure it in Cloudflare before enabling the program in a release.
+
+### Transcript access and deletion operations
+
+Treat transcript access as a production-data operation. Do not expose the R2
+bucket publicly, copy transcript bodies into logs, or query them from ordinary
+analytics dashboards. Use an account with narrowly scoped R2 read access and
+record the reason and upload ID for every manual read.
+
+To remove one upload, first look up its private object key, delete the R2 object,
+then delete the metadata row. Verify both stores no longer contain it:
+
+```bash
+npx wrangler d1 execute jcode-telemetry --remote --command \
+  "SELECT object_key FROM transcript_uploads WHERE upload_id='<UPLOAD_ID>'"
+npx wrangler r2 object delete \
+  "jcode-consented-transcripts/<OBJECT_KEY>" --remote
+npx wrangler d1 execute jcode-telemetry --remote --command \
+  "DELETE FROM transcript_uploads WHERE upload_id='<UPLOAD_ID>'"
+```
+
+For deletion by installation telemetry ID, enumerate every `upload_id` and
+`object_key` first, delete every R2 object, then delete the matching D1 rows.
+Never delete the metadata first because that loses the keys needed to locate
+the private objects. The 30-day R2 lifecycle is the backstop, not a substitute
+for explicit deletion requests.
+
 ### D1 size self-defense
 
 D1 hard-caps databases at 10 GB on Workers Paid (500 MB on Free). The first

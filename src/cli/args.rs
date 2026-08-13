@@ -254,6 +254,10 @@ pub(crate) enum Command {
         json: bool,
     },
 
+    /// Inspect or change anonymous telemetry settings
+    #[command(subcommand)]
+    Telemetry(TelemetryCommand),
+
     /// Self-development mode: run as a canary session on the shared server
     #[command(alias = "selfdev")]
     SelfDev {
@@ -551,6 +555,20 @@ pub(crate) enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum TelemetryCommand {
+    /// Show the current telemetry state without creating an anonymous ID
+    Status {
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable anonymous usage telemetry
+    Enable,
+    /// Disable all telemetry persistently
+    Disable,
+}
+
+#[derive(Subcommand, Debug)]
 pub(crate) enum AccountCommand {
     /// Open browser-based device authorization and wait for plan activation
     Login {
@@ -582,6 +600,19 @@ pub(crate) enum ServerCommand {
     /// Internal: hold a lightweight connection open until stdin closes.
     #[command(hide = true)]
     Keepalive,
+
+    /// Pin the shared server channel to an installed version.
+    ///
+    /// Defaults to the active `current` version. This only selects the daemon's
+    /// binary; run `jcode server reload` separately to apply it.
+    Promote {
+        /// Installed version to promote (defaults to the current channel)
+        version: Option<String>,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Gracefully reload the running background server onto the newest binary.
     ///
