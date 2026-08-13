@@ -43,7 +43,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-use cache::{cache_graph, cached_graph};
+use cache::{cache_graph, cached_graph, cached_graph_for_backend};
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
     clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
@@ -1671,6 +1671,42 @@ impl MemoryManager {
 
     /// Load project memories as a MemoryGraph with automatic migration
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
+        // When the sqlite-gvec backend is active, route everything
+        // through the trait. The legacy JSON path is preserved below
+        // for users on the default backend or when the trait open
+        // fails for any reason.
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            let backend = if self.test_mode {
+                crate::memory::test_backend()
+            } else {
+                crate::memory::graph_backend()
+            };
+            let key = StoreKey::new(match self.get_project_dir() {
+                Some(d) => crate::memory::project_store_key(&d),
+                None => "project:none".to_string(),
+            });
+            match backend.load(&key) {
+                Ok(mut graph) => {
+                    if Self::normalize_graph_search_text(&mut graph) {
+                        let _ = backend.save(&key, &graph);
+                    }
+                    if self.import_legacy_notes_into_graph(&mut graph)? {
+                        let _ = backend.save(&key, &graph);
+                    }
+                    if !self.test_mode {
+                        cache_graph_for_backend(backend.name(), &key, &graph, 0);
+                    }
+                    return Ok(graph);
+                }
+                Err(e) => {
+                    crate::logging::warn(&format!(
+                        "load_project_graph via {e}; falling back to JSON path"
+                    ));
+                    // fall through to legacy JSON handling
+                }
+            }
+        }
+
         let Some(path) = self.project_memory_path()? else {
             return Ok(MemoryGraph::new());
         };
@@ -1736,6 +1772,28 @@ impl MemoryManager {
 
     /// Load global memories as a MemoryGraph with automatic migration
     pub fn load_global_graph(&self) -> Result<MemoryGraph> {
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            let backend = if self.test_mode {
+                crate::memory::test_backend()
+            } else {
+                crate::memory::graph_backend()
+            };
+            let key = StoreKey::new(crate::memory::global_store_key());
+            match backend.load(&key) {
+                Ok(graph) => {
+                    if !self.test_mode {
+                        cache_graph_for_backend(backend.name(), &key, &graph, 0);
+                    }
+                    return Ok(graph);
+                }
+                Err(e) => {
+                    crate::logging::warn(&format!(
+                        "load_global_graph via {e}; falling back to JSON path"
+                    ));
+                }
+            }
+        }
+
         let path = self.global_memory_path()?;
         if !self.test_mode
             && let Some(mut graph) = cached_graph(&path)
@@ -1791,6 +1849,31 @@ impl MemoryManager {
 
    /// Save project memories as a MemoryGraph
    pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
+       if crate::memory::active_backend_name() == "sqlite-gvec" {
+           let backend = if self.test_mode { crate::memory::test_backend() } else { crate::memory::graph_backend() };
+           let key = StoreKey::new(match self.get_project_dir() {
+               Some(d) => crate::memory::project_store_key(&d),
+               None => "project:none".to_string(),
+           });
+           if let Err(e) = backend.save(&key, graph) {
+               crate::logging::warn(&format!(
+                   "save_project_graph via {e}; falling back to JSON path"
+               ));
+               return self.save_project_graph_json(graph);
+           }
+           if !self.test_mode {
+               cache_graph_for_backend(backend.name(), &key, graph, 0);
+           }
+           return Ok(());
+       }
+       self.save_project_graph_json(graph)
+   }
+
+   /// Internal: write the project graph to the legacy JSON snapshot.
+   /// Kept separate so `save_project_graph` can route to either the
+   /// trait backend or this path without duplicating the validation /
+   /// cache-update code below.
+   fn save_project_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
        if let Some(path) = self.project_memory_path()? {
             let report = graph.validate();
             if !report.is_valid() {
@@ -1811,6 +1894,25 @@ impl MemoryManager {
 
    /// Save global memories as a MemoryGraph
    pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
+       if crate::memory::active_backend_name() == "sqlite-gvec" {
+           let backend = if self.test_mode { crate::memory::test_backend() } else { crate::memory::graph_backend() };
+           let key = StoreKey::new(crate::memory::global_store_key());
+           if let Err(e) = backend.save(&key, graph) {
+               crate::logging::warn(&format!(
+                   "save_global_graph via {e}; falling back to JSON path"
+               ));
+               return self.save_global_graph_json(graph);
+           }
+           if !self.test_mode {
+               cache_graph_for_backend(backend.name(), &key, graph, 0);
+           }
+           return Ok(());
+       }
+       self.save_global_graph_json(graph)
+   }
+
+   /// Internal: write the global graph to the legacy JSON snapshot.
+   fn save_global_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
        let path = self.global_memory_path()?;
         let report = graph.validate();
         if !report.is_valid() {
@@ -2129,14 +2231,22 @@ pub fn active_backend_name() -> &'static str {
 /// Try to construct the SQLite backend. Returns `None` if the feature
 /// is off or the open call fails (the caller should fall back to JSON
 /// and log why).
+///
+/// `test_dir` switches to the per-test database so `new_test()` does
+/// not see the real user memory.
 #[cfg(feature = "sqlite-gvec")]
-fn try_open_sqlite_backend() -> Option<Arc<dyn GraphBackend>> {
+fn try_open_sqlite_backend(test_dir: bool) -> Option<Arc<dyn GraphBackend>> {
     use crate::memory::backend::SqliteGvecBackend;
-    match SqliteGvecBackend::open_default() {
+    let result = if test_dir {
+        SqliteGvecBackend::open_test_dir()
+    } else {
+        SqliteGvecBackend::open_default()
+    };
+    match result {
         Ok(b) => Some(Arc::new(b)),
         Err(e) => {
             crate::logging::warn(&format!(
-                "SqliteGvecBackend::open_default failed: {e}; falling back to JSON"
+                "SqliteGvecBackend::open failed: {e}; falling back to JSON"
             ));
             None
         }
@@ -2144,7 +2254,7 @@ fn try_open_sqlite_backend() -> Option<Arc<dyn GraphBackend>> {
 }
 
 #[cfg(not(feature = "sqlite-gvec"))]
-fn try_open_sqlite_backend() -> Option<Arc<dyn GraphBackend>> {
+fn try_open_sqlite_backend(_test_dir: bool) -> Option<Arc<dyn GraphBackend>> {
     None
 }
 
@@ -2159,7 +2269,7 @@ pub fn graph_backend() -> Arc<dyn GraphBackend> {
     BACKEND
         .get_or_init(|| {
             if active_backend_name() == "sqlite-gvec"
-                && let Some(b) = try_open_sqlite_backend()
+                && let Some(b) = try_open_sqlite_backend(false)
             {
                 return b;
             }
@@ -2170,6 +2280,20 @@ pub fn graph_backend() -> Arc<dyn GraphBackend> {
             Arc::new(crate::memory::backend::JsonBackend::new(root))
         })
         .clone()
+}
+
+/// Return the per-test backend. Always returns a fresh, isolated
+/// instance (no caching) so a single test run cannot leak state into
+/// the next.
+pub fn test_backend() -> Arc<dyn GraphBackend> {
+    if active_backend_name() == "sqlite-gvec"
+        && let Some(b) = try_open_sqlite_backend(true)
+    {
+        return b;
+    }
+    let root = crate::memory::backend::JsonBackend::default_root()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    Arc::new(crate::memory::backend::JsonBackend::new(root))
 }
 
 /// Convenience: derive a `StoreKey` from a project's directory hash

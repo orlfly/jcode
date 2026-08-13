@@ -146,6 +146,23 @@ pub trait GraphBackend: Debug + Send + Sync {
     ) -> anyhow::Result<()> {
         self.save(key, graph)
     }
+
+    /// Run a full-text search over the Memory nodes of `key`.
+    ///
+    /// Returns `(memory_id, score)` pairs ordered by relevance, where
+    /// `score` is a non-negative float and larger means more relevant.
+    ///
+    /// The default implementation is a no-op: backends without a
+    /// dedicated text index return `Ok(vec![])`. Backends with FTS5
+    /// (or equivalent) override this to do an indexed search.
+    fn text_search(
+        &self,
+        _key: &StoreKey,
+        _query: &str,
+        _k: usize,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Ok(vec![])
+    }
 }
 
 /// Replay a mutation log onto an in-memory `MemoryGraph`.

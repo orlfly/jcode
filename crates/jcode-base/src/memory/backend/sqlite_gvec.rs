@@ -88,6 +88,21 @@ impl SqliteGvecBackend {
         Self::open(file)
     }
 
+    /// Open an isolated SQLite database under
+    /// `<jcode_dir>/memory/test/backend-sqlite/gvec.sqlite`. Used by
+    /// `MemoryManager::new_test()` so the test suite does not see or
+    /// pollute the real user memory store.
+    pub fn open_test_dir() -> Result<Self> {
+        let dir = storage::jcode_dir()?
+            .join("memory")
+            .join("test")
+            .join("backend-sqlite");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create test SqliteGvecBackend dir {}", dir.display()))?;
+        let file = dir.join("gvec.sqlite");
+        Self::open(file)
+    }
+
     /// Open or create the SQLite database at `path`.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
@@ -451,6 +466,7 @@ impl GraphBackend for SqliteGvecBackend {
     ) -> Result<MemoryGraph> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let g = self.graph(key)?;
+        ensure_text_index(&g)?;
         for m in mutations {
             match m {
                 GraphMutation::UpsertMemory { id, json } => {
@@ -510,6 +526,192 @@ impl GraphBackend for SqliteGvecBackend {
         // Apply mutations first, then save the resulting graph.
         let _ = self.apply_mutations(key, mutations)?;
         self.save(key, graph)
+    }
+
+    /// Run an FTS5 search across the Memory nodes of a single store.
+    ///
+    /// `query` follows FTS5 query syntax (raw user query is best
+    /// sanitised by the caller — words joined with `AND` is usually
+    /// safest). Returns `(memory_id, score)` pairs ordered by BM25
+    /// relevance; `score` is a non-negative float where larger means
+    /// more relevant (we negate gvec's raw BM25 to make the order
+    /// intuitive).
+    fn text_search(
+        &self,
+        key: &StoreKey,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let g = self.graph(key)?;
+        ensure_text_index(&g)?;
+        let storage = &g.storage;
+        let prefix = storage.prefix.clone();
+        if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(anyhow::anyhow!(
+                "text_search: refusing to query non-identifier prefix {prefix:?}"
+            ));
+        }
+        let fts_tbl = format!("jcode_fts_{prefix}");
+        let sql = format!(
+            "SELECT rowid, -bm25({fts_tbl}) AS score \
+             FROM {fts_tbl} \
+             WHERE {fts_tbl} MATCH ?1 \
+             ORDER BY score DESC \
+             LIMIT ?2"
+        );
+        let rows = storage
+            .exec_ref()
+            .query_all_json(
+                &sql,
+                &[
+                    gvec_core::sql::SqlValue::Text(query.to_string()),
+                    gvec_core::sql::SqlValue::Integer(k as i64),
+                ],
+            )
+            .map_err(|e| anyhow::anyhow!("text_search query: {e}"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let rowid = match &row[0] {
+                Value::Number(n) => n.as_i64().unwrap_or(0),
+                Value::String(s) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            let score = match &row[1] {
+                Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32,
+                _ => 0.0,
+            };
+            if let Some(id) = rowid_to_memory_id(&g, rowid)? {
+                out.push((id, score));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Lazily create a standalone-content FTS5 shadow index for
+/// `Memory.content` and keep it in sync via triggers.
+///
+/// We do **not** use `gvec_core::fts::create_text_index` here because
+/// that helper currently fails to backfill its own external-content
+/// FTS5 table on a bundled-rusqlite build (the `INSERT INTO
+/// fts(rowid, content) SELECT ...` raises `constraint failed` because
+/// FTS5 external-content tables do not accept a `content` column).
+/// Instead we build our own external-content table shadowing the
+/// gvec `nodes` table directly, which works reliably on bundled
+/// SQLite.
+///
+/// gvec's `text_search` is also skipped for the same reason; we
+/// query the FTS5 index directly here.
+fn ensure_text_index(graph: &Graph) -> Result<()> {
+    let storage = &graph.storage;
+    let exec = storage.exec_ref();
+    if !gvec_core::fts::fts5_available(exec) {
+        crate::logging::warn("SQLite build has no FTS5; text_search disabled");
+        return Ok(());
+    }
+    let prefix = storage.prefix.clone();
+    // Identifiers are validated against gvec's prefix naming rules
+    // when constructing the table via gvec (we only use plain
+    // ASCII prefixes here).
+    if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(anyhow::anyhow!(
+            "ensure_text_index: refusing to create FTS5 for non-identifier prefix {prefix:?}"
+        ));
+    }
+    let fts_tbl = format!("jcode_fts_{prefix}");
+    let nodes_tbl = format!("{prefix}_nodes");
+    let trig_ins = format!("jcode_fts_{prefix}_ai");
+    let trig_upd = format!("jcode_fts_{prefix}_au");
+    let trig_del = format!("jcode_fts_{prefix}_ad");
+    let lbl_pat = format!("%Memory%");
+    let prop_json = "$.content";
+
+    // Standalone-content FTS5 table (no `content=` clause) so we can
+    // insert directly with `(rowid, content)`. This matches what
+    // gvec itself does and avoids the external-content 'insert'
+    // command's stricter INSERT/VALUES-only rule.
+    exec.execute(
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {fts_tbl} USING fts5(
+                content,
+                tokenize='unicode61 remove_diacritics 2'
+            )"
+        ),
+        &[],
+    )
+    .map_err(|e| anyhow::anyhow!("ensure_text_index create fts: {e}"))?;
+
+    // Backfill: standalone-content tables accept direct
+    // (rowid, content) inserts and `ON CONFLICT` lets us re-run the
+    // backfill safely after `save` rewrites the nodes table.
+    exec.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {fts_tbl}(rowid, content)
+                SELECT n.id, json_extract(n.properties, '{prop_json}')
+                  FROM {nodes_tbl} n
+                 WHERE n.labels LIKE ?1
+                   AND json_extract(n.properties, '{prop_json}') IS NOT NULL"
+        ),
+        &[gvec_core::sql::SqlValue::Text(lbl_pat.clone())],
+    )
+    .map_err(|e| anyhow::anyhow!("ensure_text_index backfill: {e}"))?;
+
+    // Sync triggers (one-time create). Standalone-content FTS5 tables
+    // support `INSERT OR REPLACE` for both insert and update.
+    let ai = format!(
+        "CREATE TRIGGER IF NOT EXISTS {trig_ins}
+            AFTER INSERT ON {nodes_tbl}
+            WHEN new.labels LIKE '{lbl_pat}'
+        BEGIN
+            INSERT OR REPLACE INTO {fts_tbl}(rowid, content)
+                VALUES(new.id, json_extract(new.properties, '{prop_json}'));
+        END"
+    );
+    let ad = format!(
+        "CREATE TRIGGER IF NOT EXISTS {trig_del}
+            AFTER DELETE ON {nodes_tbl}
+            WHEN old.labels LIKE '{lbl_pat}'
+        BEGIN
+            DELETE FROM {fts_tbl} WHERE rowid = old.id;
+        END"
+    );
+    let au = format!(
+        "CREATE TRIGGER IF NOT EXISTS {trig_upd}
+            AFTER UPDATE ON {nodes_tbl}
+            WHEN new.labels LIKE '{lbl_pat}'
+        BEGIN
+            INSERT OR REPLACE INTO {fts_tbl}(rowid, content)
+                VALUES(new.id, json_extract(new.properties, '{prop_json}'));
+        END"
+    );
+    exec.execute(&ai, &[])
+        .map_err(|e| anyhow::anyhow!("ensure_text_index create trig_ins: {e}"))?;
+    exec.execute(&ad, &[])
+        .map_err(|e| anyhow::anyhow!("ensure_text_index create trig_del: {e}"))?;
+    exec.execute(&au, &[])
+        .map_err(|e| anyhow::anyhow!("ensure_text_index create trig_upd: {e}"))?;
+    Ok(())
+}
+
+/// Reverse-map a gvec rowid back to the jcode `Memory:<id>` string.
+/// Returns `Ok(None)` if the row has been deleted between the FTS5 hit
+/// and this lookup.
+fn rowid_to_memory_id(graph: &Graph, rowid: i64) -> Result<Option<String>> {
+    use gvec_core::ids::NodeId;
+    let nid = NodeId(rowid);
+    match graph.storage.get_node(nid) {
+        Ok(node) => {
+            let id = node
+                .properties
+                .get("__jcode_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(id)
+        }
+        Err(_) => Ok(None),
     }
 }
 
@@ -642,6 +844,73 @@ mod tests {
     fn ensure_known_label_default() {
         assert_eq!(ensure_known_label("Memory"), "Memory");
         assert_eq!(ensure_known_label(""), "Node");
+    }
+
+    #[test]
+    fn fts5_text_search_finds_upserted_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteGvecBackend::open(dir.path().join("fts.sqlite")).unwrap();
+        let key = StoreKey::new("fts-test".to_string());
+
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(jcode_memory_types::MemoryEntry::new(
+            jcode_memory_types::MemoryCategory::Fact,
+            "rust ownership explained briefly",
+        ));
+        graph.add_memory(jcode_memory_types::MemoryEntry::new(
+            jcode_memory_types::MemoryCategory::Fact,
+            "python decorators and closures",
+        ));
+        backend.save(&key, &graph).unwrap();
+
+        // Force the FTS5 shadow index to be created by applying an
+        // idempotent mutation. (Real callers route through
+        // apply_mutations.)
+        backend
+            .apply_mutations(
+                &key,
+                &[GraphMutation::UpsertMemory {
+                    id: "noop".to_string(),
+                    json: serde_json::to_string(&jcode_memory_types::MemoryEntry::new(
+                        jcode_memory_types::MemoryCategory::Fact,
+                        "noop",
+                    ))
+                    .unwrap(),
+                }],
+            )
+            .unwrap();
+
+        let hits = backend.text_search(&key, "rust", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "expected FTS5 to find the rust memory, got empty"
+        );
+        let (id, score) = &hits[0];
+        assert!(
+            *score > 0.0,
+            "expected positive BM25 score for 'rust' hit, got id={id:?} score={score}"
+        );
+        assert!(id.starts_with("mem_"), "id should be a jcode memory id: {id:?}");
+
+        // And the other memory must NOT appear for the unrelated query.
+        let py_hits = backend.text_search(&key, "python", 5).unwrap();
+        assert!(
+            !py_hits.is_empty(),
+            "expected FTS5 to find the python memory"
+        );
+        assert_ne!(hits[0].0, py_hits[0].0, "rust and python must hit distinct rows");
+    }
+
+    #[test]
+    fn fts5_available_for_bundled_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteGvecBackend::open(dir.path().join("probe.sqlite")).unwrap();
+        let key = StoreKey::new("probe".to_string());
+        let g = backend.graph(&key).unwrap();
+        assert!(
+            gvec_core::fts::fts5_available(g.storage.exec_ref()),
+            "bundled rusqlite must expose FTS5"
+        );
     }
 
     // Suppress unused-import warning when the binary is built without tests.
