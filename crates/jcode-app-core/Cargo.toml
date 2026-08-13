@@ -115,6 +115,8 @@ jemalloc-prof = ["jcode-base/jemalloc-prof"]
 embeddings = ["jcode-base/embeddings"]
 # live AWS Bedrock support lives in jcode-base (provider/bedrock); forward there.
 bedrock = ["jcode-base/bedrock"]
+# SQLite + sqlite-gvec memory graph backend lives in jcode-base; forward there.
+sqlite-gvec = ["jcode-base/sqlite-gvec"]
 # Used only by the CentOS 7 portable Linux release build.
 linux-compat-vendored-openssl = ["jcode-notify-email/linux-compat-vendored-openssl"]
 # PDF text extraction lives in this crate (tool/read.rs).
