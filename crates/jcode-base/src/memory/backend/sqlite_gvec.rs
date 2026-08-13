@@ -594,17 +594,17 @@ impl GraphBackend for SqliteGvecBackend {
 /// Lazily create a standalone-content FTS5 shadow index for
 /// `Memory.content` and keep it in sync via triggers.
 ///
-/// We do **not** use `gvec_core::fts::create_text_index` here because
-/// that helper currently fails to backfill its own external-content
-/// FTS5 table on a bundled-rusqlite build (the `INSERT INTO
-/// fts(rowid, content) SELECT ...` raises `constraint failed` because
-/// FTS5 external-content tables do not accept a `content` column).
-/// Instead we build our own external-content table shadowing the
-/// gvec `nodes` table directly, which works reliably on bundled
-/// SQLite.
-///
-/// gvec's `text_search` is also skipped for the same reason; we
-/// query the FTS5 index directly here.
+/// This deliberately mirrors `gvec_core::fts::create_text_index` in
+/// shape (standalone-content FTS5 table + AI/AU/AD triggers) but is
+/// inlined here so we own the schema and triggers outright. That gives
+/// us two things gvec's helper doesn't:
+///   1. We can name the table/triggers under a `jcode_fts_<prefix>`
+///      namespace that doesn't collide with whatever the user types
+///      into Cypher (e.g. `CREATE TEXT INDEX ON :Doc(body)` would
+///      otherwise create a parallel table on top of ours).
+///   2. We use `INSERT OR REPLACE` + `WHEN new.labels LIKE ...` so a
+///      re-run of ensure_text_index on a save-rewritten nodes table
+///      re-syncs cleanly without failing on duplicate rowids.
 fn ensure_text_index(graph: &Graph) -> Result<()> {
     let storage = &graph.storage;
     let exec = storage.exec_ref();
@@ -911,6 +911,25 @@ mod tests {
             gvec_core::fts::fts5_available(g.storage.exec_ref()),
             "bundled rusqlite must expose FTS5"
         );
+    }
+
+    #[test]
+    fn upstream_gvec_create_text_index_works_via_our_backend() {
+        // Direct repro of gvec's own fts_create_and_search but
+        // mounted through SqliteGvecBackend. This should pass —
+        // otherwise the bug is upstream and our wrapper is innocent.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteGvecBackend::open(dir.path().join("upstream.sqlite")).unwrap();
+        let key = StoreKey::new("upstream-repro".to_string());
+        let g = backend.graph(&key).unwrap();
+
+        g.run(r#"CREATE (a:Doc {title: "Rust guide", body: "the rust programming language"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {title: "Python guide", body: "python is dynamic and high-level"})"#).unwrap();
+        g.run(r#"CREATE (c:Doc {title: "Rust async", body: "rust async runtime and tokio"})"#).unwrap();
+
+        g.create_text_index("Doc", "body", None).unwrap();
+        let hits = g.text_search("Doc", "body", "rust", 10).unwrap();
+        assert_eq!(hits.len(), 2, "expected 2 rust hits, got {:?}", hits);
     }
 
     // Suppress unused-import warning when the binary is built without tests.
