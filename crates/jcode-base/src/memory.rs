@@ -16,6 +16,7 @@ use crate::sidecar::Sidecar;
 use crate::storage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use jcode_memory_types::{GraphBackend, StoreKey};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use std::time::Instant;
 
 #[path = "memory/activity.rs"]
 mod activity;
+mod backend;
 mod cache;
 #[path = "memory/pending.rs"]
 mod pending;
@@ -2089,6 +2091,100 @@ impl Default for MemoryManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ==================== Pluggable Graph Backend ====================
+
+/// Name of the active graph backend, used by diagnostics and tests.
+///
+/// Resolved once per process from the `JCODE_MEMORY_BACKEND`
+/// environment variable:
+///
+/// - `json` (default) — write the entire `MemoryGraph` to a single
+///   atomic JSON snapshot under `~/.jcode/memory/projects/<hash>.json`.
+/// - `sqlite-gvec` — use the SQLite + sqlite-gvec engine
+///   (`SqliteGvecBackend`). Requires the `sqlite-gvec` Cargo feature.
+///
+/// When the requested backend is unavailable (e.g. SQLite feature not
+/// compiled in, or `SqliteGvecBackend::open_default` failed), the
+/// selector logs a warning and falls back to JSON so the rest of the
+/// app continues to work.
+pub fn active_backend_name() -> &'static str {
+    static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let raw = std::env::var("JCODE_MEMORY_BACKEND").unwrap_or_default();
+        match raw.to_lowercase().as_str() {
+            "" | "json" => "json",
+            "sqlite" | "sqlite-gvec" | "gvec" => "sqlite-gvec",
+            other => {
+                crate::logging::warn(&format!(
+                    "JCODE_MEMORY_BACKEND={other:?} is not recognised; falling back to 'json'"
+                ));
+                "json"
+            }
+        }
+    })
+}
+
+/// Try to construct the SQLite backend. Returns `None` if the feature
+/// is off or the open call fails (the caller should fall back to JSON
+/// and log why).
+#[cfg(feature = "sqlite-gvec")]
+fn try_open_sqlite_backend() -> Option<Arc<dyn GraphBackend>> {
+    use crate::memory::backend::SqliteGvecBackend;
+    match SqliteGvecBackend::open_default() {
+        Ok(b) => Some(Arc::new(b)),
+        Err(e) => {
+            crate::logging::warn(&format!(
+                "SqliteGvecBackend::open_default failed: {e}; falling back to JSON"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "sqlite-gvec"))]
+fn try_open_sqlite_backend() -> Option<Arc<dyn GraphBackend>> {
+    None
+}
+
+/// Return the active `GraphBackend` for a given `StoreKey`.
+///
+/// The first call per process initialises a process-wide singleton
+/// (currently the JSON backend); the SQLite backend, when available,
+/// is shared via `Arc` so all threads see the same connection.
+pub fn graph_backend() -> Arc<dyn GraphBackend> {
+    use std::sync::OnceLock;
+    static BACKEND: OnceLock<Arc<dyn GraphBackend>> = OnceLock::new();
+    BACKEND
+        .get_or_init(|| {
+            if active_backend_name() == "sqlite-gvec"
+                && let Some(b) = try_open_sqlite_backend()
+            {
+                return b;
+            }
+            // Default / fallback: JSON backend rooted under
+            // `~/.jcode/memory/backend-json/`.
+            let root = crate::memory::backend::JsonBackend::default_root()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            Arc::new(crate::memory::backend::JsonBackend::new(root))
+        })
+        .clone()
+}
+
+/// Convenience: derive a `StoreKey` from a project's directory hash
+/// (matches `project_memory_path`).
+pub fn project_store_key(project_dir: &std::path::Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    project_dir.hash(&mut hasher);
+    format!("project:{:016x}", hasher.finish())
+}
+
+/// Convenience: the store key for the global memory scope.
+pub fn global_store_key() -> &'static str {
+    "global"
 }
 
 #[cfg(test)]

@@ -117,6 +117,13 @@ jcode-side-panel-types = { path = "../jcode-side-panel-types" }
 tempfile = "3"
 qrcode = { version = "0.14.1", default-features = false }
 
+# sqlite-gvec graph + vector engine (vendored submodule).
+# When enabled, exposes SqliteGvecBackend as an alternative to the JSON
+# backend for memory storage. The gvec binding crate pulls in a bundled
+# SQLite (~5MB compiled), so this is opt-in to keep cold builds fast.
+gvec = { path = "../../third_party/sqlite-gvec/crates/gvec-bindings", optional = true }
+gvec-core = { path = "../../third_party/sqlite-gvec/crates/gvec-core", optional = true }
+
 [features]
 default = ["embeddings", "bedrock"]
 # Compiles the in-crate test helpers (storage::lock_test_env,
@@ -139,6 +146,10 @@ embeddings = ["dep:jcode-embedding"]
 # jcode-provider-bedrock (aws-sdk); forward there. Without it the Bedrock
 # provider still compiles but live calls return an explanatory error.
 bedrock = ["jcode-provider-bedrock/aws-sdk"]
+# Enable the SQLite + sqlite-gvec memory backend. Off by default to keep
+# cold builds fast; turn on with `--features sqlite-gvec` once the
+# gvec submodule is initialised.
+sqlite-gvec = ["dep:gvec", "dep:gvec-core"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }

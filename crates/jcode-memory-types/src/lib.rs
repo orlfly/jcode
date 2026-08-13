@@ -14,6 +14,9 @@ pub use actions::{
     MemoryRole, check_preconditions, evaluate_gates, requires_confirmation,
 };
 
+pub mod backend;
+pub use backend::{GraphBackend, GraphMutation, StoreKey, apply_mutations_in_place};
+
 pub mod validation;
 pub use validation::{
     Severity, ValidationIssue, ValidationReport, validate_action as validate_memory_action,

@@ -9,6 +9,8 @@ autobins = false
 members = [
     ".",
     "crates/jcode-agent-runtime",
+    "third_party/sqlite-gvec/crates/gvec-core",
+    "third_party/sqlite-gvec/crates/gvec-bindings",
     "crates/jcode-app-core",
     "crates/jcode-base",
     "crates/jcode-tui",
@@ -92,6 +94,29 @@ members = [
     "crates/jcode-tui-workspace",
     "crates/jcode-render-core",
 ]
+
+# Shared workspace dependencies used by both jcode crates and the
+# vendored sqlite-gvec submodule. The sqlite-gvec crates rely on
+# `version.workspace = true` etc., so the same keys must be defined
+# here even if jcode itself inlines the versions in sub-crates.
+# `workspace.package` mirrors the values used inside the gvec submodule
+# so that gvec-core / gvec-bindings keep resolving their inherited
+# fields; jcode's own crates override `edition`/`version` per-crate.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+thiserror = "1"
+# The vendored sqlite-gvec submodule references these by
+# `workspace = true`; declare them at the jcode root so the inherited
+# resolution succeeds.
+gvec-core = { path = "third_party/sqlite-gvec/crates/gvec-core" }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 
 [lib]
 name = "jcode"
