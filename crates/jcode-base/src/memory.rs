@@ -43,7 +43,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-use cache::{cache_graph, cached_graph, cached_graph_for_backend};
+use cache::{cache_graph, cache_graph_for_backend, cached_graph};
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
     clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
@@ -1081,6 +1081,16 @@ impl MemoryManager {
             return Ok(Vec::new());
         }
 
+        // Fast path: when the sqlite-gvec backend is active, run an
+        // FTS5 BM25 search per StoreKey and merge the ranked hits.
+        // JSON paths (and any backend that does not implement
+        // text_search) keep the existing in-memory substring scan.
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            if let Some(hits) = self.fts_search_scoped(&query_lower, scope) {
+                return Ok(hits);
+            }
+        }
+
         let mut results = Vec::new();
 
         for memory in self.collect_memories_scoped(scope)? {
@@ -1094,6 +1104,153 @@ impl MemoryManager {
 
     pub fn list_all(&self) -> Result<Vec<MemoryEntry>> {
         self.list_all_scoped(MemoryScope::All)
+    }
+
+    /// Run an FTS5 search across the active stores selected by `scope`,
+    /// returning the matching `MemoryEntry` rows ordered by their
+    /// merged BM25 score (descending).
+    ///
+    /// Returns `None` when the backend is not sqlite-gvec or when the
+    /// per-store search yields no hits — callers should fall back to
+    /// the in-memory scan in that case so a partial backend failure
+    /// is not visible to the user.
+    fn fts_search_scoped(
+        &self,
+        query: &str,
+        scope: MemoryScope,
+    ) -> Option<Vec<MemoryEntry>> {
+        use jcode_memory_types::StoreKey;
+
+        let backend = if self.test_mode {
+            crate::memory::test_backend()
+        } else {
+            crate::memory::graph_backend()
+        };
+
+        // FTS5 query syntax: we treat each whitespace-separated token
+        // as a `term` and join them with AND so a substring like
+        // "rust ownership" matches both words. We also quote each
+        // term to neutralise punctuation that FTS5 would otherwise
+        // interpret as operators.
+        let mut fts_query = String::new();
+        for (i, tok) in query.split_whitespace().enumerate() {
+            if i > 0 {
+                fts_query.push_str(" AND ");
+            }
+            // Strip the FTS5 quoting chars from the user's token.
+            let cleaned: String = tok
+                .chars()
+                .filter(|c| !matches!(c, '"' | '*' | '(' | ')' | ':' | '-' | '+' | '^'))
+                .collect();
+            if cleaned.is_empty() {
+                continue;
+            }
+            fts_query.push('"');
+            fts_query.push_str(&cleaned);
+            fts_query.push('"');
+        }
+        if fts_query.is_empty() {
+            return None;
+        }
+
+        // Reasonable default cap; callers can re-rank above this if
+        // they want.
+        let k: usize = 32;
+
+        // Load the project + global graphs once and use them as a
+        // id→MemoryEntry index for the merge. We still call into the
+        // trait only for the FTS5 search — the surrounding graph
+        // objects come from the existing in-memory cache path so the
+        // cost stays bounded.
+        let mut by_id: std::collections::HashMap<String, MemoryEntry> =
+            std::collections::HashMap::new();
+        if scope.includes_project()
+            && let Ok(graph) = self.load_project_graph()
+        {
+            for (id, entry) in &graph.memories {
+                by_id.insert(id.clone(), entry.clone());
+            }
+        }
+        if scope.includes_global()
+            && let Ok(graph) = self.load_global_graph()
+        {
+            for (id, entry) in &graph.memories {
+                by_id.entry(id.clone()).or_insert_with(|| entry.clone());
+            }
+        }
+        if by_id.is_empty() {
+            return Some(Vec::new());
+        }
+
+        // Collect BM25 hits across the relevant stores, weighting the
+        // global hits slightly higher (matching the legacy behaviour
+        // where global memory is more "trusted" than per-project).
+        let mut scored: Vec<(f32, String)> = Vec::new();
+        let mut saw_any = false;
+
+        if scope.includes_project()
+            && let Some(project) = self.get_project_dir()
+        {
+            let key = StoreKey::new(crate::memory::project_store_key(&project));
+            match backend.text_search(&key, &fts_query, k) {
+                Ok(hits) if !hits.is_empty() => {
+                    saw_any = true;
+                    for (id, score) in hits {
+                        scored.push((score, id));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    crate::logging::warn(&format!(
+                        "fts_search_scoped project: {e}"
+                    ));
+                }
+            }
+        }
+
+        if scope.includes_global() {
+            let key = StoreKey::new(crate::memory::global_store_key());
+            match backend.text_search(&key, &fts_query, k) {
+                Ok(hits) if !hits.is_empty() => {
+                    saw_any = true;
+                    // Small global boost so a global memory outranks
+                    // an equally-scored project memory.
+                    const GLOBAL_BOOST: f32 = 1.1;
+                    for (id, score) in hits {
+                        scored.push((score * GLOBAL_BOOST, id));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    crate::logging::warn(&format!(
+                        "fts_search_scoped global: {e}"
+                    ));
+                }
+            }
+        }
+
+        if !saw_any {
+            // Either the FTS5 index is empty (database has no Memory
+            // nodes) or both queries failed — fall back to the
+            // in-memory scan so the caller still sees a result.
+            return None;
+        }
+
+        // Sort by score desc and dedupe by id, keeping the best
+        // score for any duplicate (shouldn't happen since the two
+        // stores have disjoint ids, but be defensive).
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(scored.len());
+        for (_score, id) in scored {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(entry) = by_id.remove(&id) {
+                out.push(entry);
+            }
+        }
+        Some(out)
     }
 
     pub fn list_all_scoped(&self, scope: MemoryScope) -> Result<Vec<MemoryEntry>> {

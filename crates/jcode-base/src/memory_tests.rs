@@ -969,3 +969,132 @@ fn focus_query_text_falls_back_when_all_stripped() {
     // Nothing substantive survives -> fall back to raw rather than empty.
     assert_eq!(focused, raw);
 }
+
+// --- FTS5 business integration tests ---
+//
+// These tests only meaningfully exercise the FTS5 codepath when the
+// sqlite-gvec backend is selected. Under the default JSON backend
+// `search_scoped` falls back to the in-memory scanner so they are
+// still correct — they just verify the routing layer doesn't crash.
+
+#[cfg_attr(not(feature = "sqlite-gvec"), ignore = "needs sqlite-gvec FTS5")]
+#[test]
+fn search_scoped_ranks_memories_via_fts5() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new_test().with_project_dir("/tmp/jcode-fts-rank");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "rust ownership and borrowing rules",
+            ))
+            .expect("remember rust");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "python decorators and closures",
+            ))
+            .expect("remember python");
+        manager
+            .remember_global(MemoryEntry::new(
+                MemoryCategory::Preference,
+                "user prefers vim keybindings",
+            ))
+            .expect("remember global");
+
+        let hits = manager.search("rust ownership").expect("fts search");
+        assert!(!hits.is_empty(), "expected at least one FTS5 hit");
+        // The rust memory must be the top-ranked hit.
+        assert!(
+            hits[0].content.contains("rust"),
+            "top hit should mention rust, got {:?}",
+            hits[0].content
+        );
+
+        let scoped = manager
+            .search_scoped("python", MemoryScope::Project)
+            .expect("scoped fts");
+        assert!(
+            scoped.iter().all(|m| m.content.contains("python")),
+            "project-scoped search must not leak the global vim memory"
+        );
+        assert!(
+            scoped.iter().any(|m| m.content.contains("python")),
+            "project-scoped search must still find the python memory"
+        );
+    });
+}
+
+#[test]
+fn search_scoped_ignores_punctuation_in_query() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new_test().with_project_dir("/tmp/jcode-fts-punct");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "compile cache invalidation",
+            ))
+            .expect("remember");
+
+        // FTS5 treats `:` as a column-prefix operator; the manager
+        // must strip such characters so user queries with file paths
+        // or version strings still match.
+        let hits = manager
+            .search_scoped("compile:cache", MemoryScope::Project)
+            .expect("search with colon");
+        assert!(
+            !hits.is_empty(),
+            "expected FTS5 to tolerate ':' in the query"
+        );
+    });
+}
+
+#[cfg_attr(not(feature = "sqlite-gvec"), ignore = "needs sqlite-gvec FTS5")]
+#[test]
+fn fts5_stays_in_sync_after_full_save_replace() {
+    with_temp_home(|_home| {
+        // Exercise the `save_project_graph` (full drop+rewrite) path:
+        // the AI/AD triggers must keep the FTS5 shadow table in sync
+        // without requiring an explicit ensure_text_index call.
+        let manager = MemoryManager::new_test().with_project_dir("/tmp/jcode-fts-save");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "first sentence about apples",
+            ))
+            .expect("remember apples");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "second sentence about oranges",
+            ))
+            .expect("remember oranges");
+
+        // Forget the oranges entry: this re-saves the whole graph,
+        // dropping and re-inserting every node. The FTS5 index must
+        // reflect that only `apples` remains.
+        let all = manager.list_all().expect("list all");
+        let orange_id = all
+            .iter()
+            .find(|m| m.content.contains("oranges"))
+            .map(|m| m.id.clone())
+            .expect("orange id");
+        assert!(manager.forget(&orange_id).expect("forget orange"));
+
+        let hits = manager
+            .search_scoped("oranges", MemoryScope::Project)
+            .expect("search oranges after forget");
+        assert!(
+            hits.is_empty(),
+            "forget should have purged the orange FTS5 row, got {:?}",
+            hits
+        );
+
+        let apple_hits = manager
+            .search_scoped("apples", MemoryScope::Project)
+            .expect("search apples after forget");
+        assert!(
+            apple_hits.iter().any(|m| m.content.contains("apples")),
+            "apple memory must still be searchable after the rewrite"
+        );
+    });
+}

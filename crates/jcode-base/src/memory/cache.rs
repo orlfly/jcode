@@ -71,7 +71,7 @@ pub(super) fn cache_graph(path: PathBuf, graph: &MemoryGraph) {
 /// Cache a graph loaded from a non-file backend (sqlite-gvec, etc.).
 /// `version` is bumped by the caller on every write; cache hits
 /// only while the backend reports the same version.
-pub(super) fn cache_graph_for_backend(
+pub fn cache_graph_for_backend(
     backend_name: &str,
     key: &StoreKey,
     graph: &MemoryGraph,
@@ -89,7 +89,7 @@ pub(super) fn cache_graph_for_backend(
     }
 }
 
-pub(super) fn cached_graph_for_backend(
+pub fn cached_graph_for_backend(
     backend_name: &str,
     key: &StoreKey,
     version: u64,
