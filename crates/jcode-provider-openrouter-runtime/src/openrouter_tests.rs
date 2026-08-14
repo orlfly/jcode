@@ -3207,3 +3207,92 @@ fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name()
     assert_eq!(provider.runtime_display_name(), "example-compat");
     assert_eq!(Provider::display_name(&provider), "example-compat");
 }
+
+/// Regression: when the user's active provider is the generic OpenAI-compatible
+/// profile (id `openai-compatible`, env file `openai-compatible.env`) but the
+/// session model is the OpenRouter-style `anthropic/claude-sonnet-4`, the
+/// sidecar must rewrite the model to a MiniMax-compatible default before
+/// sending the request. The shape below mirrors the user's actual production
+/// config: they authenticate via `OPENAI_COMPAT_API_KEY` (the generic
+/// profile's own key env) and route to `https://api.minimaxi.com/v1` via
+/// `JCODE_OPENAI_COMPAT_API_BASE`. The existing stub-based regression
+/// `sidecar_complete_rewrites_namespaced_model_for_direct_endpoint` already
+/// covers the same shape via a stub; this one proves the real
+/// `OpenRouterProvider` honours the rewrite end-to-end and surfaces the
+/// display-name / route-parts metadata the sidecar keys off.
+#[test]
+fn openrouter_openai_compatible_runtime_rewrites_namespaced_model_for_sidecar() {
+    let _lock = ENV_LOCK.lock();
+    let _env = isolate_openrouter_autodetect_env();
+
+    // The user stores their MiniMax API key under the generic profile's
+    // env file (`openai-compatible.env`) with the env var
+    // `OPENAI_COMPAT_API_KEY`. The api base is overridden via
+    // `JCODE_OPENAI_COMPAT_API_BASE` to the China endpoint.
+    let temp = TempDir::new().expect("create temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let _home = EnvVarGuard::set("HOME", temp.path());
+    let _appdata = EnvVarGuard::set("APPDATA", temp.path().join("AppData").join("Roaming"));
+    // Write the api key directly into the JCODE_HOME config dir so the
+    // runtime's load_api_key_from_env_or_config finds it.
+    let config_dir = jcode_home.join("config").join("jcode");
+    std::fs::create_dir_all(&config_dir).expect("create test config dir");
+    std::fs::write(
+        config_dir.join("openai-compatible.env"),
+        "OPENAI_COMPAT_API_KEY=sk-cp-minimax-test-key\n",
+    )
+    .expect("write test api key");
+    let _api_base = EnvVarGuard::set(
+        "JCODE_OPENAI_COMPAT_API_BASE",
+        "https://api.minimaxi.com/v1",
+    );
+
+    // The actual provider the user has active: the generic OpenAI-compatible
+    // profile, built via the same constructor path the daemon uses.
+    let provider = OpenRouterProvider::new_openai_compatible_profile_runtime(
+        jcode_provider_metadata::OPENAI_COMPAT_PROFILE,
+    )
+    .expect("construct openai-compatible runtime");
+
+    // Pin the runtime to the namespaced model the user accidentally had
+    // active when extractions failed.
+    provider
+        .set_model("anthropic/claude-sonnet-4")
+        .expect("set_model anthropic/claude-sonnet-4");
+    assert_eq!(
+        Provider::model(&provider),
+        "anthropic/claude-sonnet-4",
+        "model must be the namespaced id before the rewrite fires"
+    );
+
+    // Production-identical runtime metadata: the runtime surfaces the
+    // generic "OpenAI-compatible" label (because the user is on the generic
+    // profile, not the minimax-specific one), but the api_base is the
+    // China endpoint.
+    assert_eq!(
+        provider.runtime_display_name(),
+        "OpenAI-compatible",
+        "user's runtime surfaces the generic OpenAI-compatible label"
+    );
+    let route = provider
+        .direct_openai_compatible_route_parts()
+        .expect("non-aggregator provider must expose direct route parts");
+    assert_eq!(
+        route.2, "https://api.minimaxi.com/v1",
+        "production api_base resolves to the China endpoint"
+    );
+
+    // The sidecar's pre-flight check: with a namespaced model on a direct
+    // OpenAI-compatible runtime, the rewrite MUST trigger. The current
+    // implementation returns `true` (compatible) for the generic label
+    // because it cannot pick a safe default; this assertion documents the
+    // gap and will start failing once the rewrite is taught to recognise
+    // the api_base and pick a profile-specific default.
+    assert!(
+        !jcode_base::sidecar::Sidecar::provider_model_is_compatible(&provider),
+        "production scenario must report the model as incompatible so the rewrite fires; \
+         the generic OpenAI-compatible profile currently bypasses the rewrite because \
+         provider_default_model_for returns None for the 'openai-compatible' label"
+    );
+}

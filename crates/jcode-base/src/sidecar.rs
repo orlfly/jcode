@@ -84,6 +84,7 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
     let name = provider.display_name().to_ascii_lowercase();
     let route_parts = provider.direct_openai_compatible_route_parts();
     let api_base = route_parts.as_ref().map(|parts| parts.2.to_ascii_lowercase());
+    let raw_api_base = route_parts.as_ref().map(|parts| parts.2.as_str());
 
     let is_direct = is_direct_openai_compatible_runtime(&name)
         || api_base
@@ -93,11 +94,20 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
         return raw;
     }
 
-    let default = provider_default_model_for(&name).or_else(|| {
-        api_base
-            .as_deref()
-            .and_then(provider_default_model_for)
-    });
+    let default_from_api_base_profile: Option<String> = raw_api_base
+        .and_then(|api_base| {
+            let profile_id = crate::provider_catalog::openai_compatible_profile_id_for_api_base(api_base)?;
+            crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
+                .and_then(|profile| profile.default_model)
+                .map(|m| m.to_string())
+                .or_else(|| {
+                    crate::provider_catalog::newest_released_model_for_openai_compatible_profile(profile_id)
+                })
+        });
+
+    let default: Option<&str> = provider_default_model_for(&name)
+        .or_else(|| api_base.as_deref().and_then(provider_default_model_for))
+        .or(default_from_api_base_profile.as_deref());
     match default {
         Some(default) => {
             crate::logging::warn(&format!(
@@ -1591,6 +1601,81 @@ mod tests {
         );
 
         // provider_model_is_compatible must also agree.
+        assert!(!Sidecar::provider_model_is_compatible(&buggy));
+    }
+
+    /// The 2026-08-14 second-pass bug: the user authenticates via the generic
+    /// `openai-compatible` profile (env file `openai-compatible.env` with
+    /// `OPENAI_COMPAT_API_KEY`) but routes to `https://api.minimaxi.com/v1`
+    /// via `JCODE_OPENAI_COMPAT_API_BASE`. `display_name()` returns the
+    /// generic "OpenAI-compatible" label and the substring table can't pick a
+    /// default for that. The fix looks up the catalog by api_base so the
+    /// `minimax` profile's catalog default becomes the rewrite target.
+    #[test]
+    fn safe_model_for_provider_rewrites_namespaced_model_via_api_base_lookup() {
+        struct GenericOpenAICompatibleAtMiniMax {
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for GenericOpenAICompatibleAtMiniMax {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!("safe_model_for_provider does not call complete")
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                // Generic OpenAI-compatible profile keeps the generic label
+                // even when pointing at a known vendor's endpoint.
+                "OpenAI-compatible".to_string()
+            }
+            fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+                Some((
+                    "OpenAI-compatible".to_string(),
+                    "openai-compatible:openai-compatible".to_string(),
+                    "https://api.minimaxi.com/v1".to_string(),
+                ))
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(GenericOpenAICompatibleAtMiniMax {
+                    model: self.model,
+                })
+            }
+        }
+
+        let buggy = GenericOpenAICompatibleAtMiniMax {
+            model: "anthropic/claude-sonnet-4",
+        };
+        // The api_base lookup must identify the minimax profile and use a
+        // MiniMax-compatible model as the rewrite target. The exact model
+        // depends on whether the user's disk cache has a newer release than
+        // the catalog default (`MiniMax-M2.7`); the user's actual cache
+        // holds `MiniMax-M3`, so the rewrite picks whichever model is
+        // strongest at runtime. Without the api_base-based fallback this
+        // returned the raw namespaced model and the production HTTP 400
+        // fired.
+        let safe = safe_model_for_provider(&buggy);
+        assert!(
+            safe == "MiniMax-M2.7" || safe == "MiniMax-M3",
+            "sidecar must rewrite the OpenRouter-style model via the api_base → profile \
+             lookup when the runtime surface label is generic 'OpenAI-compatible' \
+             (the 2026-08-14 second-pass regression); got {}",
+            safe
+        );
+        assert!(
+            !safe.contains('/'),
+            "rewritten model must not be a vendor/family namespace; got {}",
+            safe
+        );
         assert!(!Sidecar::provider_model_is_compatible(&buggy));
     }
 
