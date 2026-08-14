@@ -127,7 +127,18 @@ pub fn clear_session_scratch(session_id: &str) {
 /// Testable core of [`clear_session_scratch`], parameterized on the scratch
 /// directory so unit tests can use a tempdir instead of the real
 /// `~/.jcode/scratch`.
+///
+/// Defensive: an empty `session_id` does *not* match every entry. The
+/// `name.contains(id)` check would otherwise degenerate to `name.contains("")`
+/// which is true for every name, so a caller passing an empty id would
+/// accidentally wipe out scratch entries from unrelated sessions. Returning
+/// early is the safe choice — the production call site in
+/// `client_disconnect_cleanup` always passes a real session id, so this guard
+/// is dead code in production but cheap insurance against future callers.
 fn clear_session_scratch_in(scratch: &Path, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
     if !scratch.exists() {
         return;
     }
@@ -579,6 +590,122 @@ mod tests {
         assert!(theirs_dir.exists(), "other session's scratch must be untouched");
         assert!(shared_cache.exists(), "shared node-compile-cache must be untouched");
         assert!(other.exists(), "unrelated file must be untouched");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Edge cases: empty / missing directories ---
+
+    #[test]
+    fn clear_session_scratch_in_is_noop_when_scratch_dir_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-scratch-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Note: dir is NOT created. Caller path doesn't exist.
+        clear_session_scratch_in(&dir, "session_abc");
+        // Nothing to assert — the contract is "no panic, no side effects".
+    }
+
+    #[test]
+    fn clear_session_scratch_in_is_noop_when_scratch_dir_empty() {
+        let dir = make_dir_unique("scratch-empty");
+        // Empty directory should be a no-op.
+        clear_session_scratch_in(&dir, "session_abc");
+        assert!(dir.exists(), "dir should not be removed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_session_scratch_in_with_empty_session_id_is_safe_noop() {
+        let dir = make_dir_unique("scratch-empty-id");
+
+        // Other-session entries that an empty-id matcher would wrongly wipe if
+        // the defensive `is_empty` early-return were missing.
+        let other_dir = dir.join("jcode-session-test-session_other_999");
+        fs::create_dir_all(&other_dir).unwrap();
+        let other_cache = dir.join("node-compile-cache-session_other_999");
+        fs::create_dir_all(&other_cache).unwrap();
+
+        clear_session_scratch_in(&dir, "");
+
+        assert!(
+            other_dir.exists(),
+            "empty session_id must not wipe other sessions' scratch"
+        );
+        assert!(
+            other_cache.exists(),
+            "empty session_id must not wipe other sessions' compile cache"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_old_session_backups_in_is_noop_when_sessions_dir_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-sessions-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Dir does not exist: read_dir will fail, the function must not panic.
+        prune_old_session_backups_in(&dir, Local::now());
+    }
+
+    #[test]
+    fn prune_old_session_backups_in_is_noop_when_sessions_dir_empty() {
+        let dir = make_dir_unique("sessions-empty");
+        prune_old_session_backups_in(&dir, Local::now());
+        assert!(dir.exists(), "empty session dir should not be removed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_old_session_backups_in_keeps_mixed_session_and_other_files() {
+        // Real sessions dir contains both .bak and .json/.journal files plus
+        // occasional tmp files. The prune must touch only .bak files and never
+        // confuse .json for .bak (which would lose transcripts).
+        let dir = make_dir_unique("sessions-mixed");
+
+        let write = |name: &str, age_days: u64| {
+            let path = dir.join(name);
+            let mut f = File::create(&path).expect("create");
+            f.write_all(b"x").ok();
+            if age_days > 0 {
+                f.set_modified(SystemTime::now() - StdDuration::from_secs(age_days * 24 * 60 * 60))
+                    .expect("set mtime");
+            }
+            path
+        };
+
+        // Old .bak -> pruned.
+        let _ = write("session_a.bak", 60);
+        // Recent .bak -> kept (within 7-day window).
+        let recent_bak = write("session_a.bak", 1);
+        // Old .json -> must NOT be touched at all.
+        let old_json = write("session_a.json", 60);
+        // Old .journal -> must NOT be touched.
+        let old_journal = write("session_a.journal.jsonl", 60);
+        // Old .tmp -> must NOT be touched.
+        let old_tmp = write("session_a.tmp", 60);
+        // Old temp file reusing .bak suffix but without a session_id -> still
+        // pruned by age rule.
+        let old_orphan = write("orphan.bak", 60);
+
+        prune_old_session_backups_in(&dir, Local::now());
+
+        assert!(recent_bak.exists(), "recent .bak kept");
+        assert!(old_json.exists(), ".json untouched");
+        assert!(old_journal.exists(), ".journal untouched");
+        assert!(old_tmp.exists(), ".tmp untouched");
+        assert!(!old_orphan.exists(), "orphan .bak pruned by age");
 
         fs::remove_dir_all(&dir).ok();
     }
