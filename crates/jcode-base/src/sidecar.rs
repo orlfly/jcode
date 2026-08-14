@@ -1762,6 +1762,175 @@ mod tests {
         );
     }
 
+    /// Regression test for the 2026-08-14 second incident: the MiniMax China
+    /// endpoint (`https://api.minimaxi.com/v1`) was not present in the
+    /// MINIMAX_PROFILE catalog entry (only the international `minimax.io`
+    /// endpoint is). When `apply_profile_key_based_endpoint_overrides`
+    /// rewrites api_base for an `sk-cp-` key, the catalog-based profile
+    /// lookup returned None and the rewrite silently fell through, sending
+    /// `anthropic/claude-sonnet-4` to api.minimaxi.com and getting HTTP 400.
+    #[test]
+    fn safe_model_for_provider_rewrites_namespaced_model_for_minimax_china_endpoint() {
+        struct StubProvider {
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for StubProvider {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!("safe_model_for_provider does not call complete")
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                // Generic OpenAI-compatible profile label.
+                "OpenAI-compatible".to_string()
+            }
+            fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+                Some((
+                    "OpenAI-compatible".to_string(),
+                    "openai-compatible:openai-compatible".to_string(),
+                    crate::provider_catalog::MINIMAX_CHINA_API_BASE.to_string(),
+                ))
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(StubProvider { model: self.model })
+            }
+        }
+
+        let buggy = StubProvider {
+            model: "anthropic/claude-sonnet-4",
+        };
+        let safe_model = safe_model_for_provider(&buggy);
+        assert_ne!(
+            safe_model, "anthropic/claude-sonnet-4",
+            "namespaced model on China endpoint must be rewritten"
+        );
+        assert!(
+            safe_model == "MiniMax-M3" || safe_model.starts_with("MiniMax-M"),
+            "safe_model must resolve to a MiniMax catalog default, got: {}",
+            safe_model
+        );
+    }
+
+    /// Regression test for the 2026-08-14 third-pass bug: the daemon's
+    /// `Server::new` registers the active provider as `Arc<dyn Provider>` whose
+    /// concrete type is `MultiProvider`. `MultiProvider` historically did NOT
+    /// override `direct_openai_compatible_route_parts`, so vtable dispatch hit
+    /// the trait's default `None` impl. That made `safe_model_for_provider`
+    /// think the runtime was a non-direct aggregator and skip the api_base
+    /// catalog lookup entirely — silently regressing the rewrite-gap fix on
+    /// every session that goes through `MultiProvider`. The fix is the
+    /// `MultiProvider::direct_openai_compatible_route_parts` override that
+    /// delegates to `active_openrouter_execution_provider()`. This test
+    /// exercises that override through the full sidecar path using a
+    /// `MultiProvider`-shaped wrapper that mimics the production dispatch.
+    #[test]
+    fn safe_model_for_provider_rewrites_through_multiprovider_wrapper() {
+        // Inner provider: an OpenRouterProvider-shaped stub that exposes
+        // route_parts via the inherent impl (simulated by returning Some
+        // through direct_openai_compatible_route_parts).
+        struct Inner {
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for Inner {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!()
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                "OpenAI-compatible".to_string()
+            }
+            fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+                Some((
+                    "OpenAI-compatible".to_string(),
+                    "openai-compatible:openai-compatible".to_string(),
+                    crate::provider_catalog::MINIMAX_CHINA_API_BASE.to_string(),
+                ))
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(Inner { model: self.model })
+            }
+        }
+
+        // Outer wrapper: mimics MultiProvider. Name comes back as "OpenRouter"
+        // (capital R) like the real impl, and direct_openai_compatible_route_parts
+        // delegates to the inner provider. Without the delegation (i.e. the
+        // default `None`), this test would fail because safe_model would equal
+        // the raw namespaced model.
+        struct Wrapper {
+            inner: std::sync::Arc<dyn crate::provider::Provider>,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for Wrapper {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!()
+            }
+            fn name(&self) -> &str {
+                "OpenRouter"
+            }
+            fn display_name(&self) -> String {
+                self.inner.display_name()
+            }
+            fn model(&self) -> String {
+                self.inner.model()
+            }
+            fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+                self.inner.direct_openai_compatible_route_parts()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(Wrapper {
+                    inner: self.inner.fork(),
+                })
+            }
+        }
+
+        let buggy = Wrapper {
+            inner: std::sync::Arc::new(Inner {
+                model: "anthropic/claude-sonnet-4",
+            }),
+        };
+        let safe_model = safe_model_for_provider(&buggy);
+        assert_ne!(
+            safe_model, "anthropic/claude-sonnet-4",
+            "MultiProvider-style wrapper must delegate direct_openai_compatible_route_parts \
+             so the sidecar can see the China endpoint and rewrite; got raw={:?}",
+            safe_model
+        );
+        assert!(
+            safe_model == "MiniMax-M3" || safe_model.starts_with("MiniMax-M"),
+            "safe_model must resolve to a MiniMax catalog default, got: {}",
+            safe_model
+        );
+    }
+
     /// A pure openrouter profile (no direct endpoint) should still preserve
     /// the OpenRouter-style namespace. With display_name() returning the
     /// human-facing string for a true aggregator (something like

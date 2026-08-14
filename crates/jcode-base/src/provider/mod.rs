@@ -1788,6 +1788,25 @@ impl Provider for MultiProvider {
             .and_then(|provider| provider.explicit_provider_pin_for_current_model())
     }
 
+    fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+        // Delegate to the active OpenRouter execution runtime (which may be
+        // the public aggregator, a jcode subscription runtime, or a direct
+        // OpenAI-compatible profile). The default `Provider` impl returns None,
+        // which makes `safe_model_for_provider` in the sidecar think every
+        // provider is a non-direct aggregator and skip its api_base → profile
+        // catalog lookup. That silently regressed the rewrite-gap fix on the
+        // user's generic `openai-compatible` profile (the 2026-08-14 second
+        // incident). The `name()` / `display_name()` overrides above already
+        // route through `active_openrouter_execution_provider`; this matches
+        // that pattern.
+        if matches!(self.active_provider(), ActiveProvider::OpenRouter)
+            && let Some(execution) = self.active_openrouter_execution_provider()
+        {
+            return execution.direct_openai_compatible_route_parts();
+        }
+        None
+    }
+
     fn active_resolved_credential(&self) -> Option<jcode_provider_core::ResolvedCredential> {
         use jcode_provider_core::ResolvedCredential;
         match self.active_provider() {

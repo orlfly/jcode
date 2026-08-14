@@ -306,6 +306,16 @@ pub fn openai_compatible_profile_by_id(id: &str) -> Option<OpenAiCompatibleProfi
 
 pub fn openai_compatible_profile_id_for_api_base(api_base: &str) -> Option<&'static str> {
     let normalized = normalize_api_base(api_base)?;
+
+    // The MiniMax China endpoint (sk-cp- key prefix flips api_base during
+    // `apply_profile_key_based_endpoint_overrides`) is not the catalog
+    // profile's primary `api_base`, so the straight equality check below
+    // misses it. Match both endpoints to the same profile id so the sidecar
+    // rewrite can find a known default model.
+    if normalized == MINIMAX_CHINA_API_BASE {
+        return Some("minimax");
+    }
+
     openai_compatible_profiles()
         .iter()
         .copied()
