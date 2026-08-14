@@ -39,6 +39,15 @@ pub(super) fn render_memory_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Li
         }
     }
 
+    // When the sidecar is auto-disabled, append a short amber status line so
+    // the user understands why precision recall silently degraded. This is
+    // the highest-signal line in the widget for a user who just noticed
+    // their memory precision dropped — without it, the widget would render
+    // only the brain emoji + count and the user would have no clue why.
+    if info.sidecar_auto_disabled && !info.disabled && lines.len() < inner.height as usize {
+        lines.push(render_memory_auto_disabled_line(info, max_width));
+    }
+
     lines.truncate(inner.height as usize);
     lines
 }
@@ -553,6 +562,20 @@ pub(super) fn render_memory_compact(info: &MemoryInfo, inner_width: u16) -> Vec<
         ));
     }
 
+    // Surface sustained-degradation auto-disable even when the activity
+    // widget is idle: the user needs to see WHY their precision recall is
+    // missing, not just that it's missing. We deliberately use amber rather
+    // than red: this is degraded operation, not a hard error.
+    if info.sidecar_auto_disabled && !info.disabled {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(rgb(100, 100, 110))));
+        }
+        spans.push(Span::styled(
+            "⚠ NO-LLM",
+            Style::default().fg(rgb(255, 180, 80)).bold(),
+        ));
+    }
+
     vec![Line::from(spans)]
 }
 
@@ -577,8 +600,40 @@ pub(super) fn render_memory_expanded(info: &MemoryInfo, inner: Rect) -> Vec<Line
         }
     }
 
+    // When the sidecar is auto-disabled, append a short explanation AFTER
+    // any activity so the user understands why recall silently degraded.
+    // This is the highest-signal line in the widget for a user who just
+    // noticed their memory precision dropped.
+    if info.sidecar_auto_disabled && !info.disabled {
+        if lines.len() < inner.height as usize {
+            lines.push(render_memory_auto_disabled_line(info, max_width));
+        }
+    }
+
     lines.truncate(inner.height as usize);
     lines
+}
+
+/// "LLM judge auto-disabled after N failed reranks" status line. Amber
+/// to signal degraded operation; not red because memory is still working
+/// via the no-LLM hybrid path.
+fn render_memory_auto_disabled_line(info: &MemoryInfo, max_width: usize) -> Line<'static> {
+    let count = info.sidecar_auto_disabled_after;
+    let detail = if count > 0 {
+        format!(
+            "LLM judge auto-disabled after {count} failed reranks — using hybrid fallback (no-LLM). \
+             Reload with `agents.memory_sidecar_enabled = false` to silence this badge."
+        )
+    } else {
+        "LLM judge auto-disabled — using hybrid fallback (no-LLM). \
+         Reload with `agents.memory_sidecar_enabled = false` to silence this badge."
+            .to_string()
+    };
+    let truncated = truncate_with_ellipsis(&detail, max_width.saturating_sub(2).max(20));
+    Line::from(vec![
+        Span::styled("⚠ ", Style::default().fg(rgb(255, 180, 80))),
+        Span::styled(truncated, Style::default().fg(rgb(255, 200, 120))),
+    ])
 }
 fn format_age(duration: std::time::Duration) -> String {
     let secs = duration.as_secs();

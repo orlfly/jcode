@@ -517,6 +517,16 @@ pub struct MemoryInfo {
     pub disabled: bool,
     /// Selected sidecar model/backend label for memory work
     pub sidecar_model: Option<String>,
+    /// Whether the LLM-backed sidecar was auto-disabled this session after
+    /// sustained judge failures (see `memory::memory_sidecar_auto_disabled`).
+    /// When true, memory is silently running on the no-LLM hybrid path. We
+    /// surface this so the user can see *why* precision recall is missing,
+    /// not just that it's missing.
+    pub sidecar_auto_disabled: bool,
+    /// Consecutive degradation count at the moment auto-disable triggered.
+    /// Zero unless `sidecar_auto_disabled` is true. Surfaced for the tooltip
+    /// so the user can correlate with their config / provider health.
+    pub sidecar_auto_disabled_after: u64,
     /// Current memory activity
     pub activity: Option<MemoryActivity>,
     /// Graph topology for visualization (node positions + edges)
@@ -527,7 +537,14 @@ pub struct MemoryInfo {
 
 impl MemoryInfo {
     pub(crate) fn should_render(&self) -> bool {
-        !self.disabled && (self.total_count > 0 || self.activity.is_some())
+        // Render whenever memory is enabled AND we have something to show:
+        // memories stored, in-flight activity, OR the sidecar was auto-disabled
+        // this session. The auto-disabled state is the most important one to
+        // surface — it explains why precision recall silently went away.
+        !self.disabled
+            && (self.total_count > 0
+                || self.activity.is_some()
+                || self.sidecar_auto_disabled)
     }
 
     pub(crate) fn should_show_activity(&self) -> bool {

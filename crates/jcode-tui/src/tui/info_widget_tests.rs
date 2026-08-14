@@ -1813,3 +1813,118 @@ fn compact_page_height_matches_for_cost_based_usage() {
     let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
     assert_eq!(lines.len() as u16, layout.pages[0].height);
 }
+
+/// Regression test for the 2026-08-14 incident: when the LLM judge auto-
+/// disables after sustained degradations, the memory widget MUST surface an
+/// amber "NO-LLM" badge so the user can see why precision recall silently
+/// dropped. Before this fix, the badge didn't exist and the user only saw
+/// "fewer memories" with no explanation.
+#[test]
+fn memory_widget_shows_no_llm_badge_when_sidecar_auto_disabled() {
+    // Idle state, zero memories, but auto-disabled: this is the worst case
+    // — without the badge the widget would render NOTHING.
+    let info = MemoryInfo {
+        total_count: 0,
+        sidecar_auto_disabled: true,
+        sidecar_auto_disabled_after: 5,
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        memory_info: Some(info),
+        ..Default::default()
+    };
+
+    // should_render() must return true so the badge is even reachable.
+    assert!(
+        data.memory_info.as_ref().unwrap().should_render(),
+        "memory widget should render even with zero memories when sidecar is auto-disabled"
+    );
+
+    let text = render_memory_widget(&data, Rect::new(0, 0, 40, 5))
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The widget function uses a longer amber explanation
+    // ("LLM judge auto-disabled after N failed reranks") since it has more
+    // vertical room than the one-line compact view.
+    assert!(
+        text.contains("auto-disabled"),
+        "auto-disabled explanation missing from widget text: {text:?}"
+    );
+    assert!(
+        text.contains("5"),
+        "auto-disabled explanation should report the streak count: {text:?}"
+    );
+
+    // Also exercise the compact one-liner path used by the top status bar,
+    // which has only enough room for the short ⚠ NO-LLM tag.
+    let compact_text: String = super::memory_render::render_memory_compact(
+        data.memory_info.as_ref().unwrap(),
+        40,
+    )
+    .iter()
+    .flat_map(|line| line.spans.iter())
+    .map(|span| span.content.as_ref())
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        compact_text.contains("NO-LLM"),
+        "auto-disabled badge missing from compact line: {compact_text:?}"
+    );
+}
+
+#[test]
+fn memory_widget_omits_no_llm_badge_when_sidecar_healthy() {
+    // Sanity check: when the sidecar is healthy we must NOT show the badge.
+    let info = MemoryInfo {
+        total_count: 12,
+        sidecar_model: Some("openai · gpt-5.3-codex-spark".to_string()),
+        sidecar_auto_disabled: false,
+        sidecar_auto_disabled_after: 0,
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        memory_info: Some(info),
+        ..Default::default()
+    };
+
+    let text = render_memory_widget(&data, Rect::new(0, 0, 40, 5))
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("NO-LLM"),
+        "badge appeared when sidecar was healthy: {text:?}"
+    );
+}
+
+#[test]
+fn memory_widget_omits_no_llm_badge_when_memory_disabled() {
+    // The auto-disable badge is meaningless when the user has memory off.
+    let info = MemoryInfo {
+        total_count: 12,
+        sidecar_auto_disabled: true,
+        sidecar_auto_disabled_after: 5,
+        disabled: true,
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        memory_info: Some(info),
+        ..Default::default()
+    };
+
+    let text = render_memory_widget(&data, Rect::new(0, 0, 40, 5))
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.contains("NO-LLM"),
+        "badge appeared when memory was disabled: {text:?}"
+    );
+}

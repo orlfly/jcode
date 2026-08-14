@@ -1132,10 +1132,21 @@ pub(super) fn gather_memory_info(
         None
     };
 
+    // The sidecar may have been auto-disabled this session after sustained
+    // judge failures (see `memory::memory_sidecar_auto_disabled`). We surface
+    // that state — even when memory is enabled and `sidecar_model` is also
+    // set above — so the user can see why precision recall is silently
+    // degraded.
+    let sidecar_auto_disabled = memory_enabled && crate::memory::memory_sidecar_auto_disabled();
+    let sidecar_auto_disabled_after =
+        crate::memory_judge_metrics::consecutive_degradation_count();
+
     let finalize = |mut info: MemoryInfo| {
         info.activity = activity.clone();
         info.sidecar_model = sidecar_model.clone();
         info.disabled = !memory_enabled;
+        info.sidecar_auto_disabled = sidecar_auto_disabled;
+        info.sidecar_auto_disabled_after = sidecar_auto_disabled_after;
         info
     };
 
@@ -1180,7 +1191,11 @@ fn fallback_memory_info(
     sidecar_model: &Option<String>,
 ) -> Option<MemoryInfo> {
     // No cached counts yet. Show whatever live signal we have.
-    if activity.is_none() && sidecar_model.is_none() && memory_enabled {
+    if activity.is_none()
+        && sidecar_model.is_none()
+        && memory_enabled
+        && !crate::memory::memory_sidecar_auto_disabled()
+    {
         return None;
     }
     Some(MemoryInfo {
@@ -1188,6 +1203,8 @@ fn fallback_memory_info(
         sidecar_model: sidecar_model.clone(),
         activity: activity.clone(),
         disabled: !memory_enabled,
+        sidecar_auto_disabled: memory_enabled && crate::memory::memory_sidecar_auto_disabled(),
+        sidecar_auto_disabled_after: crate::memory_judge_metrics::consecutive_degradation_count(),
         ..Default::default()
     })
 }
@@ -1245,7 +1262,11 @@ fn gather_memory_info_inner(working_dir: Option<String>) -> Option<MemoryInfo> {
         global_graph.as_ref(),
     );
 
-    if total_count > 0 || activity.is_some() || sidecar_model.is_some() {
+    if total_count > 0
+        || activity.is_some()
+        || sidecar_model.is_some()
+        || crate::memory::memory_sidecar_auto_disabled()
+    {
         Some(MemoryInfo {
             total_count,
             project_count,
@@ -1255,6 +1276,8 @@ fn gather_memory_info_inner(working_dir: Option<String>) -> Option<MemoryInfo> {
             sidecar_model,
             activity,
             disabled: false,
+            sidecar_auto_disabled: crate::memory::memory_sidecar_auto_disabled(),
+            sidecar_auto_disabled_after: crate::memory_judge_metrics::consecutive_degradation_count(),
             graph_nodes,
             graph_edges,
         })
