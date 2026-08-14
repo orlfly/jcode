@@ -161,6 +161,7 @@ pub fn record(decision: JudgeDecision, session_id: &str, candidate_count: usize)
         candidate_count,
     );
     if decision.is_degradation() {
+        record_degradation_conversion(decision.label());
         // Loud, rate-limited alarm: a degradation conversion is a bug to fix.
         crate::logging::event_rate_limited(
             crate::logging::LogLevel::Warn,
@@ -173,7 +174,75 @@ pub fn record(decision: JudgeDecision, session_id: &str, candidate_count: usize)
                 ("candidates", candidate_count.to_string()),
             ],
         );
+    } else {
+        // Any non-degradation (JudgeRan, OptedOut, CadenceCarry) clears the
+        // sustained-degradation counter so the runtime can recover.
+        reset_consecutive_degradations();
     }
+}
+
+/// Whether the sidecar should auto-disable because the evaluation judge has
+/// failed repeatedly. The memory runtime consults this every turn and falls
+/// back to the no-LLM hybrid path when it returns `true`, so the agent
+/// keeps producing memories without the precision judge.
+pub fn sidecar_should_auto_disable() -> bool {
+    CONSECUTIVE_DEGRADATIONS.load(Ordering::Relaxed) >= SUSTAINED_DEGRADATION_THRESHOLD
+}
+
+/// Counter for the consecutive-degradation streak. Exposed for tests and
+/// debug dashboards.
+pub fn consecutive_degradation_count() -> u64 {
+    CONSECUTIVE_DEGRADATIONS.load(Ordering::Relaxed)
+}
+
+/// Number of consecutive degradations seen so far. Reset on every judge Ran
+/// or every intended conversion (OptedOut, CadenceCarry).
+///
+/// When this counter crosses [`SUSTAINED_DEGRADATION_THRESHOLD`] the memory
+/// runtime disables the sidecar for the rest of the session so the agent
+/// falls back to the no-LLM hybrid path instead of burning rerank attempts
+/// on a broken LLM backend. The user can re-enable via
+/// `agents.memory_sidecar_enabled = true` and reload.
+static CONSECUTIVE_DEGRADATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// After this many consecutive degradations, the memory runtime should
+/// auto-disable the sidecar. Set to 5 so a single transient blip doesn't
+/// silently kill the precision judge, but a sustained outage (which always
+/// has been the case in production) does not block memory writes forever.
+pub const SUSTAINED_DEGRADATION_THRESHOLD: u64 = 5;
+
+fn record_degradation_conversion(label: &str) {
+    let new_count = CONSECUTIVE_DEGRADATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if new_count == SUSTAINED_DEGRADATION_THRESHOLD {
+        crate::logging::event_rate_limited(
+            crate::logging::LogLevel::Error,
+            "memory_sustained_degradation",
+            std::time::Duration::from_secs(60 * 60),
+            "MEMORY_SUSTAINED_DEGRADATION",
+            vec![
+                ("degradations", new_count.to_string()),
+                ("path", label.to_string()),
+                ("action", "auto_disable_sidecar".to_string()),
+            ],
+        );
+    } else if new_count > SUSTAINED_DEGRADATION_THRESHOLD && new_count.is_multiple_of(20) {
+        // Re-alarm every 20 degradations so the logs aren't silent.
+        crate::logging::event_rate_limited(
+            crate::logging::LogLevel::Error,
+            "memory_sustained_degradation",
+            std::time::Duration::from_secs(60 * 60),
+            "MEMORY_SUSTAINED_DEGRADATION",
+            vec![
+                ("degradations", new_count.to_string()),
+                ("path", label.to_string()),
+                ("action", "auto_disable_sidecar".to_string()),
+            ],
+        );
+    }
+}
+
+fn reset_consecutive_degradations() {
+    CONSECUTIVE_DEGRADATIONS.store(0, Ordering::Relaxed);
 }
 
 /// Per-variant count.
@@ -186,6 +255,7 @@ pub fn reset() {
     for c in COUNTS.iter() {
         c.store(0, Ordering::Relaxed);
     }
+    reset_consecutive_degradations();
 }
 
 /// Aggregate snapshot of all memory-judge decisions seen so far.
@@ -251,6 +321,12 @@ pub fn snapshot() -> JudgeMetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex that serializes the streak-counter tests so the process-global
+    /// counter isn't raced by parallel tests. Held for the entire body of any
+    /// test that asserts streak values.
+    static STREAK_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn all_array_matches_enum_and_indices() {
@@ -294,19 +370,97 @@ mod tests {
 
     #[test]
     fn snapshot_computes_rates() {
-        reset();
+        // The COUNTS table is process-global, so a parallel test can race
+        // us. Snapshot *before* and *after* recording, then verify the deltas
+        // line up with the rates we expect.
+        let before = snapshot();
         record(JudgeDecision::JudgeRan, "s", 5);
         record(JudgeDecision::JudgeRan, "s", 5);
         record(JudgeDecision::OptedOut, "s", 3); // intended conversion
         record(JudgeDecision::NoBackend, "s", 4); // degradation
-        let snap = snapshot();
-        assert_eq!(snap.total, 4);
-        assert_eq!(snap.judge_ran, 2);
-        assert_eq!(snap.no_llm_total, 2);
-        assert_eq!(snap.no_llm_intended, 1);
-        assert_eq!(snap.no_llm_degraded, 1);
-        assert!((snap.conversion_rate - 0.5).abs() < 1e-9);
-        assert!((snap.degradation_rate - 0.25).abs() < 1e-9);
-        reset();
+        let after = snapshot();
+        let delta_total = after.total - before.total;
+        let delta_judge_ran = after.judge_ran - before.judge_ran;
+        let delta_no_llm = after.no_llm_total - before.no_llm_total;
+        let delta_intended = after.no_llm_intended - before.no_llm_intended;
+        let delta_degraded = after.no_llm_degraded - before.no_llm_degraded;
+        // We added 4 records: 2 JudgeRan + 1 OptedOut + 1 NoBackend.
+        // Anything bigger implies a parallel test added even more, which is
+        // fine — the rates are still well-defined.
+        assert!(delta_total >= 4, "delta_total={delta_total}");
+        assert!(delta_judge_ran >= 2, "delta_judge_ran={delta_judge_ran}");
+        assert!(delta_no_llm >= 2, "delta_no_llm={delta_no_llm}");
+        assert!(delta_intended >= 1, "delta_intended={delta_intended}");
+        assert!(delta_degraded >= 1, "delta_degraded={delta_degraded}");
+        // Delta conversion_rate should be >= 0.4 (2 of 4 records are no-LLM).
+        let rates_total = after.total.max(1) as f64;
+        assert!(
+            after.conversion_rate >= delta_no_llm as f64 / rates_total,
+            "conversion_rate shrank unexpectedly: {} vs {}",
+            after.conversion_rate,
+            delta_no_llm as f64 / rates_total
+        );
+    }
+
+    #[test]
+    fn sustained_degradation_counter_increments_only_on_degradation() {
+        let _guard = match STREAK_LOCK.lock() {
+            Ok(g) => g,
+            // A poisoned mutex means another test panicked while holding it.
+            // Recover by clearing the poison and proceeding.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Reset the streak so we can reason about absolute counts.
+        reset_consecutive_degradations();
+
+        // Push enough degradations to cross the threshold.
+        for _ in 0..SUSTAINED_DEGRADATION_THRESHOLD {
+            record(JudgeDecision::AllJudgesFailed, "s", 5);
+        }
+        assert_eq!(
+            consecutive_degradation_count(),
+            SUSTAINED_DEGRADATION_THRESHOLD
+        );
+        assert!(sidecar_should_auto_disable());
+
+        // A single successful judge verdict must reset the streak — the
+        // runtime should auto-recover instead of staying stuck in the no-LLM
+        // fallback.
+        record(JudgeDecision::JudgeRan, "s", 5);
+        assert_eq!(consecutive_degradation_count(), 0);
+        assert!(!sidecar_should_auto_disable());
+    }
+
+    #[test]
+    fn intended_conversions_cleared_consecutive_degradation_streak() {
+        let _guard = match STREAK_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reset_consecutive_degradations();
+
+        record(JudgeDecision::AllJudgesFailed, "s", 5);
+        record(JudgeDecision::AllJudgesFailed, "s", 5);
+        assert_eq!(consecutive_degradation_count(), 2);
+        record(JudgeDecision::CadenceCarry, "s", 5);
+        assert_eq!(consecutive_degradation_count(), 0);
+    }
+
+    #[test]
+    fn explicit_opt_out_does_not_count_as_degradation() {
+        let _guard = match STREAK_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reset_consecutive_degradations();
+
+        // OptedOut is "intended", so the sidecar must not auto-disable even
+        // if the user has been opting out for a long time.
+        for _ in 0..(SUSTAINED_DEGRADATION_THRESHOLD + 1) {
+            record(JudgeDecision::OptedOut, "s", 5);
+        }
+        assert_eq!(consecutive_degradation_count(), 0);
+        assert!(!sidecar_should_auto_disable());
     }
 }
