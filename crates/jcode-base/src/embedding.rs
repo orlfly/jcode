@@ -128,6 +128,25 @@ pub fn get_embedder() -> Result<Arc<Embedder>> {
         return Ok(Arc::clone(embedder));
     }
 
+    // Recovery path: a previous load attempt failed (typically because the
+    // network was unreachable when the artifact was first requested). If the
+    // model files have since appeared on disk — placed manually by the user,
+    // restored from a backup, or downloaded by an out-of-band tool — invalidate
+    // the stale cached error and let the next `Embedder::load()` retry.
+    // Without this, the cache pins the first failure forever and every
+    // subsequent `embed()` call logs MEMORY_EMBEDDING_FAILED even though the
+    // model is sitting in `models_dir()` ready to load.
+    if cache.load_error.is_some() {
+        if let Ok(model_dir) = models_dir() {
+            if backend::is_model_available(&model_dir) {
+                crate::logging::info(
+                    "Embedding model files are now available on disk; retrying load after prior failure",
+                );
+                cache.load_error = None;
+            }
+        }
+    }
+
     if let Some(err) = cache.load_error.as_ref() {
         return Err(anyhow::anyhow!("{}", err));
     }

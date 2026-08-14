@@ -228,10 +228,30 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
             ));
         }
         Err(e) => {
-            crate::logging::info(&format!(
-                "Final extraction for session {} failed: {}",
-                session_id, e
-            ));
+            // Promote silent INFO -> WARN and emit a metric event so silent
+            // provider/sidecar outages are visible in dashboards and don't get
+            // lost between a final-extraction failure and zero new memories.
+            crate::logging::event_rate_limited(
+                crate::logging::LogLevel::Warn,
+                "memory_final_extraction_failed",
+                std::time::Duration::from_secs(60),
+                &format!(
+                    "Final extraction for session {} failed: {}",
+                    session_id, e
+                ),
+                vec![
+                    ("session_id", session_id.clone()),
+                    ("error", e.to_string()),
+                ],
+            );
+            crate::runtime_memory_log::emit_event(
+                crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                    "final_extraction_failed",
+                    "memory_final_extraction_failed",
+                )
+                .with_session_id(session_id.clone())
+                .with_detail(e.to_string()),
+            );
         }
     }
 }
@@ -557,8 +577,14 @@ impl MemoryAgent {
         {
             Ok(Ok((emb, _model))) => emb,
             Ok(Err(e)) => {
+                // MEMORY_EMBEDDING_FAILED: dense retrieval fell back to hybrid.
+                // Promote INFO -> WARN so silent degradations surface in
+                // standard log scrapers, and emit a runtime-memory-log event
+                // so the regression appears in the per-process memory
+                // dashboard (memory_events jsonl) instead of being lost
+                // between rate-limited logs.
                 crate::logging::event_rate_limited(
-                    crate::logging::LogLevel::Info,
+                    crate::logging::LogLevel::Warn,
                     "memory_agent_embedding_failed",
                     std::time::Duration::from_secs(60),
                     "MEMORY_EMBEDDING_FAILED",
@@ -568,11 +594,33 @@ impl MemoryAgent {
                         ("fallback", "skip_memory_relevance".to_string()),
                     ],
                 );
+                crate::runtime_memory_log::emit_event(
+                    crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                        "embedding_failed",
+                        "MEMORY_EMBEDDING_FAILED",
+                    )
+                    .with_session_id(session_id.to_string())
+                    .with_detail(e.to_string()),
+                );
                 memory::set_state(MemoryState::Idle);
                 return Ok(());
             }
             Err(e) => {
-                crate::logging::info(&format!("Embedding task failed: {}", e));
+                crate::logging::event_rate_limited(
+                    crate::logging::LogLevel::Warn,
+                    "memory_agent_embedding_task_failed",
+                    std::time::Duration::from_secs(60),
+                    &format!("Embedding task panicked: {}", e),
+                    vec![("session_id", session_id.to_string())],
+                );
+                crate::runtime_memory_log::emit_event(
+                    crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                        "embedding_failed",
+                        "embedding_task_panic",
+                    )
+                    .with_session_id(session_id.to_string())
+                    .with_detail(e.to_string()),
+                );
                 memory::set_state(MemoryState::Idle);
                 return Ok(());
             }
