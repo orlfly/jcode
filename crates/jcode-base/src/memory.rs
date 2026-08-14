@@ -143,12 +143,32 @@ pub fn memory_llm_judge_available() -> bool {
 /// The one case we suppress is "sidecar mode requested but no LLM backend is
 /// reachable" (e.g. logged out / lost access): rather than silently degrading
 /// to the low-precision no-LLM path, memory goes dormant until a login returns.
+///
+/// Additionally, after [`SUSTAINED_DEGRADATION_THRESHOLD`] consecutive judge
+/// failures the runtime auto-disables the sidecar for the rest of the session
+/// (see [`memory_judge_metrics::sidecar_should_auto_disable`]). This lets the
+/// agent keep writing memories via the no-LLM hybrid path instead of burning
+/// every rerank on a broken LLM backend. The counter resets on the first
+/// successful judge verdict, so a one-off outage recovers automatically.
 pub fn memory_runtime_active() -> bool {
     if !memory_sidecar_enabled() {
         // Explicit opt-out: user chose the no-LLM hybrid path on purpose.
         return true;
     }
+    if crate::memory_judge_metrics::sidecar_should_auto_disable() {
+        // Auto-disabled after sustained degradations: treat this turn as the
+        // no-LLM hybrid path so memory writes keep happening. The user can
+        // re-enable via `agents.memory_sidecar_enabled = true` and reload.
+        return true;
+    }
     crate::sidecar::Sidecar::llm_backend_available()
+}
+
+/// Whether the sidecar is currently auto-disabled due to sustained judge
+/// failures. Exposed for the TUI status badge so the user can see why memory
+/// is silently running on the no-LLM path.
+pub fn memory_sidecar_auto_disabled() -> bool {
+    crate::memory_judge_metrics::sidecar_should_auto_disable()
 }
 
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
