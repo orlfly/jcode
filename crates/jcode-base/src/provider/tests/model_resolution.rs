@@ -2433,3 +2433,58 @@ fn bare_openai_compatible_model_ids_route_to_their_profile_not_the_active_provid
         );
     });
 }
+
+/// Regression test for the 2026-08-14 memory sidecar incident: when the parent
+/// provider is actively dispatched through a direct OpenAI-compatible profile
+/// (e.g. DeepSeek, MiniMax, Kimi), `fork()` MUST copy the parent's
+/// `openai_compatible_profiles` map and `active_openai_compatible_profile`
+/// pointer to the child. Otherwise the forked provider falls back to the
+/// plain `OpenRouter` slot identity and `display_name()` returns "OpenRouter"
+/// even though the active execution runtime is DeepSeek. Downstream safety
+/// checks like `safe_model_for_provider` rely on the correct runtime name to
+/// rewrite OpenRouter-style `vendor/family` model ids before they hit a direct
+/// endpoint and trigger HTTP 400 — without this, every memory rerank on the
+/// fork silently cascades to `all_judges_failed`.
+#[test]
+fn fork_preserves_active_openai_compatible_profile_so_runtime_identity_survives() {
+    with_clean_provider_test_env(|| {
+        with_env_var("DEEPSEEK_API_KEY", "test-deepseek-key", || {
+            let provider = MultiProvider {
+                claude: RwLock::new(None),
+                anthropic: RwLock::new(None),
+                openai: RwLock::new(None),
+                copilot_api: RwLock::new(None),
+                antigravity: RwLock::new(None),
+                gemini: RwLock::new(None),
+                cursor: RwLock::new(None),
+                bedrock: RwLock::new(None),
+                openrouter: RwLock::new(None),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
+                active: RwLock::new(ActiveProvider::OpenAI),
+                use_claude_cli: false,
+                startup_notices: RwLock::new(Vec::new()),
+                initial_provider: None,
+                routes_memo: std::sync::Mutex::new(None),
+                post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+
+            provider
+                .set_model("deepseek:deepseek-v4-flash")
+                .expect("DeepSeek profile-prefixed model should initialize direct provider");
+            assert_eq!(
+                provider.display_name(),
+                "DeepSeek",
+                "parent must report the active direct runtime identity"
+            );
+
+            let fork = provider.fork();
+            assert_eq!(
+                Provider::display_name(fork.as_ref()),
+                "DeepSeek",
+                "fork must inherit the active openai-compatible profile so downstream safety \
+                 checks see the correct runtime identity"
+            );
+        });
+    });
+}

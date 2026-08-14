@@ -61,12 +61,20 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
         return raw;
     }
 
-    // A provider's runtime label (e.g. "deepseek", "openai-compatible:deepseek",
-    // "openrouter-compatible") is the single best signal we have for the
-    // endpoint shape. If the runtime points at a direct OpenAI-compatible
-    // service, the stored model must not use OpenRouter's vendor/family
-    // namespace.
-    let name = provider.name().to_ascii_lowercase();
+    // A provider's runtime label can be misleading: the OpenRouter slot is
+    // a thin wrapper that may point at the public aggregator OR at any
+    // direct OpenAI-compatible endpoint (DeepSeek, MiniMax, NVIDIA NIM,
+    // Moonshot, ...). We use `display_name()` because it asks the
+    // OpenRouter runtime for its *actual* underlying profile id, which is
+    // the single best signal we have for the endpoint shape. If the runtime
+    // points at a direct OpenAI-compatible service, the stored model must
+    // not use OpenRouter's vendor/family namespace.
+    //
+    // Regression test for the 2026-08-14 incident: a session labelled
+    // "OpenRouter" but pointing at `https://api.minimaxi.com/v1` was
+    // sending `anthropic/claude-sonnet-4` to the MiniMax direct API,
+    // returning HTTP 400 "unknown model 'anthropic/claude-sonnet-4'".
+    let name = provider.display_name().to_ascii_lowercase();
     if !is_direct_openai_compatible_runtime(&name) {
         return raw;
     }
@@ -409,7 +417,7 @@ impl Sidecar {
 
     /// Whether the provider-backed sidecar can confidently use the configured
     /// model. When the active provider is a direct API (DeepSeek, Moonshot,
-    /// etc.) and its model name carries an OpenRouter-style namespace
+    /// MiniMax, ...) and its model name carries an OpenRouter-style namespace
     /// (e.g. `anthropic/claude-sonnet-4`), the sidecar will silently re-route
     /// to the provider's default model. Callers that need to know whether the
     /// sidecar is operating in degraded mode can use this to log a warning.
@@ -418,7 +426,9 @@ impl Sidecar {
         if !is_namespaced_model(&raw) {
             return true;
         }
-        let name = provider.name().to_ascii_lowercase();
+        // Use display_name() so we correctly classify the OpenRouter slot
+        // when it is actually pointing at a direct endpoint (e.g. MiniMax).
+        let name = provider.display_name().to_ascii_lowercase();
         !is_direct_openai_compatible_runtime(&name)
     }
 
@@ -1490,6 +1500,103 @@ mod tests {
             model: "claude-haiku-4-5-20251001",
         };
         assert_eq!(safe_model_for_provider(&claude), "claude-haiku-4-5-20251001");
+    }
+
+    /// The actual 2026-08-14 incident: a session labelled `openrouter` (the
+    /// aggregator slot) but actually pointing at a direct endpoint
+    /// (`https://api.minimaxi.com/v1`). The previous fix used `provider.name()`
+    /// which returned "openrouter" and so missed the rewrite. We must use
+    /// `display_name()` which asks the OpenRouter runtime for its *actual*
+    /// underlying profile (e.g. "MiniMax").
+    #[test]
+    fn safe_model_for_provider_uses_display_name_for_openrouter_slot() {
+        struct OpenRouterPointingAtMiniMax {
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for OpenRouterPointingAtMiniMax {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!("safe_model_for_provider does not call complete")
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                // OpenRouter runtime reporting its actual underlying profile.
+                "MiniMax".to_string()
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(OpenRouterPointingAtMiniMax { model: self.model })
+            }
+        }
+
+        // OpenRouter slot + namespaced model + display_name="MiniMax" →
+        // must rewrite to the MiniMax default. Without display_name() this
+        // falls through unchanged, which is the production bug.
+        let buggy = OpenRouterPointingAtMiniMax {
+            model: "anthropic/claude-sonnet-4",
+        };
+        let safe = safe_model_for_provider(&buggy);
+        assert_eq!(
+            safe, "MiniMax-M3",
+            "sidecar must rewrite the OpenRouter-style model using display_name() \
+             (the underlying direct endpoint), not name() (the aggregator label)"
+        );
+
+        // provider_model_is_compatible must also agree.
+        assert!(!Sidecar::provider_model_is_compatible(&buggy));
+    }
+
+    /// A pure openrouter profile (no direct endpoint) should still preserve
+    /// the OpenRouter-style namespace. With display_name() returning the
+    /// human-facing string for a true aggregator (something like
+    /// "OpenRouter"), we don't rewrite.
+    #[test]
+    fn safe_model_for_provider_keeps_namespaced_model_on_pure_openrouter() {
+        struct PureOpenRouter {
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for PureOpenRouter {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!()
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                // True aggregator: display_name still surfaces as "OpenRouter".
+                "OpenRouter".to_string()
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(PureOpenRouter { model: self.model })
+            }
+        }
+
+        let pure = PureOpenRouter {
+            model: "anthropic/claude-sonnet-4",
+        };
+        // Pure aggregator: keep the namespaced model.
+        assert_eq!(safe_model_for_provider(&pure), "anthropic/claude-sonnet-4");
+        assert!(Sidecar::provider_model_is_compatible(&pure));
     }
 
     #[test]

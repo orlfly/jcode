@@ -2810,6 +2810,28 @@ impl Provider for MultiProvider {
             None
         };
 
+        // Clone the parent's compatible-profile registry so the forked
+        // provider retains the active execution runtime identity. Without
+        // this, `display_name()` on the fork would fall back to the
+        // OpenRouter slot label even when the active runtime is a direct
+        // OpenAI-compatible profile (e.g. MiniMax pointing at
+        // https://api.minimaxi.com/v1). Downstream safety checks like
+        // `safe_model_for_provider` rely on the correct runtime name to
+        // rewrite OpenRouter-style `vendor/family` model ids before they
+        // hit a direct endpoint and trigger HTTP 400 (issue: 2026-08-14
+        // all_judges_failed cascade from a session labelled "OpenRouter"
+        // but dispatching to api.minimaxi.com/v1).
+        let compatible_profiles = self
+            .openai_compatible_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let active_compatible_profile = self
+            .active_openai_compatible_profile
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
         let provider = Self {
             claude: RwLock::new(claude),
             anthropic: RwLock::new(anthropic),
@@ -2820,8 +2842,8 @@ impl Provider for MultiProvider {
             cursor: RwLock::new(cursor_provider),
             bedrock: RwLock::new(bedrock_provider),
             openrouter: RwLock::new(openrouter),
-            openai_compatible_profiles: RwLock::new(HashMap::new()),
-            active_openai_compatible_profile: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(compatible_profiles),
+            active_openai_compatible_profile: RwLock::new(active_compatible_profile),
             active: RwLock::new(active),
             use_claude_cli: self.use_claude_cli,
             startup_notices: RwLock::new(Vec::new()),
