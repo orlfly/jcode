@@ -70,16 +70,34 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
     // points at a direct OpenAI-compatible service, the stored model must
     // not use OpenRouter's vendor/family namespace.
     //
+    // When `display_name()` is ambiguous (a generic "OpenAI-compatible"
+    // profile that points at e.g. api.minimaxi.com), we fall back to the
+    // provider's direct route parts, which expose the actual API base URL.
+    // That base URL is matched against the same known-runtime table so a
+    // misconfigured namespaced model still gets rewritten even when the
+    // profile was created under the generic slot.
+    //
     // Regression test for the 2026-08-14 incident: a session labelled
     // "OpenRouter" but pointing at `https://api.minimaxi.com/v1` was
     // sending `anthropic/claude-sonnet-4` to the MiniMax direct API,
     // returning HTTP 400 "unknown model 'anthropic/claude-sonnet-4'".
     let name = provider.display_name().to_ascii_lowercase();
-    if !is_direct_openai_compatible_runtime(&name) {
+    let route_parts = provider.direct_openai_compatible_route_parts();
+    let api_base = route_parts.as_ref().map(|parts| parts.2.to_ascii_lowercase());
+
+    let is_direct = is_direct_openai_compatible_runtime(&name)
+        || api_base
+            .as_deref()
+            .map_or(false, |base| is_direct_openai_compatible_runtime(base));
+    if !is_direct {
         return raw;
     }
 
-    let default = provider_default_model_for(&name);
+    let default = provider_default_model_for(&name).or_else(|| {
+        api_base
+            .as_deref()
+            .and_then(provider_default_model_for)
+    });
     match default {
         Some(default) => {
             crate::logging::warn(&format!(
@@ -1703,7 +1721,17 @@ mod tests {
                 "openrouter"
             }
             fn display_name(&self) -> String {
-                "MiniMax".to_string()
+                // A generic OpenAI-compatible profile points at MiniMax but
+                // carries the ambiguous "OpenAI-compatible" label — exactly
+                // the shape that used to defeat safe_model_for_provider.
+                "OpenAI-compatible".to_string()
+            }
+            fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
+                Some((
+                    "OpenAI-compatible".to_string(),
+                    "openai-compatible:openai-compatible".to_string(),
+                    "https://api.minimaxi.com/v1".to_string(),
+                ))
             }
             fn model(&self) -> String {
                 self.current.lock().unwrap().clone()
