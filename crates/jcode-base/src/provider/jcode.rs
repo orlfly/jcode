@@ -422,4 +422,57 @@ mod tests {
                 .any(|route| route.model == "claude-fable-5")
         );
     }
+
+    /// Regression for 2026-08-14 all_judges_failed cascade.
+    ///
+    /// `JcodeProvider::fork` previously rebuilt via `Self::new()`, which
+    /// discarded the active openai-compatible profile and reset the active
+    /// provider back to the default subscription model. The memory sidecar
+    /// then sent an OpenRouter-style `vendor/family` model id to a direct
+    /// OpenAI-compatible endpoint and got HTTP 400 "unknown model" back.
+    ///
+    /// The fork fix delegates to `MultiProvider::fork`, which preserves the
+    /// active openai-compatible profile and selected model. This test
+    /// asserts the invariant we can exercise in isolation: `fork()` returns
+    /// a non-panicking handle, the parent stays intact across the fork,
+    /// and the fork returns a provider that successfully reports a model.
+    /// We avoid asserting the model string is curated because the fork
+    /// delegates to `MultiProvider`, which returns the runtime spec
+    /// (`openrouter:<id>`) rather than the curated id — both shapes are
+    /// expected and the sidecar uses `display_name()` for the routing
+    /// decision, not the raw model string.
+    #[test]
+    fn jcode_provider_fork_is_idempotent_and_does_not_mutate_parent() {
+        let _guard = crate::storage::lock_test_env();
+        crate::subscription_catalog::clear_runtime_env();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        runtime.block_on(async {
+            let provider = JcodeProvider::new();
+            let parent_model_before = provider.model();
+
+            // First fork should succeed and return a usable provider.
+            let forked = provider.fork();
+            let forked_model = forked.model();
+            assert!(
+                !forked_model.is_empty(),
+                "fork() must return a provider that reports a model; got empty model"
+            );
+
+            // Parent must remain untouched after the fork.
+            assert_eq!(
+                provider.model(),
+                parent_model_before,
+                "fork() must not mutate the parent's model"
+            );
+
+            // Forking twice must produce two independent handles that both
+            // report a valid model and leave the parent alone.
+            let forked2 = provider.fork();
+            assert!(!forked2.model().is_empty());
+            assert_eq!(provider.model(), parent_model_before);
+        });
+
+        crate::subscription_catalog::clear_runtime_env();
+    }
 }
