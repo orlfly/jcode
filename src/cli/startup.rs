@@ -36,6 +36,12 @@ pub async fn run() -> Result<()> {
         .name("jcode-session-bak-prune".to_string())
         .spawn(crate::session::prune_old_session_backups)
         .ok();
+    // Prune transient entries (`jcode-session-test-*`) and age out the shared
+    // `node-compile-cache` so `~/.jcode/scratch/` does not accumulate.
+    std::thread::Builder::new()
+        .name("jcode-scratch-prune".to_string())
+        .spawn(crate::session::prune_scratch_dir)
+        .ok();
     logging::info("jcode starting");
 
     // Wire config-reload reactions without making config depend on auth/bus:

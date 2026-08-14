@@ -51,7 +51,7 @@ pub use jcode_session_types::{
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
-pub use maintenance::prune_old_session_backups;
+pub use maintenance::{clear_session_scratch, prune_old_session_backups, prune_scratch_dir};
 pub use memory_profile::SessionMemoryProfileSnapshot;
 use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,

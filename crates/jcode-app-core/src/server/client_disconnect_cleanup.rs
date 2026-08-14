@@ -161,6 +161,14 @@ pub(super) async fn cleanup_client_connection(
                     .with_session_id(sid.clone())
                     .force_attribution();
                     crate::runtime_memory_log::emit_event(event);
+                    // Best-effort session-scoped scratch cleanup. The bash
+                    // tool uses `~/.jcode/scratch/` as its TMPDIR for every
+                    // command, so per-session temp entries accumulate here
+                    // over a long session. Anything not matching this
+                    // session_id is left alone so concurrent sessions are
+                    // not disturbed. Runs before `sid` is moved into the
+                    // final-extraction trigger below.
+                    crate::session::clear_session_scratch(&sid);
                     if let Some(transcript) = transcript {
                         crate::memory_agent::trigger_final_extraction_with_dir(
                             transcript,
