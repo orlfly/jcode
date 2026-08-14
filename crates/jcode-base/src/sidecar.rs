@@ -515,8 +515,19 @@ impl Sidecar {
         // API endpoint), switch the provider to its safe default for the
         // lifetime of this call. Doing it on the forked provider keeps the
         // main agent's selection untouched.
+        //
+        // IMPORTANT: only compare against `provider.model()`. This provider
+        // is a *fresh* fork taken above, and it still carries the active
+        // session's possibly-misconfigured namespaced model. `self.model`
+        // was rewritten to the safe default at construction time (during
+        // `auto_select_backend`) but that was a *different* fork — it does
+        // NOT reflect this fork's current model. Testing `safe_model !=
+        // self.model` here would make the condition always false (they are
+        // equal) and silently skip the rewrite, re-introducing the
+        // all_judges_failed cascade when the direct endpoint rejects the
+        // OpenRouter-style model.
         let safe_model = safe_model_for_provider(provider.as_ref());
-        if safe_model != self.model && safe_model != provider.model() {
+        if safe_model != provider.model() {
             if let Err(err) = provider.set_model(&safe_model) {
                 crate::logging::warn(&format!(
                     "Sidecar: failed to switch provider to safe model '{}': {}",
@@ -1641,6 +1652,110 @@ mod tests {
             model: "deepseek-v4-flash",
         };
         assert!(Sidecar::provider_model_is_compatible(&ok));
+    }
+
+    /// End-to-end dispatch regression for the 2026-08-14 all_judges_failed
+    /// cascade. When the live agent provider is a direct OpenAI-compatible
+    /// endpoint (MiniMax) that carries an OpenRouter-style namespaced model
+    /// (`anthropic/claude-sonnet-4`), the sidecar must rewrite the model to
+    /// the endpoint's default BEFORE calling complete — otherwise the direct
+    /// API returns HTTP 400 "unknown model" and the memory rerank decays all
+    /// candidates.
+    #[test]
+    fn sidecar_complete_rewrites_namespaced_model_for_direct_endpoint() {
+        use std::sync::{Arc, Mutex};
+
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        // A stub that models a MiniMax direct endpoint misconfigured with an
+        // OpenRouter-style model. It records the model actually used in
+        // `complete` so the test can assert the sidecar rewrote it, and it
+        // honors `set_model` (like a real provider) so the rewrite sticks.
+        #[derive(Clone)]
+        struct DirectEndpointStub {
+            requested_model: Arc<Mutex<Vec<String>>>,
+            current: Arc<Mutex<String>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for DirectEndpointStub {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                let model = self
+                    .current
+                    .lock()
+                    .unwrap()
+                    .clone();
+                self.requested_model.lock().unwrap().push(model);
+                let stream = futures::stream::once(async move {
+                    Ok(jcode_message_types::StreamEvent::TextDelta("ok".to_string()))
+                });
+                Ok(Box::pin(stream))
+            }
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn display_name(&self) -> String {
+                "MiniMax".to_string()
+            }
+            fn model(&self) -> String {
+                self.current.lock().unwrap().clone()
+            }
+            fn set_model(&self, model: &str) -> Result<()> {
+                *self.current.lock().unwrap() = model.to_string();
+                Ok(())
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(DirectEndpointStub {
+                    requested_model: Arc::clone(&self.requested_model),
+                    current: Arc::clone(&self.current),
+                })
+            }
+        }
+
+        let stub = DirectEndpointStub {
+            requested_model: Arc::new(Mutex::new(Vec::new())),
+            current: Arc::new(Mutex::new("anthropic/claude-sonnet-4".to_string())),
+        };
+        crate::provider::set_active_provider(Arc::new(stub.clone()));
+
+        let sidecar = Sidecar::with_configured_model(None);
+        assert_eq!(
+            sidecar.backend_name(),
+            "provider",
+            "no OAuth creds => must route through the live agent provider"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt
+            .block_on(sidecar.complete("rank these", "a\nb"))
+            .expect("provider-backed completion should succeed");
+        assert_eq!(out, "ok");
+
+        // The sidecar must have called complete with a rewritten (non-namespaced)
+        // model — the endpoint's default — not the misconfigured OpenRouter name.
+        let requested = stub.requested_model.lock().unwrap();
+        assert!(
+            requested
+                .iter()
+                .all(|m| !is_namespaced_model(m)),
+            "sidecar must NOT send the OpenRouter-style model to a direct endpoint; got {:?}",
+            *requested
+        );
+        assert!(
+            !requested.is_empty(),
+            "sidecar must have invoked complete at least once"
+        );
     }
 
     #[test]
