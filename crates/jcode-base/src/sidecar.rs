@@ -1372,6 +1372,7 @@ struct ClaudeUsage {
 mod tests {
     use super::*;
     use crate::auth::codex;
+    use jcode_provider_core::Provider;
     use std::ffi::OsString;
 
     struct EnvVarGuard {
@@ -1380,6 +1381,11 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            crate::env::set_var(key, value);
+            Self { key, previous }
+        }
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
             let previous = std::env::var_os(key);
             crate::env::set_var(key, value);
@@ -1677,6 +1683,83 @@ mod tests {
             safe
         );
         assert!(!Sidecar::provider_model_is_compatible(&buggy));
+    }
+
+    /// Integration counterpart of the runtime-level test in
+    /// `openrouter_tests::openrouter_openai_compatible_runtime_rewrites_namespaced_model_for_sidecar`.
+    /// Constructs a real `OpenRouterProvider` with the user's production env
+    /// shape (same `openai-compatible.env` + `JCODE_OPENAI_COMPAT_API_BASE` the
+    /// daemon handles) and runs the sidecar's exact code path:
+    /// 1. `safe_model_for_provider(&provider)` ⇒ must NOT return the raw
+    ///    namespaced model.
+    /// 2. `provider.model()` ⇒ must agree with the safe model (i.e. the
+    ///    rewrite is consistent with what the runtime would actually send).
+    /// The two assertions together prove the sidecar will not push
+    /// `anthropic/claude-sonnet-4` to the api.minimaxi.com endpoint.
+    #[test]
+    fn safe_model_for_provider_rewrites_namespaced_model_for_real_openai_compatible_runtime() {
+        let _lock = crate::storage::lock_test_env();
+
+        // Mirror the user's production env exactly. The api base override is
+        // what causes the autodetect path to land on the openai-compatible
+        // profile pointing at api.minimaxi.com. The api key is read from the
+        // env file the user installed under `~/.config/jcode/openai-compatible.env`.
+        let _api_base = EnvVarGuard::set(
+            "JCODE_OPENAI_COMPAT_API_BASE",
+            "https://api.minimaxi.com/v1",
+        );
+        let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "openai-compatible");
+
+        // If the user's env file is missing (e.g. on a CI machine), skip
+        // rather than failing. The test is meaningful only when the
+        // production config is present.
+        let api_key_path = dirs::config_dir()
+            .map(|d| d.join("jcode").join("openai-compatible.env"))
+            .filter(|p| p.exists());
+        if api_key_path.is_none() {
+            eprintln!("skipping: openai-compatible.env not present at the user's config dir");
+            return;
+        }
+
+        let provider = jcode_provider_openrouter_runtime::OpenRouterProvider::new_openai_compatible_profile_runtime(
+            jcode_provider_metadata::OPENAI_COMPAT_PROFILE,
+        )
+        .expect("construct openai-compatible runtime from the user's env");
+
+        // Pin the runtime to the namespaced model the user accidentally had
+        // active when extractions failed.
+        provider
+            .set_model("anthropic/claude-sonnet-4")
+            .expect("set_model anthropic/claude-sonnet-4");
+
+        // The actual sidecar rewrite path.
+        let safe_model = safe_model_for_provider(&provider);
+        assert!(
+            !safe_model.contains('/'),
+            "safe_model_for_provider must NOT return a vendor/family namespace \
+             for the user's runtime; got raw={:?}",
+            provider.model(),
+        );
+        assert!(
+            safe_model == "MiniMax-M3" || safe_model == "MiniMax-M2.7",
+            "safe_model_for_provider must rewrite the user's namespaced model to a \
+             MiniMax-compatible default; got {:?} (raw was {:?})",
+            safe_model,
+            provider.model(),
+        );
+
+        // The sidecar's next step is `provider.set_model(&safe_model)`. Run
+        // that and verify the provider's model is now the rewritten value
+        // (the value the next API request will actually carry).
+        provider
+            .set_model(&safe_model)
+            .expect("set_model to rewritten default");
+        assert_eq!(
+            provider.model(),
+            safe_model,
+            "after rewrite, provider.model() must reflect the rewritten model; \
+             the next outbound request will use this value"
+        );
     }
 
     /// A pure openrouter profile (no direct endpoint) should still preserve
