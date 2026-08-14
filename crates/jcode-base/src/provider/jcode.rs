@@ -268,10 +268,15 @@ impl Provider for JcodeProvider {
 
     fn fork(&self) -> Arc<dyn Provider> {
         self.ensure_runtime_mode();
-        let forked = Self::new();
-        let selected_model = self.model();
-        let _ = forked.set_model(&selected_model);
-        Arc::new(forked)
+        // Delegate to the inner MultiProvider's fork() so the active
+        // openai-compatible profile (e.g. MiniMax, DeepSeek, Kimi) and the
+        // parent's model survive the fork. A fresh `Self::new()` would throw
+        // away the parent's compat profile and reset active provider, causing
+        // downstream safety checks like `safe_model_for_provider` to see a
+        // generic OpenRouter/OpenAI-compatible runtime and send
+        // `vendor/family` model ids verbatim to a direct endpoint (HTTP 400,
+        // 2026-08-14 all_judges_failed cascade).
+        self.inner.fork()
     }
 
     fn native_result_sender(&self) -> Option<NativeToolResultSender> {
