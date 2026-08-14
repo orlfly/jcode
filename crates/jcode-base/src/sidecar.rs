@@ -397,23 +397,28 @@ impl Sidecar {
     /// Pick the best available sidecar backend.
     ///
     /// Preference order:
-    /// 1. OpenAI GPT-5.6 Luna at reasoning=none if Codex creds exist.
-    /// 2. Claude haiku (dedicated fast/cheap OAuth path) if Claude creds exist.
-    /// 3. The live agent provider (works for EVERY provider jcode supports:
-    ///    Copilot, Antigravity, Gemini, Cursor, Bedrock, OpenRouter, and even
-    ///    OpenAI/Claude API-key setups), dispatched via `complete_simple`.
+    /// 1. The live agent provider (the user's CURRENT SESSION model). This is
+    ///    the default so memory extraction / rerank run on the same model the
+    ///    user is paying for and seeing responses from. The dedicated
+    ///    fast/cheap paths below exist only as a fallback when no provider is
+    ///    registered (e.g. credentials-only login with no active session).
+    /// 2. OpenAI GPT-5.6 Luna at reasoning=none if Codex creds exist
+    ///    (legacy fast/cheap path).
+    /// 3. Claude haiku (legacy fast/cheap OAuth path) if Claude creds exist.
     ///
-    /// Only when no provider is registered at all do we fall back to Claude,
-    /// which then fails on use with a clear credentials error.
+    /// To force one of the dedicated fast/cheap paths even when a session
+    /// provider is registered, set `agents.memory_model` to a known OpenAI or
+    /// Claude model id (e.g. `gpt-5.6-luna`).
+    ///
+    /// Only when no provider is registered AND no OAuth credentials exist do we
+    /// fall back to a Claude placeholder, which then fails on use with a clear
+    /// credentials error.
     fn auto_select_backend() -> (SidecarBackend, String) {
-        if auth::codex::load_credentials().is_ok() {
-            (SidecarBackend::OpenAI, SIDECAR_OPENAI_MODEL.to_string())
-        } else if auth::claude::load_credentials().is_ok() {
-            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
-        } else if let Some(provider) = crate::provider::active_provider_fork() {
-            // Dispatch through whatever provider the user is running on. The
-            // model string is informational here; the provider already has the
-            // user's selected model and routes accordingly.
+        if let Some(provider) = crate::provider::active_provider_fork() {
+            // Dispatch through whatever provider the user is currently running
+            // on (their SESSION model). The model string is informational here;
+            // the provider already has the user's selected model and routes
+            // accordingly.
             //
             // SAFETY: if the provider is a direct OpenAI-compatible profile
             // (e.g. DeepSeek, Moonshot, OpenRouter-compatible), the model name
@@ -426,6 +431,10 @@ impl Sidecar {
             // namespace identifier that the endpoint does not understand.
             let model = safe_model_for_provider(provider.as_ref());
             (SidecarBackend::Provider, model)
+        } else if auth::codex::load_credentials().is_ok() {
+            (SidecarBackend::OpenAI, SIDECAR_OPENAI_MODEL.to_string())
+        } else if auth::claude::load_credentials().is_ok() {
+            (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
         } else {
             // No credentials and no live provider: default to Claude so the
             // eventual error message is actionable.
@@ -1829,6 +1838,9 @@ mod tests {
         let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
         let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
 
+        // No active provider registered (so the fallback path is exercised).
+        crate::provider::clear_active_provider_for_test();
+
         codex::upsert_account_from_tokens("openai-1", "sk-test-key-123", "", None, None)
             .expect("write OpenAI test auth");
         crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
@@ -1847,6 +1859,147 @@ mod tests {
         assert_eq!(sidecar.model, SIDECAR_OPENAI_MODEL);
         codex::set_active_account_override(None);
         crate::auth::claude::set_active_account_override(None);
+        crate::provider::clear_active_provider_for_test();
+    }
+
+    #[test]
+    fn test_backend_selection_prefers_active_provider_over_oauth_creds() {
+        // The user's CURRENT SESSION model should win over any Codex/Claude
+        // OAuth credentials that happen to be present on disk. Otherwise
+        // memory extraction silently runs on a different (fast/cheap) model
+        // than the one the user is paying for and seeing responses from.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        codex::upsert_account_from_tokens("openai-1", "sk-test-key-123", "", None, None)
+            .expect("write OpenAI test auth");
+        crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+            label: "claude-1".to_string(),
+            access: "claude-access".to_string(),
+            refresh: "claude-refresh".to_string(),
+            expires: 4_102_444_800_000,
+            email: None,
+            scopes: Vec::new(),
+            subscription_type: None,
+        })
+        .expect("write Claude test auth");
+
+        // Register an active provider (simulates the user's session being on
+        // a non-OpenAI/Claude provider like OpenRouter/Gemini/Copilot).
+        let stub = SimpleProviderStub {
+            name: "openrouter",
+            model: "anthropic/claude-sonnet-4",
+        };
+        crate::provider::set_active_provider(std::sync::Arc::new(stub));
+
+        let sidecar = Sidecar::with_configured_model(None);
+        assert_eq!(
+            sidecar.backend,
+            SidecarBackend::Provider,
+            "with an active session provider, sidecar must dispatch through it \
+             even when Codex/Claude OAuth creds exist"
+        );
+        assert_eq!(sidecar.model, "anthropic/claude-sonnet-4");
+
+        codex::set_active_account_override(None);
+        crate::auth::claude::set_active_account_override(None);
+        crate::provider::clear_active_provider_for_test();
+    }
+
+    #[test]
+    fn test_backend_selection_uses_claude_oauth_when_no_provider() {
+        // Without an active provider, the dedicated Claude fast/cheap path
+        // must remain available as a fallback so credentials-only logins
+        // still get a working sidecar.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        crate::provider::clear_active_provider_for_test();
+
+        crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+            label: "claude-1".to_string(),
+            access: "claude-access".to_string(),
+            refresh: "claude-refresh".to_string(),
+            expires: 4_102_444_800_000,
+            email: None,
+            scopes: Vec::new(),
+            subscription_type: None,
+        })
+        .expect("write Claude test auth");
+
+        let sidecar = Sidecar::with_configured_model(None);
+        assert_eq!(sidecar.backend, SidecarBackend::Claude);
+        assert_eq!(sidecar.model, SIDECAR_CLAUDE_MODEL);
+        crate::auth::claude::set_active_account_override(None);
+        crate::provider::clear_active_provider_for_test();
+    }
+
+    #[test]
+    fn test_backend_selection_memory_model_override_beats_session_provider() {
+        // `agents.memory_model` is the documented opt-in to force a dedicated
+        // fast/cheap path even when a session provider is registered. This
+        // verifies the override still works after the priority flip.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("create temp jcode home");
+        let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let stub = SimpleProviderStub {
+            name: "openrouter",
+            model: "anthropic/claude-sonnet-4",
+        };
+        crate::provider::set_active_provider(std::sync::Arc::new(stub));
+
+        let sidecar = Sidecar::with_configured_model(Some(SIDECAR_OPENAI_MODEL.to_string()));
+        assert_eq!(
+            sidecar.backend,
+            SidecarBackend::OpenAI,
+            "agents.memory_model = 'gpt-5.6-luna' must force the OpenAI fast path \
+             even when a session provider is registered"
+        );
+        assert_eq!(sidecar.model, SIDECAR_OPENAI_MODEL);
+        crate::provider::clear_active_provider_for_test();
+    }
+
+    #[derive(Clone)]
+    struct SimpleProviderStub {
+        name: &'static str,
+        model: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for SimpleProviderStub {
+        async fn complete(
+            &self,
+            _messages: &[crate::message::Message],
+            _tools: &[crate::message::ToolDefinition],
+            _system: &str,
+            _resume_session_id: Option<&str>,
+        ) -> Result<crate::provider::EventStream> {
+            let stream = futures::stream::once(async move {
+                Ok(jcode_message_types::StreamEvent::TextDelta("ok".to_string()))
+            });
+            Ok(Box::pin(stream))
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn display_name(&self) -> String {
+            self.name.to_string()
+        }
+        fn model(&self) -> String {
+            self.model.to_string()
+        }
+        fn set_model(&self, _model: &str) -> Result<()> {
+            Ok(())
+        }
+        fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+            std::sync::Arc::new(self.clone())
+        }
     }
 
     #[test]

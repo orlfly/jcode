@@ -568,8 +568,9 @@ fn test_generated_default_config_uses_low_openai_reasoning_effort() {
     );
     assert!(
         content.contains("memory_model = \"gpt-5.6-luna\"")
-            && content.contains("reasoning effort \"none\""),
-        "generated default config should document the Luna memory sidecar default"
+            && content.contains("force a dedicated fast/cheap path"),
+        "generated default config should document that memory_model is an opt-in \
+         override of the session-model-first default"
     );
 
     // Effort keys come from the per-platform keybinding registry; the template

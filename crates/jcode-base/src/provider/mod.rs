@@ -101,6 +101,17 @@ pub fn set_active_provider(provider: Arc<dyn Provider>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
 }
 
+/// Test-only: clear the active provider registration so a test can verify the
+/// "no provider registered" path of any code that calls `active_provider_fork`.
+/// `lock_test_env` serializes tests, so the registration will be restored by
+/// later tests that set their own.
+#[cfg(test)]
+pub fn clear_active_provider_for_test() {
+    *ACTIVE_PROVIDER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 /// Fetch the registered active provider, if any. Returns a forked handle so the
 /// caller gets an independent provider instance (per the [`Provider::fork`]
 /// contract) that will not interfere with the main agent's model selection.

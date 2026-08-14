@@ -426,8 +426,12 @@ swarm_max_concurrent_agents = 32
 # Env override: JCODE_SWARM_STRIP_LAYOUT
 # swarm_strip_layout = "vertical"
 #
-# Model for the memory sidecar (relevance/extraction). Unset = sidecar auto-select
-# (OpenAI defaults to gpt-5.6-luna with reasoning effort "none").
+# Model for the memory sidecar (relevance/extraction). Unset = sidecar uses
+# the user's CURRENT SESSION model (active provider) so extraction runs on the
+# same model the user is paying for. To force a dedicated fast/cheap path
+# instead, set this to an OpenAI model id (e.g. "gpt-5.6-luna") or a Claude
+# model id (e.g. "claude-haiku-4-5-20251001"); this re-enables the legacy
+# priority where Codex/Claude OAuth creds win over the session provider.
 # Env override: JCODE_MEMORY_MODEL
 # memory_model = "gpt-5.6-luna"
 #
