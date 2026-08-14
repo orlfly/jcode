@@ -485,4 +485,134 @@ mod tests {
         }
         assert!(!maybe_unload_if_idle(Duration::from_secs(1)));
     }
+
+    // --- P0 recovery path: stale load_error must be cleared when model
+    //     files appear on disk, so the next call retries instead of
+    //     returning the cached error forever. ---
+
+    fn with_temp_jcode_home<F: FnOnce(&std::path::Path)>(f: F) {
+        // Use the test env lock so concurrent tests don't fight over
+        // JCODE_HOME / the global embedder cache.
+        let _guard = crate::storage::lock_test_env();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-embed-recovery-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp JCODE_HOME");
+        let prev = std::env::var("JCODE_HOME").ok();
+        // SAFETY: only the test thread reads/writes this var while the
+        // process-wide lock is held.
+        unsafe { std::env::set_var("JCODE_HOME", &dir) };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
+        match prev {
+            Some(prev) => unsafe { std::env::set_var("JCODE_HOME", prev) },
+            None => unsafe { std::env::remove_var("JCODE_HOME") },
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn get_embedder_clears_stale_load_error_when_model_files_appear() {
+        // P0 regression guard: before the fix, a failed first load put an
+        // error into the cache that was never cleared. After the fix, the
+        // next call sees the model on disk, clears the cached error, and
+        // attempts to load. The load still fails (empty files), but the
+        // error message proves the retry happened.
+        with_temp_jcode_home(|home| {
+            // Reset cache.
+            if let Ok(mut cache) = embedder_cache().lock() {
+                *cache = EmbedderCache::default();
+            }
+            let stale = "stale cached load error from a previous attempt";
+            {
+                let mut cache = embedder_cache().lock().unwrap();
+                cache.load_error = Some(stale.to_string());
+            }
+            // Place empty model files — `is_model_available` only checks
+            // existence, so the recovery path will trigger, but the load
+            // itself will fail with a fresh error.
+            let model_dir = home
+                .join("models")
+                .join(crate::embedding::backend::MODEL_NAME);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(model_dir.join("model.onnx"), b"").unwrap();
+            std::fs::write(model_dir.join("tokenizer.json"), b"").unwrap();
+
+            let result = crate::embedding::get_embedder();
+
+            assert!(result.is_err(), "empty model files should fail to load");
+            let err_msg = match result {
+                Ok(_) => unreachable!("asserted is_err above"),
+                Err(e) => e.to_string(),
+            };
+            assert_ne!(
+                err_msg, stale,
+                "recovery path must clear stale error before retry"
+            );
+            // The cache should now hold the NEW error, not the stale one.
+            let cache = embedder_cache().lock().unwrap();
+            let cached = cache.load_error.as_deref().unwrap_or("");
+            assert_ne!(cached, stale, "cache must no longer hold stale error");
+        });
+    }
+
+    #[test]
+    fn get_embedder_keeps_cached_error_when_model_still_missing() {
+        // Counterpart test: when the model is still missing, the cached
+        // error must be returned as-is without attempting the loaded-from-disk
+        // branch.
+        with_temp_jcode_home(|_home| {
+            if let Ok(mut cache) = embedder_cache().lock() {
+                *cache = EmbedderCache::default();
+            }
+            let stale = "network unreachable when fetching model";
+            {
+                let mut cache = embedder_cache().lock().unwrap();
+                cache.load_error = Some(stale.to_string());
+            }
+            // No model files placed on disk at all.
+
+            let result = crate::embedding::get_embedder();
+
+            assert!(result.is_err(), "no model should fail");
+            let err_msg = match result {
+                Ok(_) => unreachable!("asserted is_err above"),
+                Err(e) => e.to_string(),
+            };
+            assert_eq!(
+                err_msg, stale,
+                "cached error must be returned verbatim when model is still missing"
+            );
+        });
+    }
+
+    #[test]
+    fn get_embedder_keeps_no_error_when_cache_is_fresh() {
+        // Sanity baseline: with nothing in the cache and no model files,
+        // get_embedder attempts the load and caches a fresh error. This
+        // matches the original "first load attempt" path.
+        with_temp_jcode_home(|_home| {
+            if let Ok(mut cache) = embedder_cache().lock() {
+                *cache = EmbedderCache::default();
+            }
+            // No model files; no load_error.
+
+            let result = crate::embedding::get_embedder();
+
+            assert!(result.is_err(), "no model should fail");
+            let cache = embedder_cache().lock().unwrap();
+            assert!(
+                cache.load_error.is_some(),
+                "fresh load failure must populate cache.load_error"
+            );
+        });
+    }
 }
