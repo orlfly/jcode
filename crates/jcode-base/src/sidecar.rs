@@ -47,6 +47,192 @@ const CLAUDE_CODE_JCODE_NOTICE: &str = "You are jcode, powered by Claude Code. Y
 /// Maximum tokens for sidecar responses (keep small for speed/cost)
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
+/// OpenRouter-style model names carry a `vendor/family` namespace (e.g.
+/// `anthropic/claude-sonnet-4`, `openai/gpt-5.5`). Direct OpenAI-compatible
+/// providers (DeepSeek, Moonshot, MiniMax, etc.) expect their own bare model
+/// ids (`deepseek-chat`, `moonshot-v1-8k`). When the sidecar forks a provider
+/// whose endpoint is a direct API but whose model is in the OpenRouter
+/// namespace, we MUST rewrite the model to a known-compatible default instead
+/// of trusting the stored model — otherwise the direct API returns HTTP 400
+/// "Model Not Exist" and the memory rerank falls into `all_judges_failed`.
+fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
+    let raw = provider.model();
+    if !is_namespaced_model(&raw) {
+        return raw;
+    }
+
+    // A provider's runtime label (e.g. "deepseek", "openai-compatible:deepseek",
+    // "openrouter-compatible") is the single best signal we have for the
+    // endpoint shape. If the runtime points at a direct OpenAI-compatible
+    // service, the stored model must not use OpenRouter's vendor/family
+    // namespace.
+    let name = provider.name().to_ascii_lowercase();
+    if !is_direct_openai_compatible_runtime(&name) {
+        return raw;
+    }
+
+    let default = provider_default_model_for(&name);
+    match default {
+        Some(default) => {
+            crate::logging::warn(&format!(
+                "Sidecar: provider '{}' carries model '{}' which is incompatible with \
+                 a direct OpenAI-compatible endpoint; falling back to default '{}' to \
+                 avoid memory rerank degradation (all_judges_failed).",
+                name, raw, default
+            ));
+            default.to_string()
+        }
+        None => raw,
+    }
+}
+
+/// Direct OpenAI-compatible runtime labels that do NOT understand the
+/// `vendor/family` namespace. Matched by substring so the varied
+/// `openai-compatible:<profile>` shapes and dashed profile ids all work.
+fn is_direct_openai_compatible_runtime(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    const KNOWN_RUNTIMES: &[&str] = &[
+        "deepseek",
+        "moonshot",
+        "kimi",
+        "minimax",
+        "minimaxi",
+        "bigmodel",
+        "zhipu",
+        "zhipuai",
+        "cerebras",
+        "groq",
+        "fireworks",
+        "together",
+        "deepinfra",
+        "mistral",
+        "perplexity",
+        "xai",
+        "nvidia",
+        "nvidia-nim",
+        "coda",
+        "siliconflow",
+        "lingyiwanwu",
+        "stepfun",
+        "baichuan",
+        "sensenova",
+        "cohere",
+        "chutes",
+        "lmstudio",
+        "ollama",
+        "vllm",
+        "llamacpp",
+    ];
+    if KNOWN_RUNTIMES.iter().any(|k| normalized == *k || normalized.contains(k)) {
+        return true;
+    }
+    // The openai-compatible generic namespace is always direct.
+    normalized.starts_with("openai-compatible:") || normalized == "openai-compatible"
+}
+
+/// OpenRouter-style model (`<vendor>/<family>`). Don't be too restrictive —
+/// the slash is the spiciest signal. We let the endpoint check decide
+/// whether the namespace actually breaks things.
+fn is_namespaced_model(model: &str) -> bool {
+    if let Some((vendor, _rest)) = model.split_once('/') {
+        !vendor.is_empty()
+            && vendor.len() <= 64
+            && !vendor.contains('\\')
+            && !vendor.contains('?')
+            && !vendor.contains('#')
+    } else {
+        false
+    }
+}
+
+/// Per-runtime default model that the sidecar can use when the stored
+/// model is incompatible with the endpoint. These mirror the defaults the
+/// catalogs ship with so we always have a model that the endpoint accepts.
+///
+/// Update these whenever a new direct OpenAI-compatible profile is added.
+fn provider_default_model_for(name: &str) -> Option<&'static str> {
+    if name.contains("deepseek") {
+        return Some("deepseek-chat");
+    }
+    if name.contains("moonshot") || name.contains("kimi") {
+        return Some("moonshot-v1-8k");
+    }
+    if name.contains("minimaxi") || name == "minimax" || name.contains("minimax") {
+        return Some("MiniMax-M3");
+    }
+    if name.contains("bigmodel") || name.contains("zhipu") {
+        return Some("glm-4.6");
+    }
+    if name.contains("cerebras") {
+        return Some("llama-3.3-70b");
+    }
+    if name.contains("groq") {
+        return Some("llama-3.3-70b-versatile");
+    }
+    if name.contains("fireworks") {
+        return Some("accounts/fireworks/models/llama-v3p3-70b-instruct");
+    }
+    if name.contains("together") {
+        return Some("meta-llama/Llama-3.3-70B-Instruct-Turbo");
+    }
+    if name.contains("deepinfra") {
+        return Some("meta-llama/Llama-3.3-70B-Instruct");
+    }
+    if name.contains("mistral") {
+        return Some("mistral-large-latest");
+    }
+    if name.contains("perplexity") {
+        return Some("sonar");
+    }
+    if name.contains("xai") {
+        return Some("grok-3-mini");
+    }
+    if name.contains("nvidia") {
+        return Some("meta/llama-3.3-70b-instruct");
+    }
+    if name.contains("cohere") {
+        return Some("command-r-plus");
+    }
+    if name.contains("siliconflow") {
+        return Some("Qwen/Qwen2.5-72B-Instruct");
+    }
+    if name.contains("lingyiwanwu") {
+        return Some("yi-large");
+    }
+    if name.contains("stepfun") {
+        return Some("step-1v-32k");
+    }
+    if name.contains("baichuan") {
+        return Some("Baichuan4");
+    }
+    if name.contains("sensenova") {
+        return Some("SenseChat-5");
+    }
+    if name.contains("chutes") {
+        return Some("deepseek-ai/DeepSeek-V3");
+    }
+    if name == "lmstudio" || name.contains("lmstudio") {
+        return Some("local-model");
+    }
+    if name == "ollama" || name.contains("ollama") {
+        return Some("llama3.3");
+    }
+    if name == "vllm" || name.contains("vllm") {
+        return Some("local-model");
+    }
+    if name == "llamacpp" || name.contains("llamacpp") {
+        return Some("local-model");
+    }
+    if name.starts_with("openai-compatible:") || name == "openai-compatible" {
+        // Generic OpenAI-compatible: we don't know what models the endpoint
+        // exposes, so we can't suggest a safe default. The caller will fall
+        // through to the raw model and the request will still fail loudly
+        // if the endpoint rejects it — no silent degradation.
+        return None;
+    }
+    None
+}
+
 /// Whether retrying a failed sidecar request can reasonably succeed without a
 /// configuration or credential change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +388,38 @@ impl Sidecar {
             // Dispatch through whatever provider the user is running on. The
             // model string is informational here; the provider already has the
             // user's selected model and routes accordingly.
-            (SidecarBackend::Provider, provider.model())
+            //
+            // SAFETY: if the provider is a direct OpenAI-compatible profile
+            // (e.g. DeepSeek, Moonshot, OpenRouter-compatible), the model name
+            // it carries may belong to a different namespace (e.g. the
+            // OpenRouter-style `anthropic/claude-sonnet-4` on a DeepSeek direct
+            // endpoint). Sending that to the direct API returns HTTP 400
+            // "Model Not Exist" and cascades into `all_judges_failed` for the
+            // memory rerank. To prevent this, prefer the provider's *default*
+            // model (the one it was constructed with) when it carries a
+            // namespace identifier that the endpoint does not understand.
+            let model = safe_model_for_provider(provider.as_ref());
+            (SidecarBackend::Provider, model)
         } else {
             // No credentials and no live provider: default to Claude so the
             // eventual error message is actionable.
             (SidecarBackend::Claude, SIDECAR_CLAUDE_MODEL.to_string())
         }
+    }
+
+    /// Whether the provider-backed sidecar can confidently use the configured
+    /// model. When the active provider is a direct API (DeepSeek, Moonshot,
+    /// etc.) and its model name carries an OpenRouter-style namespace
+    /// (e.g. `anthropic/claude-sonnet-4`), the sidecar will silently re-route
+    /// to the provider's default model. Callers that need to know whether the
+    /// sidecar is operating in degraded mode can use this to log a warning.
+    pub fn provider_model_is_compatible(provider: &dyn crate::provider::Provider) -> bool {
+        let raw = provider.model();
+        if !is_namespaced_model(&raw) {
+            return true;
+        }
+        let name = provider.name().to_ascii_lowercase();
+        !is_direct_openai_compatible_runtime(&name)
     }
 
     /// Whether a usable LLM backend is actually reachable for the sidecar right
@@ -287,6 +499,22 @@ impl Sidecar {
         let provider = crate::provider::active_provider_fork().context(
             "No active provider registered for sidecar; memory features require a logged-in provider",
         )?;
+
+        // If the stored model name is incompatible with the provider's
+        // endpoint (e.g. `anthropic/claude-sonnet-4` on a DeepSeek direct
+        // API endpoint), switch the provider to its safe default for the
+        // lifetime of this call. Doing it on the forked provider keeps the
+        // main agent's selection untouched.
+        let safe_model = safe_model_for_provider(provider.as_ref());
+        if safe_model != self.model && safe_model != provider.model() {
+            if let Err(err) = provider.set_model(&safe_model) {
+                crate::logging::warn(&format!(
+                    "Sidecar: failed to switch provider to safe model '{}': {}",
+                    safe_model, err
+                ));
+            }
+        }
+
         provider
             .complete_simple(user_message, system)
             .await
@@ -1121,6 +1349,191 @@ mod tests {
     fn test_sidecar_fast_model() {
         assert_eq!(SIDECAR_FAST_MODEL, "gpt-5.6-luna");
         assert_eq!(SIDECAR_CLAUDE_MODEL, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn is_namespaced_model_recognises_openrouter_style() {
+        // OpenRouter shape: `vendor/family`
+        assert!(is_namespaced_model("anthropic/claude-sonnet-4"));
+        assert!(is_namespaced_model("openai/gpt-5.5"));
+        assert!(is_namespaced_model("google/gemini-3-flash"));
+        assert!(is_namespaced_model("meta-llama/llama-3.3-70b-instruct"));
+
+        // Direct endpoints' bare ids must NOT be considered namespaced, even
+        // when they have dashes or dots.
+        assert!(!is_namespaced_model("deepseek-v4-flash"));
+        assert!(!is_namespaced_model("MiniMax-M3"));
+        assert!(!is_namespaced_model("moonshot-v1-8k"));
+        assert!(!is_namespaced_model("claude-haiku-4-5-20251001"));
+
+        // Some direct endpoints use slashes for their own naming (Kimi).
+        // We don't reject these because the endpoint check will.
+        assert!(is_namespaced_model("moonshotai/kimi-k2.5"));
+
+        // Malformed inputs
+        assert!(!is_namespaced_model(""));
+        assert!(!is_namespaced_model("/no-vendor"));
+        assert!(!is_namespaced_model("has\\backslash/model"));
+    }
+
+    #[test]
+    fn is_direct_openai_compatible_runtime_matches_known_providers() {
+        // Direct OpenAI-compatible providers.
+        assert!(is_direct_openai_compatible_runtime("deepseek"));
+        assert!(is_direct_openai_compatible_runtime("openai-compatible:deepseek"));
+        assert!(is_direct_openai_compatible_runtime("DEEPSEEK"));
+        assert!(is_direct_openai_compatible_runtime("moonshotai"));
+        assert!(is_direct_openai_compatible_runtime("openai-compatible:moonshot-v1-8k"));
+        assert!(is_direct_openai_compatible_runtime("kimi"));
+        assert!(is_direct_openai_compatible_runtime("openai-compatible"));
+        assert!(is_direct_openai_compatible_runtime("openai-compatible:my-custom-thing"));
+
+        // OpenRouter-shaped providers (NOT direct)
+        assert!(!is_direct_openai_compatible_runtime("openrouter"));
+        assert!(!is_direct_openai_compatible_runtime("anthropic"));
+        assert!(!is_direct_openai_compatible_runtime("openai")); // openai proper is OAuth/API-key, not direct
+        assert!(!is_direct_openai_compatible_runtime("claude"));
+        assert!(!is_direct_openai_compatible_runtime("copilot"));
+        assert!(!is_direct_openai_compatible_runtime("gemini"));
+        assert!(!is_direct_openai_compatible_runtime("bedrock"));
+        assert!(!is_direct_openai_compatible_runtime("cursor"));
+    }
+
+    #[test]
+    fn provider_default_model_for_returns_known_defaults() {
+        assert_eq!(provider_default_model_for("deepseek"), Some("deepseek-chat"));
+        assert_eq!(
+            provider_default_model_for("openai-compatible:deepseek"),
+            Some("deepseek-chat")
+        );
+        assert_eq!(
+            provider_default_model_for("moonshot"),
+            Some("moonshot-v1-8k")
+        );
+        assert_eq!(provider_default_model_for("kimi"), Some("moonshot-v1-8k"));
+        assert_eq!(
+            provider_default_model_for("minimaxi"),
+            Some("MiniMax-M3")
+        );
+        assert_eq!(
+            provider_default_model_for("openai-compatible:my-random-thing"),
+            None,
+            "generic openai-compatible runs don't know which model works"
+        );
+        assert_eq!(provider_default_model_for("openrouter"), None);
+        assert_eq!(provider_default_model_for("anthropic"), None);
+    }
+
+    /// Regression test for the 2026-08-14 memory incident: the sidecar was
+    /// dispatching to a DeepSeek direct endpoint with an OpenRouter-style
+    /// model name (`anthropic/claude-sonnet-4`), causing HTTP 400 "Model Not
+    /// Exist" and `all_judges_failed` for every memory rerank.
+    #[test]
+    fn safe_model_for_provider_rewrites_namespaced_model_on_direct_endpoint() {
+        struct StubProvider {
+            name: &'static str,
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for StubProvider {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!("safe_model_for_provider does not call complete")
+            }
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(StubProvider {
+                    name: self.name,
+                    model: self.model,
+                })
+            }
+        }
+
+        // Bug case: DeepSeek direct provider with OpenRouter-style model.
+        let buggy = StubProvider {
+            name: "deepseek",
+            model: "anthropic/claude-sonnet-4",
+        };
+        let safe = safe_model_for_provider(&buggy);
+        assert_eq!(
+            safe, "deepseek-chat",
+            "sidecar must rewrite the OpenRouter-style model to a DeepSeek-safe default"
+        );
+
+        // Already-correct case: bare model on a direct endpoint.
+        let ok = StubProvider {
+            name: "deepseek",
+            model: "deepseek-v4-flash",
+        };
+        assert_eq!(safe_model_for_provider(&ok), "deepseek-v4-flash");
+
+        // OpenRouter-shaped namespaced model on OpenRouter — must stay.
+        let or = StubProvider {
+            name: "openrouter",
+            model: "anthropic/claude-sonnet-4",
+        };
+        assert_eq!(safe_model_for_provider(&or), "anthropic/claude-sonnet-4");
+
+        // Bare model on a non-direct provider — must stay.
+        let claude = StubProvider {
+            name: "claude",
+            model: "claude-haiku-4-5-20251001",
+        };
+        assert_eq!(safe_model_for_provider(&claude), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn provider_model_is_compatible_returns_false_for_buggy_pairs() {
+        struct StubProvider {
+            name: &'static str,
+            model: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for StubProvider {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::message::ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> Result<crate::provider::EventStream> {
+                unreachable!()
+            }
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn model(&self) -> String {
+                self.model.to_string()
+            }
+            fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+                std::sync::Arc::new(StubProvider {
+                    name: self.name,
+                    model: self.model,
+                })
+            }
+        }
+
+        let buggy = StubProvider {
+            name: "deepseek",
+            model: "anthropic/claude-sonnet-4",
+        };
+        assert!(!Sidecar::provider_model_is_compatible(&buggy));
+
+        let ok = StubProvider {
+            name: "deepseek",
+            model: "deepseek-v4-flash",
+        };
+        assert!(Sidecar::provider_model_is_compatible(&ok));
     }
 
     #[test]
