@@ -405,6 +405,8 @@ pub enum NamedProviderType {
     #[serde(alias = "openai-compatible", alias = "openai_compatible")]
     #[default]
     OpenAiCompatible,
+    #[serde(alias = "anthropic-compatible", alias = "anthropic_compatible")]
+    AnthropicCompatible,
     OpenRouter,
 }
 
@@ -443,6 +445,9 @@ pub struct NamedProviderConfig {
     pub api: Option<String>,
     pub auth: NamedProviderAuth,
     pub auth_header: Option<String>,
+    /// Extra HTTP headers sent with every request to this provider.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub env_file: Option<String>,
@@ -485,6 +490,7 @@ impl Default for NamedProviderConfig {
             api: None,
             auth: NamedProviderAuth::Bearer,
             auth_header: None,
+            headers: std::collections::BTreeMap::new(),
             api_key_env: None,
             api_key: None,
             env_file: None,
@@ -946,6 +952,8 @@ pub struct KeybindingsConfig {
     pub scroll_prompt_down: String,
     /// Scroll bookmark toggle key (default: "ctrl+g")
     pub scroll_bookmark: String,
+    /// Toggle auto-poke (default: "ctrl+p"). Set "" to disable.
+    pub auto_poke_toggle: String,
     /// Scroll up fallback key (default: unset; Cmd+K moves up by prompt on macOS)
     pub scroll_up_fallback: String,
     /// Scroll down fallback key (default: unset; Cmd+J moves down by prompt on macOS)
@@ -1012,6 +1020,7 @@ impl Default for KeybindingsConfig {
             scroll_prompt_up: get("scroll_prompt_up", "ctrl+["),
             scroll_prompt_down: get("scroll_prompt_down", "ctrl+]"),
             scroll_bookmark: get("scroll_bookmark", "ctrl+g"),
+            auto_poke_toggle: get("auto_poke_toggle", "ctrl+p"),
             scroll_up_fallback: get("scroll_up_fallback", ""),
             scroll_down_fallback: get("scroll_down_fallback", ""),
             workspace_left: get("workspace_left", "alt+h"),

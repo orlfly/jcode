@@ -1948,10 +1948,6 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
             app.toggle_input_stash();
             true
         }
-        KeyCode::Char('p') => {
-            super::commands::toggle_auto_poke_hotkey_local(app);
-            true
-        }
         KeyCode::Char('v') => {
             paste_from_clipboard(app);
             true
@@ -2278,6 +2274,10 @@ pub(super) fn handle_pre_control_shortcuts(
 
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    if app.toggle_keys.auto_poke.matches(code, modifiers) {
+        super::commands::toggle_auto_poke_hotkey_local(app);
+        return true;
+    }
     if app.toggle_keys.copy_selection.matches(code, modifiers) {
         app.toggle_copy_selection_mode();
         return true;
@@ -3767,7 +3767,8 @@ impl App {
         // Leaving the preview should happen as soon as the user acts on it.
         self.onboarding_preview_mode = false;
 
-        // Add user message to display (show placeholder to user, not full paste)
+        // Add the expanded user message to the transcript. The composer remains compact
+        // while editing, but sent turns should show the actual pasted content.
         // Remember the typed prompt so we can restore it to the input box if this
         // turn fails (e.g. "token refresh needed"), instead of dropping it.
         self.last_submitted_input = Some(raw_input.clone());
@@ -3780,7 +3781,7 @@ impl App {
 
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
-            content: raw_input, // Show placeholder to user (condensed view)
+            content: input.clone(),
             tool_calls: vec![],
             duration_secs: None,
             title: None,
