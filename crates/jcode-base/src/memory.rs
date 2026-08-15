@@ -1296,6 +1296,21 @@ impl MemoryManager {
         Ok(false)
     }
 
+    /// Returns true if a memory with the given id exists in the requested
+    /// scope. Used by the memory tool to reject `remember` calls that would
+    /// otherwise silently overwrite an existing entry via `add_memory`'s
+    /// `HashMap::insert` semantics.
+    pub fn has_memory(&self, id: &str, scope: &str) -> Result<bool> {
+        match scope {
+            "project" => Ok(self.load_project_graph()?.get_memory(id).is_some()),
+            "global" => Ok(self.load_global_graph()?.get_memory(id).is_some()),
+            _ => Err(anyhow::anyhow!(
+                "Unknown scope for has_memory: {}. Use project or global",
+                scope
+            )),
+        }
+    }
+
     // === Sidecar Integration ===
 
     /// Extract memories from a session transcript using the Haiku sidecar

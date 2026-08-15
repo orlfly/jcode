@@ -114,7 +114,10 @@ impl Tool for MemoryTool {
                     "enum": ["fact", "preference", "entity", "correction"]
                 },
                 "query": { "type": "string" },
-                "id": { "type": "string" },
+                "id": {
+                    "type": "string",
+                    "description": "Memory id. Required for forget/tag/related. For remember, optional: when supplied, must be unique within the target scope and match [A-Za-z0-9_:.-]{1,256}; auto-generated if omitted."
+                },
                 "tags": { "type": "array", "items": { "type": "string" } },
                 "scope": { "type": "string", "enum": ["project", "global", "all"] },
                 "from_id": { "type": "string" },
@@ -146,6 +149,22 @@ impl Tool for MemoryTool {
                     .parse()
                     .map_err(|err| anyhow::anyhow!("invalid memory category: {}", err))?;
                 let scope = input.scope.as_deref().unwrap_or("project");
+
+                // If a custom id is supplied, validate it and ensure it does not
+                // collide with an existing memory in the target scope. Honoring
+                // the supplied id silently here would let `add_memory`'s
+                // `HashMap::insert` overwrite a previously remembered entry.
+                if let Some(ref id) = input.id {
+                    validate_custom_memory_id(id)?;
+                    if manager.has_memory(id, scope)? {
+                        return Err(anyhow::anyhow!(
+                            "memory id '{}' already exists in {} scope; \
+                             forget it first or omit id to auto-generate",
+                            id, scope
+                        ));
+                    }
+                }
+
                 memory::set_state(MemoryState::ToolAction {
                     action: "remember".into(),
                     detail: truncate_for_widget(&content, 40),
@@ -154,6 +173,9 @@ impl Tool for MemoryTool {
                     MemoryEntry::new(category.clone(), &content).with_source(ctx.session_id);
                 if let Some(tags) = input.tags {
                     entry = entry.with_tags(tags);
+                }
+                if let Some(id) = input.id {
+                    entry = entry.with_id(id);
                 }
                 let id = if scope == "global" {
                     manager.remember_global(entry)?
@@ -457,6 +479,35 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
     }
 }
 
+/// Validate a user-supplied memory id. Keeps the id set small enough to be
+/// safe in storage paths and printable in tool output, and avoids whitespace,
+/// control characters, and JSON/scope-relevant punctuation that would let a
+/// caller smuggle graph-internal separators or empty segments.
+///
+/// Allowed: `[A-Za-z0-9_:.-]`, length 1..=256, must not be empty after trim.
+fn validate_custom_memory_id(id: &str) -> Result<()> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("custom memory id must not be empty"));
+    }
+    if id.chars().count() > 256 {
+        return Err(anyhow::anyhow!(
+            "custom memory id must be at most 256 characters (got {})",
+            id.chars().count()
+        ));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-' | '.'))
+    {
+        return Err(anyhow::anyhow!(
+            "custom memory id must contain only [A-Za-z0-9_:.\\-]; got {:?}",
+            id
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +655,189 @@ mod tests {
             "test mode unexpectedly saw real project memory, so this test cannot \
              distinguish the two paths: {}",
             blind.output
+        );
+
+        if let Some(prev_home) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    /// Regression: a user-supplied `id` must be honored by `remember`, not
+    /// silently replaced by an auto-generated one. The pre-fix tool accepted
+    /// the `id` field on input but never propagated it to `MemoryEntry`,
+    /// so callers that tried to thread a stable id through (e.g. deterministic
+    /// skill:NAME keys) got back a different id on every call.
+    #[tokio::test]
+    async fn remember_honors_supplied_id() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+
+        let tool = MemoryTool::new();
+        let out = tool
+            .execute(
+                json!({
+                    "action": "remember",
+                    "content": "issue-v8-supplied-id",
+                    "category": "fact",
+                    "scope": "project",
+                    "id": "skill:deploy-pipeline"
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("remember with custom id should succeed");
+        assert!(
+            out.output.contains("[id: skill:deploy-pipeline]"),
+            "supplied id must round-trip to the result line, got: {}",
+            out.output
+        );
+
+        // The stored memory must be reachable via the supplied id through the
+        // real manager — proves the id is committed to the graph, not just
+        // echoed in the response message.
+        let list = tool
+            .execute(
+                json!({ "action": "list", "scope": "project" }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("list should succeed");
+        assert!(
+            list.output.contains("skill:deploy-pipeline"),
+            "memory with custom id must appear under that id in list, got: {}",
+            list.output
+        );
+
+        if let Some(prev_home) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    /// A supplied id that already exists must be rejected — silent overwrite
+    /// via `add_memory`'s `HashMap::insert` would be a data-loss bug. Callers
+    /// who really want to refresh content should `forget` first, or we can
+    /// add a separate `upsert` action later.
+    #[tokio::test]
+    async fn remember_rejects_supplied_id_that_already_exists() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+
+        let tool = MemoryTool::new();
+        let first = tool
+            .execute(
+                json!({
+                    "action": "remember",
+                    "content": "first write",
+                    "scope": "project",
+                    "id": "skill:duplicate-probe"
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("first remember should succeed");
+        assert!(first.output.contains("skill:duplicate-probe"));
+
+        let _second = tool
+            .execute(
+                json!({
+                    "action": "remember",
+                    "content": "second write should be rejected",
+                    "scope": "project",
+                    "id": "skill:duplicate-probe"
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect_err("second remember with same id must error");
+        // Confirm the original content was not overwritten: the surviving
+        // memory must still contain "first write", not the second-write text.
+        let list = tool
+            .execute(
+                json!({ "action": "list", "scope": "project" }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("list should succeed");
+        assert!(
+            list.output.contains("first write"),
+            "original content must survive a rejected collision, got: {}",
+            list.output
+        );
+        assert!(
+            !list.output.contains("second write"),
+            "rejected collision must not have written new content, got: {}",
+            list.output
+        );
+
+        if let Some(prev_home) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    /// Defensive: malformed ids are rejected at validation time, not after a
+    /// graph write. Pins the allowed character set so we don't accidentally
+    /// widen it without thinking about graph-internal separators (the `tag:`
+    /// prefix used by tag nodes, the `:` that joins kind+key, etc.).
+    #[tokio::test]
+    async fn remember_rejects_malformed_supplied_id() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+
+        let tool = MemoryTool::new();
+        for bad in [
+            "",            // empty
+            "   ",         // whitespace only
+            "has space",   // embedded whitespace
+            "has/slash",   // path separator
+            "has\nnewline", // control character
+            "has\"quote",  // JSON-relevant punctuation
+        ] {
+            let result = tool
+                .execute(
+                    json!({
+                        "action": "remember",
+                        "content": "should never persist",
+                        "scope": "project",
+                        "id": bad
+                    }),
+                    test_ctx(Some(project.path().to_path_buf())),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "malformed id {:?} must be rejected, got {:?}",
+                bad,
+                result.map(|o| o.output)
+            );
+        }
+
+        // None of the rejected writes should have leaked into storage.
+        let list = tool
+            .execute(
+                json!({ "action": "list", "scope": "project" }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("list should succeed");
+        assert!(
+            !list.output.contains("should never persist"),
+            "no malformed-id write should have committed, got: {}",
+            list.output
         );
 
         if let Some(prev_home) = prev_home {
