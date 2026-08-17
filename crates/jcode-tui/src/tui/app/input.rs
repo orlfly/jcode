@@ -1637,6 +1637,7 @@ impl App {
                 // leave incomplete todos would never be poked. Stay armed and
                 // simply do nothing this turn.
                 crate::logging::info("AUTO_POKE_DECISION action=idle reason=no_todos incomplete=0");
+                self.todo_final_response_requested = false;
                 return false;
             }
             // Deferred quality checks land here, once, instead of interrupting
@@ -1731,11 +1732,19 @@ impl App {
                 "✅ All todos done. Completion confidence: {}.",
                 confidence_label
             )));
+            if !self.todo_final_response_requested {
+                self.todo_final_response_requested = true;
+                self.queued_messages
+                    .push(crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string());
+                self.pending_queued_dispatch = true;
+                return true;
+            }
             self.pending_queued_dispatch = false;
             return false;
         }
 
         let poke_message = super::commands::build_poke_message(&incomplete);
+        self.todo_final_response_requested = false;
         let fingerprint =
             serde_json::to_string(&incomplete).unwrap_or_else(|_| poke_message.clone());
         if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint) {
@@ -2479,7 +2488,7 @@ fn handle_inline_image_toggle_shortcut(app: &mut App, key: char) -> bool {
     true
 }
 
-fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
+pub(super) fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
     if !key.eq_ignore_ascii_case(&'e') {
         return false;
     }

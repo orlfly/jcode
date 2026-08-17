@@ -190,9 +190,15 @@ through jcode, priced per model rather than with one blended rate. Setup:
 ```bash
 npm run migrate:model-prices   # creates model_prices (migration 0023)
 npm run sync:model-prices      # fills it from https://models.dev/api.json
-npm run token-value            # daily / per-model / summary panels
+npm run token-value:fresh      # refresh prices, then run the dashboard (recommended)
+npm run token-value            # dashboard using prices already stored in D1
 npm run token-value:daily      # just the per-day series, in date order
 ```
+
+`npm run token-value:fresh` is the safe default before quoting dollar values: it
+refreshes the remote D1 price mappings and then runs the daily / per-model /
+summary panels. Use `npm run token-value` only when the prices were refreshed
+recently.
 
 `npm run token-value:daily` is the plain time series when all you want is
 "dollars per day": one row per day with the tokens, sessions, and distinct
@@ -223,6 +229,16 @@ Three things to know before quoting the number:
 - **Check `priced_token_pct` / `unpriced_tokens`.** Every panel reports them.
   If coverage drops, re-run the sync before trusting the dollar figure.
 
+
+## Prompt-user dashboard
+
+`npm run prompt-users` uses the strict product definition requested for user
+metrics: one distinct non-CI machine that ran at least one prompt. It reports
+rolling prompt DAU and WAU from the union of `turn_end` and prompted lifecycle
+rows, including in-flight or unclosed sessions. Since raw `turn_end` rows have
+30-day retention, monthly growth and the all-time lower bound use durable
+`session_end` / `session_crash` rows with `had_user_prompt > 0` so both monthly
+windows have equivalent coverage.
 
 ## Reading DAU without fooling yourself
 

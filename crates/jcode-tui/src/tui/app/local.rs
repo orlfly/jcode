@@ -5,7 +5,7 @@ use crate::bus::{
 };
 use crate::message::{
     ContentBlock, Message, Role, background_task_status_notice,
-    format_background_task_notification_markdown, format_background_task_progress_markdown,
+    format_background_task_notification_markdown,
 };
 use crate::session::StoredDisplayRole;
 use anyhow::Result;
@@ -165,6 +165,10 @@ pub(super) fn handle_bus_event(
             handle_background_task_progress(app, progress);
             true
         }
+        Ok(BusEvent::BackgroundTaskStalled(task)) => {
+            handle_background_task_stalled(app, task);
+            true
+        }
         Ok(BusEvent::InputShellCompleted(shell)) => {
             handle_input_shell_completed(app, shell);
             true
@@ -309,7 +313,9 @@ pub(super) fn handle_ui_activity(app: &mut App, activity: UiActivity) -> bool {
 
     match activity.kind {
         UiActivityKind::Background => {
-            app.push_display_message(DisplayMessage::background_task(activity.message.clone()))
+            if !app.upsert_running_background_task_started(&activity.message) {
+                app.push_display_message(DisplayMessage::background_task(activity.message.clone()))
+            }
         }
         UiActivityKind::Auth | UiActivityKind::Catalog => {
             if activity.message.trim().is_empty() {
@@ -321,7 +327,7 @@ pub(super) fn handle_ui_activity(app: &mut App, activity: UiActivity) -> bool {
                 )
                 .is_some()
             {
-                app.upsert_background_task_progress_message(activity.message.clone());
+                app.upsert_running_background_task_progress(&activity.message);
             } else {
                 app.push_display_message(DisplayMessage::system(activity.message.clone()))
             }
@@ -423,12 +429,23 @@ fn apply_terminal_event(
 }
 
 fn handle_background_task_completed(app: &mut App, task: BackgroundTaskCompleted) {
+    if task.session_id == app.session.id {
+        let label = crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref(),
+        );
+        let status = if task.status == crate::bus::BackgroundTaskStatus::Completed {
+            crate::tui::BackgroundTaskRowStatus::Completed
+        } else {
+            crate::tui::BackgroundTaskRowStatus::Failed
+        };
+        app.finish_background_task(task.task_id.clone(), label, status);
+    }
     if !task.notify || task.session_id != app.session.id {
         return;
     }
 
     let notification = format_background_task_notification_markdown(&task);
-    app.push_display_message(DisplayMessage::background_task(notification.clone()));
     app.set_status_notice(background_task_status_notice(&task));
 
     if !app.is_processing {
@@ -463,12 +480,76 @@ fn handle_background_task_completed(app: &mut App, task: BackgroundTaskCompleted
     }
 }
 
+fn handle_background_task_stalled(app: &mut App, task: crate::bus::BackgroundTaskStalled) {
+    if task.session_id != app.session.id {
+        return;
+    }
+
+    let notification = crate::message::format_background_task_stalled_markdown(&task);
+    let percent = app
+        .background_task_rows_ref()
+        .iter()
+        .find(|row| row.task_id == task.task_id)
+        .and_then(|row| row.percent);
+    app.upsert_running_background_task(
+        task.task_id.clone(),
+        crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref(),
+        ),
+        percent,
+    );
+    app.set_status_notice(format!(
+        "Background task stalled · {} · no output for {}s",
+        crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref()
+        ),
+        task.stall_wake_seconds
+    ));
+
+    if !app.is_processing {
+        app.add_provider_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: notification.clone(),
+                cache_control: None,
+            }],
+            timestamp: Some(chrono::Utc::now()),
+            tool_duration_ms: None,
+        });
+        app.session.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: notification,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::BackgroundTask),
+        );
+        let _ = app.session.save();
+
+        if task.wake {
+            app.pending_turn = true;
+            app.is_processing = true;
+            app.status = ProcessingStatus::Sending;
+            if app.processing_started.is_none() {
+                app.processing_started = Some(std::time::Instant::now());
+            }
+            app.visible_turn_started = Some(std::time::Instant::now());
+        }
+    }
+}
+
 fn handle_background_task_progress(app: &mut App, event: BackgroundTaskProgressEvent) {
     if event.session_id != app.session.id {
         return;
     }
 
-    app.upsert_background_task_progress_message(format_background_task_progress_markdown(&event));
+    let label = crate::message::background_task_display_label(
+        &event.tool_name,
+        event.display_name.as_deref(),
+    );
+    app.upsert_running_background_task(event.task_id.clone(), label, event.progress.percent);
 
     let notice = format!(
         "Background task · {} · {}",

@@ -154,6 +154,9 @@ pub enum ApiEvent {
         /// Model id, e.g. `claude-sonnet-4-20250514`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
 
     /// Reply to `ListModels`: the models this session can switch to.
@@ -173,6 +176,9 @@ pub enum ApiEvent {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Reasoning effort, e.g. `high`, for providers that expose it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
         routes: Vec<ModelRouteInfo>,
     },
 
@@ -254,6 +260,8 @@ pub struct SessionInfo {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// The effective persisted display title. A custom rename takes precedence
+    /// over the generated or imported title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub status: String,

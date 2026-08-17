@@ -1435,7 +1435,7 @@ fn wrap_todo_detail(value: &str, width: usize) -> Vec<String> {
     chunks
 }
 
-/// Plan-level intent lines shown once above the todo groups.
+/// Plan-level assessment lines shown once above the todo groups.
 fn push_todo_plan_details(
     lines: &mut Vec<Line<'static>>,
     plan: &crate::todo::TodoPlan,
@@ -1443,31 +1443,34 @@ fn push_todo_plan_details(
     inner_width: usize,
     compact_details: bool,
 ) {
-    if let Some(state) = plan.understands_user_intent {
-        lines.push(todo_card_line(
-            vec![
-                Span::styled(
-                    "Understands user intent ",
-                    Style::default().fg(todo_label_color()),
-                ),
-                Span::styled(
-                    state.as_str().to_string(),
-                    Style::default().fg(todo_score_color()),
-                ),
-            ],
-            base_indent,
-            inner_width,
-        ));
-    }
-    if let Some(intention) = plan
+    let intention = plan
         .user_intention
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+        .filter(|value| !value.is_empty());
+    if let Some(state) = plan.understands_user_intent {
+        let state_color = match state {
+            crate::todo::IntentUnderstanding::Uncertain => todo_failure_color(),
+            crate::todo::IntentUnderstanding::Partial => todo_warning_color(),
+            crate::todo::IntentUnderstanding::Clear
+            | crate::todo::IntentUnderstanding::Complete => todo_score_color(),
+        };
+        let mut spans = vec![
+            Span::styled("Intent ", Style::default().fg(todo_label_color())),
+            Span::styled(state.as_str().to_string(), Style::default().fg(state_color)),
+            Span::styled(": ", Style::default().fg(todo_label_color())),
+        ];
+        if let Some(intention) = intention {
+            spans.push(Span::styled(
+                intention.to_string(),
+                Style::default().fg(todo_meta_color()),
+            ));
+        }
+        lines.push(todo_card_line(spans, base_indent, inner_width));
+    } else if let Some(intention) = intention {
         push_todo_detail(
             lines,
-            "User intention",
+            "Intent",
             intention,
             base_indent,
             inner_width,
@@ -1642,6 +1645,22 @@ fn render_todo_plan_update(
     let Some(update) = plan_update else {
         return Vec::new();
     };
+    let intent_is_unclear = !crate::todo::intent_understanding_passes(
+        update
+            .after
+            .as_ref()
+            .and_then(|plan| plan.understands_user_intent),
+    );
+    if !update
+        .fields
+        .contains(&crate::todo::TodoPlanField::UnderstandsUserIntent)
+        && !(intent_is_unclear
+            && update
+                .fields
+                .contains(&crate::todo::TodoPlanField::UserIntention))
+    {
+        return Vec::new();
+    }
     let centered = markdown::center_code_blocks();
     let card_width = if centered {
         (width.saturating_sub(4) as usize).min(120)
@@ -1678,16 +1697,19 @@ fn render_todo_plan_update(
                 base_indent,
                 inner_width,
             ),
-            crate::todo::TodoPlanField::UserIntention => push_todo_text_update(
-                &mut lines,
-                "User intention",
-                update
-                    .after
-                    .as_ref()
-                    .and_then(|plan| plan.user_intention.as_deref()),
-                base_indent,
-                inner_width,
-            ),
+            crate::todo::TodoPlanField::UserIntention if intent_is_unclear => {
+                push_todo_text_update(
+                    &mut lines,
+                    "User intention",
+                    update
+                        .after
+                        .as_ref()
+                        .and_then(|plan| plan.user_intention.as_deref()),
+                    base_indent,
+                    inner_width,
+                )
+            }
+            crate::todo::TodoPlanField::UserIntention => {}
         }
     }
 
@@ -4153,6 +4175,7 @@ pub(crate) fn render_tool_message(
     }
 
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
+        && tools_ui::show_bash_output()
         && msg.content.trim() != "Command completed successfully (no output)"
     {
         const MAX_COLLAPSED_OUTPUT_LINES: usize = 3;
@@ -4160,7 +4183,7 @@ pub(crate) fn render_tool_message(
         let total = output_lines.clone().count();
         for output in output_lines.skip(total.saturating_sub(MAX_COLLAPSED_OUTPUT_LINES)) {
             let output_line = Line::from(vec![
-                Span::styled("    │ ", Style::default().fg(dim_color())),
+                Span::raw("      "),
                 Span::styled(output.to_string(), Style::default().fg(dim_color())),
             ]);
             lines.push(super::truncate_line_with_ellipsis_to_width(

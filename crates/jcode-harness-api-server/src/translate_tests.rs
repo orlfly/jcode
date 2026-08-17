@@ -52,6 +52,16 @@ impl Drop for ScopedJcodeHome {
 }
 
 fn write_session_record(home: &Path, session_id: &str, working_dir: &Path) -> PathBuf {
+    write_session_record_with_titles(home, session_id, working_dir, None, None)
+}
+
+fn write_session_record_with_titles(
+    home: &Path,
+    session_id: &str,
+    working_dir: &Path,
+    title: Option<&str>,
+    custom_title: Option<&str>,
+) -> PathBuf {
     let sessions = home.join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions directory");
     let path = sessions.join(format!("{session_id}.json"));
@@ -59,6 +69,8 @@ fn write_session_record(home: &Path, session_id: &str, working_dir: &Path) -> Pa
         &path,
         json!({
             "working_dir": working_dir,
+            "title": title,
+            "custom_title": custom_title,
             "messages": [{"role": "user", "content": "hello"}],
         })
         .to_string(),
@@ -114,6 +126,16 @@ fn create_session_maps_to_subscribe() {
 
 #[test]
 fn state_event_answers_pending_attach() {
+    let home = ScopedJcodeHome::new("attach-title");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    write_session_record_with_titles(
+        &home.path,
+        "abc",
+        &project,
+        Some("Generated attach title"),
+        Some("Persisted attach rename"),
+    );
     let mut state = BridgeState::default();
     let out = state.api_request_to_legacy(&json!({"req": "create_session", "id": 5}));
     assert_eq!(
@@ -138,7 +160,11 @@ fn state_event_answers_pending_attach() {
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].reply_to, Some(5));
     match &frames[0].event {
-        ApiEvent::Attached { session } => assert_eq!(session.session_id, "abc"),
+        ApiEvent::Attached { session } => {
+            assert_eq!(session.session_id, "abc");
+            assert_eq!(session.title.as_deref(), Some("Persisted attach rename"));
+            assert_eq!(session.working_dir.as_deref(), project.to_str());
+        }
         other => panic!("unexpected: {other:?}"),
     }
     assert_eq!(state.session_id.as_deref(), Some("abc"));
@@ -855,6 +881,54 @@ fn reasoning_effort_reports_provider_refusal() {
     assert!(matches!(frames[0].event, ApiEvent::Error { .. }));
 }
 
+/// An effort change is identity, like a model change: every attached client
+/// needs to hear it, not only the requester. A change made by another client
+/// (no pending request here) must still arrive as a `model_info` broadcast,
+/// and the requester's own change gets the broadcast after its `Ok`.
+#[test]
+fn reasoning_effort_changes_are_broadcast_as_model_info() {
+    let mut state = state_with_session();
+
+    // Unsolicited change (another client's request id): broadcast only.
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": 999, "effort": "high",
+    }));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].reply_to, None);
+    match &frames[0].event {
+        ApiEvent::ModelInfo {
+            reasoning_effort, ..
+        } => assert_eq!(reasoning_effort.as_deref(), Some("high")),
+        other => panic!("expected model_info, got {other:?}"),
+    }
+
+    // The same effort again is not news: no broadcast.
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": 999, "effort": "high",
+    }));
+    assert!(frames.is_empty(), "unchanged effort must not re-broadcast");
+
+    // This client's own change: Ok reply first, then the broadcast.
+    let out = state.api_request_to_legacy(&json!({
+        "id": 7, "req": "set_reasoning_effort", "effort": "low",
+    }));
+    let legacy_id = match &out[0] {
+        Outbound::Legacy(value) => value["id"].as_u64().unwrap(),
+        _ => unreachable!(),
+    };
+    let frames = state.legacy_event_to_api(&json!({
+        "type": "reasoning_effort_changed", "id": legacy_id, "effort": "low",
+    }));
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].reply_to, Some(7));
+    assert!(matches!(frames[0].event, ApiEvent::Ok));
+    assert!(matches!(
+        &frames[1].event,
+        ApiEvent::ModelInfo { reasoning_effort, .. }
+            if reasoning_effort.as_deref() == Some("low")
+    ));
+}
+
 /// Compaction can be refused (nothing to compact, a turn in flight) and the
 /// daemon says so with `success: false`, not an error frame. Telling the
 /// client "done" would claim work that never happened.
@@ -1032,8 +1106,20 @@ fn unattached_list_sessions_discovers_all_persisted_records() {
     let second_root = home.path.join("second-project");
     std::fs::create_dir_all(&first_root).unwrap();
     std::fs::create_dir_all(&second_root).unwrap();
-    write_session_record(&home.path, "persisted_one", &first_root);
-    write_session_record(&home.path, "persisted_two", &second_root);
+    write_session_record_with_titles(
+        &home.path,
+        "persisted_one",
+        &first_root,
+        Some("  Generated first title  "),
+        None,
+    );
+    write_session_record_with_titles(
+        &home.path,
+        "persisted_two",
+        &second_root,
+        Some("Generated second title"),
+        Some("  Custom second title  "),
+    );
     std::fs::write(home.path.join("sessions/not-a-session.txt"), "ignored").unwrap();
 
     let event = only_reply_event(
@@ -1051,6 +1137,8 @@ fn unattached_list_sessions_discovers_all_persisted_records() {
     );
     assert_eq!(sessions[0].working_dir.as_deref(), first_root.to_str());
     assert_eq!(sessions[1].working_dir.as_deref(), second_root.to_str());
+    assert_eq!(sessions[0].title.as_deref(), Some("Generated first title"));
+    assert_eq!(sessions[1].title.as_deref(), Some("Custom second title"));
 }
 
 #[test]
@@ -1060,6 +1148,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         "type": "available_models_updated",
         "provider_name": "anthropic",
         "provider_model": "claude-sonnet",
+        "reasoning_effort": "high",
         "available_models": ["claude-sonnet", "gemini-pro"],
         "available_model_routes": [
             {
@@ -1088,6 +1177,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
         session_id,
         provider,
         model,
+        reasoning_effort,
         routes,
     } = event
     else {
@@ -1096,6 +1186,7 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
     assert_eq!(session_id, "s1");
     assert_eq!(provider.as_deref(), Some("anthropic"));
     assert_eq!(model.as_deref(), Some("claude-sonnet"));
+    assert_eq!(reasoning_effort.as_deref(), Some("high"));
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[1].provider, "gemini");
     assert!(!routes[1].available);

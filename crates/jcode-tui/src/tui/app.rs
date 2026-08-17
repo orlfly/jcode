@@ -950,6 +950,9 @@ pub struct App {
     /// has sent. Without a budget, a model that stops updating its todos gets
     /// nudged on every turn forever, silently burning an API call per tick.
     todo_completion_gate_attempts: u8,
+    /// Whether the clean completion handoff has already requested a user-facing
+    /// final response for the current todo cycle.
+    todo_final_response_requested: bool,
     /// Exact continuation sent for the last incomplete todo state. An unchanged
     /// list must not trigger another automatic turn: the agent may be parked on
     /// a worker, wake, or human decision, and repeated pokes cannot help.
@@ -1344,6 +1347,10 @@ pub struct App {
     /// Last time the pinned todo band re-read todos from disk (1s throttle).
     #[allow(dead_code)]
     pinned_todos_checked_at: Option<Instant>,
+    /// User-expanded state for the pinned todo band's `+N more` row.
+    pinned_todos_expanded: bool,
+    /// Running and terminal background tasks shown beneath the pinned todo band.
+    background_task_rows: Vec<crate::tui::BackgroundTaskRow>,
     last_side_panel_refresh: Option<Instant>,
     // Most recently persisted focus target for dictation routing.
     last_client_focus_recorded_at: Option<Instant>,

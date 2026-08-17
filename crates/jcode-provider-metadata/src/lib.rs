@@ -346,6 +346,20 @@ mod tests {
     }
 
     #[test]
+    fn orcarouter_login_identifies_openai_compatible_endpoint() {
+        let provider = resolve_login_selection("orcarouter", &cli_login_providers())
+            .expect("OrcaRouter CLI login provider");
+        let LoginProviderTarget::OpenAiCompatible(profile) = provider.target else {
+            panic!("OrcaRouter should use the OpenAI-compatible runtime");
+        };
+
+        assert_eq!(profile.id, "orcarouter");
+        assert_eq!(profile.api_base, "https://api.orcarouter.ai/v1");
+        assert_eq!(profile.api_key_env, "ORCAROUTER_API_KEY");
+        assert!(profile.requires_api_key);
+    }
+
+    #[test]
     fn normalize_api_base_accepts_private_http_hosts() {
         assert_eq!(
             normalize_api_base("http://192.168.1.25:8000/v1/").as_deref(),
@@ -436,7 +450,7 @@ mod tests {
     #[test]
     fn minimax_profile_uses_official_openai_compatible_configuration() {
         assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
-        assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(MINIMAX_PROFILE.api_key_env, "MINIMAX_API_KEY");
     }
 
     #[test]
