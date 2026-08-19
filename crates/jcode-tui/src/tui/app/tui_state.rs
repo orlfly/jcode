@@ -1595,9 +1595,7 @@ impl crate::tui::TuiState for App {
             session_name,
             working_dir: self.session.working_dir.clone(),
             client_count,
-            // Memory remains available through commands and tools, but no longer
-            // occupies a dedicated info widget.
-            memory_info: None,
+            memory_info: gather_memory_info(self.memory_enabled, self.session.working_dir.clone()),
             swarm_info,
             background_info,
             usage_info,
