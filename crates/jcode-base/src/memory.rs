@@ -80,14 +80,6 @@ fn apply_plan(graph: &mut MemoryGraph, new_id: &str, plan: &jcode_memory_types::
     jcode_memory_types::rule_engine::apply_graph_effects(plan, new_id, graph);
 }
 
-/// Log a rule plan summary through the memory event channel so the activity
-/// panel can show that the ontology engine fired for a given write.  This
-/// currently emits nothing on the hot path; observers that want a richer
-/// trail should use `memory_log::log_rule_plan` instead.
-fn log_rule_plan(plan: &jcode_memory_types::rule_engine::RulePlan, event: &str) {
-    let _ = (plan, event);
-}
-
 /// Producer of synthetic [`MemoryEntry`] values contributed by a higher layer.
 ///
 /// Used to invert the legacy `memory -> skill` dependency: the `skill` layer
@@ -627,9 +619,7 @@ impl MemoryManager {
         // log a RuleApplied event so the activity panel can show that the
         // ontology engine fired; future rules will plug in here without
         // changing the call sites.
-        if event == "event.dedup" {
-            let _ = existing; // keep parameter live for future rule effects
-        }
+        let _ = (event, existing, _existing_id, _entry, _embedding);
     }
 
     /// Insert or update a memory with a stable ID in the project graph.
