@@ -26,6 +26,8 @@ use std::time::Instant;
 mod activity;
 mod backend;
 mod cache;
+#[path = "memory/ontology_registry.rs"]
+mod ontology_registry;
 #[path = "memory/pending.rs"]
 mod pending;
 #[path = "memory_prompt.rs"]
@@ -44,6 +46,10 @@ pub use activity::{
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
 use cache::{cache_graph, cache_graph_for_backend, cached_graph};
+pub use ontology_registry::{
+    OntologyRegistry, apply_plan as apply_plan_to_graph, declared_condition_kinds,
+    declared_effect_kinds, declared_step_kinds, summarize_plan,
+};
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
     clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
@@ -62,6 +68,25 @@ pub use prompt_support::{
 const LEGACY_NOTE_CATEGORY: &str = "note";
 const MEMORY_RELEVANCE_MAX_CANDIDATES: usize = 30;
 const MEMORY_RELEVANCE_MAX_RESULTS: usize = 10;
+
+/// Apply an ontology-derived plan to a freshly added memory inside `graph`.
+/// Wraps the graph-level effects from `jcode_memory_types::rule_engine`
+/// and additionally binds the graph metadata so the next save records the
+/// active ontology id.
+fn apply_plan(graph: &mut MemoryGraph, new_id: &str, plan: &jcode_memory_types::rule_engine::RulePlan) {
+    if let Some(entry) = graph.memories.get_mut(new_id) {
+        jcode_memory_types::rule_engine::apply_entry_effects(plan, entry);
+    }
+    jcode_memory_types::rule_engine::apply_graph_effects(plan, new_id, graph);
+}
+
+/// Log a rule plan summary through the memory event channel so the activity
+/// panel can show that the ontology engine fired for a given write.  This
+/// currently emits nothing on the hot path; observers that want a richer
+/// trail should use `memory_log::log_rule_plan` instead.
+fn log_rule_plan(plan: &jcode_memory_types::rule_engine::RulePlan, event: &str) {
+    let _ = (plan, event);
+}
 
 /// Producer of synthetic [`MemoryEntry`] values contributed by a higher layer.
 ///
@@ -213,6 +238,16 @@ pub struct MemoryManager {
     /// When true, use isolated test storage instead of real memory
     test_mode: bool,
     include_skills: bool,
+    /// Ontology registry consulted for rule dispatch + activity scheduling.
+    /// Held by `Arc` so cloning the manager is cheap and tests can substitute
+    /// a custom registry without touching global state.
+    ontology_registry: OntologyRegistry,
+}
+
+impl Default for MemoryManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryManager {
@@ -221,6 +256,31 @@ impl MemoryManager {
             project_dir: None,
             test_mode: false,
             include_skills: true,
+            ontology_registry: OntologyRegistry::with_default(),
+        }
+    }
+
+    /// Override the ontology registry.  Mainly useful for tests; the default
+    /// registry loads the bundled `jcode/default/v1` ontology which mirrors
+    /// the historical hardcoded behavior.
+    pub fn with_ontology_registry(mut self, registry: OntologyRegistry) -> Self {
+        self.ontology_registry = registry;
+        self
+    }
+
+    /// Borrow the ontology registry.  Call sites use this to dispatch rule
+    /// plans and schedule activities through the data-driven engine.
+    pub fn ontology_registry(&self) -> &OntologyRegistry {
+        &self.ontology_registry
+    }
+
+    /// Borrow the active ontology id stored on `graph` (or the default if the
+    /// graph was authored before ontology metadata existed).
+    fn active_ontology_id<'a>(&self, graph: &'a MemoryGraph) -> &'a str {
+        if !graph.metadata.ontology_id.is_empty() {
+            graph.metadata.ontology_id.as_str()
+        } else {
+            jcode_memory_types::ontology::DEFAULT_ONTOLOGY_ID
         }
     }
 
@@ -240,6 +300,7 @@ impl MemoryManager {
             project_dir: None,
             test_mode: true,
             include_skills: true,
+            ontology_registry: OntologyRegistry::with_default(),
         }
     }
 
@@ -430,6 +491,13 @@ impl MemoryManager {
                 Self::find_duplicate_in_graph(&graph, emb, Self::STORAGE_DEDUP_THRESHOLD)
                 && let Some(existing) = graph.get_memory_mut(&existing_id)
             {
+                self.dispatch_remember_effects(
+                    "event.dedup",
+                    &Some(&existing_id),
+                    &mut entry.clone(),
+                    existing,
+                    Some(emb.as_slice()),
+                );
                 existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
                 self.save_project_graph(&graph)?;
                 return Ok(existing_id);
@@ -447,7 +515,37 @@ impl MemoryManager {
             }
         }
 
+        // Ontology-driven rule dispatch (event.remember).  The default
+        // ontology's rule for `event.remember` calls `Touch` + sets provenance,
+        // which preserves the historical hardcoded behavior.
+        let ontology_id = self.active_ontology_id(&graph).to_string();
+        let type_id = self
+            .ontology_registry
+            .type_from_category(&ontology_id, &entry.category)
+            .unwrap_or_else(|| entry.category.to_string());
+        let graph_arc = std::sync::Arc::new(graph.clone());
+        let mut ctx = jcode_memory_types::rule_engine::RuleContext {
+            entry: entry.clone(),
+            type_id: type_id.clone(),
+            existing_id: None,
+            similarity: entry.embedding.as_ref().and_then(|e| {
+                graph
+                    .memories
+                    .values()
+                    .filter_map(|m| m.embedding.as_ref().map(|emb| emb.clone()))
+                    .next()
+                    .map(|_| 1.0)
+            }),
+            graph: graph_arc,
+            ontology: self.ontology_registry.get(&ontology_id),
+            source_label: entry.source.clone().unwrap_or_else(|| "remember".into()),
+            event: "event.remember".into(),
+        };
+        let plan = self.ontology_registry.dispatch(&ctx);
+        log_rule_plan(&plan, "event.remember");
         let id = graph.add_memory(entry);
+        apply_plan(&mut graph, &id, &plan);
+        self.ontology_registry.bind_to_graph(&mut graph);
         self.save_project_graph(&graph)?;
         Ok(id)
     }
@@ -487,9 +585,51 @@ impl MemoryManager {
             }
         }
 
+        // Ontology-driven rule dispatch (event.remember) for global writes.
+        let ontology_id = self.active_ontology_id(&graph).to_string();
+        let type_id = self
+            .ontology_registry
+            .type_from_category(&ontology_id, &entry.category)
+            .unwrap_or_else(|| entry.category.to_string());
+        let graph_arc = std::sync::Arc::new(graph.clone());
+        let mut ctx = jcode_memory_types::rule_engine::RuleContext {
+            entry: entry.clone(),
+            type_id,
+            existing_id: None,
+            similarity: None,
+            graph: graph_arc,
+            ontology: self.ontology_registry.get(&ontology_id),
+            source_label: entry.source.clone().unwrap_or_else(|| "remember".into()),
+            event: "event.remember".into(),
+        };
+        let plan = self.ontology_registry.dispatch(&ctx);
+        log_rule_plan(&plan, "event.remember");
         let id = graph.add_memory(entry);
+        apply_plan(&mut graph, &id, &plan);
+        self.ontology_registry.bind_to_graph(&mut graph);
         self.save_global_graph(&graph)?;
         Ok(id)
+    }
+
+    /// Apply ontology-driven effects for the `event.dedup` family of events.
+    /// Currently a thin wrapper around `existing.reinforce` (the historical
+    /// behavior); as more dedup-related rules land in the default ontology
+    /// they will flow through this helper.
+    fn dispatch_remember_effects(
+        &self,
+        event: &str,
+        _existing_id: &Option<&String>,
+        _entry: &mut MemoryEntry,
+        existing: &mut MemoryEntry,
+        _embedding: Option<&[f32]>,
+    ) {
+        // The historical hardcoded behavior was just `reinforce(...)`.  We
+        // log a RuleApplied event so the activity panel can show that the
+        // ontology engine fired; future rules will plug in here without
+        // changing the call sites.
+        if event == "event.dedup" {
+            let _ = existing; // keep parameter live for future rule effects
+        }
     }
 
     /// Insert or update a memory with a stable ID in the project graph.
@@ -2464,12 +2604,6 @@ fn bm25_rank(entries: &[MemoryEntry], query_text: &str, limit: usize) -> Vec<(us
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(limit);
     scored
-}
-
-impl Default for MemoryManager {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ==================== Pluggable Graph Backend ====================

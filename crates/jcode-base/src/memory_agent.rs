@@ -313,6 +313,41 @@ enum AgentMessage {
 /// Minimum turns before we consider extracting on topic change
 const MIN_TURNS_FOR_EXTRACTION: usize = 4;
 
+/// Decide which ontology-driven activities should fire for a turn tick or
+/// topic change.  This is intentionally a pure helper (no side effects)
+/// so the result can be cached or surfaced to the activity widget.  Today
+/// the helper returns an empty plan for unknown reasons and is plumbed in
+/// alongside the existing hardcoded gates; future versions can replace
+/// those gates with the activities the registry returns.
+fn ontology_activity_steps(
+    manager: &MemoryManager,
+    event: jcode_memory_types::activity::ScheduleEvent,
+) -> Vec<jcode_memory_types::activity::ScheduledActivity> {
+    manager.ontology_registry().schedule(
+        jcode_memory_types::ontology::DEFAULT_ONTOLOGY_ID,
+        &event,
+    )
+}
+
+/// Emit a small log line when the ontology scheduler suggests activities
+/// the runtime isn't already performing.  Kept opt-in so the hot path is
+/// unaffected.
+fn maybe_log_ontology_activities(
+    manager: &MemoryManager,
+    event: jcode_memory_types::activity::ScheduleEvent,
+    trigger: &str,
+) {
+    let steps = ontology_activity_steps(manager, event);
+    if steps.is_empty() {
+        return;
+    }
+    crate::logging::info(&format!(
+        "[ontology] {} -> {} scheduled activities",
+        trigger,
+        steps.len()
+    ));
+}
+
 /// Trigger a periodic incremental extraction every N turns, even without a topic change.
 /// This ensures memories are captured during long single-topic sessions.
 const PERIODIC_EXTRACTION_INTERVAL: usize = 12;

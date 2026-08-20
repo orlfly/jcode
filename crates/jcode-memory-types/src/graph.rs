@@ -224,6 +224,20 @@ pub struct GraphMetadata {
     /// Total links discovered via co-relevance
     #[serde(default)]
     pub link_discovery_count: u64,
+    /// Ontology id the graph was authored against (e.g. `jcode/default/v1`).
+    /// Runtime rules/activities consult this id to look up the matching
+    /// `Ontology` from the registry.  Empty string means "no ontology bound"
+    /// — the runtime falls back to the hardcoded behavior.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ontology_id: String,
+    /// Ontology version that was bound.  Lets the runtime detect when the
+    /// bound ontology has been upgraded and re-validate stored entries.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ontology_version: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// The memory graph - HashMap-based for clean JSON serialization

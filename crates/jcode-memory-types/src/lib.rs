@@ -6,6 +6,33 @@ pub use graph::{
 pub mod instance;
 pub use instance::{
     ExtractionMethod, IdentityMetadata, LifecycleMetadata, MemoryStatus, ProvenanceRecord,
+    default_lifecycle_transition_table,
+};
+
+pub mod ontology;
+pub use ontology::{
+    Activity, ActivityStep, ActivityTrigger, Condition, Effect, Ontology, OntologyType,
+    PropertyDef, PropertyKind, RelationshipDef, Rule, ScoringPolicy, DecayPolicy,
+    LifecyclePolicy, LifecycleTransition, TrustMultiplier, WeightRange,
+    DEFAULT_ONTOLOGY_ID, DEFAULT_ONTOLOGY_VERSION, default_event_names, default_ontology,
+    validate_default_ontology, EVENT_DEDUP, EVENT_FINALIZE, EVENT_LINK, EVENT_REMEMBER,
+    EVENT_SUPERSEDE, EVENT_TAG, EVENT_TOPIC_CHANGE, EVENT_TURN_TICK, EVENT_UNTAG,
+    EVENT_UPSERT, EVENT_CONTRADICT, REL_CONTRADICTS, REL_DERIVED_FROM, REL_HAS_TAG,
+    REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES, RULE_DEDUP_REINFORCE, RULE_LINK,
+    RULE_REMEMBER, RULE_SUPERSEDE, RULE_TAG, RULE_UNTAG, RULE_UPSERT,
+    RULE_CONTRADICT, TYPE_CORRECTION, TYPE_ENTITY, TYPE_FACT, TYPE_GOAL, TYPE_NOTE,
+    TYPE_PREFERENCE, TYPE_SKILL,
+};
+
+pub mod rule_engine;
+pub use rule_engine::{
+    RuleContext, RulePlan, RuleSkip, apply_entry_effects, apply_graph_effects,
+    declared_effect_kinds, dispatch_event, evaluate_condition, rule_for_event,
+};
+
+pub mod activity;
+pub use activity::{
+    ScheduleEvent, ScheduledActivity, describe_step, schedule, steps_of_kind,
 };
 
 pub mod actions;
@@ -220,6 +247,13 @@ pub enum MemoryEventKind {
     ToolLinked { from: String, to: String },
     /// Agent listed memories via tool.
     ToolListed { count: usize },
+    /// Ontology-driven rule engine applied at least one effect.  Payload
+    /// describes the plan summary so the activity log can correlate rule
+    /// activity with the originating event.
+    RuleApplied { detail: String },
+    /// Ontology-driven rule engine skipped one or more rules.  Payload is a
+    /// human-readable explanation useful for diagnostics.
+    RuleSkip { detail: String },
 }
 
 // Persistent memory model and pure search helpers.

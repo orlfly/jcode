@@ -264,6 +264,14 @@ pub fn log_event(kind: &MemoryEventKind) {
         MemoryEventKind::ToolListed { count } => {
             ("tool_listed", Some(serde_json::json!({ "count": count })))
         }
+        MemoryEventKind::RuleApplied { detail } => (
+            "rule_applied",
+            Some(serde_json::json!({ "detail": detail })),
+        ),
+        MemoryEventKind::RuleSkip { detail } => (
+            "rule_skip",
+            Some(serde_json::json!({ "detail": detail })),
+        ),
     };
 
     write_log(event, detail);

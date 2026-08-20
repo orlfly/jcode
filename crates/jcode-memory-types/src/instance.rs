@@ -166,6 +166,22 @@ impl MemoryStatus {
     }
 }
 
+/// Return the canonical lifecycle transition table.  Used by the rule
+/// engine as a fallback when an ontology type is not registered.  Mirrors
+/// the state machine in [`MemoryStatus::can_transition_to`].
+pub fn default_lifecycle_transition_table() -> Vec<(MemoryStatus, MemoryStatus)> {
+    vec![
+        (MemoryStatus::Active, MemoryStatus::Expired),
+        (MemoryStatus::Active, MemoryStatus::Archived),
+        (MemoryStatus::Active, MemoryStatus::Disputed),
+        (MemoryStatus::Expired, MemoryStatus::Active),
+        (MemoryStatus::Expired, MemoryStatus::Archived),
+        (MemoryStatus::Archived, MemoryStatus::Active),
+        (MemoryStatus::Disputed, MemoryStatus::Active),
+        (MemoryStatus::Disputed, MemoryStatus::Archived),
+    ]
+}
+
 /// Identity metadata for entity disambiguation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct IdentityMetadata {
