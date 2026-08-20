@@ -534,7 +534,6 @@ impl MemoryManager {
             event: "event.remember".into(),
         };
         let plan = self.ontology_registry.dispatch(&ctx);
-        log_rule_plan(&plan, "event.remember");
         let id = graph.add_memory(entry);
         apply_plan(&mut graph, &id, &plan);
         self.ontology_registry.bind_to_graph(&mut graph);
@@ -595,7 +594,6 @@ impl MemoryManager {
             event: "event.remember".into(),
         };
         let plan = self.ontology_registry.dispatch(&ctx);
-        log_rule_plan(&plan, "event.remember");
         let id = graph.add_memory(entry);
         apply_plan(&mut graph, &id, &plan);
         self.ontology_registry.bind_to_graph(&mut graph);
