@@ -172,6 +172,8 @@ fn is_telemetry_subcommand_invocation(
                     | "--model"
                     | "--provider-profile"
                     | "--tool-profile"
+                    | "--mcp-tools"
+                    | "--mcp-tools-token-threshold"
                     | "--tools"
                     | "--disabled-tools"
             );
@@ -516,6 +518,21 @@ mod tests {
             "run",
             "telemetry"
         ]));
+    }
+
+    #[test]
+    fn parses_mcp_tool_exposure_flags() {
+        let args = parse_args(&[
+            "jcode",
+            "--mcp-tools",
+            "deferred",
+            "--mcp-tools-token-threshold",
+            "4321",
+            "run",
+            "hello",
+        ]);
+        assert_eq!(args.mcp_tools.as_deref(), Some("deferred"));
+        assert_eq!(args.mcp_tools_token_threshold, Some(4_321));
     }
 
     #[test]
