@@ -455,10 +455,18 @@ pub fn build_emergency_summary_text(
 ) -> String {
     let mut summary_parts: Vec<String> = Vec::new();
 
+    // Strip any prior `[Emergency compaction]` segments from the existing
+    // summary so repeated hard compactions don't append another marker each
+    // time and grow the summary without bound. Anything before the first
+    // emergency marker (e.g. an earlier proactive/semantic summary) is
+    // preserved verbatim; only the accumulated emergency noise is discarded.
     if let Some(existing) = existing_summary
         && !existing.is_empty()
     {
-        summary_parts.push(existing.to_string());
+        let stripped = strip_prior_emergency_segments(existing);
+        if !stripped.is_empty() {
+            summary_parts.push(stripped.to_string());
+        }
     }
 
     summary_parts.push(format!(
@@ -489,6 +497,22 @@ pub fn build_emergency_summary_text(
     }
 
     summary_parts.join("\n\n")
+}
+
+/// Strip any prior `[Emergency compaction]` segments from `text` and
+/// return the cleaned prefix.
+///
+/// Repeated hard compactions append a fresh emergency marker to the
+/// existing summary each time, which grows the summary without bound and
+/// feeds it back into every API payload. This helper removes everything
+/// from the first `**[Emergency compaction]**` marker onward so only the
+/// most recent emergency block survives. Any earlier proactive/semantic
+/// summary content is preserved verbatim.
+fn strip_prior_emergency_segments(text: &str) -> &str {
+    match text.find("**[Emergency compaction]**") {
+        Some(idx) => text[..idx].trim_end(),
+        None => text,
+    }
 }
 
 fn collect_emergency_summary_hints(
@@ -1032,5 +1056,56 @@ mod tests {
         let stripped = emergency_strip_large_images(&mut messages, 2000);
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn build_emergency_summary_strips_prior_emergency_markers() {
+        // Simulate a summary that already contains one emergency marker from a
+        // previous hard compact, plus a non-emergency prefix (e.g. an earlier
+        // proactive summary) and trailing emergency noise (Tools used,
+        // Files referenced, a second marker).
+        let prior = "# Earlier proactive summary\n\n\
+                     **[Emergency compaction]**: 5 messages were dropped to recover from context overflow.\n\
+                     The conversation had ~150k tokens which exceeded the 200k limit.\n\n\
+                     Tools used: read, bash\n\n\
+                     Files referenced: src/lib.rs\n\n\
+                     **[Emergency compaction]**: 3 messages were dropped to recover from context overflow.\n\
+                     The conversation had ~180k tokens which exceeded the 200k limit.";
+
+        let fresh = build_emergency_summary_text(Some(prior), 7, 220_000, 200_000, &[]);
+
+        // Non-emergency prefix preserved.
+        assert!(
+            fresh.contains("# Earlier proactive summary"),
+            "earlier non-emergency summary should be preserved, got: {fresh}"
+        );
+        // Exactly one emergency marker (the freshly built one) — no accumulation.
+        assert_eq!(
+            fresh.matches("[Emergency compaction]").count(),
+            1,
+            "prior emergency markers should be stripped, got: {fresh}"
+        );
+        // The fresh marker references the latest drop count.
+        assert!(fresh.contains("7 messages were dropped"));
+    }
+
+    #[test]
+    fn build_emergency_summary_no_existing_keeps_all_content() {
+        // No existing summary — new emergency block should be built normally.
+        let fresh = build_emergency_summary_text(None, 2, 250_000, 200_000, &[]);
+        assert_eq!(fresh.matches("[Emergency compaction]").count(), 1);
+        assert!(fresh.contains("2 messages were dropped"));
+    }
+
+    #[test]
+    fn build_emergency_summary_existing_without_marker_passes_through() {
+        // Existing summary without any emergency marker (e.g. a normal proactive
+        // summary) should be preserved verbatim and the new emergency block
+        // appended on top.
+        let prior = "# Proactive summary\nUser asked about X. Agent did Y.";
+        let fresh = build_emergency_summary_text(Some(prior), 1, 210_000, 200_000, &[]);
+        assert!(fresh.contains("# Proactive summary"));
+        assert!(fresh.contains("User asked about X. Agent did Y."));
+        assert!(fresh.contains("1 messages were dropped"));
     }
 }
