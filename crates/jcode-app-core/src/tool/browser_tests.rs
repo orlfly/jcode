@@ -18,6 +18,7 @@ fn snapshot_maps_to_annotated_get_content() {
     let input = BrowserInput {
         action: "snapshot".into(),
         browser: None,
+        mode: None,
         provider_action: None,
         params: None,
         url: None,
@@ -60,6 +61,7 @@ fn eval_maps_script_and_page_world() {
     let input = BrowserInput {
         action: "eval".into(),
         browser: None,
+        mode: None,
         provider_action: None,
         params: None,
         url: None,
@@ -100,6 +102,7 @@ fn interactables_maps_to_bridge_action() {
     let input = BrowserInput {
         action: "interactables".into(),
         browser: None,
+        mode: None,
         provider_action: None,
         params: None,
         url: None,
@@ -179,10 +182,15 @@ fn resolve_provider_accepts_auto_and_firefox() {
 }
 
 #[test]
+fn resolve_provider_accepts_chrome() {
+    assert!(resolve_provider(Some("chrome")).is_ok());
+}
+
+#[test]
 fn resolve_provider_rejects_unsupported_browser() {
-    let err = resolve_provider(Some("chrome"))
+    let err = resolve_provider(Some("safari"))
         .err()
-        .expect("chrome should not resolve yet");
+        .expect("safari should not resolve yet");
     assert!(
         err.to_string()
             .contains("not wired into the built-in browser tool")

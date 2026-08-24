@@ -1908,6 +1908,7 @@ pub async fn run_browser(action: &str) -> Result<()> {
     match action {
         "setup" => browser::run_setup_command().await?,
         "status" => {
+            // Report both the Firefox bridge status and Chrome availability.
             let status = browser::ensure_browser_ready_noninteractive().await?;
             println!("Browser automation");
             println!("  backend: {}", status.backend);
@@ -1947,6 +1948,14 @@ pub async fn run_browser(action: &str) -> Result<()> {
             if !status.missing_actions.is_empty() {
                 println!("  missing actions: {}", status.missing_actions.join(", "));
             }
+            println!(
+                "  chrome: {}",
+                if browser::chrome_available() {
+                    "available (use the browser tool with browser='chrome' and mode='headless' or mode='visible')"
+                } else {
+                    "not found"
+                }
+            );
 
             if status.ready {
                 println!("\nBuilt-in browser tool is ready.");

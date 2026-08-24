@@ -7,9 +7,13 @@ use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "chrome.rs"]
+mod chrome;
+
 pub struct BrowserTool;
 
 static FIREFOX_PROVIDER: FirefoxBridgeProvider = FirefoxBridgeProvider;
+static CHROME_PROVIDER: chrome::ChromeCdpProvider = chrome::ChromeCdpProvider;
 
 impl BrowserTool {
     pub fn new() -> Self {
@@ -26,6 +30,8 @@ struct BrowserInput {
     action: String,
     #[serde(default)]
     browser: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     provider_action: Option<String>,
     #[serde(default)]
@@ -196,6 +202,14 @@ impl Tool for BrowserTool {
             }),
         );
         properties.insert(
+            "mode".into(),
+            json!({
+                "type": "string",
+                "enum": ["headless", "visible"],
+                "description": "For chrome: 'headless' runs Chrome with no window (unattended automation); 'visible' runs Chrome with a real window so the user can watch and collaborate. Defaults to 'headless'."
+            }),
+        );
+        properties.insert(
             "provider_action".into(),
             json!({
                 "type": "string",
@@ -340,12 +354,15 @@ fn attach_browser_metadata(
 
 fn resolve_provider(browser: Option<&str>) -> Result<&'static dyn BrowserProvider> {
     let browser = browser.unwrap_or("auto");
+    if CHROME_PROVIDER.supported_browsers().contains(&browser) {
+        return Ok(&CHROME_PROVIDER);
+    }
     if FIREFOX_PROVIDER.supported_browsers().contains(&browser) {
         return Ok(&FIREFOX_PROVIDER);
     }
 
     anyhow::bail!(
-        "Browser backend '{}' is not wired into the built-in browser tool yet. Use auto/firefox for now.",
+        "Browser backend '{}' is not wired into the built-in browser tool yet. Use auto/chrome/firefox for now.",
         browser
     )
 }

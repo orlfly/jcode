@@ -944,6 +944,78 @@ pub async fn run_setup_command() -> Result<()> {
     Ok(())
 }
 
+/// Detect whether a Chrome/Chromium binary is available on this system.
+pub fn chrome_available() -> bool {
+    chrome_binary().is_ok()
+}
+
+/// Resolve the Chrome/Chromium binary path, or an error if none is found.
+pub fn chrome_binary() -> Result<PathBuf> {
+    if let Ok(explicit) = std::env::var("JCODE_CHROME_PATH")
+        && !explicit.is_empty()
+        && PathBuf::from(&explicit).exists()
+    {
+        return Ok(PathBuf::from(explicit));
+    }
+
+    #[cfg(target_os = "linux")]
+    let candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/google/chrome/chrome",
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+
+    for path in candidates {
+        if PathBuf::from(path).exists() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    // Fall back to PATH lookup.
+    if let Some(path) = which_on_path("google-chrome") {
+        return Ok(path);
+    }
+    if let Some(path) = which_on_path("google-chrome-stable") {
+        return Ok(path);
+    }
+    if let Some(path) = which_on_path("chromium") {
+        return Ok(path);
+    }
+    if let Some(path) = which_on_path("chromium-browser") {
+        return Ok(path);
+    }
+    if let Some(path) = which_on_path("chrome") {
+        return Ok(path);
+    }
+
+    anyhow::bail!(
+        "Chrome/Chromium binary not found. Install Google Chrome or Chromium, or set JCODE_CHROME_PATH."
+    )
+}
+
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)]
 #[path = "browser_tests.rs"]
