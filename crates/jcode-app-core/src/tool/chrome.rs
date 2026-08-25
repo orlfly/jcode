@@ -459,6 +459,69 @@ async fn execute_chrome_action(
             let result = chrome_wait(port, selector, input.timeout_ms.unwrap_or(5000)).await?;
             Ok(render_chrome_action("wait", result))
         }
+        "interactables" => {
+            let result = chrome_interactables(port).await?;
+            Ok(render_chrome_action("interactables", result))
+        }
+        "list_frames" => {
+            let result = chrome_list_frames(port).await?;
+            Ok(render_chrome_action("list_frames", result))
+        }
+        "get_active_tab" => {
+            let result = chrome_get_active_tab(port).await?;
+            Ok(render_chrome_action("get_active_tab", result))
+        }
+        "select_tab" => {
+            let tab_id = input
+                .tab_id
+                .ok_or_else(|| anyhow::anyhow!("tab_id is required for select_tab"))?;
+            let result = chrome_select_tab(port, tab_id).await?;
+            Ok(render_chrome_action("select_tab", result))
+        }
+        "fill_form" => {
+            let fields = input
+                .fields
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("fields is required for fill_form"))?;
+            let result = chrome_fill_form(port, &fields).await?;
+            Ok(render_chrome_action("fill_form", result))
+        }
+        "select" => {
+            let selector = input
+                .selector
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("selector is required for select"))?;
+            let value = input
+                .text
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("text (option value) is required for select"))?;
+            let result = chrome_select(port, selector, value).await?;
+            Ok(render_chrome_action("select", result))
+        }
+        "scroll" => {
+            let result = chrome_scroll(port, input).await?;
+            Ok(render_chrome_action("scroll", result))
+        }
+        "upload" => {
+            let selector = input
+                .selector
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("selector is required for upload"))?;
+            let path = input
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("path is required for upload"))?;
+            let result = chrome_upload(port, selector, path).await?;
+            Ok(render_chrome_action("upload", result))
+        }
+        "press" => {
+            let key = input
+                .key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("key is required for press"))?;
+            let result = chrome_press(port, key).await?;
+            Ok(render_chrome_action("press", result))
+        }
         "provider_command" => {
             let method = input.provider_action.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("provider_action is required when action='provider_command'")
@@ -656,6 +719,250 @@ async fn chrome_wait(port: u16, selector: Option<&str>, timeout_ms: u64) -> Resu
     );
     let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
         "expression": script, "returnByValue": true, "awaitPromise": true
+    })).await?;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Enumerate interactive elements (buttons, links, inputs, selects, textareas)
+/// with stable refs so the model can target them with click/type/select.
+async fn chrome_interactables(port: u16) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let script = r#"(function() {
+        const els = Array.from(document.querySelectorAll(
+            'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="radio"], [tabindex]'
+        ));
+        const out = [];
+        els.forEach((el, i) => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) return;
+            const tag = el.tagName.toLowerCase();
+            const type = el.getAttribute('type') || '';
+            const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || el.name || '').trim().slice(0, 120);
+            out.push({
+                ref: i,
+                tag: type ? tag + '[' + type + ']' : tag,
+                selector: (() => {
+                    if (el.id) return '#' + CSS.escape(el.id);
+                    if (el.name) return tag + '[name="' + el.name + '"]';
+                    return null;
+                })(),
+                text: label,
+                value: el.value !== undefined ? el.value : null,
+                visible: !!(rect.width && rect.height)
+            });
+        });
+        return out;
+    })()"#;
+    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": script, "returnByValue": true
+    })).await?;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// List frames in the current page (main frame + iframes).
+async fn chrome_list_frames(port: u16) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let script = r#"(function() {
+        const out = [];
+        const walk = (win, depth) => {
+            out.push({ depth, url: win.location.href, name: win.name || null });
+            Array.from(win.frames).forEach(f => walk(f, depth + 1));
+        };
+        walk(window, 0);
+        return out;
+    })()"#;
+    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": script, "returnByValue": true
+    })).await?;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Return the currently active tab (the one the CDP page websocket is attached to).
+async fn chrome_get_active_tab(port: u16) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let url = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": "location.href", "returnByValue": true
+    })).await?;
+    let title = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": "document.title", "returnByValue": true
+    })).await?;
+    Ok(json!({
+        "url": url.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
+        "title": title.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
+    }))
+}
+
+/// Activate a tab by its CDP target id (from list_tabs).
+async fn chrome_select_tab(port: u16, tab_id: i64) -> Result<Value> {
+    let targets = cdp_http_json(port, "/json").await.unwrap_or(Value::Array(vec![]));
+    let list = targets.as_array().cloned().unwrap_or_default();
+    let target = list.iter().find(|t| {
+        t.get("id").and_then(|v| v.as_str()).map(|s| s == tab_id.to_string()).unwrap_or(false)
+    });
+    match target {
+        Some(t) => {
+            let ws_url = t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).unwrap_or("");
+            // Bring the tab to the foreground via the browser-level endpoint.
+            let _ = cdp_http_json(port, &format!("/json/activate/{}", tab_id)).await;
+            Ok(json!({
+                "selected": true,
+                "id": tab_id,
+                "url": t.get("url").cloned().unwrap_or(Value::Null),
+                "title": t.get("title").cloned().unwrap_or(Value::Null),
+                "webSocketDebuggerUrl": ws_url,
+            }))
+        }
+        None => Ok(json!({ "selected": false, "id": tab_id, "error": "tab not found" })),
+    }
+}
+
+/// Fill multiple form fields at once. Each field: { selector, value, checked }.
+async fn chrome_fill_form(port: u16, fields: &[BrowserField]) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let mut results = Vec::new();
+    for field in fields {
+        let selector_lit = serde_json::to_string(&field.selector).unwrap_or_else(|_| "\"\"".to_string());
+        let value_lit = field.value.as_deref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string())).unwrap_or_else(|| "null".to_string());
+        let checked = field.checked.unwrap_or(false);
+        let script = format!(
+            r#"(function() {{
+                const el = document.querySelector({sel});
+                if (!el) return {{ filled: false, selector: {sel}, error: 'not found' }};
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) {{
+                    el.checked = {checked};
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return {{ filled: true, selector: {sel}, checked: el.checked }};
+                }}
+                if (tag === 'select') {{
+                    const val = {value};
+                    if (val !== null) {{
+                        el.value = val;
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                    return {{ filled: true, selector: {sel}, value: el.value }};
+                }}
+                el.focus();
+                const val = {value};
+                if (val !== null) {{
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+                return {{ filled: true, selector: {sel}, value: el.value }};
+            }})()"#,
+            sel = selector_lit,
+            value = value_lit,
+            checked = checked,
+        );
+        let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+            "expression": script, "returnByValue": true
+        })).await?;
+        results.push(result.get("result").cloned().unwrap_or(Value::Null));
+    }
+    Ok(json!({ "filled": results.len(), "results": results }))
+}
+
+/// Select an option in a <select> by value (or text).
+async fn chrome_select(port: u16, selector: &str, value: &str) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let selector_lit = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let value_lit = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    let script = format!(
+        r#"(function() {{
+            const el = document.querySelector({sel});
+            if (!el) return {{ selected: false, error: 'not found' }};
+            if (el.tagName.toLowerCase() !== 'select') return {{ selected: false, error: 'not a select' }};
+            const val = {value};
+            let matched = false;
+            Array.from(el.options).forEach(opt => {{
+                if (opt.value === val || opt.textContent.trim() === val) {{ el.value = opt.value; matched = true; }}
+            }});
+            if (!matched) return {{ selected: false, error: 'option not found' }};
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return {{ selected: true, value: el.value }};
+        }})()"#,
+        sel = selector_lit,
+        value = value_lit,
+    );
+    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": script, "returnByValue": true
+    })).await?;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Scroll the page (or a container) to a position.
+async fn chrome_scroll(port: u16, input: &BrowserInput) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let position = input.position.as_deref().unwrap_or("top");
+    let selector_lit = input.selector.as_deref().map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())).unwrap_or_else(|| "null".to_string());
+    let (x, y) = match input.scroll_to.as_ref() {
+        Some(st) => (st.x.unwrap_or(0.0), st.y.unwrap_or(0.0)),
+        None => (0.0, 0.0),
+    };
+    let script = format!(
+        r#"(function() {{
+            const target = {sel} ? document.querySelector({sel}) : document.scrollingElement || document.documentElement;
+            if (!target) return {{ scrolled: false, error: 'target not found' }};
+            const pos = {position};
+            if (pos === 'top') {{ target.scrollTop = 0; target.scrollTo(0, 0); }}
+            else if (pos === 'bottom') {{ target.scrollTop = target.scrollHeight; }}
+            else if (pos === 'left') {{ target.scrollLeft = 0; }}
+            else if (pos === 'right') {{ target.scrollLeft = target.scrollWidth; }}
+            else if (pos === 'center') {{ target.scrollTop = target.scrollHeight / 2; }}
+            else {{ target.scrollTo({x}, {y}); }}
+            return {{ scrolled: true, scrollTop: target.scrollTop, scrollLeft: target.scrollLeft }};
+        }})()"#,
+        sel = selector_lit,
+        position = serde_json::to_string(position).unwrap_or_else(|_| "\"top\"".to_string()),
+        x = x,
+        y = y,
+    );
+    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": script, "returnByValue": true
+    })).await?;
+    Ok(result.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Upload a file to an <input type=file> via CDP DOM.setFileInputFiles.
+async fn chrome_upload(port: u16, selector: &str, path: &str) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    // Resolve the node id for the file input.
+    let selector_lit = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+    let doc = send_cdp(&mut ws, "DOM.getDocument", json!({ "depth": -1 })).await?;
+    let root = doc.get("root").and_then(|r| r.get("nodeId")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let query = send_cdp(&mut ws, "DOM.querySelector", json!({
+        "nodeId": root, "selector": selector
+    })).await?;
+    let node_id = query.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
+    if node_id == 0 {
+        return Ok(json!({ "uploaded": false, "selector": selector_lit, "error": "file input not found" }));
+    }
+    let result = send_cdp(&mut ws, "DOM.setFileInputFiles", json!({
+        "nodeId": node_id, "files": [path]
+    })).await?;
+    Ok(json!({ "uploaded": true, "selector": selector_lit, "path": path, "result": result }))
+}
+
+/// Dispatch a keyboard key press to the focused element.
+async fn chrome_press(port: u16, key: &str) -> Result<Value> {
+    let mut ws = cdp_session(port).await?;
+    let key_lit = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
+    let script = format!(
+        r#"(function() {{
+            const el = document.activeElement;
+            if (!el) return {{ pressed: false, error: 'no active element' }};
+            const key = {key};
+            const opts = {{ key, bubbles: true, cancelable: true }};
+            el.dispatchEvent(new KeyboardEvent('keydown', opts));
+            el.dispatchEvent(new KeyboardEvent('keypress', opts));
+            el.dispatchEvent(new KeyboardEvent('keyup', opts));
+            return {{ pressed: true, key, tag: el.tagName }};
+        }})()"#,
+        key = key_lit,
+    );
+    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
+        "expression": script, "returnByValue": true
     })).await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }

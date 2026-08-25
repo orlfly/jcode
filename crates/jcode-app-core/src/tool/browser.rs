@@ -88,7 +88,7 @@ struct BrowserInput {
     scroll_to: Option<ScrollTo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct BrowserField {
     selector: String,
     #[serde(default)]
