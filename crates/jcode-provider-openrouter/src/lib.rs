@@ -51,6 +51,26 @@ pub struct ModelInfo {
     pub pricing: ModelPricing,
     #[serde(default)]
     pub created: Option<u64>,
+    /// Whether this model accepts image input. `None` means unknown/unspecified
+    /// and callers fall back to provider-level heuristics. Populated for Ollama
+    /// models from the native `/api/show` `capabilities` array (which lists
+    /// `"vision"` for vision-capable models) so a text-only model like
+    /// `deepseek-v4-flash:cloud` is not assumed to accept images.
+    #[serde(default)]
+    pub supports_image_input: Option<bool>,
+}
+
+impl Default for ModelInfo {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            context_length: None,
+            pricing: ModelPricing::default(),
+            created: None,
+            supports_image_input: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

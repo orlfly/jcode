@@ -358,6 +358,14 @@ impl Provider for OpenRouterProvider {
             return false;
         }
 
+        // A live catalog (e.g. Ollama's native /api/show capabilities) may
+        // report per-model image support. When it does, that is authoritative:
+        // a text-only model like `deepseek-v4-flash:cloud` must not be assumed
+        // to accept images just because the profile is OpenAI-compatible.
+        if let Some(supports_images) = self.live_catalog_image_support(&model_id) {
+            return supports_images;
+        }
+
         // Direct OpenAI-compatible local providers such as Ollama and LM Studio
         // document image content support on /v1/chat/completions. We already
         // serialize image blocks using OpenAI's image_url content-part shape in
@@ -833,6 +841,27 @@ impl OpenRouterProvider {
     ) -> Option<jcode_provider_openrouter::DiskCache> {
         self.load_disk_cache_entry_for_this_profile()
             .filter(|entry| self.model_disk_cache_source_matches(entry))
+    }
+
+    /// Resolve per-model image-input support from the live model catalog
+    /// (in-memory cache, then disk cache). Returns `None` when the catalog has
+    /// no entry for this model or does not record image support.
+    fn live_catalog_image_support(&self, model_id: &str) -> Option<bool> {
+        if let Ok(cache) = self.models_cache.try_read() {
+            if let Some(model) = cache.models.iter().find(|m| m.id == *model_id) {
+                if let Some(supports) = model.supports_image_input {
+                    return Some(supports);
+                }
+            }
+        }
+        if let Some(cache_entry) = self.load_usable_model_disk_cache_entry() {
+            if let Some(model) = cache_entry.models.iter().find(|m| m.id == *model_id) {
+                if let Some(supports) = model.supports_image_input {
+                    return Some(supports);
+                }
+            }
+        }
+        None
     }
 
     /// Load this provider's own model disk cache, ignoring the process-global

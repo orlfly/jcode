@@ -124,6 +124,22 @@ fn parse_trained_context_from_show(body: &str) -> Result<Option<u64>> {
         .max())
 }
 
+/// Whether the model accepts image input, from the `/api/show` `capabilities`
+/// array. Ollama lists `"vision"` for vision-capable models and omits it for
+/// text-only models (e.g. `deepseek-v4-flash:cloud`). `None` when the response
+/// does not carry a capabilities array.
+fn parse_vision_capability_from_show(body: &str) -> Result<Option<bool>> {
+    let value: Value =
+        serde_json::from_str(body).context("/api/show response was not valid JSON")?;
+    let Some(caps) = value.get("capabilities").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        caps.iter()
+            .any(|c| c.as_str().is_some_and(|s| s.eq_ignore_ascii_case("vision"))),
+    ))
+}
+
 async fn fetch_server_default(client: &Client, root: &str) -> Result<Option<u64>> {
     let body = client
         .get(format!("{root}/api/ps"))
@@ -193,21 +209,34 @@ async fn enrich_ollama_context_lengths(client: &Client, api_base: &str, models: 
     let server_default = probe_or_log("/api/ps", fetch_server_default(client, &root).await);
 
     let mut trained_by_model: HashMap<String, Option<u64>> = HashMap::new();
+    let mut vision_by_model: HashMap<String, Option<bool>> = HashMap::new();
     for model in models.iter() {
-        if trained_by_model.contains_key(&model.id) {
-            continue;
+        if !trained_by_model.contains_key(&model.id) {
+            let trained = probe_or_log(
+                "/api/show",
+                fetch_trained_context(client, &root, &model.id).await,
+            );
+            trained_by_model.insert(model.id.clone(), trained);
         }
-        let trained = probe_or_log(
-            "/api/show",
-            fetch_trained_context(client, &root, &model.id).await,
-        );
-        trained_by_model.insert(model.id.clone(), trained);
+        if !vision_by_model.contains_key(&model.id) {
+            let vision = probe_or_log(
+                "/api/show",
+                fetch_vision_capability(client, &root, &model.id).await,
+            );
+            vision_by_model.insert(model.id.clone(), vision);
+        }
     }
 
     for model in models.iter_mut() {
         let trained = trained_by_model.get(&model.id).copied().flatten();
         let effective = effective_context_for_model(&model.id, trained, server_default);
         model.context_length = Some(effective);
+        // Record whether the model accepts image input so the request
+        // chokepoint can strip images for text-only models instead of sending
+        // them and getting a 400 (e.g. deepseek-v4-flash:cloud).
+        if let Some(vision) = vision_by_model.get(&model.id).copied().flatten() {
+            model.supports_image_input = Some(vision);
+        }
 
         if let Some(trained) = trained
             && trained > effective
@@ -221,6 +250,20 @@ async fn enrich_ollama_context_lengths(client: &Client, api_base: &str, models: 
             ));
         }
     }
+}
+
+async fn fetch_vision_capability(client: &Client, root: &str, model: &str) -> Result<Option<bool>> {
+    let body = client
+        .post(format!("{root}/api/show"))
+        .timeout(PROBE_TIMEOUT)
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .context("POST /api/show failed")?
+        .text()
+        .await
+        .context("reading /api/show body failed")?;
+    parse_vision_capability_from_show(&body)
 }
 
 #[cfg(test)]
@@ -321,5 +364,20 @@ mod tests {
             None
         );
         assert!(parse_trained_context_from_show("not json").is_err());
+    }
+
+    #[test]
+    fn parses_vision_capability_from_show_payload() {
+        let vision = r#"{"capabilities":["completion","tools","thinking","vision"]}"#;
+        assert_eq!(parse_vision_capability_from_show(vision).unwrap(), Some(true));
+        let no_vision = r#"{"capabilities":["completion","tools","thinking"]}"#;
+        assert_eq!(
+            parse_vision_capability_from_show(no_vision).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_vision_capability_from_show(r#"{"model_info":{}}"#).unwrap(),
+            None
+        );
     }
 }

@@ -75,7 +75,32 @@ pub(crate) fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
         }),
         pricing: parse_model_pricing(object.get("pricing")),
         created: object.get("created").and_then(value_as_u64),
+        supports_image_input: parse_supports_image_input(object),
     })
+}
+
+/// Resolve image-input support from a catalog model object.
+///
+/// Some OpenAI-compatible gateways advertise it as a boolean `vision` /
+/// `supports_vision` / `image_input` field, or as a `capabilities` array that
+/// contains `"vision"` / `"image"`. `None` means the catalog did not say, and
+/// callers fall back to provider-level heuristics.
+fn parse_supports_image_input(object: &serde_json::Map<String, Value>) -> Option<bool> {
+    for key in ["vision", "supports_vision", "image_input", "supports_image_input"] {
+        if let Some(value) = object.get(key) {
+            if let Some(b) = value.as_bool() {
+                return Some(b);
+            }
+        }
+    }
+    if let Some(caps) = object.get("capabilities").and_then(Value::as_array) {
+        let has_vision = caps.iter().any(|c| {
+            c.as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("vision") || s.eq_ignore_ascii_case("image"))
+        });
+        return Some(has_vision);
+    }
+    None
 }
 
 pub(crate) fn first_u64_field(
@@ -123,5 +148,44 @@ pub(crate) fn parse_model_pricing(value: Option<&Value>) -> ModelPricing {
         input_cache_write: object
             .get("input_cache_write")
             .and_then(value_as_pricing_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vision_from_capabilities_array() {
+        let v: Value = serde_json::from_str(
+            r#"{"id":"qwen3.5:397b-cloud","capabilities":["completion","thinking","tools","vision"]}"#,
+        )
+        .unwrap();
+        let model = parse_model_info_value(&v).unwrap();
+        assert_eq!(model.supports_image_input, Some(true));
+    }
+
+    #[test]
+    fn parses_no_vision_from_capabilities_without_vision() {
+        let v: Value = serde_json::from_str(
+            r#"{"id":"deepseek-v4-flash:cloud","capabilities":["completion","thinking","tools"]}"#,
+        )
+        .unwrap();
+        let model = parse_model_info_value(&v).unwrap();
+        assert_eq!(model.supports_image_input, Some(false));
+    }
+
+    #[test]
+    fn parses_boolean_vision_field() {
+        let v: Value = serde_json::from_str(r#"{"id":"m","vision":true}"#).unwrap();
+        let model = parse_model_info_value(&v).unwrap();
+        assert_eq!(model.supports_image_input, Some(true));
+    }
+
+    #[test]
+    fn leaves_image_support_unknown_when_absent() {
+        let v: Value = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
+        let model = parse_model_info_value(&v).unwrap();
+        assert_eq!(model.supports_image_input, None);
     }
 }

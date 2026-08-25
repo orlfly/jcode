@@ -62,6 +62,7 @@ fn named_profile_static_models_survive_live_catalog_refresh() {
             context_length: Some(128_000),
             pricing: Default::default(),
             created: None,
+            supports_image_input: None,
         }];
         cache.fetched = true;
         cache.cached_at = Some(1);
