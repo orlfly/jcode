@@ -227,6 +227,24 @@ fn test_env_override_swarm_model() {
 }
 
 #[test]
+fn wake_mode_defaults_parses_and_env_overrides() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_WAKE_MODE");
+    assert_eq!(
+        Config::default().server.wake_mode,
+        crate::config::WakeMode::Internal
+    );
+    let parsed: Config = toml::from_str("[server]\nwake_mode = \"external\"\n").unwrap();
+    assert_eq!(parsed.server.wake_mode, crate::config::WakeMode::External);
+
+    crate::env::set_var("JCODE_WAKE_MODE", "external");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.server.wake_mode, crate::config::WakeMode::External);
+    restore_env_var("JCODE_WAKE_MODE", prev);
+}
+
+#[test]
 fn spawn_hook_defaults_to_none_and_parses_from_toml() {
     assert_eq!(Config::default().terminal.spawn_hook, None);
 
@@ -588,7 +606,7 @@ fn tool_config_disabled_only_keeps_full_profile_with_deny_list() {
 }
 
 #[test]
-fn test_generated_default_config_uses_low_openai_reasoning_effort() {
+fn test_generated_default_config_has_expected_user_defaults() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -644,6 +662,15 @@ fn test_generated_default_config_uses_low_openai_reasoning_effort() {
     let parsed: Config =
         toml::from_str(&content).expect("generated default config should parse as Config");
     assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Inline);
+    assert!(
+        parsed.display.show_thinking,
+        "freshly created user config should request model reasoning"
+    );
+    assert_eq!(
+        parsed.display.reasoning_display(),
+        jcode_config_types::ReasoningDisplayMode::Full,
+        "freshly created user config should show the full reasoning trace"
+    );
 
     if let Some(prev) = prev_home {
         crate::env::set_var("JCODE_HOME", prev);
@@ -1072,6 +1099,8 @@ fn populate_context_limits_from_config_ref_seeds_global_cache() {
             base_url: "https://gateway.example.test/v1".to_string(),
             models: vec![NamedProviderModelConfig {
                 id: model_id.to_string(),
+                reasoning: None,
+                reasoning_effort: None,
                 context_window: Some(1_000_000),
                 input: Vec::new(),
             }],
@@ -1106,11 +1135,15 @@ fn populate_context_limits_from_config_seeds_qualified_runtime_model_shapes() {
             models: vec![
                 NamedProviderModelConfig {
                     id: "issue421-qwen-128k".to_string(),
+                    reasoning: None,
+                    reasoning_effort: None,
                     context_window: Some(131_072),
                     input: Vec::new(),
                 },
                 NamedProviderModelConfig {
                     id: "/opt/models/issue421-ornith-35b-q4.gguf".to_string(),
+                    reasoning: None,
+                    reasoning_effort: None,
                     context_window: Some(131_072),
                     input: Vec::new(),
                 },

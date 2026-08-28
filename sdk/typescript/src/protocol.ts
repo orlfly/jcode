@@ -79,6 +79,7 @@ export type ApiRequest =
   | { req: "set_retention_policy"; archive_after_days?: number }
   | { req: "create_session"; working_dir?: string }
   | { req: "attach_session"; session_id: string }
+  | { req: "fork_session"; session_id: string }
   | { req: "detach_session"; session_id: string }
   | {
       req: "send_message";
@@ -126,6 +127,7 @@ export type ApiEvent =
   | { ev: "error"; code: ErrorCode; message: string }
   | { ev: "sessions"; sessions: SessionInfo[] }
   | { ev: "attached"; session: SessionInfo }
+  | { ev: "session_forked"; session: SessionInfo }
   | { ev: "history"; session_id: string; messages: HistoryMessage[]; images?: RenderedImage[] }
   | { ev: "pong" }
   | { ev: "text_delta"; session_id: string; text: string }
@@ -151,6 +153,12 @@ export type ApiEvent =
       cache_read_input?: number;
     }
   | { ev: "turn_done"; session_id: string }
+  | {
+      ev: "wake_requested";
+      session_id: string;
+      reason: string;
+      notification: string;
+    }
   | {
       ev: "background_progress";
       session_id: string;
@@ -251,6 +259,7 @@ export const KNOWN_EVENT_KINDS = [
   "error",
   "sessions",
   "attached",
+  "session_forked",
   "history",
   "side_pane_images",
   "pong",
@@ -263,6 +272,7 @@ export const KNOWN_EVENT_KINDS = [
   "tool_done",
   "token_usage",
   "turn_done",
+  "wake_requested",
   "background_progress",
   "message_accepted",
   "permission_request",
@@ -289,6 +299,7 @@ export const KNOWN_REQUEST_KINDS = [
   "set_retention_policy",
   "create_session",
   "attach_session",
+  "fork_session",
   "detach_session",
   "send_message",
   "cancel",

@@ -473,6 +473,40 @@ fn background_task_rows_retain_the_two_most_recently_active_tasks() {
 }
 
 #[test]
+fn indeterminate_background_update_preserves_last_known_percent() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
+    let mut app = create_test_app();
+    app.session.short_name = Some("test".to_string());
+    app.push_display_message(DisplayMessage::assistant("ordinary transcript content"));
+    app.upsert_running_background_task(
+        "build".to_string(),
+        "cargo build".to_string(),
+        Some(42.0),
+    );
+
+    // A later phase-only parser update carries no percentage. It should update
+    // activity/label state without resetting the visible bar to zero.
+    app.upsert_running_background_task("build".to_string(), "Compiling jcode".to_string(), None);
+
+    let row = app
+        .background_task_rows_ref()
+        .iter()
+        .find(|row| row.task_id == "build")
+        .expect("background row should remain present");
+    assert_eq!(row.percent, Some(42.0));
+    assert_eq!(row.label, "Compiling jcode");
+
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("Compiling jcode") && rendered.contains("42%"),
+        "phase-only update reset or hid the visible percentage:\n{rendered}"
+    );
+}
+
+#[test]
 fn completed_background_tasks_clear_after_they_stop_being_relevant() {
     let mut app = create_test_app();
     app.finish_background_task(

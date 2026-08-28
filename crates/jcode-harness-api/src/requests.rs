@@ -10,7 +10,7 @@ pub enum ApiRequest {
     Hello {
         min_version: u32,
         max_version: u32,
-        /// Client name and version, e.g. "jcode-desktop2/0.1.0".
+        /// Client name and version, e.g. "external-client/0.1.0".
         client: String,
     },
 
@@ -45,6 +45,9 @@ pub enum ApiRequest {
 
     /// Attach to an existing session and subscribe to its event stream.
     AttachSession { session_id: String },
+
+    /// Clone an attached session's transcript into a new, idle session.
+    ForkSession { session_id: String },
 
     /// Detach from the currently attached session.
     DetachSession { session_id: String },

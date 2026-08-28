@@ -14,8 +14,6 @@ The most intelligent harness
 
 <a href="https://trendshift.io/repositories/25042?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-25042" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/25042" alt="1jehuang/jcode | Trendshift" width="250" height="55"></a>
 
-<a href="https://github.com/1jehuang/jcode/stargazers"><img src="docs/images/star-history.svg" alt="jcode cumulative GitHub stars over time, sampled weekly" width="700"></a>
-
 <a href="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.mp4">
   <img src="https://github.com/1jehuang/jcode/releases/download/readme-assets/jcode-yc-launch.webp" alt="jcode YC launch video" width="800">
 </a>
@@ -451,10 +449,17 @@ base_url = "https://llm.example.com/v1"
 api_key_env = "JCODE_PROVIDER_MY_API_API_KEY"
 env_file = "provider-my-api.env"
 default_model = "my-model-id"
+# Optional: prevent model names such as `gpt-5-*` from automatically enabling
+# `reasoning_effort` on gateways that reject it.
+disable_reasoning_heuristics = true
 
 [[providers.my-api.models]]
 id = "my-model-id"
 context_window = 128000
+# Explicitly enable `/effort` and select this model's initial effort. Set
+# `reasoning = false` on an individual model to disable it instead.
+reasoning = true
+reasoning_effort = "high"
 ```
 
 Anthropic Messages-compatible gateways use the same named-profile surface with

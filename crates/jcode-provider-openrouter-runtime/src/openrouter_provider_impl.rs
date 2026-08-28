@@ -155,7 +155,14 @@ impl Provider for OpenRouterProvider {
                 // GPT-family models on direct compat gateways (e.g. OpenCode
                 // Zen serving gpt-5.3-codex-spark) take the standard OpenAI
                 // `reasoning_effort` field with OpenAI's effort vocabulary.
-                let effort = if jcode_base::prompt::is_swarm_effort(effort) {
+                let effort = if strict_openai_schema
+                    && (jcode_base::prompt::is_swarm_effort(effort) || effort == "max")
+                {
+                    // Strict OpenAI-schema endpoints such as Mistral document
+                    // xhigh as their strongest accepted value and reject the
+                    // jcode/OpenAI UX alias `max`.
+                    "xhigh"
+                } else if jcode_base::prompt::is_swarm_effort(effort) {
                     "max"
                 } else {
                     effort
@@ -434,6 +441,17 @@ impl Provider for OpenRouterProvider {
             }
         } else {
             self.clear_pin_if_model_changed(&model_id, true);
+        }
+
+        if self
+            .model_reasoning_config()
+            .and_then(|config| config.1.as_ref())
+            .is_some()
+        {
+            let configured = self.configured_effort_for_model();
+            if let Ok(mut effort) = self.reasoning_effort.try_write() {
+                *effort = configured;
+            }
         }
 
         let stored_effort = self
@@ -789,6 +807,8 @@ impl Provider for OpenRouterProvider {
             supports_model_catalog: self.supports_model_catalog,
             profile_id: self.profile_id.clone(),
             reasoning_effort_support: self.reasoning_effort_support,
+            disable_reasoning_heuristics: self.disable_reasoning_heuristics,
+            static_reasoning_config: self.static_reasoning_config.clone(),
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
             static_models: self.static_models.clone(),

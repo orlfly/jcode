@@ -1577,9 +1577,22 @@ pub enum MemorySubcommand {
 }
 
 pub fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
+    run_memory_command_for_dir(cmd, std::env::current_dir().ok())
+}
+
+fn run_memory_command_for_dir(
+    cmd: MemorySubcommand,
+    project_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
     use memory::{MemoryEntry, MemoryManager};
 
-    let manager = MemoryManager::new();
+    let project_dir = project_dir.filter(|dir| !dir.as_os_str().is_empty());
+    // Match agent-side memory resolution: project memory is available only when
+    // the caller supplied a concrete working directory.
+    let manager = match project_dir.as_ref() {
+        Some(dir) => MemoryManager::new().with_project_dir(dir),
+        _ => MemoryManager::new(),
+    };
 
     match cmd {
         MemorySubcommand::List { scope, tag } => {
@@ -1717,6 +1730,9 @@ pub fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
             scope,
             overwrite,
         } => {
+            if scope != "global" && project_dir.is_none() {
+                anyhow::bail!("cannot import project memories without a project directory");
+            }
             let content = std::fs::read_to_string(&input)?;
             let memories: Vec<memory::MemoryEntry> = serde_json::from_str(&content)?;
 
@@ -1724,6 +1740,7 @@ pub fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
             let mut skipped = 0;
 
             for entry in memories {
+                let entry_id = entry.id.clone();
                 let result = if scope == "global" {
                     if !overwrite
                         && let Ok(graph) = manager.load_global_graph()
@@ -1744,9 +1761,12 @@ pub fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
                     manager.remember_project(entry)
                 };
 
-                if result.is_ok() {
-                    imported += 1;
-                }
+                result.map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to durably import memory {entry_id} into {scope} scope: {error}"
+                    )
+                })?;
+                imported += 1;
             }
 
             println!("Imported {} memories ({} skipped)", imported, skipped);
@@ -1962,6 +1982,14 @@ pub async fn run_browser(action: &str) -> Result<()> {
             } else if status.responding && !status.compatible {
                 println!(
                     "\nThe browser bridge is connected, but the installed Firefox extension is out of date for this jcode build. Run `jcode browser setup` to repair or update it."
+                );
+            } else if status.binary_installed && !browser::is_firefox_running() {
+                println!(
+                    "\nFirefox is not running, so the bridge cannot respond. Start Firefox (or run a browser tool action, which launches it automatically), then re-check status. Setup is one-time and does not need to be re-run."
+                );
+            } else if status.binary_installed {
+                println!(
+                    "\nFirefox is running, but the bridge is not responding. Check that the Browser Agent Bridge extension is enabled in the running profile. Run `jcode browser setup` only to repair the install."
                 );
             } else {
                 println!("\nRun `jcode browser setup` to install or repair it.");

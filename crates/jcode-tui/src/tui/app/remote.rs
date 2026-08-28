@@ -136,6 +136,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw |= app.poll_session_picker_load();
     needs_redraw |= app.poll_session_picker_presence();
     needs_redraw |= app.onboarding_tick();
+    needs_redraw |= app.progress_update_simulator();
     needs_redraw |= app.refresh_keybindings_if_config_reloaded();
 
     let _ = check_debug_command(app, remote).await;
@@ -391,6 +392,7 @@ async fn apply_terminal_event(
     };
     match event {
         Some(Ok(Event::FocusGained)) => {
+            crate::tui::reapply_configured_terminal_modes();
             input_attribution.event = Some("focus_gained".to_string());
             needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
@@ -767,6 +769,7 @@ fn handle_terminal_event_while_disconnected(
 
     match event {
         Some(Ok(Event::FocusGained)) => {
+            crate::tui::reapply_configured_terminal_modes();
             needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
         }
@@ -1208,8 +1211,8 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     // client to receive and render History: requests and events share one
     // ordered socket, so the server finishes writing the Subscribe History
     // response before it reads this Message request. Do not echo the user turn
-    // locally here because the still-in-flight History payload would clear it;
-    // the server's ordered Transcript event will add it immediately afterwards.
+    // locally here because the still-in-flight History payload would clear it.
+    // Preserve the echo and apply it immediately after History instead.
     //
     // This removes the visible, intermittent pause between the fork window
     // opening and its prompt starting, which was proportional to history payload
@@ -1224,6 +1227,7 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         app.submit_input_on_startup = false;
         app.startup_submit_deferred_reason = None;
         let prepared = input::take_prepared_input(app);
+        app.pending_startup_prompt_echo = Some(prepared.raw_input.clone());
         app.last_submitted_input = Some(prepared.raw_input);
         crate::logging::info(&format!(
             "Startup auto-submit sent behind ordered Subscribe: input_chars={} pending_images={}",

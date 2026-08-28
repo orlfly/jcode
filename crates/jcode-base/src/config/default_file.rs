@@ -160,8 +160,8 @@ emoji = true
 # Usage percentage wording: "left" (default) or "used".
 usage_display = "left"
 
-# Show thinking/reasoning content (default: false)
-show_thinking = false
+# Show thinking/reasoning content (default: true)
+show_thinking = true
 
 # How to display reasoning/thinking content: "off", "full", or "current".
 #   off     - never show reasoning
@@ -169,7 +169,7 @@ show_thinking = false
 #   current - show only the live reasoning; collapse it once the model commits
 #             an assistant message or runs a tool, then show the next one
 # When unset, falls back to show_thinking (true => full, false => off).
-reasoning_display = "off"
+reasoning_display = "full"
 
 # Markdown spacing style: "compact" (chat/TUI) or "document" (docs-like)
 # markdown_spacing = "compact"
@@ -403,6 +403,15 @@ cross_provider_failover = "countdown"
 # Env overrides: JCODE_MAX_RETRIES, JCODE_RETRY_BACKOFF_CAP_SECS.
 # max_retries = 8
 # retry_backoff_cap_secs = 30
+
+[server]
+# Who executes autonomous wake requests from background completion/stall,
+# swarm await completion, and communication delivery.
+# "internal" starts or interrupts turns in the daemon (default).
+# "external" emits typed wake_requested events for an operator to handle and
+# never starts a turn or injects into a running turn.
+# Env override: JCODE_WAKE_MODE
+wake_mode = "internal"
 
 [agents]
 # Defaults for spawned helper agents (swarm workers, subagents, sidecars).
@@ -719,6 +728,15 @@ mod tests {
             toml::from_str::<Config>(&template).expect("the shipped config template must parse");
         assert_eq!(config.tools.mcp_tools, McpToolsMode::Auto);
         assert_eq!(config.tools.mcp_tools_token_threshold, 8_000);
+        assert!(
+            config.display.show_thinking,
+            "the shipped user config must request model reasoning"
+        );
+        assert_eq!(
+            config.display.reasoning_display(),
+            ReasoningDisplayMode::Full,
+            "the shipped user config must keep the full reasoning trace visible"
+        );
     }
 
     /// Colors are only discoverable if the template mentions them, since most
