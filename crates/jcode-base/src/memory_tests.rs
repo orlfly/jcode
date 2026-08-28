@@ -1147,3 +1147,21 @@ fn fts5_stays_in_sync_after_full_save_replace() {
         );
     });
 }
+
+#[test]
+fn extraction_noise_filter_rejects_fragments_and_hashes() {
+    // Low-value noise that should NOT be stored.
+    assert!(is_extraction_noise(""), "empty");
+    assert!(is_extraction_noise("   "), "whitespace only");
+    assert!(is_extraction_noise("85fa7777a"), "bare hash");
+    assert!(is_extraction_noise("a1b2c3d4e5f6"), "hex hash");
+    assert!(is_extraction_noise("----"), "symbols only");
+    assert!(is_extraction_noise(":::"), "symbols only");
+    assert!(is_extraction_noise("CONTENT"), "single identifier too short");
+    assert!(is_extraction_noise("Commit"), "single word too short");
+
+    // Real memories must pass the gate.
+    assert!(!is_extraction_noise("The project uses rust with sqlite for persistence"));
+    assert!(!is_extraction_noise("User prefers tabs over spaces in python code"));
+    assert!(!is_extraction_noise("The auth token lives in the environment, never in code"));
+}

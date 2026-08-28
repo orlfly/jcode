@@ -433,6 +433,15 @@ impl GraphBackend for SqliteGvecBackend {
     fn save(&self, key: &StoreKey, graph: &MemoryGraph) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let g = self.graph(key)?;
+        // Ensure the FTS5 shadow index exists and stays in sync BEFORE
+        // rewriting the nodes table. `remember_project`/`save_project_graph`
+        // route through `save()` (the slow replace-all path) rather than
+        // `apply_mutations`, so without this the FTS5 index is only ever
+        // created on the mutation-log path or on the first explicit
+        // `search()`. That left most stores without a text index (P1-2: only
+        // a couple of graphs had FTS5 tables). Running it here guarantees
+        // every store that is written also gets a live keyword index.
+        ensure_text_index(&g)?;
         // Reset everything: for this PoC, the SQL backend treats save
         // as a replace-all. The mutation log API on the trait is the
         // efficient path; save() is the slow path.

@@ -1045,9 +1045,15 @@ Output ONLY the formatted lines, no other text. If no NEW memories worth extract
             .filter_map(|line| {
                 let parts: Vec<&str> = line.split('|').collect();
                 if parts.len() >= 3 {
+                    let content = parts[1].trim().to_string();
+                    // P0-3: drop low-value noise before it reaches storage so it
+                    // never pollutes vector recall (bare ids, fragments, hashes).
+                    if crate::memory::is_extraction_noise(&content) {
+                        return None;
+                    }
                     Some(ExtractedMemory {
                         category: parts[0].trim().to_lowercase(),
-                        content: parts[1].trim().to_string(),
+                        content,
                         trust: parts[2].trim().to_lowercase(),
                     })
                 } else {

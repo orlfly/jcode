@@ -295,6 +295,12 @@ async fn apply_auth_runtime_model_to_agent(
         if result.is_ok() {
             agent_guard.reset_provider_session();
         }
+        // Keep the memory sidecar's global active provider in sync with the
+        // session's model after an auth-driven model change, same as a manual
+        // model switch (see apply_set_model).
+        if result.is_ok() {
+            crate::provider::set_active_provider(agent_guard.provider_handle());
+        }
         result.map(|_| agent_guard.provider_model())
     };
 
@@ -341,6 +347,11 @@ async fn apply_auth_route_to_agent(
         let result = agent_guard.set_route_selection_from_auth(&selection);
         if result.is_ok() {
             agent_guard.reset_provider_session();
+        }
+        // Keep the memory sidecar's global active provider in sync with the
+        // session's model after an auth-driven route change, same as apply_set_model.
+        if result.is_ok() {
+            crate::provider::set_active_provider(agent_guard.provider_handle());
         }
         result.map(|_| agent_guard.provider_model())
     };
@@ -584,6 +595,14 @@ fn apply_set_model(
         }
         result.map(|_| (agent.provider_model(), agent.provider_name()))
     };
+    // Keep the background helpers (memory sidecar rerank/relevance/extraction)
+    // in sync with the session's newly-selected model. The global active
+    // provider is registered once at server startup; without re-registering it
+    // here, the memory sidecar stays pinned to the startup model and never
+    // follows user model switches.
+    if result.is_ok() {
+        crate::provider::set_active_provider(agent.provider_handle());
+    }
     send_model_changed_result(id, result, current, client_event_tx);
 }
 
@@ -632,6 +651,11 @@ fn apply_set_route(
         }
         result.map(|_| (agent.provider_model(), agent.provider_name()))
     };
+    // Keep the background helpers (memory sidecar) in sync with the session's
+    // newly-selected model, same as apply_set_model.
+    if result.is_ok() {
+        crate::provider::set_active_provider(agent.provider_handle());
+    }
     send_model_changed_result(id, result, current, client_event_tx);
 }
 

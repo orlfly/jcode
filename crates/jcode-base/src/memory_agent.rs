@@ -419,6 +419,13 @@ struct SessionState {
     /// hybrid order, which would otherwise inject low-similarity bloat and
     /// destroy the high-precision guarantee.
     last_verified_ids: Vec<String>,
+    /// Whether a genuine LLM judge verdict ran during the most recent
+    /// retrieval for this session. Only a real judge verdict (RerankOutcome::
+    /// Judged) should drive confidence decays of non-verified candidates;
+    /// cadence-carry / judge-failure / opted-out turns never evaluate the
+    /// candidates, so decaying them there is a false-negative confidence hit
+    /// (the P0-1 one-way-decay bug: 2931 decays vs 74 boosts).
+    last_judge_ran: bool,
 }
 
 /// The persistent memory agent state
@@ -869,7 +876,10 @@ impl MemoryAgent {
                 );
                 if outcome == crate::memory_rerank::RerankOutcome::Judged {
                     // Real judge verdict: surface it and remember it as the new
-                    // verified set for future cadence/failure carries.
+                    // verified set for future cadence/failure carries. Also note
+                    // that a genuine judge ran this turn so rejected candidates
+                    // below can be decayed (they were actually evaluated).
+                    self.session_state(session_id).last_judge_ran = true;
                     let result: Vec<_> = reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect();
                     {
                         let ss = self.session_state(session_id);
@@ -881,7 +891,9 @@ impl MemoryAgent {
                     // unvetted hybrid order; carry the last judge-verified set so
                     // everything surfaced stays judge-backed. The failed attempt still
                     // advances the cadence, while the global circuit breaker suppresses
-                    // cross-session retry storms.
+                    // cross-session retry storms. Candidates are NOT decayed here: they
+                    // were never evaluated this turn, so decaying them would be a
+                    // false-negative confidence hit (the P0-1 one-way-decay bug).
                     let carried = self.carry_verified(session_id, new_candidates);
                     crate::logging::event_rate_limited(
                         crate::logging::LogLevel::Info,
@@ -901,7 +913,8 @@ impl MemoryAgent {
                 // consensus rerank verified (intersected with the current
                 // candidate set), preserving high precision. Falling back to the
                 // noisy no-LLM hybrid order here would inject low-similarity
-                // bloat (the exact behavior we are trying to avoid).
+                // bloat (the exact behavior we are trying to avoid). No judge ran
+                // this turn, so no candidates are decayed.
                 crate::memory_judge_metrics::record(
                     crate::memory_judge_metrics::JudgeDecision::CadenceCarry,
                     session_id,
@@ -930,11 +943,23 @@ impl MemoryAgent {
         };
 
         let verified_ids: Vec<String> = relevant.iter().map(|e| e.id.clone()).collect();
-        let rejected_ids: Vec<String> = candidate_ids
-            .iter()
-            .filter(|id| !verified_ids.contains(id))
-            .cloned()
-            .collect();
+        // P0-1 fix: only mark non-verified candidates as "rejected" (and thus decay
+        // their confidence) when a genuine LLM judge verdict ran THIS turn. On
+        // cadence-carry, judge-failure, and opted-out turns the candidates were never
+        // evaluated, so decaying them is a false-negative confidence hit that
+        // systematically drives high-relevance memories toward GC (2931 decays vs
+        // 74 boosts). When no judge ran, decay nothing and simply boost verified.
+        let rejected_ids: Vec<String> = if self.session_state(session_id).last_judge_ran {
+            candidate_ids
+                .iter()
+                .filter(|id| !verified_ids.contains(id))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Reset the flag for the next turn.
+        self.session_state(session_id).last_judge_ran = false;
 
         let retrieval_ctx = RetrievalContext {
             verified_ids: verified_ids.clone(),

@@ -188,6 +188,49 @@ pub fn memory_sidecar_auto_disabled() -> bool {
     crate::memory_judge_metrics::sidecar_should_auto_disable()
 }
 
+/// Minimum meaningful content length (in chars) for an LLM-extracted memory.
+///
+/// Content shorter than this is almost always extraction noise (a bare
+/// identifier, a truncated path fragment, a lone symbol) that pollutes vector
+/// recall without adding semantic value. See the P0-3 noise audit.
+pub const MIN_MEANINGFUL_MEMORY_LEN: usize = 12;
+
+/// Classify a memory's content as low-value extraction noise.
+///
+/// These are the patterns observed polluting the recall pool (P0-3 audit):
+/// - content shorter than [`MIN_MEANINGFUL_MEMORY_LEN`] chars (bare ids, paths)
+/// - content with no alphabetic/digit substance (only symbols, e.g. "---", "::")
+/// - pure git commit hashes, which the extraction prompt already says to skip
+///
+/// Returns true when the content looks like noise that should NOT be stored.
+pub fn is_extraction_noise(content: &str) -> bool {
+    let c = content.trim();
+    if c.is_empty() {
+        return true;
+    }
+    if c.chars().count() < MIN_MEANINGFUL_MEMORY_LEN {
+        return true;
+    }
+    // Must have at least one "word-ish" character; content that is only
+    // whitespace/symbols (e.g. "----", ":::", "**") is not a real memory.
+    let has_word_chars = c
+        .chars()
+        .any(|ch| ch.is_alphabetic() || ch.is_ascii_digit());
+    if !has_word_chars {
+        return true;
+    }
+    // Pure commit-hash shaped strings (7-40 hex chars with no spaces) are
+    // transient git noise, not durable knowledge.
+    let trimmed_len = c.len();
+    let is_hex_hash = (7..=40).contains(&trimmed_len)
+        && !c.contains(char::is_whitespace)
+        && c.chars().all(|ch| ch.is_ascii_hexdigit());
+    if is_hex_hash {
+        return true;
+    }
+    false
+}
+
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
     let (Some(event_tx), Some(activity)) = (event_tx, activity_snapshot()) else {
         return;
