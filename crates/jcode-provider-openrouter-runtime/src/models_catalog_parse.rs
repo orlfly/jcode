@@ -56,6 +56,7 @@ pub(crate) fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
             object,
             &[
                 "context_length",
+                "context_window",
                 "contextLength",
                 "max_context_length",
                 "maxModelLength",
@@ -187,5 +188,18 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
         let model = parse_model_info_value(&v).unwrap();
         assert_eq!(model.supports_image_input, None);
+    }
+
+    #[test]
+    fn conifer_context_window_and_pricing_are_parsed() {
+        let models = parse_openai_compatible_models_response(
+            r#"{"data":[{"id":"gpt-5.6-sol","context_window":1000000,"pricing":{"input":"0.1","output":"0.2","cached_input":"0.01"}}]}"#,
+        )
+        .expect("Conifer catalog response should parse");
+
+        assert_eq!(models[0].context_length, Some(1_000_000));
+        assert_eq!(models[0].pricing.prompt.as_deref(), Some("0.1"));
+        assert_eq!(models[0].pricing.completion.as_deref(), Some("0.2"));
+        assert_eq!(models[0].pricing.input_cache_read.as_deref(), Some("0.01"));
     }
 }
