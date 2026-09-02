@@ -946,13 +946,8 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                 let experimental_notice = app.active_experimental_feature_notice();
                 let subagent = app.subagent_status();
 
-                let mut spans = vec![
-                    Span::styled(spinner, Style::default().fg(anim_color)),
-                    Span::styled(
-                        format!(" running {}", name),
-                        Style::default().fg(anim_color).bold(),
-                    ),
-                ];
+                let mut spans =
+                    running_tool_header_spans(spinner, name, tool_detail.as_deref(), anim_color);
 
                 // For batch tool: show "completed/total · last_tool" progress
                 if is_batch {
@@ -962,11 +957,6 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                         batch_prog,
                         batch_total_initial,
                     );
-                } else if let Some(detail) = tool_detail {
-                    spans.push(Span::styled(
-                        format!(" · {}", detail),
-                        Style::default().fg(dim_color()),
-                    ));
                 }
 
                 if let Some(notice) = experimental_notice {
@@ -1067,6 +1057,28 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
     frame.render_widget(Paragraph::new(line), area);
 }
 
+fn running_tool_header_spans(
+    spinner: &'static str,
+    name: &str,
+    detail: Option<&str>,
+    anim_color: Color,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(spinner, Style::default().fg(anim_color)),
+        Span::styled(
+            format!(" running {}", name),
+            Style::default().fg(dim_color()),
+        ),
+    ];
+    if let Some(detail) = detail {
+        spans.push(Span::styled(
+            format!(" · {}", detail),
+            Style::default().fg(anim_color).bold(),
+        ));
+    }
+    spans
+}
+
 /// Append the "+N queued" suffix span (in the queued accent color) when there
 /// are queued follow-up messages. Centralizes the repeated check/styling shared
 /// by every processing-status branch in `draw_status`.
@@ -1104,6 +1116,22 @@ fn streaming_status_spans(
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn running_tool_header_emphasizes_detail_over_tool_name() {
+        let accent = Color::Rgb(12, 34, 56);
+        let spans = running_tool_header_spans("*", "bash", Some("cargo test"), accent);
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content.as_ref(), "*");
+        assert_eq!(spans[0].style.fg, Some(accent));
+        assert_eq!(spans[1].content.as_ref(), " running bash");
+        assert_eq!(spans[1].style.fg, Some(dim_color()));
+        assert!(!spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].content.as_ref(), " · cargo test");
+        assert_eq!(spans[2].style.fg, Some(accent));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
 
     #[test]
     fn visual_line_move_follows_soft_wrapped_rows() {
