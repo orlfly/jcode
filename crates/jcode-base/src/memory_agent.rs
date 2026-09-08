@@ -316,6 +316,16 @@ enum AgentMessage {
 /// Minimum turns before we consider extracting on topic change
 const MIN_TURNS_FOR_EXTRACTION: usize = 4;
 
+/// Tiered duplicate thresholds for extraction-time dedup. At or above
+/// EXACT_DUP_THRESHOLD the candidate is a verbatim-level duplicate and is
+/// reinforced directly; between NEAR_DUP_THRESHOLD and EXACT the LLM must
+/// confirm the same information before reinforcing; below NEAR the candidate
+/// is stored as a new memory. Public for acceptance tests that pin the tier
+/// boundary via explicit embeddings (the local ONNX model is unavailable in
+/// sandboxed test homes).
+pub const EXACT_DUP_THRESHOLD: f32 = 0.95;
+pub const NEAR_DUP_THRESHOLD: f32 = 0.80;
+
 /// Decide which ontology-driven activities should fire for a turn tick or
 /// topic change.  This is intentionally a pure helper (no side effects)
 /// so the result can be cached or surfaced to the activity widget.  Today
@@ -1156,9 +1166,9 @@ impl MemoryAgent {
                         // duplicate that reinforces directly; the next tier down still
                         // retrieves candidates (rephrasings of the same fact) and lets
                         // the LLM confirm they carry the same information before
-                        // reinforcing. Below that, store as a new memory.
-                        const EXACT_DUP_THRESHOLD: f32 = 0.95;
-                        const NEAR_DUP_THRESHOLD: f32 = 0.80;
+                        // reinforcing. Below that, store as a new memory. Constants
+                        // are declared at module level (EXACT_DUP_THRESHOLD /
+                        // NEAR_DUP_THRESHOLD).
                         let similar =
                             memory_manager.find_similar(&mem.content, NEAR_DUP_THRESHOLD, 3);
 

@@ -1165,3 +1165,52 @@ fn extraction_noise_filter_rejects_fragments_and_hashes() {
     assert!(!is_extraction_noise("User prefers tabs over spaces in python code"));
     assert!(!is_extraction_noise("The auth token lives in the environment, never in code"));
 }
+
+#[test]
+fn hybrid_retrieval_favors_stronger_memory_on_tie() {
+    // B acceptance: the strength/recency prior in hybrid_fuse must lift a
+    // heavily-reinforced memory above an otherwise identical weak twin when
+    // both are near-identical matches for the query.
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new().with_project_dir("/tmp/jcode-hybrid-strength");
+
+        // Distinct-but-related embeddings so write-time dedup (cos >= 0.90)
+        // keeps both rows; query [1, 0] ranks the weak twin first on dense.
+        let weak = MemoryEntry::new(MemoryCategory::Fact, "The release channel is stable")
+            .with_embedding(vec![1.0, 0.0]);
+        let strong = MemoryEntry::new(MemoryCategory::Fact, "The release channel stays stable")
+            .with_embedding(vec![0.8, 0.6]);
+
+        let weak_id = manager.remember_project(weak).expect("remember weak");
+        let strong_id = manager.remember_project(strong).expect("remember strong");
+        assert_ne!(weak_id, strong_id, "twins must be distinct rows");
+
+        // Drive the strong twin to a high strength via reinforcements; the
+        // weak twin stays at strength 1.
+        for i in 0..12 {
+            let mut graph = manager.load_project_graph().unwrap();
+            graph
+                .get_memory_mut(&strong_id)
+                .unwrap()
+                .reinforce(&format!("acceptance-{i}"), 0);
+            manager.save_project_graph(&graph).unwrap();
+        }
+
+        let results = manager
+            .find_similar_hybrid("which release channel", &[1.0, 0.0], 10)
+            .expect("hybrid");
+        let ids: Vec<&str> = results.iter().map(|(e, _)| e.id.as_str()).collect();
+
+        assert_eq!(ids.len(), 2, "both twins should surface");
+        assert_eq!(
+            ids[0], strong_id,
+            "the stronger twin must rank first on a near-tie; got order {ids:?}"
+        );
+        let weak_pos = results.iter().position(|(e, _)| e.id == weak_id).unwrap();
+        let strong_pos = results.iter().position(|(e, _)| e.id == strong_id).unwrap();
+        assert!(
+            strong_pos < weak_pos,
+            "strong (pos {strong_pos}) must precede weak (pos {weak_pos})"
+        );
+    });
+}

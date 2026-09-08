@@ -224,3 +224,293 @@ fn dynamic_gate_empty_input_returns_empty() {
     let out = dynamic_gate_select(Vec::new(), 5);
     assert!(out.is_empty());
 }
+
+// ============================================================================
+// Acceptance tests for the strength-balance feature (E/B/A/C/D)
+// ============================================================================
+
+/// E/B acceptance: touch_entries on surfaced (verified) memories bumps
+/// access_count and refreshes updated_at even when the judge did NOT run
+/// this turn (the no-LLM cadence-carry path that previously skipped all
+/// reinforcement).
+#[test]
+fn surfaced_memories_are_touched_even_without_judge() {
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let dir = std::env::temp_dir().join(format!(
+        "jcode-touch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::env::set_var("JCODE_HOME", &dir);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let manager = crate::memory::MemoryManager::new().with_project_dir("/tmp/jcode-touch");
+
+        let id = manager
+            .remember_project(
+                crate::memory::MemoryEntry::new(MemoryCategory::Fact, "surfaced memory fact")
+                    .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+
+        // Backdate to simulate a memory untouched for a while.
+        {
+            let mut graph = manager.load_project_graph().unwrap();
+            let entry = graph.get_memory_mut(&id).unwrap();
+            entry.access_count = 0;
+            entry.updated_at = chrono::Utc::now() - chrono::Duration::days(5);
+            manager.save_project_graph(&graph).unwrap();
+        }
+
+        // Simulate the maintenance step the agent runs on a cadence-carry
+        // turn (no judge verdict): touch the surfaced ids.
+        manager.touch_entries(std::slice::from_ref(&id)).unwrap();
+
+        let graph = manager.load_project_graph().unwrap();
+        let entry = graph.get_memory(&id).unwrap();
+        assert_eq!(
+            entry.access_count, 1,
+            "surfaced memory must gain access credit on a no-judge turn"
+        );
+        assert!(
+            (chrono::Utc::now() - entry.updated_at).num_seconds() < 60,
+            "surfaced memory updated_at must be refreshed to now"
+        );
+    }));
+
+    match old {
+        Some(v) => crate::env::set_var("JCODE_HOME", v),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A acceptance: a judge-verified memory grows strength (not just confidence).
+#[test]
+fn judge_verified_memory_gains_strength() {
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let dir = std::env::temp_dir().join(format!(
+        "jcode-strength-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::env::set_var("JCODE_HOME", &dir);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let manager = crate::memory::MemoryManager::new().with_project_dir("/tmp/jcode-strength");
+
+        let id = manager
+            .remember_project(
+                crate::memory::MemoryEntry::new(MemoryCategory::Fact, "verified adoption fact")
+                    .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+
+        let strength_before = manager
+            .load_project_graph()
+            .unwrap()
+            .get_memory(&id)
+            .unwrap()
+            .strength;
+
+        let (boosted, _decayed) =
+            apply_confidence_updates(&manager, std::slice::from_ref(&id), &[]);
+        assert_eq!(boosted, 1);
+
+        let graph = manager.load_project_graph().unwrap();
+        let entry = graph.get_memory(&id).unwrap();
+        assert_eq!(
+            entry.strength,
+            strength_before + 1,
+            "judge-verified memory must gain +1 strength per verified turn"
+        );
+        assert_eq!(entry.reinforcements.len(), 1);
+        assert_eq!(
+            entry.reinforcements[0].session_id, "judge-verified",
+            "reinforcement provenance should name the adoption channel"
+        );
+    }));
+
+    match old {
+        Some(v) => crate::env::set_var("JCODE_HOME", v),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// D acceptance: a rejected (judge-missed) memory that is FRESH or has been
+/// accessed must NOT decay; only genuinely dormant memories (access_count == 0
+/// and older than the dormancy window) decay.
+#[test]
+fn non_dormant_rejected_memories_are_not_decayed() {
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let dir = std::env::temp_dir().join(format!(
+        "jcode-nodecay-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::env::set_var("JCODE_HOME", &dir);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let manager = crate::memory::MemoryManager::new().with_project_dir("/tmp/jcode-nodecay");
+
+        // Fresh + never accessed (default state after remember_project).
+        let fresh = manager
+            .remember_project(
+                crate::memory::MemoryEntry::new(MemoryCategory::Fact, "fresh near-miss fact")
+                    .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+        // Old but accessed (recently used).
+        let used = manager
+            .remember_project(
+                crate::memory::MemoryEntry::new(MemoryCategory::Fact, "old but used fact")
+                    .with_embedding(vec![0.0, 1.0]),
+            )
+            .unwrap();
+        {
+            let mut graph = manager.load_project_graph().unwrap();
+            let entry = graph.get_memory_mut(&used).unwrap();
+            entry.access_count = 3;
+            entry.updated_at = chrono::Utc::now() - chrono::Duration::days(60);
+            manager.save_project_graph(&graph).unwrap();
+        }
+
+        let conf = |id: &str| {
+            manager
+                .load_project_graph()
+                .unwrap()
+                .get_memory(id)
+                .unwrap()
+                .confidence
+        };
+        let fresh_before = conf(&fresh);
+        let used_before = conf(&used);
+
+        let (_boosted, decayed) = apply_confidence_updates(
+            &manager,
+            &[],
+            &[fresh.clone(), used.clone()],
+        );
+        assert_eq!(decayed, 0, "neither fresh nor recently-used memory may decay");
+        assert_eq!(conf(&fresh), fresh_before, "fresh memory confidence unchanged");
+        assert_eq!(conf(&used), used_before, "accessed memory confidence unchanged");
+    }));
+
+    match old {
+        Some(v) => crate::env::set_var("JCODE_HOME", v),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// C acceptance (tier boundary, LLM-free branch): pins the EXACT vs NEAR tier
+/// boundary the dedup loop uses. Uses explicit embeddings so the test does not
+/// depend on the local ONNX model (absent in sandboxed test homes); cosine over
+/// explicit vectors exercises the exact same `score_and_filter` path that
+/// `find_similar` drives at extraction time.
+#[test]
+fn tiered_dedup_exact_dup_clears_threshold_without_llm() {
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let dir = std::env::temp_dir().join(format!(
+        "jcode-tier-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::env::set_var("JCODE_HOME", &dir);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use crate::memory_agent::{EXACT_DUP_THRESHOLD, NEAR_DUP_THRESHOLD};
+        let manager =
+            crate::memory::MemoryManager::new().with_project_dir("/tmp/jcode-tiered-dedup");
+
+        let id = manager
+            .remember_project(
+                crate::memory::MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    "The scheduler retries failed jobs up to three times before alerting.",
+                )
+                .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+
+        // Verbatim-level duplicate: cosine 1.0, far above EXACT (0.95), so the
+        // extraction loop reinforces directly with NO LLM confirmation call.
+        let exact_score = manager
+            .find_similar_with_embedding(&[1.0, 0.0], NEAR_DUP_THRESHOLD, 3)
+            .unwrap()
+            .into_iter()
+            .find(|(e, _)| e.id == id)
+            .map(|(_, s)| s)
+            .unwrap_or_else(|| panic!("verbatim duplicate must be retrieved at {NEAR_DUP_THRESHOLD}"));
+        assert!(
+            exact_score >= EXACT_DUP_THRESHOLD,
+            "verbatim duplicate scored {exact_score}, must clear EXACT tier {EXACT_DUP_THRESHOLD} \
+             so no LLM confirmation is needed"
+        );
+
+        // Rephrase-of-same-fact zone: cosine ~0.9 lands between NEAR (0.80)
+        // and EXACT (0.95) -- retrieved as a near-dup candidate and handed to
+        // the LLM confirm step rather than blindly reinforced.
+        let rephrase_score = manager
+            .find_similar_with_embedding(&[0.9, 0.436], NEAR_DUP_THRESHOLD, 3)
+            .unwrap()
+            .into_iter()
+            .find(|(e, _)| e.id == id)
+            .map(|(_, s)| s);
+        if let Some(score) = rephrase_score {
+            assert!(
+                score >= NEAR_DUP_THRESHOLD && score < EXACT_DUP_THRESHOLD,
+                "rephrase scored {score}, must land in the LLM-confirm tier \
+                 [{NEAR_DUP_THRESHOLD}, {EXACT_DUP_THRESHOLD})"
+            );
+        }
+
+        // Distinct fact: cosine ~0 < NEAR (0.80) so it is stored as a NEW
+        // memory, never folded into the existing row.
+        let distinct_score = manager
+            .find_similar_with_embedding(&[0.0, 1.0], NEAR_DUP_THRESHOLD, 3)
+            .unwrap()
+            .into_iter()
+            .find(|(e, _)| e.id == id)
+            .map(|(_, s)| s);
+        assert!(
+            distinct_score.is_none(),
+            "orthogonal memory scored {distinct_score:?}, must fall below NEAR tier"
+        );
+    }));
+
+    match old {
+        Some(v) => crate::env::set_var("JCODE_HOME", v),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
