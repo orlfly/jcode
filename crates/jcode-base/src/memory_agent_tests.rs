@@ -89,12 +89,23 @@ fn apply_confidence_updates_batches_boost_and_decay() {
             .with_embedding(vec![1.0, 0.0]);
         keep_entry.confidence = 0.5; // below cap so a boost is observable
         let keep = manager.remember_project(keep_entry).unwrap();
+        // A genuinely DORMANT memory: never accessed and older than the 30-day
+        // dormancy window, so the conditional decay in apply_confidence_updates
+        // applies to it. Backdate AFTER remember_project because its Touch
+        // effect stamps updated_at = now.
         let stale = manager
             .remember_project(
                 MemoryEntry::new(MemoryCategory::Fact, "rejected memory")
                     .with_embedding(vec![0.0, 1.0]),
             )
             .unwrap();
+        {
+            let mut graph = manager.load_project_graph().unwrap();
+            let entry = graph.get_memory_mut(&stale).unwrap();
+            entry.access_count = 0;
+            entry.updated_at = chrono::Utc::now() - chrono::Duration::days(60);
+            manager.save_project_graph(&graph).unwrap();
+        }
 
         let conf_before = |id: &str| {
             manager
@@ -113,7 +124,7 @@ fn apply_confidence_updates_batches_boost_and_decay() {
             std::slice::from_ref(&stale),
         );
         assert_eq!(boosted, 1, "one verified memory boosted");
-        assert_eq!(decayed, 1, "one rejected memory decayed");
+        assert_eq!(decayed, 1, "one dormant rejected memory decayed");
 
         let keep_after = conf_before(&keep);
         let stale_after = conf_before(&stale);

@@ -1121,8 +1121,8 @@ impl MemoryAgent {
             }
         };
 
-        // Similarity threshold for duplicate detection
-        const DUPLICATE_THRESHOLD: f32 = 0.90;
+        // (Tiered duplicate thresholds EXACT_DUP_THRESHOLD / NEAR_DUP_THRESHOLD
+        // are declared inside the extraction loop below.)
 
         // Run extraction in background - don't block the main flow
         tokio::spawn(async move {
@@ -1151,13 +1151,24 @@ impl MemoryAgent {
                             _ => memory::TrustLevel::Medium,
                         };
 
-                        // Check for duplicate: find semantically similar existing memories
+                        // Check for duplicate: find semantically similar existing memories.
+                        // Tiered thresholds: >= EXACT_DUP_THRESHOLD is a verbatim-level
+                        // duplicate that reinforces directly; the next tier down still
+                        // retrieves candidates (rephrasings of the same fact) and lets
+                        // the LLM confirm they carry the same information before
+                        // reinforcing. Below that, store as a new memory.
+                        const EXACT_DUP_THRESHOLD: f32 = 0.95;
+                        const NEAR_DUP_THRESHOLD: f32 = 0.80;
                         let similar =
-                            memory_manager.find_similar(&mem.content, DUPLICATE_THRESHOLD, 1);
+                            memory_manager.find_similar(&mem.content, NEAR_DUP_THRESHOLD, 3);
 
                         if let Ok(matches) = similar
-                            && let Some((existing, _sim)) = matches.first()
+                            && let Some((existing, sim)) = matches.first()
                         {
+                            let is_exact = *sim >= EXACT_DUP_THRESHOLD;
+                            let llm_confirms = !is_exact
+                                && matches!(sidecar.check_contradiction(&mem.content, &existing.content).await, Ok(false));
+                            if is_exact || llm_confirms {
                             let existing_id = existing.id.clone();
                             let mut did_reinforce = false;
 
@@ -1206,6 +1217,7 @@ impl MemoryAgent {
                                 known_ids.push(existing_id.clone());
                             }
                             continue;
+                            }
                         }
 
                         // No duplicate - check for contradiction in same category
@@ -1388,6 +1400,18 @@ impl MemoryAgent {
                 apply_confidence_updates(&memory_manager, &ctx.verified_ids, &ctx.rejected_ids);
             if boosted > 0 || decayed > 0 {
                 memory::add_event(MemoryEventKind::MaintenanceConfidence { boosted, decayed });
+            }
+
+            // 2b. Strength touch on every surfaced memory. Regardless of whether
+            // the LLM judge ran this turn (judge verdict, cadence carry, or judge
+            // failure carry), a memory that was actually surfaced in front of the
+            // agent deserves usage credit: it increments access_count and refreshes
+            // updated_at, which keeps the confidence-decay budget from silently
+            // eroding memories during no-LLM stretches (the 87% zero-reinforcement
+            // imbalance: decays outnumbered boosts 378:213 because carry turns
+            // skipped all reinforcement). Pure local operation, no LLM needed.
+            if let Err(e) = memory_manager.touch_entries(&ctx.verified_ids) {
+                crate::logging::info(&format!("Memory touch failed: {}", e));
             }
 
             // 4. Gap detection: Log when we had no relevant memories
@@ -1893,15 +1917,34 @@ fn apply_confidence_updates(
         for id in verified_ids {
             if let Some(entry) = graph.get_memory_mut(id) {
                 entry.boost_confidence(BOOST);
+                // Judge-verified adoption: consensus kept this memory in front of
+                // the agent, which is behavioral evidence it is being used. Grow
+                // strength (not just confidence) so the retrieval prior and GC
+                // ranking see real usage, not a confidence value that decays back
+                // to baseline every maintenance cycle.
+                entry.reinforce("judge-verified", 0);
                 boosted += 1;
                 changed = true;
             }
         }
         for id in rejected_ids {
             if let Some(entry) = graph.get_memory_mut(id) {
-                entry.decay_confidence(DECAY);
-                decayed += 1;
-                changed = true;
+                // Conditional decay: only erode confidence for DORMANT memories
+                // (never accessed and older than the dormancy window). A memory
+                // that was recently accessed or is still fresh was plausibly a
+                // near-miss for this query, not a stale fact; decaying it on
+                // every judge miss drove the 378:213 decay/boost imbalance and
+                // systematically pushed useful memories toward GC.
+                const DORMANT_MIN_AGE_DAYS: f64 = 30.0;
+                let age_days = (chrono::Utc::now() - entry.updated_at).num_seconds() as f64
+                    / 86_400.0;
+                let dormant =
+                    entry.access_count == 0 && age_days >= DORMANT_MIN_AGE_DAYS;
+                if dormant {
+                    entry.decay_confidence(DECAY);
+                    decayed += 1;
+                    changed = true;
+                }
             }
         }
 

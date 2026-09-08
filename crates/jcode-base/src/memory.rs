@@ -919,11 +919,29 @@ impl MemoryManager {
             *fused.entry(*idx).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
         }
 
+        // Strength / recency prior. RRF scores live in ~[0, 0.03]; a logarithmic
+        // strength term plus a bounded recency bonus gives frequently-reinforced
+        // and recently-used memories a gentle lift without letting a strength-30
+        // veteran drown every strength-1 newcomer (the 87% strength=1 long tail
+        // needs the log to keep the prior sub-dominant to relevance).
+        let now = chrono::Utc::now();
+        let prior = |e: &MemoryEntry| -> f32 {
+            let strength_term = (e.strength as f32).ln() * 0.002;
+            let age_days = (now - e.updated_at).num_seconds() as f32 / 86_400.0;
+            let recency_term = (-age_days / 14.0).exp() * 0.004;
+            strength_term + recency_term
+        };
+
         let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
         top_k_by_score(
             fused
                 .into_iter()
-                .filter_map(|(idx, score)| entries[idx].take().map(|e| (e, score))),
+                .filter_map(|(idx, score)| {
+                    entries[idx].take().map(|e| {
+                        let s = prior(&e);
+                        (e, score + s)
+                    })
+                }),
             limit,
         )
     }
@@ -1171,7 +1189,7 @@ impl MemoryManager {
         Ok((generated, failed))
     }
 
-    fn touch_entries(&self, ids: &[String]) -> Result<()> {
+    pub fn touch_entries(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
