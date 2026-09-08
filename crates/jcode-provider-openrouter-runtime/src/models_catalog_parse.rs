@@ -57,6 +57,7 @@ pub(crate) fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
             &[
                 "context_length",
                 "context_window",
+                "context_size",
                 "contextLength",
                 "max_context_length",
                 "maxModelLength",
@@ -188,6 +189,18 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
         let model = parse_model_info_value(&v).unwrap();
         assert_eq!(model.supports_image_input, None);
+    }
+
+    #[test]
+    fn novita_model_catalog_preserves_names_and_context_limits() {
+        let models = parse_openai_compatible_models_response(
+            r#"{"data":[{"id":"zai-org/glm-5.3","object":"model","owned_by":"novita","display_name":"GLM 5.3","context_size":1048576,"created":1787105676}]}"#,
+        )
+        .expect("Novita catalog response should parse");
+        assert_eq!(models[0].id, "zai-org/glm-5.3");
+        assert_eq!(models[0].name, "GLM 5.3");
+        assert_eq!(models[0].context_length, Some(1_048_576));
+        assert_eq!(models[0].created, Some(1_787_105_676));
     }
 
     #[test]

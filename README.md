@@ -45,6 +45,23 @@ irm https://jcode.sh/install.ps1 | iex
 Need Homebrew, source builds, provider setup, or want an agent to set it up for you?
 [Jump to detailed installation](#detailed-installation).
 
+### Updating
+
+Run `/update` in the TUI to download the latest stable release in the background
+and reload with your session preserved. From a terminal, use `jcode update`, then
+restart the client. Both commands use the same update policy, including for dev builds.
+
+Older or equal release versions are skipped. For a development build, Jcode also
+compares the running binary's Git commit with the release tag. Builds ahead of,
+identical to, or diverged from the release are preserved. If ancestry cannot be
+verified locally or through GitHub, the update stops rather than risking a downgrade.
+The displayed dev patch includes a commit-count offset, so it is not used as a
+release version comparison.
+
+This is the default `features.update_channel = "stable"` behavior. An explicit
+`"main"` channel still opts into source-branch updates. Use `/rebuild` or the
+self-dev build workflow to rebuild your own checkout.
+
 ---
 
 
@@ -339,6 +356,7 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 - **Azure OpenAI** (`jcode login --provider azure`)
 - **Alibaba Cloud Coding Plan** (`jcode login --provider alibaba-coding-plan`)
 - **Fireworks** (`jcode login --provider fireworks`)
+- **Novita AI** (`jcode login --provider novita`, API key)
 - **MiniMax** (`jcode login --provider minimax`)
 - **Meta Model API / Muse** (`jcode login --provider meta-muse`)
 - **LM Studio** (`jcode login --provider lmstudio`)
@@ -346,6 +364,10 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 - **Custom OpenAI-compatible endpoint** (`jcode login --provider openai-compatible`)
 
 For custom OpenAI-compatible endpoints, jcode now prompts for the API base and supports local localhost servers without requiring an API key.
+
+The native OpenAI providers use Responses WebSocket v2 with opportunistic
+background prewarming and HTTPS fallback. See [OpenAI WebSocket transport](docs/OPENAI_WEBSOCKET.md)
+for behavior, controls, and verification.
 
 ### Config-file setup for self-hosted endpoints and MCP
 
@@ -573,10 +595,16 @@ Example MCP config:
       "args": ["--root", "/workspace"],
       "env": {},
       "shared": true
+    },
+    "websearch": {
+      "command": "/path/to/slow-mcp-server",
+      "timeout_secs": 120
     }
   }
 }
 ```
+
+Each request to an MCP server (`tools/call`, `tools/list`, `initialize`) times out after 30 seconds by default. Set `timeout_secs` on a server whose tools legitimately run longer.
 
 For headless or SSH sessions, OAuth-style providers support `jcode login --provider <provider> --no-browser` (alias: `--headless`) so jcode prints the auth URL/QR and falls back to manual code or callback paste instead of trying to launch a local browser.
 
@@ -615,7 +643,7 @@ The above image is the first page of provider logins
 
 - **Native / first-party style providers:** `claude`, `openai`, `copilot`, `gemini`, `azure`, `alibaba-coding-plan`
 - **Aggregator / compatibility providers:** `openrouter`, `orcarouter`, `openai-compatible`
-- **Additional provider integrations:** `opencode`, `opencode-go`, `zai` / `kimi`, `302ai`, `baseten`, `cortecs`, `deepseek`, `firmware`, `huggingface`, `moonshotai`, `nebius`, `scaleway`, `stackit`, `groq`, `mistral`, `perplexity`, `togetherai`, `deepinfra`, `fireworks`, `minimax`, `xai`, `lmstudio`, `ollama`, `chutes`, `cerebras`, `cursor`, `antigravity`, `google`
+- **Additional provider integrations:** `opencode`, `opencode-go`, `zai` / `kimi`, `302ai`, `baseten`, `cortecs`, `deepseek`, `firmware`, `huggingface`, `moonshotai`, `nebius`, `scaleway`, `stackit`, `groq`, `mistral`, `perplexity`, `togetherai`, `deepinfra`, `fireworks`, `novita`, `minimax`, `xai`, `lmstudio`, `ollama`, `chutes`, `cerebras`, `cursor`, `antigravity`, `google`
 
 Jcode also supports easy multi-account switching. Ran out of tokens on your first ChatGPT Pro subscription? /account and quickly switch to your second. 
 
@@ -810,6 +838,7 @@ Set up jcode on this machine for me.
    - Azure OpenAI: `~/.config/jcode/azure-openai.env`, `AZURE_OPENAI_*`, or an existing `az login`
    - OpenRouter: `OPENROUTER_API_KEY`
    - Fireworks: `~/.config/jcode/fireworks.env`, `FIREWORKS_API_KEY`
+   - Novita AI: `~/.config/jcode/novita.env`, `NOVITA_API_KEY`
    - MiniMax: `~/.config/jcode/minimax.env`, `MINIMAX_API_KEY`
    - NVIDIA NIM: `~/.config/jcode/nvidia-nim.env`, `NVIDIA_API_KEY`
    - Alibaba Cloud Coding Plan: existing jcode config/env if present
