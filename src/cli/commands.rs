@@ -1573,6 +1573,9 @@ pub enum MemorySubcommand {
         overwrite: bool,
     },
     Stats,
+    Forget {
+        id: String,
+    },
     ClearTest,
 }
 
@@ -1774,6 +1777,17 @@ async fn run_memory_command_for_dir(
             }
 
             println!("Imported {} memories ({} skipped)", imported, skipped);
+        }
+
+        MemorySubcommand::Forget { id } => {
+            // Mirror the memory tool's forget semantics: try the project
+            // store first, then fall back to global. A missing project
+            // directory simply means the memory can only live in global.
+            if manager.forget(&id)? {
+                println!("Forgot: {id}");
+            } else {
+                println!("Not found: {id}");
+            }
         }
 
         MemorySubcommand::Stats => {

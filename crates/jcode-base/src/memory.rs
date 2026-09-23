@@ -2184,7 +2184,7 @@ pub fn active_backend_name() -> &'static str {
     NAME.get_or_init(|| {
         let raw = std::env::var("JCODE_MEMORY_BACKEND").unwrap_or_default();
         match raw.to_lowercase().as_str() {
-            "" => "json",
+            "" => default_backend_name(),
             "json" => "json",
             "sqlite" | "sqlite-gvec" | "gvec" => "sqlite-gvec",
             other => {
@@ -2195,6 +2195,32 @@ pub fn active_backend_name() -> &'static str {
             }
         }
     })
+}
+
+/// Resolve the backend used when `JCODE_MEMORY_BACKEND` is unset.
+///
+/// - In test builds the default is pinned to `json`: tests spin up many
+///   processes-within-a-process against per-test `JCODE_HOME` sandboxes, and
+///   the backend name/path is resolved once per process via `OnceLock`, so an
+///   sqlite default makes test ordering contaminate stores.
+/// - At runtime, existing installs keep their `sqlite-gvec` store when its
+///   database file is present (the pre-upstream-merge default); fresh installs
+///   with no database start on `json`.
+fn default_backend_name() -> &'static str {
+    if cfg!(test) {
+        return "json";
+    }
+    if let Ok(dir) = crate::storage::jcode_dir() {
+        if dir
+            .join("memory")
+            .join("backend-sqlite")
+            .join("gvec.sqlite")
+            .exists()
+        {
+            return "sqlite-gvec";
+        }
+    }
+    "json"
 }
 
 /// Try to construct the SQLite backend. Returns `None` if the feature

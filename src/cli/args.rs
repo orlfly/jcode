@@ -1142,6 +1142,12 @@ pub(crate) enum MemoryCommand {
         overwrite: bool,
     },
 
+    /// Forget a memory by ID (searches project then global scope)
+    Forget {
+        /// Memory ID to forget
+        id: String,
+    },
+
     /// Show memory statistics
     Stats,
 
