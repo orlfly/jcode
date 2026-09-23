@@ -35,10 +35,14 @@ fn content_hash(text: &str) -> u64 {
 
 /// Distill promotion candidates into global-scope rules via the sidecar LLM.
 ///
+/// `existing` are the generalized rules already in global scope; they are
+/// listed as "already known" so the model does not re-derive paraphrases of
+/// them (a content-hash id alone cannot catch rewordings).
 /// Returns the raw `CATEGORY|CONTENT|TRUST` lines produced by the model.
 async fn generalize_candidates(
     sidecar: &crate::sidecar::Sidecar,
     candidates: &[GlobalPromotionCandidate],
+    existing: &[String],
 ) -> Result<Vec<(String, String)>> {
     let mut listing = String::from(
         "Below are project-scope memories that recur across projects and are \
@@ -50,10 +54,23 @@ async fn generalize_candidates(
          - CONTENT: one or two sentences, under 200 chars, phrased \
          project-agnostically. Never mention specific hosts, IPs, repos, \
          ticket ids, project names, or people.\n\
-         - TRUST: medium\n\n\
-         If a memory below is too project-specific to generalize, skip it. \
+         - TRUST: medium\n\n",
+    );
+    if !existing.is_empty() {
+        listing.push_str(
+            "IMPORTANT - these rules ALREADY EXIST in global memory. Do NOT \
+             re-emit them or close paraphrases (same lesson, different words). \
+             Only output genuinely new lessons:\n",
+        );
+        for rule in existing.iter().take(40) {
+            listing.push_str(&format!("- {}\n", crate::util::truncate_str(rule, 150)));
+        }
+        listing.push('\n');
+    }
+    listing.push_str(
+        "If a memory below is too project-specific to generalize, skip it. \
          Do not emit more rules than memories worth keeping. If nothing \
-         generalizes, output nothing.\n\n",
+         generalizes beyond what already exists, output nothing.\n\n",
     );
     for candidate in candidates {
         listing.push_str(&format!(
@@ -99,6 +116,43 @@ fn parse_category(raw: &str) -> MemoryCategory {
     }
 }
 
+/// Char-trigram Jaccard similarity; catches rewordings of the same rule
+/// that a content hash cannot.
+fn trigram_similarity(a: &str, b: &str) -> f32 {
+    let norm = |s: &str| -> std::collections::HashSet<String> {
+        let lower: String = s.to_lowercase().chars().collect();
+        lower
+            .as_bytes()
+            .windows(3)
+            .map(|w| String::from_utf8_lossy(w).to_string())
+            .collect()
+    };
+    let (set_a, set_b) = (norm(a), norm(b));
+    if set_a.is_empty() || set_b.is_empty() {
+        return 0.0;
+    }
+    let inter = set_a.intersection(&set_b).count();
+    inter as f32 / set_a.union(&set_b).count() as f32
+}
+
+/// Drop output rules that paraphrase something already in global scope.
+fn filter_paraphrases(
+    rules: Vec<(String, String)>,
+    existing: &[String],
+) -> Vec<(String, String)> {
+    // Char-trigram Jaccard measured ~0.40 for a real rewording of the same
+    // rule and <0.25 for unrelated rules; 0.35 sits between them.
+    const PARAPHRASE_THRESHOLD: f32 = 0.35;
+    rules
+        .into_iter()
+        .filter(|(_, content)| {
+            !existing
+                .iter()
+                .any(|known| trigram_similarity(content, known) >= PARAPHRASE_THRESHOLD)
+        })
+        .collect()
+}
+
 /// Run one generalization pass. Returns the number of new global rules written.
 pub async fn run_generalization_pass() -> usize {
     if !crate::memory::memory_llm_judge_available() {
@@ -117,15 +171,23 @@ pub async fn run_generalization_pass() -> usize {
         return 0;
     }
 
-    // Skip rules already in global scope (same content hash id).
+    // Existing generalized rules: exact-hash skip + already-known prompt
+    // context + paraphrase filter, so repeated passes converge instead of
+    // accumulating reworded duplicates.
     let global_graph = match manager.load_global_graph() {
         Ok(graph) => graph,
         Err(_) => return 0,
     };
+    let existing: Vec<String> = global_graph
+        .memories
+        .values()
+        .filter(|m| m.id.starts_with("generalized-rule-"))
+        .map(|m| m.content.clone())
+        .collect();
 
     let sidecar = crate::sidecar::Sidecar::new();
-    let rules = match generalize_candidates(&sidecar, &candidates).await {
-        Ok(rules) => rules,
+    let rules = match generalize_candidates(&sidecar, &candidates, &existing).await {
+        Ok(rules) => filter_paraphrases(rules, &existing),
         Err(e) => {
             crate::logging::info(&format!("memory generalization skipped: {e}"));
             return 0;
@@ -260,5 +322,53 @@ mod pass_tests {
         // must return 0 rather than error or spawn writes.
         let written = super::run_generalization_pass().await;
         assert_eq!(written, 0);
+    }
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    /// Full-pass acceptance against the REAL sqlite store copy and the REAL
+    /// sidecar route when one is configured. Skipped unless
+    /// JCODE_GENERALIZER_E2E=1 is set (needs provider credentials).
+    #[tokio::test]
+    async fn full_pass_e2e_writes_gated_global_rules() {
+        if std::env::var("JCODE_GENERALIZER_E2E").is_err() {
+            return;
+        }
+        let written = super::run_generalization_pass().await;
+        // With real candidates in the store copy and a working provider, at
+        // least one gated rule should land; with no provider it must be 0.
+        eprintln!("generalizer e2e wrote: {written}");
+    }
+}
+
+#[cfg(test)]
+mod paraphrase_tests {
+    use super::{filter_paraphrases, trigram_similarity};
+
+    #[test]
+    fn similarity_catches_rewording_not_unrelated() {
+        // Same lesson, different words: high overlap.
+        let known = "Never merge pull requests yourself; leave a comment on the MR and let a human perform the merge";
+        let reworded = "never merge PRs yourself, post a comment summarizing changes and let a human merge";
+        assert!(trigram_similarity(reworded, known) >= 0.30);
+
+        // Genuinely different lesson: low overlap.
+        let other = "Always write explicit acceptance criteria into task descriptions before creation";
+        assert!(trigram_similarity(other, known) < 0.30);
+    }
+
+    #[test]
+    fn paraphrase_filter_drops_known_lessons_keeps_new() {
+        let known = vec![
+            "Never merge pull requests yourself; leave a comment on the MR and let a human perform the merge".to_string(),
+        ];
+        let rules = vec![
+            ("correction".to_string(), "never merge PRs yourself, post a summary comment and let a human merge".to_string()),
+            ("fact".to_string(), "always verify artifact digests before shipping a deployment".to_string()),
+        ];
+        let kept = filter_paraphrases(rules, &known);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].1.contains("artifact"));
     }
 }

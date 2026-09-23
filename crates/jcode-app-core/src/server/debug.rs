@@ -521,6 +521,12 @@ pub(super) async fn handle_debug_client(
                             Ok(output)
                         } else if cmd == "swarm:help" {
                             Ok(swarm_debug_help_text())
+                        } else if cmd == "memory:generalize" {
+                            // Server-level: run one background-generalization
+                            // pass with this daemon's live provider route.
+                            let written =
+                                crate::memory_generalizer::run_generalization_pass().await;
+                            Ok(format!("memory generalization wrote {written} rule(s)"))
                         } else if cmd == "help" {
                             Ok(debug_help_text())
                         } else {
