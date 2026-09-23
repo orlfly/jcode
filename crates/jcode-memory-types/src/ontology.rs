@@ -56,6 +56,7 @@ pub const REL_DERIVED_FROM: &str = "derived_from";
 pub const REL_IN_CLUSTER: &str = "in_cluster";
 
 pub const RULE_REMEMBER: &str = "rule.remember";
+pub const RULE_REMEMBER_GLOBAL_GATE: &str = "rule.remember.global_gate";
 pub const RULE_UPSERT: &str = "rule.upsert";
 pub const RULE_DEDUP_REINFORCE: &str = "rule.dedup_reinforce";
 pub const RULE_SUPERSEDE: &str = "rule.supersede";
@@ -72,6 +73,7 @@ pub const ACTIVITY_GC_ARCHIVED: &str = "activity.gc_archived";
 pub const ACTIVITY_SUMMARIZE: &str = "activity.summarize";
 
 pub const EVENT_REMEMBER: &str = "event.remember";
+pub const EVENT_REMEMBER_GLOBAL: &str = "event.remember.global";
 pub const EVENT_UPSERT: &str = "event.upsert";
 pub const EVENT_DEDUP: &str = "event.dedup";
 pub const EVENT_SUPERSEDE: &str = "event.supersede";
@@ -1000,6 +1002,22 @@ pub fn default_ontology() -> Ontology {
         })
         .with_effect(Effect::Touch);
 
+    // Global-scope write gate. Global memory is injected into every project's
+    // sessions, so it must hold conceptual, generalized, cross-project
+    // knowledge only. The gate aborts writes whose content looks like
+    // project-specific environment detail (concrete hosts, ports, task ids,
+    // repositories) unless it was produced by analysis (extraction /
+    // inference) rather than stated during a conversation. See
+    // `rule_engine::is_generalized_content`.
+    let remember_global_gate_rule = Rule::new(RULE_REMEMBER_GLOBAL_GATE, EVENT_REMEMBER_GLOBAL)
+        .with_description(
+            "Admit generalized/cross-project content to global scope; abort environment-specific content.",
+        )
+        .with_condition(Condition::Custom {
+            expression: "global_scope_generalized".to_string(),
+        })
+        .with_effect(Effect::Touch);
+
     let upsert_rule = Rule::new(RULE_UPSERT, EVENT_UPSERT)
         .with_description("Replace content/tags for an existing instance.")
         .with_condition(Condition::HasExistingId)
@@ -1056,6 +1074,7 @@ pub fn default_ontology() -> Ontology {
 
     onto = onto
         .with_rule(remember_rule)
+        .with_rule(remember_global_gate_rule)
         .with_rule(upsert_rule)
         .with_rule(dedup_rule)
         .with_rule(supersede_rule)

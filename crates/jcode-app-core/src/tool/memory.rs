@@ -95,7 +95,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Manage memory. Scope rules: use scope:\"project\" (default) for anything tied to the current codebase, deployment environment, hosts, credentials, APIs, tasks, or workflows of the project at hand; use scope:\"global\" ONLY for facts useful in ANY project (general tooling lessons, user-wide workflow preferences). Never write project-specific environment details (hostnames, IPs, repo-internal facts) to global scope: global memories are injected into every project's sessions and pollute unrelated contexts."
+        "Manage memory. Scope rules: use scope:\"project\" (default) for anything tied to the current codebase, deployment environment, hosts, credentials, APIs, tasks, or workflows of the project at hand; use scope:\"global\" ONLY for facts useful in ANY project (general tooling lessons, user-wide workflow preferences). Never write project-specific environment details (hostnames, IPs, repo-internal facts) to global scope: global memories are injected into every project's sessions and pollute unrelated contexts. This is enforced: global writes containing concrete environment identifiers (IPs, hosts, paths, task ids, credentials, deploy targets) are rejected by a scope gate and must be re-submitted with scope:\"project\"."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -182,7 +182,18 @@ impl Tool for MemoryTool {
                     entry = entry.with_id(id);
                 }
                 let id = if scope == "global" {
-                    manager.remember_global(entry)?
+                    match manager.remember_global(entry) {
+                        Ok(id) => id,
+                        Err(error) if error.to_string().contains("scope gate") => {
+                            memory::set_state(MemoryState::Idle);
+                            return Ok(ToolOutput::new(format!(
+                                "Rejected: {error}. \
+                                 Re-submit the same memory with scope \"project\" \
+                                 if it belongs to this environment, or generalize it."
+                            )));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else {
                     manager.remember_project(entry)?
                 };
@@ -849,6 +860,56 @@ mod tests {
 
         if let Some(prev_home) = prev_home {
             crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    /// Ontology scope gate: environment-specific content must be rejected
+    /// from global scope with a redirect message, not a hard error.
+    #[tokio::test]
+    async fn remember_global_gate_rejects_environment_specific() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+
+        let tool = MemoryTool::new();
+        let out = tool
+            .execute(
+                json!({
+                    "action": "remember",
+                    "content": "部署机 = 192.168.6.33, SSH root 免密, live 容器 kiagents-v2-chat-node",
+                    "category": "fact",
+                    "scope": "global"
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("gate rejection must be a graceful redirect, not an error");
+        let text = out.output.clone();
+        assert!(
+            text.contains("scope gate"),
+            "expected redirect message, got: {text}"
+        );
+
+        let generalized = tool
+            .execute(
+                json!({
+                    "action": "remember",
+                    "content": "教训：更新记忆前必须核对事实准确性，矛盾时应先修正旧条目",
+                    "category": "fact",
+                    "scope": "global"
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("generalized content should pass the gate");
+        assert!(generalized.output.contains("Remembered"));
+
+        if let Some(prev) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev);
         } else {
             crate::env::remove_var("JCODE_HOME");
         }

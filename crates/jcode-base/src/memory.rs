@@ -514,10 +514,53 @@ impl MemoryManager {
     pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
         crate::memory_types::validate_new_entry(&entry)
             .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+        // Ontology gate: global memory must stay conceptual / generalized /
+        // cross-project. Dispatch the scope-gate rule and abort environment-
+        // specific content before it ever reaches the graph. The tool layer
+        // additionally steers in-conversation writes toward project scope;
+        // generalized entries from background extraction pass the gate via
+        // their extraction provenance and content shape.
+        if let Some(verdict) = self.evaluate_global_gate(&entry) {
+            return Err(anyhow::anyhow!(
+                "global memory rejected by scope gate: {verdict}; \
+                 write environment-specific facts to project scope instead"
+            ));
+        }
         let mut graph = self.load_global_graph()?;
         let id = Self::remember_in_graph(&mut graph, entry);
         self.save_global_graph(&graph)?;
         Ok(id)
+    }
+
+    /// Run the ontology global-scope gate for `entry`. `Some(reason)` means
+    /// the write must be aborted; `None` admits it. Uses the same rule
+    /// engine as the rest of the ontology so the policy stays declarative.
+    fn evaluate_global_gate(&self, entry: &MemoryEntry) -> Option<String> {
+        let registry = self.ontology_registry();
+        let type_id = entry.category.to_string();
+        let mut ctx = registry.make_context(
+            jcode_memory_types::ontology::DEFAULT_ONTOLOGY_ID,
+            entry.clone(),
+            jcode_memory_types::ontology::EVENT_REMEMBER_GLOBAL,
+        );
+        ctx.type_id = type_id.clone();
+        ctx.scope = "global".to_string();
+        let plan = registry.dispatch(&ctx);
+        let generalized =
+            jcode_memory_types::rule_engine::is_generalized_content(&entry.content);
+        if !generalized {
+            return Some(format!(
+                "content is environment-specific (type_id={type_id})"
+            ));
+        }
+        if plan
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, jcode_memory_types::ontology::Effect::Abort { .. }))
+        {
+            return Some("aborted by ontology rule".to_string());
+        }
+        None
     }
 
     fn remember_in_graph(graph: &mut MemoryGraph, entry: MemoryEntry) -> String {

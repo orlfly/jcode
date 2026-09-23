@@ -111,6 +111,7 @@ impl OntologyRegistry {
             ontology: self.get(ontology_id),
             source_label: String::new(),
             event: event.into(),
+            scope: String::new(),
         }
     }
 

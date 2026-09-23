@@ -41,6 +41,9 @@ pub struct RuleContext {
     pub source_label: String,
     /// The event being dispatched.
     pub event: String,
+    /// Target storage scope for the write ("project" or "global").  Lets
+    /// scope-gating rules fire only on global writes; empty means unknown.
+    pub scope: String,
 }
 
 impl RuleContext {
@@ -72,6 +75,7 @@ impl RuleContext {
             ontology: Arc::new(ontology),
             source_label: "minimal".to_string(),
             event: event.into(),
+            scope: String::new(),
         }
     }
 }
@@ -172,9 +176,15 @@ pub fn evaluate_condition(cond: &Condition, ctx: &RuleContext) -> bool {
             .similarity
             .map(|s| s >= *threshold)
             .unwrap_or(false),
-        // Stub: the runtime treats unknown custom expressions as true so that
-        // they can be wired in incrementally without breaking the engine.
-        Condition::Custom { .. } => true,
+        Condition::Custom { expression } => match expression.as_str() {
+            // Global-scope gate: only generalized, cross-project content may
+            // be written to global memory. See `is_generalized_content`.
+            "global_scope_generalized" => {
+                ctx.scope == "global" && is_generalized_content(&ctx.entry.content)
+                    || ctx.scope != "global"
+            }
+            _ => true,
+        },
     }
 }
 
@@ -199,6 +209,76 @@ fn sanitize_effect(effect: &Effect, ctx: &RuleContext) -> Option<Effect> {
         }
         _ => Some(effect.clone()),
     }
+}
+
+/// Heuristic gate for global-scope memory writes.
+///
+/// Global memory is injected into every project's sessions, so it must be
+/// conceptual / generalized / cross-project knowledge (processing patterns,
+/// general rules, workflow preferences). Content that binds to one specific
+/// environment - concrete hosts, IPs, ports, absolute paths, task ids, MR
+/// numbers, container or registry references - belongs in project scope, not
+/// global. The detector is intentionally conservative: it counts concrete
+/// identifiers and flags the content as environment-specific only when
+/// several categories appear. Credential-shaped content is always rejected.
+pub fn is_generalized_content(content: &str) -> bool {
+    let text = content.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    // Credential-shaped content is never acceptable in global scope.
+    let credential_like = ["api_key", "apiKey", "API_KEY", "Bearer ", "password"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    if credential_like {
+        return false;
+    }
+
+    let mut specificity = 0usize;
+
+    // Private-network addresses.
+    let has_private_ip = ["192.168.", "10.0.", "127.0.0.1"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    if has_private_ip {
+        specificity += 2;
+    }
+
+    // Absolute filesystem paths.
+    if ["/opt/", "/home/", "C:\\"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        specificity += 1;
+    }
+
+    // Ticket / task ids: KIA-123, !19 (MR), #48330.
+    let digits_after = |prefix: &str| {
+        text.match_indices(prefix)
+            .any(|(i, _)| text[i + prefix.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    if digits_after("KIA-") || digits_after("!") || digits_after("#") {
+        specificity += 1;
+    }
+
+    // Deploy artefacts: container / image / registry references.
+    if ["容器", "镜像", "harbor", "docker ", "部署机"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        specificity += 1;
+    }
+
+    // Explicit host:port endpoints.
+    if ["localhost:", ":1337", ".cn:"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        specificity += 1;
+    }
+
+    specificity < 2
 }
 
 /// Apply a `RulePlan` directly to a `MemoryEntry` in place.  Effects that
@@ -424,6 +504,50 @@ fn effect_kind_name(e: &Effect) -> &'static str {
 }
 
 #[cfg(test)]
+mod generality_gate_tests {
+    use super::is_generalized_content;
+
+    #[test]
+    fn rejects_credential_shaped_content() {
+        assert!(!is_generalized_content(
+            "Kaneo devops API key is XFsuku and must be sent as Bearer token"
+        ));
+        assert!(!is_generalized_content("the password is hunter2"));
+    }
+
+    #[test]
+    fn rejects_environment_specific_content() {
+        assert!(!is_generalized_content(
+            "部署机 = 192.168.6.33, SSH root 免密, live 容器 kiagents-v2-chat-node"
+        ));
+        assert!(!is_generalized_content(
+            "chat-service 部署在 /opt/ki-agent-v2/infra/nginx/, KIA-243 已修复"
+        ));
+        assert!(!is_generalized_content(
+            "kaneo 实例在 localhost:1337, DB 容器 kaneo-postgres, 镜像 2.0.2-kia211"
+        ));
+    }
+
+    #[test]
+    fn accepts_generalized_processing_rules() {
+        assert!(is_generalized_content(
+            "教训：绝不在共享宿主机用 xargs 对容器执行删除——必须先列明确认再逐个操作"
+        ));
+        assert!(is_generalized_content(
+            "更新记忆前必须核对事实准确性：与已提交代码矛盾时应先修正旧条目"
+        ));
+        assert!(is_generalized_content(
+            "Spring shadow controller 完全替换原版映射，绝不能只新增端点"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_content() {
+        assert!(!is_generalized_content("   "));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ontology::{default_ontology, EVENT_REMEMBER, TYPE_FACT, TYPE_GOAL};
@@ -441,6 +565,7 @@ mod tests {
             ontology: Arc::new(ontology),
             source_label: "test".to_string(),
             event: event.to_string(),
+            scope: String::new(),
         }
     }
 
