@@ -625,6 +625,12 @@ pub struct AgentsConfig {
     /// sidecar. Recall always uses Jev and is independent of this setting.
     #[serde(default = "default_memory_sidecar_enabled")]
     pub memory_sidecar_enabled: bool,
+    /// Enable the deterministic background generalizer: a daemon task that
+    /// periodically distills repeatedly-reinforced project memories into
+    /// short universal rules and writes them to global memory through the
+    /// scope gate. Independent of ambient mode. Default: true.
+    #[serde(default = "default_memory_background_generalize")]
+    pub memory_background_generalize: bool,
     /// Legacy setting, retained for config compatibility. Jev recall ignores it.
     #[serde(default = "default_memory_rerank_cadence")]
     pub memory_rerank_cadence: usize,
@@ -680,6 +686,10 @@ fn default_memory_sidecar_enabled() -> bool {
     true
 }
 
+fn default_memory_background_generalize() -> bool {
+    true
+}
+
 fn default_memory_rerank_cadence() -> usize {
     3
 }
@@ -706,6 +716,7 @@ impl Default for AgentsConfig {
             memory_jev_threshold: default_memory_jev_threshold(),
             memory_model: None,
             memory_sidecar_enabled: default_memory_sidecar_enabled(),
+            memory_background_generalize: default_memory_background_generalize(),
             memory_rerank_cadence: default_memory_rerank_cadence(),
             memory_rerank_votes: default_memory_rerank_votes(),
             memory_rerank_min_agree: default_memory_rerank_min_agree(),

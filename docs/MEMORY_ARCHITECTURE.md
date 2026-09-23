@@ -130,6 +130,17 @@ controlled by `memory_sidecar_enabled` and `memory_model`. It is not needed to
 recall existing memories and can be disabled entirely. The old
 `memory_rerank_*` and `memory_embedding_*` settings do not affect Jev recall.
 
+### Background generalizer
+
+When `memory_background_generalize = true` (the default) the daemon runs a
+low-frequency task that scans every project store for generalized memories
+with cross-context reinforcement, asks the sidecar LLM to distill them into
+short universal rules, and writes them to global memory. Every write passes
+the global scope gate, so environment-specific facts (hosts, IPs, ticket ids,
+credentials, deploy targets) are rejected regardless of what the model emits.
+Set `memory_background_generalize = false` to disable the task; it is
+independent of ambient mode.
+
 ## Privacy
 
 Storage remains local, but Jev recall is remote inference: the focused query and

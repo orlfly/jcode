@@ -1265,6 +1265,10 @@ impl Server {
         // indexing cost while leaving exhaustive searches available on demand.
         crate::tool::spawn_recent_index_warmup();
 
+        // Periodic background memory generalization (independent of ambient
+        // mode): distills reinforced project memories into gated global rules.
+        crate::memory_generalizer::spawn_memory_generalizer();
+
         // Reconcile background-task status files orphaned by a previous
         // process image (crash or exec-based reload). Non-detached tasks die
         // with their owning process but their status files still say Running,
