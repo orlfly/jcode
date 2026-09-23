@@ -95,7 +95,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Manage memory."
+        "Manage memory. Scope rules: use scope:\"project\" (default) for anything tied to the current codebase, deployment environment, hosts, credentials, APIs, tasks, or workflows of the project at hand; use scope:\"global\" ONLY for facts useful in ANY project (general tooling lessons, user-wide workflow preferences). Never write project-specific environment details (hostnames, IPs, repo-internal facts) to global scope: global memories are injected into every project's sessions and pollute unrelated contexts."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -119,7 +119,11 @@ impl Tool for MemoryTool {
                     "description": "Memory id. Required for forget/tag/related. For remember, optional: when supplied, must be unique within the target scope and match [A-Za-z0-9_:.-]{1,256}; auto-generated if omitted."
                 },
                 "tags": { "type": "array", "items": { "type": "string" } },
-                "scope": { "type": "string", "enum": ["project", "global", "all"] },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global", "all"],
+                    "description": "Storage/retrieval scope. When remembering: default project. Use global only for knowledge useful in every project (general lessons, user-wide preferences); project-specific environment facts (hosts, repos, deployments, credentials) must stay in project scope."
+                },
                 "from_id": { "type": "string" },
                 "to_id": { "type": "string" },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, or list. Zero returns no results. Recall defaults to 10." }
