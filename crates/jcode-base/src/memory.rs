@@ -73,6 +73,9 @@ const MEMORY_RELEVANCE_MAX_RESULTS: usize = 10;
 /// Wraps the graph-level effects from `jcode_memory_types::rule_engine`
 /// and additionally binds the graph metadata so the next save records the
 /// active ontology id.
+// Dormant since the upstream Jev merge rewired remember_project/global to
+// remember_in_graph; kept for the planned ontology-driven write path.
+#[allow(dead_code)]
 fn apply_plan(graph: &mut MemoryGraph, new_id: &str, plan: &jcode_memory_types::rule_engine::RulePlan) {
     if let Some(entry) = graph.memories.get_mut(new_id) {
         jcode_memory_types::rule_engine::apply_entry_effects(plan, entry);
@@ -293,6 +296,9 @@ impl MemoryManager {
 
     /// Borrow the active ontology id stored on `graph` (or the default if the
     /// graph was authored before ontology metadata existed).
+    // Dormant since the upstream Jev merge; kept for ontology-drift checks
+    // when the ontology-driven write path is re-enabled.
+    #[allow(dead_code)]
     fn active_ontology_id<'a>(&self, graph: &'a MemoryGraph) -> &'a str {
         if !graph.metadata.ontology_id.is_empty() {
             graph.metadata.ontology_id.as_str()

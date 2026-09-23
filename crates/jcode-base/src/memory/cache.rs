@@ -13,6 +13,8 @@ struct GraphCacheEntry {
     /// cache uses `version` as a monotonic counter bumped by the
     /// backend's save path.
     modified: Option<SystemTime>,
+    // Only read by cached_graph_for_backend; path-mode entries carry 0.
+    #[allow(dead_code)]
     version: u64,
 }
 
@@ -89,6 +91,9 @@ pub fn cache_graph_for_backend(
     }
 }
 
+// Dormant since the backend cache fell out of use; kept for the planned
+// backend-level graph reuse.
+#[allow(dead_code)]
 pub fn cached_graph_for_backend(
     backend_name: &str,
     key: &StoreKey,

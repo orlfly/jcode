@@ -145,6 +145,9 @@ impl OntologyRegistry {
 /// Apply the entry effects from a plan to `entry` and the graph effects to
 /// `graph`.  This is the single entry point the runtime uses to commit a
 /// dispatched plan, ensuring order and lifecycle guards are honoured.
+// Dormant since the upstream Jev merge disconnected the ontology write path;
+// retained with its tests for the planned re-enable.
+#[allow(dead_code)]
 pub fn apply_plan(
     entry: &mut MemoryEntry,
     new_id: &str,
@@ -156,6 +159,7 @@ pub fn apply_plan(
 }
 
 /// Lightweight summary of a plan for the memory log.
+#[allow(dead_code)]
 pub fn summarize_plan(plan: &RulePlan) -> MemoryEvent {
     let applied = plan.applied_rules.len();
     let skipped = plan.skipped.len();
@@ -178,6 +182,7 @@ pub fn summarize_plan(plan: &RulePlan) -> MemoryEvent {
 
 /// Convenience that lists the kinds of effects the registry knows how to
 /// apply.  Exposed for diagnostics and tests.
+#[allow(dead_code)]
 pub fn declared_effect_kinds(ontology: &Ontology, event: &str) -> Vec<&'static str> {
     use jcode_memory_types::rule_engine::declared_effect_kinds as inner;
     inner(ontology, event)
@@ -185,6 +190,7 @@ pub fn declared_effect_kinds(ontology: &Ontology, event: &str) -> Vec<&'static s
 
 /// Convenience that lists the kinds of effects the registry has conditions
 /// for.  Exposed for diagnostics and tests.
+#[allow(dead_code)]
 pub fn declared_condition_kinds(ontology: &Ontology, event: &str) -> Vec<&'static str> {
     let mut seen = std::collections::HashSet::new();
     let mut ordered = Vec::new();
@@ -201,6 +207,7 @@ pub fn declared_condition_kinds(ontology: &Ontology, event: &str) -> Vec<&'stati
 
 /// Convenience that lists the kinds of steps the registry declares.  Exposed
 /// for diagnostics and tests.
+#[allow(dead_code)]
 pub fn declared_step_kinds(ontology: &Ontology, event: &ScheduleEvent) -> Vec<&'static str> {
     use jcode_memory_types::activity::describe_step;
     let plan = activity_schedule(event, ontology);

@@ -121,6 +121,7 @@ impl SqliteGvecBackend {
     }
 
     /// Open an in-memory backend. Used by tests.
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let db = Database::open_in_memory()
             .map_err(|e| anyhow::anyhow!("SqliteGvecBackend::open_in_memory: {e}"))?;
@@ -139,6 +140,9 @@ impl SqliteGvecBackend {
             .map_err(|e| anyhow::anyhow!("open graph '{prefix}': {e}"))
     }
 
+    // Unused now that load() reads through graph() directly; kept for
+    // callers that only need the storage handle.
+    #[allow(dead_code)]
     fn storage(&self, key: &StoreKey) -> Result<Storage> {
         let g = self.graph(key)?;
         Ok(g.storage)
@@ -762,6 +766,8 @@ fn node_props(graph: &Graph, rowid: gvec_core::ids::NodeId) -> Result<Value> {
         .map_err(|e| anyhow::anyhow!("get_node({}): {e}", rowid.0))
 }
 
+// Placeholder for reverse_edges serialization; see comment below.
+#[allow(dead_code)]
 fn edge_properties_string(graph: &Graph, _rowid: gvec_core::ids::NodeId) -> String {
     // Best-effort string for reverse_edges. We don't have a direct
     // API, so just emit an empty placeholder; the upstream
@@ -772,6 +778,9 @@ fn edge_properties_string(graph: &Graph, _rowid: gvec_core::ids::NodeId) -> Stri
 
 /// Re-export a tiny helper so callers don't need to depend on gvec-core
 /// directly to enumerate node ids.
+// Dormant mutation helper kept alongside the backend trait's
+// apply_mutations API for future bulk-edit call sites.
+#[allow(dead_code)]
 pub fn apply_in_memory(mutations: &[GraphMutation], graph: &mut MemoryGraph) -> Result<()> {
     apply_mutations_in_place(graph, mutations)
         .map_err(|e| anyhow::anyhow!("apply_in_memory: {e}"))
@@ -780,7 +789,7 @@ pub fn apply_in_memory(mutations: &[GraphMutation], graph: &mut MemoryGraph) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jcode_memory_types::{Edge, MemoryCategory, MemoryEntry, MemoryScope};
+    use jcode_memory_types::{Edge, MemoryCategory, MemoryEntry};
 
     #[test]
     fn open_in_memory_round_trip() {

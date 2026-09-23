@@ -9,20 +9,6 @@ fn restore_env_var(key: &str, previous: Option<OsString>) {
     }
 }
 
-#[cfg(unix)]
-fn write_mock_cursor_agent(dir: &std::path::Path, script_body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = dir.join("cursor-agent-mock");
-    std::fs::write(&path, script_body).expect("write mock cursor agent");
-    let mut permissions = std::fs::metadata(&path)
-        .expect("stat mock cursor agent")
-        .permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&path, permissions).expect("chmod mock cursor agent");
-    path
-}
-
 #[test]
 fn command_candidates_adds_extension_on_windows() {
     crate::env::set_var("PATHEXT", ".EXE;.BAT");
@@ -756,7 +742,6 @@ fn cursor_status_is_available_for_authenticated_native_env_session() {
     let prev_access_token = std::env::var_os("CURSOR_ACCESS_TOKEN");
     let prev_refresh_token = std::env::var_os("CURSOR_REFRESH_TOKEN");
     let prev_api_key = std::env::var_os("CURSOR_API_KEY");
-    let temp = tempfile::TempDir::new().expect("create temp dir");
 
     crate::env::set_var(
         "CURSOR_ACCESS_TOKEN",

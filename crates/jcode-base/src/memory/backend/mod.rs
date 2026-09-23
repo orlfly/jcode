@@ -117,6 +117,8 @@ impl GraphBackend for JsonBackend {
 
 /// Convert a JSON-file backend path to its SQLite backend equivalent,
 /// so callers can migrate from one to the other in place.
+// Dormant until an in-place JSON -> sqlite-gvec migration is wired up.
+#[allow(dead_code)]
 pub fn json_path_to_sqlite_path(json_path: &Path) -> PathBuf {
     json_path.with_extension("sqlite")
 }
@@ -124,7 +126,7 @@ pub fn json_path_to_sqlite_path(json_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jcode_memory_types::{EdgeKind, MemoryCategory, MemoryEntry, MemoryScope};
+    use jcode_memory_types::{EdgeKind, MemoryCategory, MemoryEntry};
     use tempfile::tempdir;
 
     #[test]
