@@ -234,6 +234,9 @@ pub fn spawn_memory_generalizer() {
         // First tick fires immediately; skip it so daemon startup is not
         // slowed by an LLM round-trip.
         interval.tick().await;
+        crate::logging::info(&format!(
+            "memory generalizer scheduled: every {DEFAULT_INTERVAL_MINUTES} min"
+        ));
         loop {
             interval.tick().await;
             run_generalization_pass().await;
