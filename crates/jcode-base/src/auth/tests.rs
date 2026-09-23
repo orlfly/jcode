@@ -751,6 +751,7 @@ fn cursor_status_is_available_for_authenticated_native_env_session() {
     crate::env::remove_var("CURSOR_API_KEY");
     AuthStatus::invalidate_cache();
 
+    // Native auth via env token is honored even with no cursor-agent CLI.
     let status = AuthStatus::check();
     assert_eq!(status.cursor, AuthState::Available);
 

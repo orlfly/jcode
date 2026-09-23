@@ -317,7 +317,7 @@ pub use self::models::{
     cached_anthropic_model_ids_for_scope, cached_context_limit_for_model, cached_openai_model_ids,
     cached_openai_reasoning_efforts, clear_all_model_unavailability_for_account,
     clear_all_provider_unavailability_for_account, clear_model_unavailable_for_account,
-    clear_provider_unavailable_for_account,
+    clear_openai_provider_unavailability_for_account_label, clear_provider_unavailable_for_account,
     context_limit_for_model, context_limit_for_model_with_provider, fetch_anthropic_model_catalog,
     fetch_anthropic_model_catalog_oauth, fetch_openai_api_key_model_catalog,
     fetch_openai_context_limits, fetch_openai_model_catalog,
