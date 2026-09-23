@@ -188,7 +188,7 @@ fn full_and_fast_auth_status_match_for_shared_probe_fields() {
 
 #[cfg(unix)]
 #[test]
-fn full_and_fast_auth_status_document_cursor_cli_exception() {
+fn full_and_fast_auth_status_honor_cursor_native_env_auth() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().expect("create temp dir");
     let home = temp.path().join("home");
@@ -202,34 +202,32 @@ fn full_and_fast_auth_status_document_cursor_cli_exception() {
         "CURSOR_API_KEY",
         "CURSOR_ACCESS_TOKEN",
         "CURSOR_REFRESH_TOKEN",
-        "JCODE_CURSOR_CLI_PATH",
     ]
     .into_iter()
     .map(|key| (key, std::env::var_os(key)))
     .collect::<Vec<_>>();
-    let mock_cli = write_mock_cursor_agent(
-        temp.path(),
-        "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then\n  echo \"Authenticated\\nAccount: test@example.com\"\n  exit 0\nfi\nexit 1\n",
-    );
 
     crate::env::set_var("JCODE_HOME", temp.path().join("jcode-home"));
     crate::env::set_var("XDG_CONFIG_HOME", &xdg);
     crate::env::set_var("HOME", &home);
     crate::env::remove_var("CURSOR_API_KEY");
-    crate::env::remove_var("CURSOR_ACCESS_TOKEN");
     crate::env::remove_var("CURSOR_REFRESH_TOKEN");
-    crate::env::set_var("JCODE_CURSOR_CLI_PATH", &mock_cli);
+    // Native auth via env token is honored by both probe modes.
+    crate::env::set_var(
+        "CURSOR_ACCESS_TOKEN",
+        "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.sig",
+    );
     AuthStatus::invalidate_cache();
 
     let (full, _) = build_auth_status_uncached(AuthProbeMode::Full);
     let (fast, _) = build_auth_status_uncached(AuthProbeMode::Fast);
 
     assert_eq!(full.cursor, AuthState::Available);
-    assert_eq!(fast.cursor, AuthState::NotConfigured);
+    assert_eq!(fast.cursor, AuthState::Available);
     assert_eq!(
         full.cursor,
         AuthState::Available,
-        "Full auth probes cursor-agent status; fast auth intentionally skips CLI/vscdb probes"
+        "Full and fast auth both honor Cursor native auth from the environment"
     );
 
     for (key, value) in saved {
@@ -750,25 +748,30 @@ fn cursor_status_is_available_for_native_auth_without_cli() {
 
 #[cfg(unix)]
 #[test]
-fn cursor_status_is_available_for_authenticated_cli_session() {
+fn cursor_status_is_available_for_authenticated_native_env_session() {
+    // The probe no longer shells out to the `cursor-agent` CLI; it reports
+    // Available when Cursor native auth (env token, auth file, vscdb, or API
+    // key) is present.
     let _lock = crate::storage::lock_test_env();
+    let prev_access_token = std::env::var_os("CURSOR_ACCESS_TOKEN");
+    let prev_refresh_token = std::env::var_os("CURSOR_REFRESH_TOKEN");
     let prev_api_key = std::env::var_os("CURSOR_API_KEY");
-    let prev_cli_path = std::env::var_os("JCODE_CURSOR_CLI_PATH");
     let temp = tempfile::TempDir::new().expect("create temp dir");
-    let mock_cli = write_mock_cursor_agent(
-        temp.path(),
-        "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then\n  echo \"Authenticated\\nAccount: test@example.com\"\n  exit 0\nfi\nexit 1\n",
-    );
 
+    crate::env::set_var(
+        "CURSOR_ACCESS_TOKEN",
+        "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.sig",
+    );
+    crate::env::remove_var("CURSOR_REFRESH_TOKEN");
     crate::env::remove_var("CURSOR_API_KEY");
-    crate::env::set_var("JCODE_CURSOR_CLI_PATH", &mock_cli);
     AuthStatus::invalidate_cache();
 
     let status = AuthStatus::check();
     assert_eq!(status.cursor, AuthState::Available);
 
+    restore_env_var("CURSOR_ACCESS_TOKEN", prev_access_token);
+    restore_env_var("CURSOR_REFRESH_TOKEN", prev_refresh_token);
     restore_env_var("CURSOR_API_KEY", prev_api_key);
-    restore_env_var("JCODE_CURSOR_CLI_PATH", prev_cli_path);
     AuthStatus::invalidate_cache();
 }
 

@@ -44,6 +44,7 @@ impl Agent {
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
         self.set_log_context();
+        let usage_turn_id = self.model_usage_turn_id();
         crate::session_metrics::record_turn(&self.session.id);
         // Mark this session as actively streaming for presence UIs (e.g. the
         // macOS menu bar indicator). Cleared automatically on every exit path.
@@ -538,6 +539,7 @@ impl Agent {
                         saw_message_end = false;
                         stop_reason = None;
                     }
+                    StreamEvent::TextDone => {}
                     StreamEvent::MessageEnd {
                         stop_reason: reason,
                     } => {
@@ -802,17 +804,17 @@ impl Agent {
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.input.clone(),
-                    thought_signature: tc.thought_signature.clone(),
-                });
+                content_blocks.push(tc.to_tool_use_block());
             }
 
             let assistant_message_id = if !content_blocks.is_empty() {
                 crate::telemetry::record_assistant_response();
                 let token_usage = Some(crate::session::StoredTokenUsage {
+                    prompt_tokens: Some(self.effective_context_tokens_from_usage(
+                        self.last_usage.input_tokens,
+                        self.last_usage.cache_read_input_tokens,
+                        self.last_usage.cache_creation_input_tokens,
+                    )),
                     input_tokens: self.last_usage.input_tokens,
                     output_tokens: self.last_usage.output_tokens,
                     cache_read_input_tokens: self.last_usage.cache_read_input_tokens,
@@ -822,6 +824,7 @@ impl Agent {
                     self.add_message_ext(Role::Assistant, content_blocks, None, token_usage);
                 self.push_embedding_snapshot_if_semantic(&text_content);
                 self.session.save()?;
+                self.record_model_turn_usage(&usage_turn_id);
                 Some(message_id)
             } else {
                 None

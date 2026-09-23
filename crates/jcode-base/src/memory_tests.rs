@@ -11,7 +11,62 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static PENDING_MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static PENDING_MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn jev_storage_preserves_code_spelling_and_scope_without_embeddings() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/jev-storage");
+        let first = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "path: foo/bar"))
+            .unwrap();
+        let second = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "path: foo-bar"))
+            .unwrap();
+        let third = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "path: Foo/bar"))
+            .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        let repeated = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "path: foo/bar"))
+            .unwrap();
+        assert_eq!(first, repeated);
+        let global = manager
+            .remember_global(MemoryEntry::new(MemoryCategory::Fact, "path: foo/bar"))
+            .unwrap();
+        assert_ne!(first, global);
+        let all = manager.list_all().unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|entry| entry.embedding.is_none()));
+        assert_eq!(
+            manager
+                .load_project_graph()
+                .unwrap()
+                .get_memory(&first)
+                .unwrap()
+                .strength,
+            2
+        );
+    });
+}
+
+#[test]
+fn jev_project_write_without_scope_fails_instead_of_silently_losing_memory() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new();
+        assert!(
+            manager
+                .remember_project(MemoryEntry::new(MemoryCategory::Fact, "fact"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .remember_global(MemoryEntry::new(MemoryCategory::Fact, "fact"))
+                .is_ok()
+        );
+    });
+}
 
 fn with_temp_home<F, T>(f: F) -> T
 where
@@ -513,9 +568,12 @@ fn test_mode_ignores_the_project_dir_and_cannot_see_real_project_memory() {
 
 #[test]
 fn sqlite_default_migrates_legacy_json_graph_once() {
-    // Only meaningful when the sqlite-gvec backend is the active default.
-    // Under the JSON backend this test is vacuous, but it still validates
-    // the routing layer handles a legacy snapshot gracefully.
+    // Only meaningful when the sqlite-gvec backend is the active backend.
+    // JSON is the default (matching upstream), so skip unless opted in.
+    if crate::memory::active_backend_name() != "sqlite-gvec" {
+        eprintln!("skipping: JCODE_MEMORY_BACKEND != sqlite-gvec");
+        return;
+    }
     with_temp_home(|_home| {
         let project_dir = "/tmp/jcode-migrate-project";
         let manager = MemoryManager::new_test().with_project_dir(project_dir);

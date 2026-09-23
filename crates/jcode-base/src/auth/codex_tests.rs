@@ -222,9 +222,11 @@ fn multi_account_active_switch_works() {
     })
     .unwrap();
 
-    assert_eq!(active_account_label().as_deref(), Some("openai-1"));
-    set_active_account("openai-2").unwrap();
-    assert_eq!(active_account_label().as_deref(), Some("openai-2"));
+    // Upsert assigns canonical animal labels (openai-otter, openai-fox, ...)
+    // regardless of the requested label.
+    assert_eq!(active_account_label().as_deref(), Some("openai-otter"));
+    set_active_account("openai-fox").unwrap();
+    assert_eq!(active_account_label().as_deref(), Some("openai-fox"));
 
     let creds = load_credentials().unwrap();
     assert_eq!(creds.access_token, "at_work");

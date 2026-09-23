@@ -111,6 +111,9 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<StoredMessage>,
+    /// Durable logical input turn identity for per-route usage deduplication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_usage_turn_id: Option<String>,
     /// Persisted compacted-view state so reload/resume can continue using the
     /// active summary + recent tail instead of re-sending the full transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -499,6 +502,7 @@ impl Session {
             updated_at: self.updated_at,
             compaction: self.compaction.clone(),
             provider_session_id: self.provider_session_id.clone(),
+            model_usage_turn_id: self.model_usage_turn_id.clone(),
             provider_key: self.provider_key.clone(),
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
@@ -700,6 +704,7 @@ impl Session {
         self.updated_at = meta.updated_at;
         self.compaction = meta.compaction;
         self.provider_session_id = meta.provider_session_id;
+        self.model_usage_turn_id = meta.model_usage_turn_id;
         self.provider_key = meta.provider_key;
         self.model = meta.model;
         self.reasoning_effort = meta.reasoning_effort;
@@ -737,6 +742,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -791,6 +797,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -1179,7 +1186,10 @@ request in this new forked session, using the inherited conversation only as con
     }
 
     pub fn token_usage_totals(&self) -> crate::protocol::TokenUsageTotals {
-        let mut totals = crate::protocol::TokenUsageTotals::default();
+        let mut totals = crate::protocol::TokenUsageTotals {
+            cache_prompt_tokens: Some(0),
+            ..Default::default()
+        };
         for message in &self.messages {
             let Some(usage) = message.token_usage.as_ref() else {
                 continue;
@@ -1190,6 +1200,10 @@ request in this new forked session, using the inherited conversation only as con
             if usage.cache_read_input_tokens.is_some()
                 || usage.cache_creation_input_tokens.is_some()
             {
+                totals.cache_prompt_tokens = totals
+                    .cache_prompt_tokens
+                    .zip(usage.prompt_tokens)
+                    .map(|(total, prompt)| total.saturating_add(prompt));
                 totals.cache_reported_input_tokens = totals
                     .cache_reported_input_tokens
                     .saturating_add(usage.input_tokens);

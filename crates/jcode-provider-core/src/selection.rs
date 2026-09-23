@@ -154,6 +154,7 @@ pub fn cli_provider_arg_for_session_key(key: &str) -> Option<&'static str> {
         "bedrock" => Some("bedrock"),
         "antigravity" => Some("antigravity"),
         "code-assist-oauth" | "google" => Some("google"),
+        "grok-build" | "grok-build-acp" => Some("grok-build"),
         // openai-compatible / custom profiles, remote-catalog, current, and any
         // unknown key have no clean standalone CLI provider value (they need a
         // profile too), so omit the flag and let the persisted session route.
@@ -441,6 +442,14 @@ mod tests {
         assert_eq!(cli_provider_arg_for_session_key("copilot"), Some("copilot"));
         assert_eq!(cli_provider_arg_for_session_key("gemini"), Some("gemini"));
         assert_eq!(cli_provider_arg_for_session_key("bedrock"), Some("bedrock"));
+        assert_eq!(
+            cli_provider_arg_for_session_key("grok-build"),
+            Some("grok-build")
+        );
+        assert_eq!(
+            cli_provider_arg_for_session_key("grok-build-acp"),
+            Some("grok-build")
+        );
         // Case-insensitive and whitespace tolerant.
         assert_eq!(
             cli_provider_arg_for_session_key("  Anthropic-API-Key "),
@@ -553,6 +562,7 @@ mod tests {
                 api_method: "a".to_string(),
                 available: true,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             },
             ModelRoute {
@@ -561,6 +571,7 @@ mod tests {
                 api_method: "a".to_string(),
                 available: false,
                 detail: "duplicate".to_string(),
+                usage: None,
                 cheapness: None,
             },
             ModelRoute {
@@ -569,6 +580,7 @@ mod tests {
                 api_method: "b".to_string(),
                 available: true,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             },
         ];
@@ -587,6 +599,7 @@ mod tests {
                 api_method: "openai-compatible".to_string(),
                 available: true,
                 detail: "generic transport".to_string(),
+                usage: None,
                 cheapness: None,
             },
             ModelRoute {
@@ -595,6 +608,7 @@ mod tests {
                 api_method: "openai-compatible:cerebras".to_string(),
                 available: true,
                 detail: "profile transport".to_string(),
+                usage: None,
                 cheapness: None,
             },
             ModelRoute {
@@ -603,6 +617,7 @@ mod tests {
                 api_method: "openai-compatible:other".to_string(),
                 available: true,
                 detail: "different provider".to_string(),
+                usage: None,
                 cheapness: None,
             },
             ModelRoute {
@@ -611,6 +626,7 @@ mod tests {
                 api_method: "openai-compatible:cerebras-alt".to_string(),
                 available: true,
                 detail: "distinct profile route".to_string(),
+                usage: None,
                 cheapness: None,
             },
         ];
@@ -662,6 +678,7 @@ mod tests {
                 api_method: a.to_string(),
                 available: seed & 1 == 0,
                 detail: format!("route-{i}"),
+                usage: None,
                 cheapness: None,
             });
         }

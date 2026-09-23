@@ -896,18 +896,21 @@ fn in_flight_count_excludes_foreign_queued_session() {
 fn latest_assistant_report_uses_last_non_empty_assistant_message() {
     let messages = vec![
         HistoryMessage {
+            response_stats: None,
             role: "assistant".to_string(),
             content: " earlier ".to_string(),
             tool_calls: None,
             tool_data: None,
         },
         HistoryMessage {
+            response_stats: None,
             role: "user".to_string(),
             content: "ignored".to_string(),
             tool_calls: None,
             tool_data: None,
         },
         HistoryMessage {
+            response_stats: None,
             role: "assistant".to_string(),
             content: " final report ".to_string(),
             tool_calls: None,
@@ -1205,6 +1208,7 @@ fn format_swarm_model_list_renders_routes_and_default() {
             api_method: "openai-api-key".to_string(),
             available: true,
             detail: "API key".to_string(),
+            usage: None,
             cheapness: None,
         },
         jcode_provider_core::ModelRoute {
@@ -1213,6 +1217,7 @@ fn format_swarm_model_list_renders_routes_and_default() {
             api_method: "anthropic-api-key".to_string(),
             available: false,
             detail: String::new(),
+            usage: None,
             cheapness: None,
         },
     ];
@@ -1470,6 +1475,7 @@ impl RawClient {
         let id = self.next_id;
         self.next_id += 1;
         self.send_request(Request::Subscribe {
+            supports_pdf_panels: false,
             id,
             working_dir: Some(working_dir.display().to_string()),
             selfdev: None,

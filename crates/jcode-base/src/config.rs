@@ -58,6 +58,10 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_COPY_BADGE_ALT_LABEL",
     "JCODE_COPY_SELECTION_TOGGLE_KEY",
     "JCODE_COPILOT_PREMIUM",
+    "JCODE_GEMINI_FORCE_OAUTH",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_PROJECT_ID",
+    "JCODE_WAKE_MODE",
     "JCODE_CROSS_PROVIDER_FAILOVER",
     "JCODE_DEBUG_SOCKET",
     "JCODE_DEFAULT_REASONING_DISPLAY",
@@ -114,6 +118,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MEMORY_EMBEDDING_MODEL",
     "JCODE_MEMORY_ENABLED",
     "JCODE_ENABLE_MERMAID",
+    "JCODE_MEMORY_JEV_PROVIDER",
     "JCODE_MEMORY_MODEL",
     "JCODE_MEMORY_SIDECAR_ENABLED",
     "JCODE_PERSIST_MEMORY_INJECTIONS",
@@ -168,6 +173,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_RETRY_BACKOFF_CAP_SECS",
     "JCODE_SWARM_ENABLED",
     "JCODE_SWARM_EFFORT",
+    "JCODE_SWARM_ROOT_EFFORT",
+    "JCODE_SWARM_DEEP_ROOT_EFFORT",
     "JCODE_SWARM_MODEL",
     "JCODE_SWARM_MAX_CONCURRENT_AGENTS",
     "JCODE_SWARM_SPAWN_MODE",
@@ -836,7 +843,7 @@ fn sponsors_is_default(sponsors: &SponsorsConfig) -> bool {
     sponsors.enabled && is_default_discovery_endpoint(&sponsors.endpoint)
 }
 
-/// Endpoints that only ever came from a shipped default, never a user choice.
+/// Endpoints used by shipped defaults. These may also be explicit user choices.
 fn is_default_discovery_endpoint(endpoint: &str) -> bool {
     matches!(
         endpoint.trim_end_matches('/'),

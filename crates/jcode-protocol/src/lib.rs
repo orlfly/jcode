@@ -50,6 +50,8 @@ pub enum CommDeliveryMode {
 /// A message in conversation history (for sync)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_stats: Option<jcode_session_types::ResponseStats>,
     pub role: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +69,10 @@ pub struct SessionActivitySnapshot {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsageTotals {
+    /// Sum of full prompt sizes for requests with cache telemetry. None means
+    /// legacy records lack per-request accounting, not that the total is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_prompt_tokens: Option<u64>,
     pub messages_with_token_usage: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -579,7 +585,7 @@ impl Request {
             Request::ClientDebugResponse { id, .. } => *id,
             Request::Subscribe { id, .. } | Request::PrepareDisconnect { id } => *id,
             Request::GetHistory { id } => *id,
-            Request::GetModelCatalog { id } => *id,
+            Request::GetModelCatalog { id, .. } => *id,
             Request::GetCompactedHistory { id, .. } => *id,
             Request::Reload { id, .. } => *id,
             Request::ResumeSession { id, .. } => *id,
@@ -648,6 +654,7 @@ impl Request {
         matches!(
             self,
             Request::Ping { .. }
+                | Request::NotifySession { .. }
                 | Request::CommShare { .. }
                 | Request::CommRead { .. }
                 | Request::CommMessage { .. }

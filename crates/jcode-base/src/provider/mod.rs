@@ -60,9 +60,9 @@ pub use jcode_provider_core::{
     ModelRouteApiMethod, NativeCompactionResult, NativeToolResult, NativeToolResultSender,
     PremiumMode, Provider, RouteBillingKind, RouteCheapnessEstimate, RouteCostConfidence,
     RouteCostSource, RouteSelection, RuntimeKey, dedupe_model_routes,
-    explicit_model_provider_prefix, fresh_transport_client, inferred_reasoning_efforts,
-    model_name_for_provider, normalize_copilot_model_name, provider_from_model_key,
-    shared_http_client, summarize_model_catalog_refresh,
+    explicit_model_provider_prefix, fresh_transport_client, grok_build_model_spec,
+    inferred_reasoning_efforts, model_name_for_provider, normalize_copilot_model_name,
+    provider_from_model_key, shared_http_client, summarize_model_catalog_refresh,
 };
 pub use jcode_provider_core::{
     FallbackPickOptions, error_looks_like_credential_failure, model_route_provider_labels_match,
@@ -239,6 +239,7 @@ fn direct_openai_compatible_profile_routes(
             api_method: api_method.clone(),
             available: true,
             detail: detail.clone(),
+            usage: None,
             cheapness: None,
         });
     }
@@ -310,26 +311,30 @@ pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Resu
 use self::dispatch::CompletionMode;
 pub use self::models::{
     AccountModelAvailability, AccountModelAvailabilityState, AnthropicModelCatalog,
-    ModelCatalogHttpStatus, OpenAIModelCatalog, begin_anthropic_model_catalog_refresh,
-    begin_openai_model_catalog_refresh, cached_anthropic_model_ids, cached_context_limit_for_model,
-    cached_openai_model_ids, cached_openai_reasoning_efforts,
-    clear_all_model_unavailability_for_account, clear_all_provider_unavailability_for_account,
-    clear_model_unavailable_for_account, clear_provider_unavailable_for_account,
+    ModelCatalogHttpStatus, OpenAIModelCatalog, anthropic_catalog_scope_for_route,
+    begin_anthropic_model_catalog_refresh, begin_anthropic_model_catalog_refresh_for_scope,
+    begin_openai_model_catalog_refresh, cached_anthropic_model_ids,
+    cached_anthropic_model_ids_for_scope, cached_context_limit_for_model, cached_openai_model_ids,
+    cached_openai_reasoning_efforts, clear_all_model_unavailability_for_account,
+    clear_all_provider_unavailability_for_account, clear_model_unavailable_for_account,
+    clear_provider_unavailable_for_account,
     context_limit_for_model, context_limit_for_model_with_provider, fetch_anthropic_model_catalog,
     fetch_anthropic_model_catalog_oauth, fetch_openai_api_key_model_catalog,
     fetch_openai_context_limits, fetch_openai_model_catalog,
     finish_anthropic_model_catalog_refresh_for_scope, finish_openai_model_catalog_refresh,
     format_account_model_availability_detail, get_best_available_openai_model,
-    is_model_available_for_account, known_anthropic_model_ids, known_openai_model_ids,
-    model_availability_for_account, model_unavailability_detail_for_account,
-    note_openai_model_catalog_refresh_attempt, openai_platform_api_key_configured,
-    persist_anthropic_model_catalog, persist_openai_model_catalog, populate_account_models,
-    populate_anthropic_models, populate_context_limits, populate_context_limits_from_config,
+    is_model_available_for_account, known_anthropic_model_ids, known_anthropic_model_ids_for_scope,
+    known_openai_model_ids, model_availability_for_account,
+    model_unavailability_detail_for_account, note_openai_model_catalog_refresh_attempt,
+    openai_platform_api_key_configured, persist_anthropic_model_catalog,
+    persist_anthropic_model_catalog_for_scope, persist_openai_model_catalog,
+    populate_account_models, populate_anthropic_models, populate_anthropic_models_for_scope,
+    populate_context_limits, populate_context_limits_from_config,
     populate_context_limits_from_config_value, provider_for_model, provider_for_model_with_hint,
     provider_unavailability_detail_for_account, record_model_unavailable_for_account,
     record_provider_unavailable_for_account, refresh_openai_model_catalog_in_background,
     resolve_model_capabilities, should_refresh_anthropic_model_catalog,
-    should_refresh_openai_model_catalog,
+    should_refresh_anthropic_model_catalog_for_scope, should_refresh_openai_model_catalog,
 };
 pub use self::selection::DefaultModelSelection;
 use self::selection::{ActiveProvider, ProviderAvailability};
@@ -3029,28 +3034,41 @@ pub fn cache_ttl_for_provider(provider: &str) -> Option<u64> {
     cache_ttl_for_provider_model(provider, None)
 }
 
+/// Whether a reported cache lifetime is an estimate rather than a hard expiry.
+/// OpenAI documents typical, maximum, or minimum lifetimes depending on model.
+/// The generic OpenRouter/subscription/Gemini values are also only heuristics.
+pub fn cache_ttl_is_estimate(provider: &str) -> bool {
+    jcode_provider_core::AuthRoute::parse(provider)
+        .is_some_and(|route| route.provider == jcode_provider_core::DualAuthProvider::OpenAI)
+        || matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "openrouter" | "jcode subscription" | "gemini"
+        )
+}
+
 /// Get the prompt cache TTL in seconds for a given provider/model pair.
 ///
-/// This is provider cache-retention policy: it depends only on provider
-/// families (anthropic/openai/...) and their model capabilities, so it lives
-/// in `provider` rather than the UI layer.
+/// This is a cache-retention estimate, not a guaranteed expiry or cache hit.
+/// It depends on the auth route, model and configured request retention.
 pub fn cache_ttl_for_provider_model(provider: &str, model: Option<&str>) -> Option<u64> {
-    match provider.to_lowercase().as_str() {
+    if let Some(route) = jcode_provider_core::AuthRoute::parse(provider)
+        && route.provider == jcode_provider_core::DualAuthProvider::OpenAI
+    {
+        // Codex OAuth omits API retention controls. A generic runtime name does
+        // not identify the credential mode, so don't claim an API-only lifetime.
+        return (route.mode == jcode_provider_core::AuthMode::ApiKey).then(|| {
+            openai::prompt_cache_ttl_for_model(
+                model,
+                openai::prompt_cache_retention_from_env().as_deref(),
+            )
+        });
+    }
+    match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" | "claude" => Some(if anthropic::is_cache_ttl_1h() {
             60 * 60
         } else {
             300
         }),
-        "openai" => {
-            if model
-                .map(openai::supports_extended_prompt_cache_retention)
-                .unwrap_or(false)
-            {
-                Some(24 * 60 * 60)
-            } else {
-                Some(300)
-            }
-        }
         "openrouter" => Some(300),
         "jcode subscription" => Some(300),
         "gemini" => Some(300),

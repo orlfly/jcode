@@ -123,7 +123,7 @@ fn memory_status_badge(activity: Option<&MemoryActivity>) -> (String, Color) {
     if let Some(pipeline) = &activity.pipeline {
         let live_step = [
             ("SEARCH", &pipeline.search, rgb(140, 180, 255)),
-            ("VERIFY", &pipeline.verify, rgb(255, 200, 100)),
+            ("JEV", &pipeline.verify, rgb(255, 200, 100)),
             ("INJECT", &pipeline.inject, rgb(200, 150, 255)),
             ("UPDATE", &pipeline.maintain, rgb(120, 220, 180)),
         ]
@@ -153,7 +153,7 @@ fn memory_status_badge(activity: Option<&MemoryActivity>) -> (String, Color) {
     match &activity.state {
         MemoryState::Idle => ("IDLE".to_string(), rgb(120, 120, 130)),
         MemoryState::Embedding => ("SEARCH".to_string(), rgb(140, 180, 255)),
-        MemoryState::SidecarChecking { .. } => ("VERIFY".to_string(), rgb(255, 200, 100)),
+        MemoryState::SidecarChecking { .. } => ("JEV".to_string(), rgb(255, 200, 100)),
         MemoryState::FoundRelevant { .. } => ("READY".to_string(), rgb(100, 200, 100)),
         MemoryState::Extracting { .. } => ("SAVE".to_string(), rgb(200, 150, 255)),
         MemoryState::Maintaining { .. } => ("UPDATE".to_string(), rgb(120, 220, 180)),
@@ -212,7 +212,7 @@ fn render_memory_pipeline_lines(pipeline: &PipelineState, max_width: usize) -> V
     vec![
         render_memory_step_line(
             "╭ ",
-            "Find matches",
+            "Load memories",
             &pipeline.search,
             memory_step_detail(
                 "search",
@@ -224,7 +224,7 @@ fn render_memory_pipeline_lines(pipeline: &PipelineState, max_width: usize) -> V
         ),
         render_memory_step_line(
             "├ ",
-            "Check relevance",
+            "Jev relevance",
             &pipeline.verify,
             memory_step_detail(
                 "verify",
@@ -275,14 +275,14 @@ fn render_memory_pipeline_display_lines(
     vec![
         render_memory_step_line(
             "╭ ",
-            "Find matches",
+            "Load memories",
             &search,
             memory_step_detail("search", &search, None, None),
             max_width,
         ),
         render_memory_step_line(
             "├ ",
-            "Check relevance",
+            "Jev relevance",
             &verify,
             memory_step_detail("verify", &verify, None, verify_progress),
             max_width,

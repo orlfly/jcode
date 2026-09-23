@@ -403,6 +403,7 @@ mod history_dedup_tests {
 
     fn message(role: &str, content: &str) -> HistoryMessage {
         HistoryMessage {
+            response_stats: None,
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,
@@ -412,6 +413,7 @@ mod history_dedup_tests {
 
     fn image(data: &str) -> RenderedImage {
         RenderedImage {
+            history_message_index: None,
             media_type: "image/png".to_string(),
             data: data.to_string(),
             label: None,
@@ -806,6 +808,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 // local push_turn_footer path: this feeds the cache
                 // countdown/cold indicators as "what gets resent".
                 let effective = crate::tui::info_widget::effective_prompt_tokens(
+                    &app.kv_cache_provider_name(),
                     input,
                     app.streaming.streaming_cache_read_tokens.unwrap_or(0),
                     app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
@@ -841,6 +844,23 @@ pub(in crate::tui::app) fn handle_server_event(
                 let has_cache_telemetry = app.streaming.streaming_cache_read_tokens.is_some()
                     || app.streaming.streaming_cache_creation_tokens.is_some();
                 if has_cache_telemetry {
+                    let prompt = crate::tui::info_widget::effective_prompt_tokens(
+                        &app.kv_cache_provider_name(),
+                        input,
+                        app.streaming.streaming_cache_read_tokens.unwrap_or(0),
+                        app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+                    );
+                    let previous_prompt = if had_cache_telemetry {
+                        app.token_accounting.last_cache_prompt_tokens.unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    app.token_accounting.total_cache_prompt_tokens = app
+                        .token_accounting
+                        .total_cache_prompt_tokens
+                        .saturating_sub(previous_prompt)
+                        .saturating_add(prompt);
+                    app.token_accounting.last_cache_prompt_tokens = Some(prompt);
                     let reported_delta = if had_cache_telemetry {
                         input.saturating_sub(previous_input)
                     } else {
@@ -868,12 +888,13 @@ pub(in crate::tui::app) fn handle_server_event(
                         );
                     app.token_accounting.last_cache_reported_input_tokens = Some(input);
                     app.token_accounting.last_cache_read_tokens =
-                        Some(app.streaming.streaming_cache_read_tokens.unwrap_or(0));
+                        app.streaming.streaming_cache_read_tokens;
                     app.token_accounting.last_cache_creation_tokens =
-                        Some(app.streaming.streaming_cache_creation_tokens.unwrap_or(0));
+                        app.streaming.streaming_cache_creation_tokens;
                 }
 
                 let effective_prompt_tokens = crate::tui::info_widget::effective_prompt_tokens(
+                    &app.kv_cache_provider_name(),
                     input,
                     app.streaming.streaming_cache_read_tokens.unwrap_or(0),
                     app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
@@ -969,6 +990,7 @@ pub(in crate::tui::app) fn handle_server_event(
             app.status_detail = Some(detail);
             eager_stream_redraw
         }
+        ServerEvent::TextDone => false,
         ServerEvent::MessageEnd { .. } => {
             app.pause_streaming_tps(true);
             app.stream_message_ended = true;
@@ -1122,6 +1144,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 }
                 app.deferred_stream_done_id = None;
                 let turn_duration_secs = app.display_turn_duration_secs();
+                app.remember_terminal_title_work();
                 if completes_resumed_turn {
                     crate::logging::info(&format!(
                         "Treating Done id={} as completion for resumed remote activity",
@@ -1223,8 +1246,9 @@ pub(in crate::tui::app) fn handle_server_event(
             // queue and re-adopt the running-turn state so the queue
             // dispatches once the real turn completes.
             if message == "Already processing a message"
-                && recover_undelivered_queued_continuation(app, "server busy rejection")
+                && recover_rejected_queued_continuation(app)
             {
+                remote.clear_pending();
                 app.is_processing = true;
                 app.status = ProcessingStatus::Thinking(Instant::now());
                 app.current_message_id = None;
@@ -1616,9 +1640,19 @@ pub(in crate::tui::app) fn handle_server_event(
             crate::set_current_session(&session_id);
             app.note_client_focus(true);
             let session_changed = prev_session_id.as_deref() != Some(session_id.as_str());
+            // The initial Subscribe snapshot predates an early startup Message
+            // sent on the same ordered connection. Adopting its session id must
+            // not make that in-flight request idle or discard its retry payload.
+            // An actual session switch must still reset the old session's state.
+            let preserve_startup_send = prev_session_id.is_none()
+                && !remote.has_loaded_history()
+                && app.pending_startup_prompt_echo.is_some()
+                && app.current_message_id.is_some();
 
             if session_changed {
-                app.rate_limit_pending_message = None;
+                if !preserve_startup_send {
+                    app.rate_limit_pending_message = None;
+                }
                 app.rate_limit_reset = None;
                 app.connection_type = None;
                 app.status_detail = None;
@@ -1634,10 +1668,12 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.streaming.streaming_cache_creation_tokens = None;
                 app.kv_cache.current_api_usage_recorded = false;
                 app.token_accounting.total_cache_reported_input_tokens = 0;
+                app.token_accounting.total_cache_prompt_tokens = 0;
                 app.token_accounting.total_cache_read_tokens = 0;
                 app.token_accounting.total_cache_creation_tokens = 0;
                 app.token_accounting.total_cache_optimal_input_tokens = 0;
                 app.token_accounting.last_cache_reported_input_tokens = None;
+                app.token_accounting.last_cache_prompt_tokens = None;
                 app.token_accounting.last_cache_read_tokens = None;
                 app.token_accounting.last_cache_creation_tokens = None;
                 app.token_accounting.last_cache_optimal_input_tokens = None;
@@ -1647,16 +1683,18 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.kv_cache.kv_cache_turn_number = None;
                 app.kv_cache.kv_cache_turn_call_index = 0;
                 app.kv_cache.kv_cache_miss_samples.clear();
-                app.processing_started = None;
-                app.clear_visible_turn_started();
+                if !preserve_startup_send {
+                    app.processing_started = None;
+                    app.clear_visible_turn_started();
+                    app.last_stream_activity = None;
+                    app.is_processing = false;
+                    app.status = ProcessingStatus::Idle;
+                }
                 app.replay_processing_started_ms = None;
                 app.replay_elapsed_override = None;
                 app.reset_streaming_tps();
-                app.last_stream_activity = None;
                 app.stream_message_ended = false;
                 app.remote_resume_activity = None;
-                app.is_processing = false;
-                app.status = ProcessingStatus::Idle;
                 app.follow_chat_bottom();
                 if prev_session_id.is_some() {
                     app.queued_messages.clear();
@@ -1751,6 +1789,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.token_accounting.total_input_tokens = 0;
                 app.token_accounting.total_output_tokens = 0;
                 app.token_accounting.total_cache_reported_input_tokens = 0;
+                app.token_accounting.total_cache_prompt_tokens = 0;
                 app.token_accounting.total_cache_read_tokens = 0;
                 app.token_accounting.total_cache_creation_tokens = 0;
                 app.token_accounting.total_cache_optimal_input_tokens = 0;
@@ -2282,6 +2321,18 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.set_status_notice(format!("Model → {}", model));
             }
             false
+        }
+        ServerEvent::ModelUsageUpdated { route } => {
+            for cached in &mut app.remote_model_options {
+                if cached.model == route.model
+                    && cached.provider == route.provider
+                    && cached.api_method == route.api_method
+                {
+                    cached.usage = route.usage.clone();
+                }
+            }
+            app.invalidate_model_picker_cache();
+            true
         }
         ServerEvent::AvailableModelsUpdated {
             provider_name,
