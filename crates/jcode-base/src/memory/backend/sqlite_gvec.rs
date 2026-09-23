@@ -30,6 +30,7 @@
 use crate::storage;
 use anyhow::{Context, Result};
 use gvec::{Database, Graph};
+use gvec_core::sql::SqlExecutor as _;
 use gvec_core::storage::Storage;
 use jcode_memory_types::{
     ClusterEntry, EdgeKind, GraphBackend, GraphMutation, MemoryGraph, StoreKey, TagEntry,
@@ -539,6 +540,44 @@ impl GraphBackend for SqliteGvecBackend {
         // Apply mutations first, then save the resulting graph.
         let _ = self.apply_mutations(key, mutations)?;
         self.save(key, graph)
+    }
+
+    /// Enumerate store keys from persisted state: every table of the form
+    /// `<prefix>_nodes` maps back to the store key whose sanitised name is
+    /// `<prefix>`. Undoes `sanitize("project:<hash>")` -> `g_project_<hash>`.
+    fn list_keys(&self) -> Result<Vec<StoreKey>> {
+        let rows = self
+            .db
+            .db
+            .conn
+            .query_all_json(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%\\_nodes' ESCAPE '\\'",
+                &[],
+            )
+            .map_err(|e| anyhow::anyhow!("list_keys: {e}"))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let Some(Value::String(name)) = row.first() else {
+                continue;
+            };
+            // Strip the trailing "_nodes", then reverse the "g_" prefix
+            // added by `graph()`. Characters that `sanitize` mapped to '_'
+            // are ambiguous, but store keys we write are safe identifiers
+            // already ("global", "project:<16 hex>"), so a single recovery
+            // pass is exact for them.
+            let prefix = name.strip_suffix("_nodes").unwrap_or(name.as_str());
+            let raw = prefix.strip_prefix("g_").unwrap_or(prefix);
+            if raw.is_empty() || raw == "global" {
+                // The global store has its own key name; keep it as-is so
+                // callers see the real key space.
+                keys.push(StoreKey::new("global".to_string()));
+            } else if let Some(hash) = raw.strip_prefix("project_") {
+                keys.push(StoreKey::new(format!("project:{hash}")));
+            } else {
+                keys.push(StoreKey::new(raw.to_string()));
+            }
+        }
+        Ok(keys)
     }
 
     /// Run an FTS5 search across the Memory nodes of a single store.

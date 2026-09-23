@@ -19,9 +19,10 @@ pub use persistence::{AmbientLock, ScheduledQueue};
 #[cfg(test)]
 pub(crate) use prompt::format_duration_rough;
 pub use prompt::{
-    MemoryGraphHealth, RecentSessionInfo, ResourceBudget, build_ambient_system_prompt,
-    format_minutes_human, format_scheduled_session_message, gather_feedback_memories,
-    gather_memory_graph_health, gather_recent_sessions,
+    GlobalPromotionCandidate, MemoryGraphHealth, RecentSessionInfo, ResourceBudget,
+    build_ambient_system_prompt, format_minutes_human, format_scheduled_session_message,
+    gather_feedback_memories, gather_global_promotion_candidates, gather_memory_graph_health,
+    gather_recent_sessions,
 };
 
 use crate::storage;

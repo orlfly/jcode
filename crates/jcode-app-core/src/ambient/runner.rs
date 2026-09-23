@@ -844,6 +844,7 @@ impl AmbientRunnerHandle {
         let graph_health = ambient::gather_memory_graph_health(&memory_manager);
         let recent_sessions = ambient::gather_recent_sessions(state.last_run);
         let feedback_memories = ambient::gather_feedback_memories(&memory_manager);
+        let promotion_candidates = ambient::gather_global_promotion_candidates(&memory_manager);
 
         let budget = ambient::ResourceBudget {
             provider: provider.name().to_string(),
@@ -861,6 +862,7 @@ impl AmbientRunnerHandle {
             &graph_health,
             &recent_sessions,
             &feedback_memories,
+            &promotion_candidates,
             &budget,
             active_sessions,
         );

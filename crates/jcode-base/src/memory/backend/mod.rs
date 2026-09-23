@@ -77,6 +77,33 @@ impl GraphBackend for JsonBackend {
         "json"
     }
 
+    /// Enumerate store keys from persisted state: every `<name>.json`
+    /// snapshot under the backend root is a store. `sanitize` maps unsafe
+    /// characters to '_' so a recovery pass is exact for the keys jcode
+    /// writes ("global", "project:<16 hex>").
+    fn list_keys(&self) -> Result<Vec<StoreKey>> {
+        let Ok(dir) = std::fs::read_dir(&self.root) else {
+            return Ok(Vec::new());
+        };
+        let mut keys = Vec::new();
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // Reverse sanitize("project:<hash>") = "project_<hash>".
+            if let Some(hash) = stem.strip_prefix("project_") {
+                keys.push(StoreKey::new(format!("project:{hash}")));
+            } else {
+                keys.push(StoreKey::new(stem.to_string()));
+            }
+        }
+        Ok(keys)
+    }
+
     fn load(&self, key: &StoreKey) -> Result<MemoryGraph> {
         let path = self.path_for(key);
         if !path.exists() {

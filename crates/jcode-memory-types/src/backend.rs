@@ -163,6 +163,19 @@ pub trait GraphBackend: Debug + Send + Sync {
     ) -> anyhow::Result<Vec<(String, f32)>> {
         Ok(vec![])
     }
+
+    /// Enumerate every store key that currently has persisted state.
+    ///
+    /// Used by cross-project maintenance passes (e.g. the ambient garden's
+    /// global-promotion scan) which must inspect all project graphs rather
+    /// than one known key. The default returns an empty list: backends that
+    /// cannot enumerate (or simply don't need to) keep working unchanged.
+    /// Implementations should list keys derived from durable storage state
+    /// (e.g. existing tables/files) so a key that was written once shows up
+    /// even if no live process holds it.
+    fn list_keys(&self) -> anyhow::Result<Vec<StoreKey>> {
+        Ok(vec![])
+    }
 }
 
 /// Replay a mutation log onto an in-memory `MemoryGraph`.

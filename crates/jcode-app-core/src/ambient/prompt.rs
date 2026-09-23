@@ -102,6 +102,90 @@ pub fn gather_memory_graph_health(
     health
 }
 
+/// A project-scope memory that looks like a candidate for promotion to
+/// global scope: generalized processing knowledge (no concrete environment
+/// identifiers) that has been reinforced across multiple sessions or
+/// working directories. The ambient garden agent reviews these candidates
+/// and generalizes them into global scope.
+#[derive(Debug, Clone)]
+pub struct GlobalPromotionCandidate {
+    pub id: String,
+    pub content: String,
+    pub category: String,
+    pub strength: u32,
+    pub access_count: u32,
+}
+
+impl GlobalPromotionCandidate {
+    fn promotion_score(&self) -> u32 {
+        self.strength.saturating_add(self.access_count)
+    }
+}
+
+/// Scan every project graph in the active backend for generalized memories
+/// that recur across contexts. Only content that already passes the
+/// global-scope generality heuristic is considered, so the ambient agent
+/// never sees environment-specific facts as promotion candidates.
+pub fn gather_global_promotion_candidates(
+    _memory_manager: &crate::memory::MemoryManager,
+) -> Vec<GlobalPromotionCandidate> {
+    let mut candidates: Vec<GlobalPromotionCandidate> = Vec::new();
+
+    let backend = crate::memory::graph_backend();
+    let Ok(keys) = backend.list_keys() else {
+        return candidates;
+    };
+    for key in keys {
+        // The global graph itself is not a promotion source.
+        if key.as_str() == crate::memory::global_store_key() {
+            continue;
+        }
+        let Ok(graph) = backend.load(&key) else {
+            continue;
+        };
+        collect_candidates_from_graph(&graph, &mut candidates);
+    }
+
+    // Strongest evidence first, and cap the list so the ambient prompt
+    // stays within budget.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.promotion_score()));
+    candidates.truncate(15);
+    candidates
+}
+
+fn collect_candidates_from_graph(
+    graph: &jcode_base::memory_types::MemoryGraph,
+    candidates: &mut Vec<GlobalPromotionCandidate>,
+) {
+    for memory in graph.memories.values() {
+        if !memory.active {
+            continue;
+        }
+        // Promotion requires cross-context reinforcement: a memory that
+        // only ever fired in one session is project noise, not general
+        // knowledge.
+        if memory.strength < 2 && memory.access_count < 2 {
+            continue;
+        }
+        if !jcode_base::memory_types::rule_engine::is_generalized_content(&memory.content) {
+            continue;
+        }
+        if candidates
+            .iter()
+            .any(|existing| existing.content == memory.content)
+        {
+            continue;
+        }
+        candidates.push(GlobalPromotionCandidate {
+            id: memory.id.clone(),
+            content: memory.content.clone(),
+            category: format!("{:?}", memory.category),
+            strength: memory.strength,
+            access_count: memory.access_count,
+        });
+    }
+}
+
 /// Gather feedback memories relevant to ambient mode.
 ///
 /// Pulls from two sources:
@@ -273,12 +357,14 @@ pub fn gather_recent_sessions(since: Option<DateTime<Utc>>) -> Vec<RecentSession
 ///
 /// Populates the template from AMBIENT_MODE.md with real data from the
 /// current state, queue, memory graph, sessions, and resource budget.
+#[allow(clippy::too_many_arguments)]
 pub fn build_ambient_system_prompt(
     state: &AmbientState,
     queue: &[ScheduledItem],
     graph_health: &MemoryGraphHealth,
     recent_sessions: &[RecentSessionInfo],
     feedback_memories: &[String],
+    promotion_candidates: &[GlobalPromotionCandidate],
     budget: &ResourceBudget,
     active_user_sessions: usize,
 ) -> String {
@@ -423,6 +509,30 @@ pub fn build_ambient_system_prompt(
     } else {
         for mem in feedback_memories {
             prompt.push_str(&format!("- {}\n", mem));
+        }
+    }
+    prompt.push('\n');
+
+    // --- Global Promotion Candidates ---
+    // Project memories that already pass the global-scope generality gate
+    // and show cross-context reinforcement. The garden agent may generalize
+    // them into global scope (which is itself gate-enforced).
+    prompt.push_str("## Global Promotion Candidates\n");
+    if promotion_candidates.is_empty() {
+        prompt.push_str("None. No project memories currently look like global knowledge.\n");
+    } else {
+        prompt.push_str(
+            "Project memories below are generalized (no environment-specific \
+             identifiers) and repeatedly reinforced. If one is genuinely useful \
+             in ANY project, write a generalized version to global scope with the \
+             memory tool (it must pass the global scope gate); otherwise leave it \
+             in project scope. Do not copy environment details into global scope.\n",
+        );
+        for candidate in promotion_candidates {
+            prompt.push_str(&format!(
+                "- [{}] {} (strength {}, accesses {})\n",
+                candidate.category, candidate.content, candidate.strength, candidate.access_count,
+            ));
         }
     }
     prompt.push('\n');

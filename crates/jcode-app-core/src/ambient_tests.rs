@@ -330,7 +330,7 @@ fn test_build_ambient_system_prompt_minimal() {
     };
 
     let prompt =
-        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &budget, 0);
+        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &[], &budget, 0);
 
     assert!(prompt.contains("ambient agent for jcode"));
     assert!(prompt.contains("## Current State"));
@@ -406,7 +406,7 @@ fn test_build_ambient_system_prompt_with_data() {
     };
 
     let prompt =
-        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &budget, 2);
+        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &[], &budget, 2);
 
     assert!(prompt.contains("15m ago"));
     assert!(prompt.contains("Active user sessions: 2"));
@@ -454,4 +454,97 @@ fn test_scheduled_queue_items_accessor() {
     let items = queue.items();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, "s1");
+}
+
+#[test]
+fn test_gather_global_promotion_candidates_filters_and_ranks() {
+    use jcode_base::memory_types::{MemoryCategory, MemoryEntry, MemoryGraph};
+
+    let guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("home");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let backend_dir = home.path().join("memory").join("backend-json");
+    std::fs::create_dir_all(&backend_dir).expect("backend dir");
+
+    // Project A: one strong generalized keeper, one env-specific reject.
+    let mut g = MemoryGraph::new();
+    for (id, content, strength, accesses, active) in [
+        ("keep1", "教训：绝不用 xargs 对容器全量删除，必须先列明确认", 3u32, 2u32, true),
+        ("env1", "部署机 = 192.168.6.33, live 容器 chat-node", 9u32, 9u32, true),
+        // Strength 1 + access 1: below the cross-context evidence bar.
+        ("weak1", "更新记忆前必须核对事实准确性", 1u32, 1u32, true),
+    ] {
+        let mut e = MemoryEntry::new(MemoryCategory::Correction, content);
+        e.id = id.to_string();
+        e.strength = strength;
+        e.access_count = accesses;
+        e.active = active;
+        g.memories.insert(e.id.clone(), e);
+    }
+    std::fs::write(
+        backend_dir.join("project_1111111111111111.json"),
+        serde_json::to_string(&g).unwrap(),
+    )
+    .unwrap();
+
+    // Project B: same generalized keeper content (dedup across projects).
+    let mut g2 = MemoryGraph::new();
+    let mut e2 = MemoryEntry::new(MemoryCategory::Correction, "教训：绝不用 xargs 对容器全量删除，必须先列明确认");
+    e2.id = "keep1b".to_string();
+    e2.strength = 5;
+    e2.access_count = 4;
+    e2.active = true;
+    g2.memories.insert(e2.id.clone(), e2);
+    std::fs::write(
+        backend_dir.join("project_2222222222222222.json"),
+        serde_json::to_string(&g2).unwrap(),
+    )
+    .unwrap();
+
+    let manager = crate::memory::MemoryManager::new();
+    let candidates = crate::ambient::gather_global_promotion_candidates(&manager);
+
+    let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+    assert!(
+        ids.contains(&"keep1") || ids.contains(&"keep1b"),
+        "generalized reinforced memory should be a candidate, got: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"env1"),
+        "environment-specific content must never be a candidate"
+    );
+    assert!(
+        !ids.contains(&"weak1"),
+        "single-context memory lacks cross-context evidence"
+    );
+    // Deduped across projects: exactly one candidate for the keeper content.
+    let keeper_count = candidates
+        .iter()
+        .filter(|c| c.content.contains("xargs"))
+        .count();
+    assert_eq!(keeper_count, 1, "identical content must be deduped");
+
+    // Candidates must surface in the ambient prompt.
+    let state = AmbientState::default();
+    let prompt = build_ambient_system_prompt(
+        &state,
+        &[],
+        &MemoryGraphHealth::default(),
+        &[],
+        &[],
+        &candidates,
+        &ResourceBudget::default(),
+        0,
+    );
+    assert!(prompt.contains("Global Promotion Candidates"));
+    assert!(prompt.contains("xargs"));
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    drop(guard);
 }
