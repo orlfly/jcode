@@ -706,11 +706,18 @@ async fn send_history_with_guard(
         };
 
         // Model-route expansion can be relatively expensive (provider/account routing,
-        // endpoint cache reads, etc.). The TUI already supports later
-        // AvailableModelsUpdated events, so keep the initial History payload fast and
-        // let the background refresh populate detailed routes asynchronously.
-        let available_model_routes = Vec::new();
-        let model_routes_ms = 0;
+        // endpoint cache reads, etc.), so it is only built for clients that explicitly
+        // asked for the model catalog via `include_model_catalog`. Those clients need the
+        // per-model provider attribution: the same model name can be served by several
+        // upstream providers, so a bare name is ambiguous in a picker. Clients that did
+        // not ask for the catalog still receive an empty list and stay fast.
+        let (available_model_routes, model_routes_ms) = if include_model_catalog {
+            let model_routes_start = Instant::now();
+            let routes = agent_guard.model_routes();
+            (routes, model_routes_start.elapsed().as_millis())
+        } else {
+            (Vec::new(), 0)
+        };
 
         let skills_start = Instant::now();
         let skills = agent_guard.available_skill_names();

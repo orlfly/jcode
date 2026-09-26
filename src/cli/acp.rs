@@ -1,6 +1,8 @@
+use super::commands::cli_route_provider_display;
 use super::dispatch;
 use super::provider_init::ProviderChoice;
 use crate::protocol::{Request, ServerEvent};
+use crate::provider::ModelRoute;
 use crate::transport::{ReadHalf, WriteHalf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -100,6 +102,11 @@ struct SessionUiState {
     provider_name: Option<String>,
     model: Option<String>,
     available_models: Vec<String>,
+    /// Display provider label per available model name (e.g. `zai`,
+    /// `OpenRouter/anthropic`). Used only to disambiguate the label shown in a
+    /// client's model picker when more than one provider offers the same
+    /// catalog; the model id sent back on selection stays unqualified.
+    model_provider_labels: HashMap<String, String>,
     reasoning_effort: Option<String>,
 }
 
@@ -170,17 +177,43 @@ fn prompt_response(stop_reason: &str, usage: &TurnUsage) -> Value {
     response
 }
 
+/// Build the per-model provider display label used by the model picker.
+///
+/// The catalog can offer the same model name through several upstream
+/// providers (e.g. an aggregating `open-ai-compatible` endpoint routing
+/// `glm-4.7` to six different vendors), so a bare model name in a client's
+/// picker is ambiguous. We key by model name and keep the provider label of
+/// the first route seen, which matches the order the daemon reports and
+/// therefore the route a bare name resolves to.
+///
+/// The label is display-only: model ids sent back on selection stay
+/// unqualified so existing routing behaviour is unchanged.
+fn model_provider_labels_from_routes(routes: &[ModelRoute]) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    for route in routes {
+        if route.model.is_empty() || route.provider.trim().is_empty() {
+            continue;
+        }
+        labels
+            .entry(route.model.clone())
+            .or_insert_with(|| cli_route_provider_display(&route.provider, &route.api_method));
+    }
+    labels
+}
+
 impl SessionUiState {
     fn from_history_fields(
         provider_name: Option<String>,
         provider_model: Option<String>,
         available_models: Vec<String>,
+        model_provider_labels: HashMap<String, String>,
         reasoning_effort: Option<String>,
     ) -> Self {
         Self {
             provider_name,
             model: provider_model,
             available_models,
+            model_provider_labels,
             reasoning_effort,
         }
     }
@@ -787,6 +820,7 @@ impl AcpRuntime {
                 provider_name,
                 provider_model,
                 available_models,
+                available_model_routes,
                 reasoning_effort,
                 ..
             } => (
@@ -795,6 +829,7 @@ impl AcpRuntime {
                     provider_name,
                     provider_model,
                     available_models,
+                    model_provider_labels_from_routes(&available_model_routes),
                     reasoning_effort,
                 ),
             ),
@@ -847,6 +882,7 @@ impl AcpRuntime {
                     provider_name,
                     provider_model,
                     available_models,
+                    available_model_routes,
                     reasoning_effort,
                     ..
                 } => {
@@ -855,6 +891,7 @@ impl AcpRuntime {
                         provider_name,
                         provider_model,
                         available_models,
+                        model_provider_labels_from_routes(&available_model_routes),
                         reasoning_effort,
                     );
                     if replay_history {
@@ -1105,6 +1142,7 @@ impl AcpRuntime {
                     provider_name,
                     provider_model,
                     available_models,
+                    available_model_routes,
                     ..
                 } = event
                 else {
@@ -1118,6 +1156,8 @@ impl AcpRuntime {
                     if provider_model.is_some() {
                         state.model = provider_model;
                     }
+                    state.model_provider_labels =
+                        model_provider_labels_from_routes(&available_model_routes);
                     state.available_models = available_models;
                     (state.model.clone(), state.available_models.clone())
                 };
@@ -1334,6 +1374,19 @@ fn insert_session_configuration(result: &mut Value, state: &SessionUiState) {
     }
 }
 
+/// Display label for one model picker entry.
+///
+/// Rendered as `provider · model` when the catalog told us which provider
+/// serves the name, matching the TUI picker's convention. Falls back to the
+/// bare name so a route-less catalog (or a model outside the reported routes)
+/// still renders. `value`/`modelId` deliberately stay unqualified.
+fn model_option_label(state: &SessionUiState, model: &str) -> String {
+    match state.model_provider_labels.get(model) {
+        Some(provider) if !provider.is_empty() => format!("{provider} · {model}"),
+        _ => model.to_string(),
+    }
+}
+
 fn session_models(state: &SessionUiState) -> Option<Value> {
     let current = state.model.as_deref()?;
     let mut models = state.available_models.clone();
@@ -1343,7 +1396,10 @@ fn session_models(state: &SessionUiState) -> Option<Value> {
     Some(json!({
         "availableModels": models
             .into_iter()
-            .map(|model| json!({ "modelId": model, "name": model }))
+            .map(|model| {
+                let label = model_option_label(state, &model);
+                json!({ "modelId": model, "name": label })
+            })
             .collect::<Vec<_>>(),
         "currentModelId": current,
     }))
@@ -1373,7 +1429,9 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
         }
         let select_options: Vec<Value> = models
             .iter()
-            .map(|name| json!({ "value": name, "name": name }))
+            .map(|name| {
+                json!({ "value": name, "name": model_option_label(state, name) })
+            })
             .collect();
         options.push(json!({
             "type": "select",

@@ -3462,7 +3462,7 @@ fn cli_api_method_display(raw: &str) -> String {
     crate::provider::ModelRouteApiMethod::parse(raw).display_label()
 }
 
-fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
+pub(crate) fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
     if crate::provider::ModelRouteApiMethod::parse(api_method).is_openrouter()
         && provider != "auto"
         && !provider.contains("OpenRouter")
