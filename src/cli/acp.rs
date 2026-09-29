@@ -21,6 +21,13 @@ const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const JSONRPC_INTERNAL_ERROR: i64 = -32603;
 const JSONRPC_SERVER_ERROR: i64 = -32000;
+const JSONRPC_RESOURCE_NOT_FOUND: i64 = -32002;
+/// Marker message for the "daemon could not attach the requested target
+/// session and silently created a new one" condition. `handle_session_load`
+/// converts it into an ACP `resource_not_found` error reply so hosts run their
+/// normal rebuild path instead of resuming a session that has no shared state
+/// with the conversation.
+const ATTACH_TARGET_NOT_FOUND: &str = "JCODE_ATTACH_TARGET_NOT_FOUND";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AcpProfile {
@@ -495,12 +502,18 @@ impl AcpRuntime {
                 self.write_available_commands(&session_id).await?;
             }
             Err(err) => {
-                self.write_error_value(
-                    id,
-                    JSONRPC_INTERNAL_ERROR,
-                    format!("Failed to attach Jcode session '{session_id}': {err:#}"),
-                )
-                .await?;
+                let (code, msg) = if err.to_string() == ATTACH_TARGET_NOT_FOUND {
+                    (
+                        JSONRPC_RESOURCE_NOT_FOUND,
+                        format!("Session not found: {session_id}"),
+                    )
+                } else {
+                    (
+                        JSONRPC_INTERNAL_ERROR,
+                        format!("Failed to attach Jcode session '{session_id}': {err:#}"),
+                    )
+                };
+                self.write_error_value(id, code, msg).await?;
             }
         }
         Ok(())
@@ -870,7 +883,7 @@ impl AcpRuntime {
             })
             .await?;
 
-        let mut attached_id = target_session_id;
+        let mut attached_id = target_session_id.clone();
         let mut ui_state = SessionUiState::default();
         loop {
             let event = session.read_event().await?;
@@ -898,9 +911,21 @@ impl AcpRuntime {
                         self.replay_history(&session_id, messages).await?;
                     }
                 }
-                ServerEvent::Done { id } if id == resume_id => break,
                 ServerEvent::Error { id, message, .. } if id == resume_id => {
                     anyhow::bail!(message);
+                }
+                ServerEvent::Done { id } if id == resume_id => {
+                    if attached_id != target_session_id {
+                        // The daemon silently created a fresh session instead
+                        // of attaching the requested one (e.g. the target was
+                        // evicted from memory). Surface this as ACP
+                        // `resource_not_found` (-32002) so the host takes its
+                        // rebuild path (session/new + config re-seed) instead
+                        // of prompting into a session that never held the
+                        // conversation's model/provider state.
+                        anyhow::bail!(ATTACH_TARGET_NOT_FOUND);
+                    }
+                    break;
                 }
                 other => {
                     if self.profile.is_extended() {
@@ -1019,8 +1044,24 @@ impl AcpRuntime {
                     stop_reason = "cancelled".to_string();
                 }
                 ServerEvent::Error { id, message, .. } if id == prompt_id => {
+                    // Report the turn failure in-band instead of an ACP error
+                    // reply. The error reply path used JSON-RPC code -32000,
+                    // which the ACP spec reserves for `auth_required`; ACP
+                    // hosts (AionCore/openCode) would then surface a bogus
+                    // "Agent requires authentication" for ordinary upstream
+                    // failures such as HTTP 429 rate limits.
+                    // See: agent-client-protocol v1 error.rs maps -32000 to
+                    // ErrorCode::AuthRequired.
                     cleanup_prompt_state(&session).await;
-                    self.write_error_value(rpc_id, JSONRPC_SERVER_ERROR, message)
+                    self.write_notification(
+                        "session/update",
+                        json!({
+                            "sessionId": session.session_id,
+                            "update": agent_message_chunk(format!("[turn error] {message}")),
+                        }),
+                    )
+                    .await?;
+                    self.write_result(rpc_id, prompt_response("refusal", &turn_usage))
                         .await?;
                     return Ok(());
                 }
@@ -1429,9 +1470,7 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
         }
         let select_options: Vec<Value> = models
             .iter()
-            .map(|name| {
-                json!({ "value": name, "name": model_option_label(state, name) })
-            })
+            .map(|name| json!({ "value": name, "name": model_option_label(state, name) }))
             .collect();
         options.push(json!({
             "type": "select",
@@ -2168,6 +2207,7 @@ mod tests {
             model: Some("gpt-5.2".to_string()),
             available_models: vec!["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
             reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
         };
         let options = session_config_options(&state);
         assert_eq!(options.len(), 2);
@@ -2203,6 +2243,7 @@ mod tests {
             model: Some("claude-opus-4-6".to_string()),
             available_models: vec!["claude-sonnet-4-5".to_string()],
             reasoning_effort: None,
+            ..SessionUiState::default()
         };
         let options = session_config_options(&state);
         let model_values: Vec<&str> = options[0]["options"]
@@ -2222,6 +2263,7 @@ mod tests {
             model: Some("deepseek-v4-flash".to_string()),
             available_models: vec!["deepseek-v4-pro".to_string()],
             reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
         };
         let mut result = json!({"sessionId": "s1"});
         insert_session_configuration(&mut result, &state);
@@ -2250,6 +2292,7 @@ mod tests {
             model: Some("mystery-model-9000".to_string()),
             available_models: Vec::new(),
             reasoning_effort: None,
+            ..SessionUiState::default()
         };
         assert_eq!(
             state.context_limit(),
