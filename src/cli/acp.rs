@@ -911,6 +911,13 @@ impl AcpRuntime {
                         self.replay_history(&session_id, messages).await?;
                     }
                 }
+                ServerEvent::SessionId { session_id, .. } => {
+                    // The daemon always names the bound session before Done.
+                    // On fallback (target missing) it is a brand-new id; on a
+                    // real resume it matches the target. Either way this is
+                    // the authoritative attach result.
+                    attached_id = session_id;
+                }
                 ServerEvent::Error { id, message, .. } if id == resume_id => {
                     anyhow::bail!(message);
                 }
