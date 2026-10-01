@@ -216,6 +216,10 @@ impl OpenRouterStream {
         arguments: Option<&str>,
         thought_signature: Option<&str>,
     ) {
+        let incoming_name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(Self::sanitize_tool_name);
         let incoming_id = id
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -243,7 +247,7 @@ impl OpenRouterStream {
         }
 
         if tc.name.trim().is_empty()
-            && let Some(incoming_name) = name.map(str::trim).filter(|value| !value.is_empty())
+            && let Some(incoming_name) = incoming_name
         {
             tc.name = incoming_name.to_string();
         }
@@ -258,6 +262,32 @@ impl OpenRouterStream {
         if !tc.id.trim().is_empty() && !tc.name.trim().is_empty() {
             Self::queue_tool_progress(&mut self.pending, index, tc);
         }
+    }
+
+    /// Some OpenAI-compatible gateways stitch a model's inline
+    /// `</think><tool_call>name` markup (or similar prose) into the SSE
+    /// `tool_calls[].function.name` field, producing names like
+    /// `bash235.json</think><tool_call>bash` that no tool registry can match
+    /// (observed via a kaneo multiplexer). Recover the real tool name by
+    /// taking the longest trailing run of `[A-Za-z0-9_-]`; drop the call when
+    /// nothing plausible remains.
+    fn sanitize_tool_name(raw: &str) -> Option<String> {
+        let ok =
+            |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if raw.bytes().all(|b| ok(b as char)) {
+            return Some(raw.to_string());
+        }
+        // Valid name = the trailing run of OK characters. For
+        // `bash235.json</think><tool_call>bash` this recovers `bash`.
+        let name: String = raw
+            .chars()
+            .rev()
+            .take_while(|c| ok(*c))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        (!name.is_empty()).then_some(name)
     }
 
     fn parse_next_event(&mut self) -> Option<StreamEvent> {
@@ -633,6 +663,41 @@ mod tests {
         .to_string();
 
         assert_eq!(drain_text(&mut stream), "hello world");
+    }
+
+    #[test]
+    fn gateway_stitched_tool_name_recovers_trailing_valid_name() {
+        // A kaneo multiplexer stitched the model's inline
+        // `235.json</think><tool_call>bash` markup into the SSE tool name,
+        // producing `bash235.json</think><tool_call>bash` which no tool
+        // registry can match ("Tool '...' is not allowed"). The accumulator
+        // must recover the trailing valid name instead.
+        let mut stream = test_stream();
+        stream.buffer = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash235.json</think><tool_call>bash","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        )
+        .to_string();
+
+        let mut names = Vec::new();
+        while let Some(event) = stream.parse_next_event() {
+            if let StreamEvent::ToolUseStart { name, .. } = event {
+                names.push(name);
+            }
+        }
+        assert_eq!(names, vec!["bash".to_string()]);
+
+        // Clean names pass through untouched.
+        assert_eq!(
+            OpenRouterStream::sanitize_tool_name("read_file"),
+            Some("read_file".to_string())
+        );
+        assert_eq!(
+            OpenRouterStream::sanitize_tool_name("bash"),
+            Some("bash".to_string())
+        );
+        // Pure garbage with no valid tail yields nothing.
+        assert_eq!(OpenRouterStream::sanitize_tool_name("</think>"), None);
     }
 
     #[test]
