@@ -300,6 +300,7 @@ impl MultiProvider {
             && Self::session_provider_key_matches_provider_name(
                 previous_provider_key,
                 provider_name,
+                model_request,
             )
         {
             return Some(previous_provider_key.to_string());
@@ -327,7 +328,27 @@ impl MultiProvider {
         Some(key.to_string())
     }
 
-    fn session_provider_key_matches_provider_name(provider_key: &str, provider_name: &str) -> bool {
+    /// Whether the named `[providers.<name>]` profile `provider_key` declares a
+    /// route that actually serves `model`. Guards both the restore path and the
+    /// switch-time key continuation against stale/unrelated profile keys.
+    fn named_provider_profile_serves_model(provider_key: &str, model: &str) -> bool {
+        let model = model.trim();
+        if provider_key.is_empty() || model.is_empty() {
+            return false;
+        }
+        let Some(profile_config) = crate::config::config().providers.get(provider_key) else {
+            return false;
+        };
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(provider_key.to_string(), profile_config.clone());
+        crate::provider::named_provider_profile_route_exists_in(&providers, model)
+    }
+
+    fn session_provider_key_matches_provider_name(
+        provider_key: &str,
+        provider_name: &str,
+        model: &str,
+    ) -> bool {
         let provider_key = Self::canonical_session_provider_key(provider_key.trim());
         let Some(derived) = Self::session_provider_key_from_provider_name(provider_name)
             .or_else(|| crate::session::derive_session_provider_key(provider_name))
@@ -346,7 +367,13 @@ impl MultiProvider {
                         provider_key,
                     )
                     .is_some()
-                    || crate::config::config().providers.contains_key(provider_key)
+                    // A named `[providers.<name>]` profile only continues a
+                    // prior key when its own declared routes actually serve
+                    // this model. A bare `contains_key` check let an unrelated
+                    // profile (e.g. `company`) keep a stale key across a user
+                    // model switch to an OpenRouter-multiplexer model, which
+                    // then pinned the session back to that profile on resume.
+                    || Self::named_provider_profile_serves_model(provider_key, model)
             }
             other => provider_key == other,
         }
@@ -434,7 +461,11 @@ impl MultiProvider {
                     provider_key,
                 )
                 .is_some()
-                    || crate::config::config().providers.contains_key(provider_key)
+                    // Only pin a named `[providers.<name>]` profile when its
+                    // declared routes actually serve this model; otherwise a
+                    // stale/unrelated key (e.g. `company`) would silently
+                    // rebind the resumed session to the wrong gateway.
+                    || Self::named_provider_profile_serves_model(provider_key, model)
                 {
                     format!("{provider_key}:{model}")
                 } else {
@@ -780,6 +811,61 @@ mod tests {
             ),
             "claude-oauth:claude-opus-5"
         );
+    }
+
+    #[test]
+    fn stale_named_provider_key_does_not_pin_unrelated_profile() {
+        // Regression: a session switched to an OpenRouter-multiplexer model
+        // while carrying `provider_key = "company"` (a named `[providers.*]`
+        // profile that does NOT serve that model). The old `contains_key`
+        // continuation kept the stale key, and resume reconstructed
+        // `company:<model>`, silently rebinding the session to the company
+        // gateway until the next explicit set_config_option.
+        crate::provider::tests::with_clean_provider_test_env(|| {
+            let jcode_home = std::env::var_os("JCODE_HOME").expect("test JCODE_HOME set");
+            std::fs::write(
+                std::path::PathBuf::from(jcode_home).join("config.toml"),
+                r#"
+[providers.company]
+type = "open-ai-compatible"
+base_url = "https://gateway.example.com/v1"
+auth = "bearer"
+
+[[providers.company.models]]
+id = "glm-5.3"
+input = ["text"]
+"#,
+            )
+            .expect("write test config.toml");
+            crate::config::invalidate_config_cache();
+
+            // Switch-time continuation: the stale `company` key must NOT be
+            // kept for a model that company does not serve.
+            let key = MultiProvider::session_provider_key_after_model_switch(
+                "deepseek-v4.1-flash:cloud",
+                "OpenRouter",
+                Some("company"),
+            );
+            assert_ne!(key.as_deref(), Some("company"));
+
+            // Resume-time reconstruction: the stale key must not produce a
+            // `company:` prefixed request for the multiplexer model.
+            let request = MultiProvider::model_switch_request_for_session_model(
+                "deepseek-v4.1-flash:cloud",
+                Some("company"),
+            );
+            assert_eq!(
+                request, "deepseek-v4.1-flash:cloud",
+                "stale named-profile key must not pin the model to that profile"
+            );
+
+            // A key whose profile DOES declare the model still pins correctly.
+            let matching = MultiProvider::model_switch_request_for_session_model(
+                "glm-5.3",
+                Some("company"),
+            );
+            assert_eq!(matching, "company:glm-5.3");
+        });
     }
 
     #[test]

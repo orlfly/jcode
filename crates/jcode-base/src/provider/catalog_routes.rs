@@ -1191,6 +1191,16 @@ fn named_provider_profile_route_for_model(model: &str) -> Option<ModelRoute> {
     named_provider_profile_route_for_model_in(model, &crate::config::config().providers)
 }
 
+/// Whether any named profile in `providers` declares a route serving `model`.
+/// Public for the session provider-key continuation/restore guards, which must
+/// verify a profile actually owns a model before pinning it.
+pub fn named_provider_profile_route_exists_in(
+    providers: &std::collections::BTreeMap<String, crate::config::NamedProviderConfig>,
+    model: &str,
+) -> bool {
+    named_provider_profile_route_for_model_in(model, providers).is_some()
+}
+
 fn named_provider_profile_route_for_model_in(
     model: &str,
     providers: &std::collections::BTreeMap<String, crate::config::NamedProviderConfig>,
