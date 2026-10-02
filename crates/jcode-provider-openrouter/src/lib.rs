@@ -41,7 +41,7 @@ pub fn known_providers() -> Vec<String> {
     KNOWN_PROVIDERS.iter().map(|p| (*p).to_string()).collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -58,19 +58,11 @@ pub struct ModelInfo {
     /// `deepseek-v4-flash:cloud` is not assumed to accept images.
     #[serde(default)]
     pub supports_image_input: Option<bool>,
-}
-
-impl Default for ModelInfo {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            context_length: None,
-            pricing: ModelPricing::default(),
-            created: None,
-            supports_image_input: None,
-        }
-    }
+    /// Declared input modalities, e.g. `["text", "image"]`. Empty when the
+    /// catalog did not say, in which case callers keep their existing default
+    /// rather than inferring a capability the source never claimed.
+    #[serde(default)]
+    pub input: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -390,12 +390,13 @@ fn send_model_changed_result(
         String,
         String,
         Option<jcode_provider_core::ResolvedCredential>,
+        Option<String>,
     )>,
     fallback_model: String,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     match result {
-        Ok((updated, provider_name, resolved_credential)) => {
+        Ok((updated, provider_name, resolved_credential, reasoning_effort)) => {
             crate::telemetry::record_model_switch();
             crate::logging::event_info(
                 "server_model_changed",
@@ -411,6 +412,7 @@ fn send_model_changed_result(
                 provider_name: Some(provider_name),
                 error: None,
                 resolved_credential,
+                reasoning_effort,
             });
         }
         Err(error) => {
@@ -428,6 +430,7 @@ fn send_model_changed_result(
                 provider_name: None,
                 error: Some(error.to_string()),
                 resolved_credential: None,
+                reasoning_effort: None,
             });
         }
     }
@@ -447,6 +450,7 @@ fn apply_cycle_model(
             provider_name: None,
             error: Some("Model switching is not available for this provider.".to_string()),
             resolved_credential: None,
+            reasoning_effort: None,
         });
         return;
     }
@@ -480,6 +484,7 @@ fn apply_cycle_model(
                 agent.provider_model(),
                 agent.provider_name(),
                 agent.active_resolved_credential(),
+                agent.provider_reasoning_effort(),
             )
         })
     };
@@ -587,6 +592,7 @@ fn apply_set_model(
                 agent.provider_model(),
                 agent.provider_name(),
                 agent.active_resolved_credential(),
+                agent.provider_reasoning_effort(),
             )
         })
     };
@@ -630,6 +636,7 @@ fn apply_set_route(
                 agent.provider_model(),
                 agent.provider_name(),
                 agent.active_resolved_credential(),
+                agent.provider_reasoning_effort(),
             )
         })
     };

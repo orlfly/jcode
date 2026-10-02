@@ -1322,7 +1322,7 @@ mod tests {
                         context_length: None,
                         pricing: jcode_provider_openrouter::ModelPricing::default(),
                         created: None,
-                        supports_image_input: None,
+                        ..Default::default()
                     })
                     .collect(),
             };
@@ -1656,7 +1656,7 @@ mod tests {
                     context_length: None,
                     pricing: jcode_provider_openrouter::ModelPricing::default(),
                     created: None,
-                    supports_image_input: None,
+                    ..Default::default()
                 })
                 .collect(),
         };

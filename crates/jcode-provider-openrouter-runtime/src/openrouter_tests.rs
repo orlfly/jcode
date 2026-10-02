@@ -2154,6 +2154,9 @@ fn direct_deepseek_profile_uses_static_1m_context_when_catalog_is_absent() {
 fn direct_deepseek_profile_uses_1m_context_for_listed_models_when_catalog_is_absent() {
     for model in ["deepseek-flash", "deepseek-v4-pro"] {
         let _lock = ENV_LOCK.lock();
+        let temp = TempDir::new().expect("create temp home");
+        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        let _home = EnvVarGuard::set("HOME", temp.path());
         let _base = EnvVarGuard::set("JCODE_OPENROUTER_API_BASE", "https://api.deepseek.com");
         let _key_name = EnvVarGuard::set("JCODE_OPENROUTER_API_KEY_NAME", "DEEPSEEK_API_KEY");
         let _api_key = EnvVarGuard::set("DEEPSEEK_API_KEY", "test");
@@ -3951,6 +3954,7 @@ fn grok_build_subscription_request_spoofs_grok_cli_and_uses_oidc_bearer() {
             name: "bash".to_string(),
             description: "run".to_string(),
             input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+            defer_loading: false,
         }];
         let mut stream = provider
             .complete(&[Message::user("hello")], &tools, "sys", None)

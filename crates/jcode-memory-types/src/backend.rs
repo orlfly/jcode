@@ -255,7 +255,7 @@ pub fn apply_mutations_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EdgeKind, MemoryCategory, MemoryEntry, MemoryScope};
+    use crate::{EdgeKind, MemoryCategory, MemoryEntry};
 
     fn sample_entry(id: &str) -> MemoryEntry {
         let mut e = MemoryEntry::new(MemoryCategory::Fact, "test content");

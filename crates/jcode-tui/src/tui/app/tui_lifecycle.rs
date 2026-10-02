@@ -112,6 +112,7 @@ impl App {
         self.dictation_key = keybind::load_dictation_key();
         self.new_terminal_key = keybind::load_new_terminal_key();
         self.open_resume_key = keybind::load_open_resume_key();
+        self.voice_input_key = keybind::load_voice_input_key();
         self.fallback_switch_key = keybind::load_fallback_switch_key();
         self.scroll_keys = keybind::load_scroll_keys();
         crate::logging::info("KEYBINDINGS: reloaded from config change");
@@ -415,6 +416,7 @@ impl App {
             terminal_title: RefCell::new(terminal_title::TerminalTitleState::default()),
             compacted_history_lazy: CompactedHistoryLazyState::default(),
             pending_history_anchor: None,
+            pending_resize_anchor: None,
             input: String::new(),
             command_candidates_cache: RefCell::new(None),
             command_suggestions_cache: RefCell::new(None),
@@ -500,6 +502,7 @@ impl App {
             background_client_action: None,
             pending_background_client_reload: None,
             restart_requested: None,
+            cloud_handoff_requested: None,
             pasted_contents: Vec::new(),
             pending_images: Vec::new(),
             route_next_prompt_to_new_session: false,
@@ -639,6 +642,7 @@ impl App {
             last_client_focus_session_id: None,
             last_side_panel_focus_id: None,
             side_panel_user_hidden: false,
+            side_panel_fullscreen: false,
             side_panel_explicit_hidden: false,
             pin_images: display.pin_images,
             inline_images_visible: super::ui_prefs::inline_images_visible(),
@@ -672,6 +676,9 @@ impl App {
             dictation_key: keybind::load_dictation_key(),
             new_terminal_key: keybind::load_new_terminal_key(),
             open_resume_key: keybind::load_open_resume_key(),
+            voice_input_key: keybind::load_voice_input_key(),
+            voice_input: None,
+            voice_input_last_press: None,
             fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             keybindings_config_generation: crate::config::config_reload_generation(),
@@ -745,10 +752,7 @@ impl App {
             last_mouse_scroll: None,
             mouse_scroll_target: None,
             mouse_scroll_queue: 0,
-            chat_overscroll_last: None,
-            chat_scroll_down_last: None,
-            chat_scroll_gesture_from_bottom: false,
-            overscroll_status_mode: display.overscroll_status,
+            agent_edited_cache: std::cell::RefCell::new(None),
             changelog_scroll: None,
             help_scroll: None,
             model_status_scroll: None,
@@ -871,6 +875,7 @@ impl App {
             terminal_title: RefCell::new(terminal_title::TerminalTitleState::default()),
             compacted_history_lazy: CompactedHistoryLazyState::default(),
             pending_history_anchor: None,
+            pending_resize_anchor: None,
             input: String::new(),
             command_candidates_cache: RefCell::new(None),
             command_suggestions_cache: RefCell::new(None),
@@ -956,6 +961,7 @@ impl App {
             background_client_action: None,
             pending_background_client_reload: None,
             restart_requested: None,
+            cloud_handoff_requested: None,
             pasted_contents: Vec::new(),
             pending_images: Vec::new(),
             route_next_prompt_to_new_session: false,
@@ -1095,6 +1101,7 @@ impl App {
             last_client_focus_session_id: None,
             last_side_panel_focus_id: None,
             side_panel_user_hidden: false,
+            side_panel_fullscreen: false,
             side_panel_explicit_hidden: false,
             pin_images: display.pin_images,
             inline_images_visible: super::ui_prefs::inline_images_visible(),
@@ -1128,6 +1135,9 @@ impl App {
             dictation_key: keybind::load_dictation_key(),
             new_terminal_key: keybind::load_new_terminal_key(),
             open_resume_key: keybind::load_open_resume_key(),
+            voice_input_key: keybind::load_voice_input_key(),
+            voice_input: None,
+            voice_input_last_press: None,
             fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             keybindings_config_generation: crate::config::config_reload_generation(),
@@ -1201,10 +1211,7 @@ impl App {
             last_mouse_scroll: None,
             mouse_scroll_target: None,
             mouse_scroll_queue: 0,
-            chat_overscroll_last: None,
-            chat_scroll_down_last: None,
-            chat_scroll_gesture_from_bottom: false,
-            overscroll_status_mode: display.overscroll_status,
+            agent_edited_cache: std::cell::RefCell::new(None),
             changelog_scroll: None,
             help_scroll: None,
             model_status_scroll: None,
@@ -1361,6 +1368,15 @@ impl App {
             app.session.working_dir = None;
             app.resume_session_id = resume_session;
             app.set_status_notice(format!("SSH: {host} (remote server)"));
+            // `/cloud` hands a mid-task session over and asks the new runtime
+            // to keep going without the user retyping anything. One-shot.
+            if let Ok(message) = std::env::var("JCODE_CLOUD_CONTINUE_MESSAGE") {
+                crate::env::remove_var("JCODE_CLOUD_CONTINUE_MESSAGE");
+                if !message.trim().is_empty() {
+                    app.hidden_queued_system_messages.push(message);
+                    app.set_status_notice(format!("Continuing on {host}"));
+                }
+            }
             return app;
         }
 

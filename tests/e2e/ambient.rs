@@ -324,8 +324,7 @@ async fn test_ambient_schedule_tool() -> Result<()> {
 #[test]
 fn test_ambient_system_prompt_builder() {
     use jcode::ambient::{
-        AmbientState, GlobalPromotionCandidate, MemoryGraphHealth, ResourceBudget,
-        build_ambient_system_prompt,
+        AmbientState, MemoryGraphHealth, ResourceBudget, build_ambient_system_prompt,
     };
 
     let state = AmbientState::default();

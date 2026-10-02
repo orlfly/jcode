@@ -7,6 +7,7 @@ mod client_comm;
 mod client_comm_channels;
 mod client_comm_context;
 mod client_comm_message;
+mod client_comm_swarms;
 mod client_disconnect_cleanup;
 mod client_lifecycle;
 mod client_lifecycle_logging;
@@ -45,6 +46,7 @@ mod runtime;
 mod socket;
 mod swarm;
 mod swarm_channels;
+mod swarm_labels;
 mod swarm_mutation_state;
 mod swarm_persistence;
 mod util;
@@ -1311,6 +1313,7 @@ impl Server {
                 if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                     sigterm.recv().await;
                     crate::logging::info("Server received SIGTERM, shutting down gracefully");
+                    crate::lid_override::release_for_exiting_process();
                     let _ = crate::registry::unregister_server(&sigterm_server_name).await;
                     std::process::exit(0);
                 }
@@ -1824,6 +1827,7 @@ impl Server {
                                     "Server idle for {} minutes with no clients. Shutting down.",
                                     idle_duration / 60
                                 ));
+                                crate::lid_override::release_for_exiting_process();
                                 let _ = crate::registry::unregister_server(&idle_server_name).await;
                                 std::process::exit(EXIT_IDLE_TIMEOUT);
                             }
@@ -1897,12 +1901,18 @@ impl Server {
             let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_active: Option<bool> = None;
+            // macOS/Windows have no process-scoped lid lock, so lid-close
+            // blocking there changes a persistent setting that this journals
+            // and restores (including after a crash of a previous daemon).
+            let mut lid_override = crate::lid_override::LidOverride::for_current_platform();
             loop {
                 interval.tick().await;
 
                 // Re-evaluate the config each tick so toggling it at runtime
                 // takes effect without restarting the daemon.
-                let enabled = crate::config::config().power.prevent_sleep_while_streaming;
+                let power = &crate::config::config().power;
+                let enabled = power.prevent_sleep_while_streaming;
+                let block_lid = enabled && power.block_lid_close;
 
                 let active = enabled && Self::any_session_streaming(&swarm_members).await;
                 if last_active != Some(active) {
@@ -1914,6 +1924,9 @@ impl Server {
                     last_active = Some(active);
                 }
                 inhibitor.set_active(active);
+                if let Some(lid) = lid_override.as_mut() {
+                    lid.set_active(active && block_lid);
+                }
             }
         });
     }

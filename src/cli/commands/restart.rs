@@ -205,7 +205,7 @@ async fn capture_connected_restart_snapshot()
             }
             crate::protocol::ServerEvent::Ack { id } if id == request_id => {}
             crate::protocol::ServerEvent::Done { id } if id == request_id => {}
-            crate::protocol::ServerEvent::Error { id, message, .. } if id == request_id => {
+            crate::protocol::ServerEvent::Error { id, .. } if id == request_id => {
                 // Same fallback contract as a `not ok` DebugResponse: a
                 // shared daemon can refuse debug control entirely; treat any
                 // command-level error as "no connected sessions known".

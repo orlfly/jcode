@@ -871,7 +871,7 @@ async fn test_dangling_tool_use_repair() {
         // Missing tool_results for tool_123 and tool_456!
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // Should have 3 messages:
     // 1. User: "Hello"
@@ -945,7 +945,7 @@ async fn test_no_repair_when_tool_results_present() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // Should have exactly 3 messages (no synthetic ones added)
     assert_eq!(formatted.len(), 3);
@@ -1027,7 +1027,7 @@ async fn test_parallel_image_tool_results_stay_contiguous() {
         make_image_result("tool_c", "c.png"),
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // assistant message + merged user tool_result message
     assert_eq!(formatted.len(), 2);
@@ -1568,7 +1568,7 @@ async fn test_sanitize_tool_ids_with_dots() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     let sanitized_id = "chatcmpl-BF2xX_tool_call_0";
     for msg in &formatted {
@@ -1613,7 +1613,7 @@ async fn test_sanitize_dangling_tool_ids_with_dots() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     let sanitized_id = "call_with_dots";
     for msg in &formatted {
@@ -2085,11 +2085,9 @@ fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
 /// `stop_reason: tool_use` with no tool call for the agent to run.
 #[test]
 fn test_anthropic_unknown_content_block_start_does_not_drop_event() {
-    for block_type in [
-        "server_tool_use",
-        "web_search_tool_result",
-        "some_future_block",
-    ] {
+    // Server tool blocks (`server_tool_use`, `web_search_tool_result`) are
+    // captured for replay; see native_web_search_sse_tests.rs.
+    for block_type in ["some_future_block", "code_execution_tool_result_future"] {
         let mut state = SseStreamState::default();
         let event = SseEvent {
             event_type: "content_block_start".to_string(),
