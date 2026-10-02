@@ -96,7 +96,10 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Manage memory. Scope rules: use scope:\"project\" (default) for anything tied to the current codebase, deployment environment, hosts, credentials, APIs, tasks, or workflows of the project at hand; use scope:\"global\" ONLY for facts useful in ANY project (general tooling lessons, user-wide workflow preferences). Never write project-specific environment details (hostnames, IPs, repo-internal facts) to global scope: global memories are injected into every project's sessions and pollute unrelated contexts. This is enforced: global writes containing concrete environment identifiers (IPs, hosts, paths, task ids, credentials, deploy targets) are rejected by a scope gate and must be re-submitted with scope:\"project\"."
+        // Keep this under the registry's description token cap (tool/tests.rs).
+        // Full scope-gate rules live in `remember`'s implementation and the
+        // memory scope enum docs; a longer description bloats every request.
+        "Manage memory (remember/recall/search/list/forget/link). Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -117,13 +120,13 @@ impl Tool for MemoryTool {
                 "query": { "type": "string" },
                 "id": {
                     "type": "string",
-                    "description": "Memory id. Required for forget/tag/related. For remember, optional: when supplied, must be unique within the target scope and match [A-Za-z0-9_:.-]{1,256}; auto-generated if omitted."
+                    "description": "Unique id [A-Za-z0-9_:.-]{1,256}; omit to auto-generate."
                 },
                 "tags": { "type": "array", "items": { "type": "string" } },
                 "scope": {
                     "type": "string",
                     "enum": ["project", "global", "all"],
-                    "description": "Storage/retrieval scope. When remembering: default project. Use global only for knowledge useful in every project (general lessons, user-wide preferences); project-specific environment facts (hosts, repos, deployments, credentials) must stay in project scope."
+                    "description": "project (default; repo/env facts), global (any-project facts only), all. Env details stay project."
                 },
                 "from_id": { "type": "string" },
                 "to_id": { "type": "string" },

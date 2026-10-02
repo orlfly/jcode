@@ -295,7 +295,7 @@ impl Tool for BrowserTool {
             json!({
                 "type": "string",
                 "enum": ["headless", "visible"],
-                "description": "For chrome: 'headless' runs Chrome with no window (unattended automation); 'visible' runs Chrome with a real window so the user can watch and collaborate. Defaults to 'headless'."
+                "description": "'headless' = no window (unattended); 'visible' = real window. Default 'headless'."
             }),
         );
         properties.insert(
