@@ -590,15 +590,24 @@ fn sqlite_default_migrates_legacy_json_graph_once() {
         storage::write_json(&path, &graph).expect("write legacy json");
 
         let loaded = manager.load_project_graph().expect("load migrates");
-        assert_eq!(loaded.memory_count(), 1, "legacy JSON should migrate into the active backend");
+        assert_eq!(
+            loaded.memory_count(),
+            1,
+            "legacy JSON should migrate into the active backend"
+        );
         assert!(
-            loaded.all_memories().any(|m| m.content.contains("legacy memory")),
+            loaded
+                .all_memories()
+                .any(|m| m.content.contains("legacy memory")),
             "migrated memory content should survive"
         );
 
         // Source renamed out of the canonical path so a later empty store
         // does not resurrect memories the user deletes after the switch.
-        assert!(!path.exists(), "legacy JSON should be renamed after migration");
+        assert!(
+            !path.exists(),
+            "legacy JSON should be renamed after migration"
+        );
         assert!(
             path.with_extension("json.migrated").exists(),
             "migration backup should be preserved"
@@ -1215,13 +1224,22 @@ fn extraction_noise_filter_rejects_fragments_and_hashes() {
     assert!(is_extraction_noise("a1b2c3d4e5f6"), "hex hash");
     assert!(is_extraction_noise("----"), "symbols only");
     assert!(is_extraction_noise(":::"), "symbols only");
-    assert!(is_extraction_noise("CONTENT"), "single identifier too short");
+    assert!(
+        is_extraction_noise("CONTENT"),
+        "single identifier too short"
+    );
     assert!(is_extraction_noise("Commit"), "single word too short");
 
     // Real memories must pass the gate.
-    assert!(!is_extraction_noise("The project uses rust with sqlite for persistence"));
-    assert!(!is_extraction_noise("User prefers tabs over spaces in python code"));
-    assert!(!is_extraction_noise("The auth token lives in the environment, never in code"));
+    assert!(!is_extraction_noise(
+        "The project uses rust with sqlite for persistence"
+    ));
+    assert!(!is_extraction_noise(
+        "User prefers tabs over spaces in python code"
+    ));
+    assert!(!is_extraction_noise(
+        "The auth token lives in the environment, never in code"
+    ));
 }
 
 #[test]

@@ -19,13 +19,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use jcode_memory_types::activity::{schedule as activity_schedule, ScheduleEvent, ScheduledActivity};
+use jcode_memory_types::activity::{
+    ScheduleEvent, ScheduledActivity, schedule as activity_schedule,
+};
 use jcode_memory_types::ontology::{
-    default_ontology, ActivityStep, Condition, Effect, Ontology, DEFAULT_ONTOLOGY_ID,
-    DEFAULT_ONTOLOGY_VERSION,
+    ActivityStep, Condition, DEFAULT_ONTOLOGY_ID, DEFAULT_ONTOLOGY_VERSION, Effect, Ontology,
+    default_ontology,
 };
 use jcode_memory_types::rule_engine::{
-    apply_entry_effects, apply_graph_effects, dispatch_event, RuleContext, RulePlan,
+    RuleContext, RulePlan, apply_entry_effects, apply_graph_effects, dispatch_event,
 };
 use jcode_memory_types::{MemoryEntry, MemoryEvent, MemoryEventKind, MemoryGraph};
 
@@ -49,7 +51,9 @@ impl OntologyRegistry {
         let mut map = HashMap::new();
         let ontology = default_ontology();
         map.insert(ontology.id.clone(), Arc::new(ontology));
-        Self { inner: Arc::new(map) }
+        Self {
+            inner: Arc::new(map),
+        }
     }
 
     /// Construct a registry containing exactly the supplied ontologies.  When
@@ -59,7 +63,9 @@ impl OntologyRegistry {
             .into_iter()
             .map(|o| (o.id.clone(), Arc::new(o)))
             .collect();
-        Self { inner: Arc::new(map) }
+        Self {
+            inner: Arc::new(map),
+        }
     }
 
     /// Look up an ontology by id.  Returns an `Arc<Ontology>` so callers can
@@ -149,12 +155,7 @@ impl OntologyRegistry {
 // Dormant since the upstream Jev merge disconnected the ontology write path;
 // retained with its tests for the planned re-enable.
 #[allow(dead_code)]
-pub fn apply_plan(
-    entry: &mut MemoryEntry,
-    new_id: &str,
-    plan: &RulePlan,
-    graph: &mut MemoryGraph,
-) {
+pub fn apply_plan(entry: &mut MemoryEntry, new_id: &str, plan: &RulePlan, graph: &mut MemoryGraph) {
     apply_entry_effects(plan, entry);
     apply_graph_effects(plan, new_id, graph);
 }
@@ -267,7 +268,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use jcode_memory_types::{
-        MemoryCategory, MemoryEntry, MemoryGraph, ProvenanceRecord, DEFAULT_ONTOLOGY_ID,
+        DEFAULT_ONTOLOGY_ID, MemoryCategory, MemoryEntry, MemoryGraph, ProvenanceRecord,
     };
 
     #[test]

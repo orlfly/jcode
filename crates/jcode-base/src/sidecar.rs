@@ -81,7 +81,9 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
     // returning HTTP 400 "unknown model 'anthropic/claude-sonnet-4'".
     let name = provider.display_name().to_ascii_lowercase();
     let route_parts = provider.direct_openai_compatible_route_parts();
-    let api_base = route_parts.as_ref().map(|parts| parts.2.to_ascii_lowercase());
+    let api_base = route_parts
+        .as_ref()
+        .map(|parts| parts.2.to_ascii_lowercase());
     let raw_api_base = route_parts.as_ref().map(|parts| parts.2.as_str());
 
     let is_direct = is_direct_openai_compatible_runtime(&name)
@@ -92,16 +94,18 @@ fn safe_model_for_provider(provider: &dyn crate::provider::Provider) -> String {
         return raw;
     }
 
-    let default_from_api_base_profile: Option<String> = raw_api_base
-        .and_then(|api_base| {
-            let profile_id = crate::provider_catalog::openai_compatible_profile_id_for_api_base(api_base)?;
-            crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
-                .and_then(|profile| profile.default_model)
-                .map(|m| m.to_string())
-                .or_else(|| {
-                    crate::provider_catalog::newest_released_model_for_openai_compatible_profile(profile_id)
-                })
-        });
+    let default_from_api_base_profile: Option<String> = raw_api_base.and_then(|api_base| {
+        let profile_id =
+            crate::provider_catalog::openai_compatible_profile_id_for_api_base(api_base)?;
+        crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
+            .and_then(|profile| profile.default_model)
+            .map(|m| m.to_string())
+            .or_else(|| {
+                crate::provider_catalog::newest_released_model_for_openai_compatible_profile(
+                    profile_id,
+                )
+            })
+    });
 
     let default: Option<&str> = provider_default_model_for(&name)
         .or_else(|| api_base.as_deref().and_then(provider_default_model_for))
@@ -157,7 +161,10 @@ fn is_direct_openai_compatible_runtime(name: &str) -> bool {
         "vllm",
         "llamacpp",
     ];
-    if KNOWN_RUNTIMES.iter().any(|k| normalized == *k || normalized.contains(k)) {
+    if KNOWN_RUNTIMES
+        .iter()
+        .any(|k| normalized == *k || normalized.contains(k))
+    {
         return true;
     }
     // The openai-compatible generic namespace is always direct.
@@ -1583,13 +1590,19 @@ mod tests {
     fn is_direct_openai_compatible_runtime_matches_known_providers() {
         // Direct OpenAI-compatible providers.
         assert!(is_direct_openai_compatible_runtime("deepseek"));
-        assert!(is_direct_openai_compatible_runtime("openai-compatible:deepseek"));
+        assert!(is_direct_openai_compatible_runtime(
+            "openai-compatible:deepseek"
+        ));
         assert!(is_direct_openai_compatible_runtime("DEEPSEEK"));
         assert!(is_direct_openai_compatible_runtime("moonshotai"));
-        assert!(is_direct_openai_compatible_runtime("openai-compatible:moonshot-v1-8k"));
+        assert!(is_direct_openai_compatible_runtime(
+            "openai-compatible:moonshot-v1-8k"
+        ));
         assert!(is_direct_openai_compatible_runtime("kimi"));
         assert!(is_direct_openai_compatible_runtime("openai-compatible"));
-        assert!(is_direct_openai_compatible_runtime("openai-compatible:my-custom-thing"));
+        assert!(is_direct_openai_compatible_runtime(
+            "openai-compatible:my-custom-thing"
+        ));
 
         // OpenRouter-shaped providers (NOT direct)
         assert!(!is_direct_openai_compatible_runtime("openrouter"));
@@ -1604,7 +1617,10 @@ mod tests {
 
     #[test]
     fn provider_default_model_for_returns_known_defaults() {
-        assert_eq!(provider_default_model_for("deepseek"), Some("deepseek-chat"));
+        assert_eq!(
+            provider_default_model_for("deepseek"),
+            Some("deepseek-chat")
+        );
         assert_eq!(
             provider_default_model_for("openai-compatible:deepseek"),
             Some("deepseek-chat")
@@ -1614,10 +1630,7 @@ mod tests {
             Some("moonshot-v1-8k")
         );
         assert_eq!(provider_default_model_for("kimi"), Some("moonshot-v1-8k"));
-        assert_eq!(
-            provider_default_model_for("minimaxi"),
-            Some("MiniMax-M3")
-        );
+        assert_eq!(provider_default_model_for("minimaxi"), Some("MiniMax-M3"));
         assert_eq!(
             provider_default_model_for("openai-compatible:my-random-thing"),
             None,
@@ -1692,7 +1705,10 @@ mod tests {
             name: "claude",
             model: "claude-haiku-4-5-20251001",
         };
-        assert_eq!(safe_model_for_provider(&claude), "claude-haiku-4-5-20251001");
+        assert_eq!(
+            safe_model_for_provider(&claude),
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     /// The actual 2026-08-14 incident: a session labelled `openrouter` (the
@@ -1791,9 +1807,7 @@ mod tests {
                 self.model.to_string()
             }
             fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
-                std::sync::Arc::new(GenericOpenAICompatibleAtMiniMax {
-                    model: self.model,
-                })
+                std::sync::Arc::new(GenericOpenAICompatibleAtMiniMax { model: self.model })
             }
         }
 
@@ -2191,14 +2205,12 @@ mod tests {
                 _system: &str,
                 _resume_session_id: Option<&str>,
             ) -> Result<crate::provider::EventStream> {
-                let model = self
-                    .current
-                    .lock()
-                    .unwrap()
-                    .clone();
+                let model = self.current.lock().unwrap().clone();
                 self.requested_model.lock().unwrap().push(model);
                 let stream = futures::stream::once(async move {
-                    Ok(jcode_message_types::StreamEvent::TextDelta("ok".to_string()))
+                    Ok(jcode_message_types::StreamEvent::TextDelta(
+                        "ok".to_string(),
+                    ))
                 });
                 Ok(Box::pin(stream))
             }
@@ -2259,9 +2271,7 @@ mod tests {
         // model — the endpoint's default — not the misconfigured OpenRouter name.
         let requested = stub.requested_model.lock().unwrap();
         assert!(
-            requested
-                .iter()
-                .all(|m| !is_namespaced_model(m)),
+            requested.iter().all(|m| !is_namespaced_model(m)),
             "sidecar must NOT send the OpenRouter-style model to a direct endpoint; got {:?}",
             *requested
         );
@@ -2457,7 +2467,9 @@ mod tests {
             _resume_session_id: Option<&str>,
         ) -> Result<crate::provider::EventStream> {
             let stream = futures::stream::once(async move {
-                Ok(jcode_message_types::StreamEvent::TextDelta("ok".to_string()))
+                Ok(jcode_message_types::StreamEvent::TextDelta(
+                    "ok".to_string(),
+                ))
             });
             Ok(Box::pin(stream))
         }

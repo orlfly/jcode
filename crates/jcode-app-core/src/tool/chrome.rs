@@ -80,7 +80,13 @@ fn chrome_binary() -> Result<PathBuf> {
         }
     }
     // Fall back to `chrome` / `google-chrome` on PATH.
-    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"] {
+    for name in [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+    ] {
         if let Some(found) = which_on_path(name) {
             return Ok(found);
         }
@@ -164,11 +170,17 @@ fn chrome_session_id(session_id: &str) -> String {
 }
 
 fn chrome_pid_path(session_id: &str) -> PathBuf {
-    crate::storage::runtime_dir().join(format!("chrome-session-{}.pid", chrome_session_id(session_id)))
+    crate::storage::runtime_dir().join(format!(
+        "chrome-session-{}.pid",
+        chrome_session_id(session_id)
+    ))
 }
 
 fn chrome_marker_path(session_id: &str) -> PathBuf {
-    crate::storage::runtime_dir().join(format!("chrome-session-{}.json", chrome_session_id(session_id)))
+    crate::storage::runtime_dir().join(format!(
+        "chrome-session-{}.json",
+        chrome_session_id(session_id)
+    ))
 }
 
 fn is_chrome_session_alive(session_id: &str) -> bool {
@@ -263,7 +275,10 @@ async fn ensure_chrome_launched(session_id: &str, mode: &str) -> Result<u16> {
 
     if !ready {
         let _ = child.kill().await;
-        bail!("Chrome did not start its DevTools endpoint on port {} within 15s", port);
+        bail!(
+            "Chrome did not start its DevTools endpoint on port {} within 15s",
+            port
+        );
     }
 
     if let Some(pid) = child.id() {
@@ -292,7 +307,10 @@ async fn cdp_version(port: u16) -> Option<Value> {
 }
 
 /// Connect a CDP WebSocket to a page target (or the browser target).
-async fn connect_page(port: u16, create_if_missing: bool) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+async fn connect_page(
+    port: u16,
+    create_if_missing: bool,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     // Find an existing page target.
     if let Some(targets) = cdp_http_json(port, "json").await
         && let Some(list) = targets.as_array()
@@ -300,7 +318,10 @@ async fn connect_page(port: u16, create_if_missing: bool) -> Result<WebSocketStr
         for t in list {
             if t.get("type").and_then(|x| x.as_str()) == Some("page") {
                 if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
-                    let (stream, _) = connect_async(ws).await.ok().context("connect CDP page websocket")?;
+                    let (stream, _) = connect_async(ws)
+                        .await
+                        .ok()
+                        .context("connect CDP page websocket")?;
                     return Ok(stream);
                 }
             }
@@ -312,7 +333,10 @@ async fn connect_page(port: u16, create_if_missing: bool) -> Result<WebSocketStr
         if let Some(created) = cdp_http_json(port, "/json/new?about:blank").await
             && let Some(ws) = created.get("webSocketDebuggerUrl").and_then(|x| x.as_str())
         {
-            let (stream, _) = connect_async(ws).await.ok().context("connect CDP new tab websocket")?;
+            let (stream, _) = connect_async(ws)
+                .await
+                .ok()
+                .context("connect CDP new tab websocket")?;
             return Ok(stream);
         }
     }
@@ -425,9 +449,7 @@ async fn execute_chrome_action(
             let result = chrome_eval(port, script).await?;
             Ok(render_chrome_action("eval", result))
         }
-        "screenshot" => {
-            chrome_screenshot(port).await
-        }
+        "screenshot" => chrome_screenshot(port).await,
         "list_tabs" => {
             let result = chrome_list_tabs(port).await?;
             Ok(render_chrome_action("list_tabs", result))
@@ -451,7 +473,14 @@ async fn execute_chrome_action(
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("text is required for type"))?;
             let selector = input.selector.as_deref();
-            let result = chrome_type(port, selector, text, input.clear.unwrap_or(false), input.submit.unwrap_or(false)).await?;
+            let result = chrome_type(
+                port,
+                selector,
+                text,
+                input.clear.unwrap_or(false),
+                input.submit.unwrap_or(false),
+            )
+            .await?;
             Ok(render_chrome_action("type", result))
         }
         "wait" => {
@@ -551,15 +580,30 @@ async fn chrome_navigate(port: u16, url: &str) -> Result<Value> {
 
 async fn chrome_snapshot(port: u16) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
-    let title = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": "document.title", "returnByValue": true
-    })).await?;
-    let text = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": "document.body ? document.body.innerText : ''", "returnByValue": true
-    })).await?;
-    let url = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": "location.href", "returnByValue": true
-    })).await?;
+    let title = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.title", "returnByValue": true
+        }),
+    )
+    .await?;
+    let text = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.body ? document.body.innerText : ''", "returnByValue": true
+        }),
+    )
+    .await?;
+    let url = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": "location.href", "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(json!({
         "content": text.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
         "title": title.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
@@ -571,21 +615,38 @@ async fn chrome_get_content(port: u16, format: &str) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
     match format {
         "html" => {
-            let html = send_cdp(&mut ws, "Runtime.evaluate", json!({
-                "expression": "document.documentElement.outerHTML", "returnByValue": true
-            })).await?;
-            Ok(json!({ "html": html.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or("") }))
+            let html = send_cdp(
+                &mut ws,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.documentElement.outerHTML", "returnByValue": true
+                }),
+            )
+            .await?;
+            Ok(
+                json!({ "html": html.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or("") }),
+            )
         }
         _ => {
-            let title = send_cdp(&mut ws, "Runtime.evaluate", json!({
-                "expression": "document.title", "returnByValue": true
-            })).await?;
+            let title = send_cdp(
+                &mut ws,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.title", "returnByValue": true
+                }),
+            )
+            .await?;
             let text = send_cdp(&mut ws, "Runtime.evaluate", json!({
                 "expression": "document.body ? document.body.innerText : ''", "returnByValue": true
             })).await?;
-            let url = send_cdp(&mut ws, "Runtime.evaluate", json!({
-                "expression": "location.href", "returnByValue": true
-            })).await?;
+            let url = send_cdp(
+                &mut ws,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "location.href", "returnByValue": true
+                }),
+            )
+            .await?;
             Ok(json!({
                 "title": title.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
                 "url": url.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
@@ -597,16 +658,26 @@ async fn chrome_get_content(port: u16, format: &str) -> Result<Value> {
 
 async fn chrome_eval(port: u16, script: &str) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true, "awaitPromise": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true, "awaitPromise": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn chrome_screenshot(port: u16) -> Result<ToolOutput> {
     let mut ws = cdp_session(port).await?;
     let _ = send_cdp(&mut ws, "Page.enable", json!({})).await;
-    let shot = send_cdp(&mut ws, "Page.captureScreenshot", json!({ "format": "png" })).await?;
+    let shot = send_cdp(
+        &mut ws,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    )
+    .await?;
     let data = shot.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
     if data.is_empty() {
@@ -619,13 +690,16 @@ async fn chrome_screenshot(port: u16) -> Result<ToolOutput> {
     let mut output = ToolOutput::new("Captured browser screenshot.".to_string())
         .with_title("browser screenshot");
     if !bytes.is_empty() {
-        output = output.with_labeled_image("image/png", STANDARD.encode(&bytes), "browser screenshot");
+        output =
+            output.with_labeled_image("image/png", STANDARD.encode(&bytes), "browser screenshot");
     }
     Ok(output)
 }
 
 async fn chrome_list_tabs(port: u16) -> Result<Value> {
-    let targets = cdp_http_json(port, "/json").await.unwrap_or(Value::Array(vec![]));
+    let targets = cdp_http_json(port, "/json")
+        .await
+        .unwrap_or(Value::Array(vec![]));
     let tabs: Vec<Value> = targets
         .as_array()
         .unwrap_or(&vec![])
@@ -644,7 +718,8 @@ async fn chrome_list_tabs(port: u16) -> Result<Value> {
 
 async fn chrome_new_tab(port: u16, url: &str) -> Result<Value> {
     let url_param = urlencoding::encode(url).to_string();
-    let target = cdp_http_json(port, &format!("/json/new?{}", url_param)).await
+    let target = cdp_http_json(port, &format!("/json/new?{}", url_param))
+        .await
         .unwrap_or(Value::Null);
     Ok(json!({ "target": target }))
 }
@@ -661,15 +736,27 @@ async fn chrome_click(port: u16, selector: &str) -> Result<Value> {
         seltxt = selector.replace('"', "\\\""),
     );
     let mut ws = cdp_session(port).await?;
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
-async fn chrome_type(port: u16, selector: Option<&str>, text: &str, clear: bool, _submit: bool) -> Result<Value> {
+async fn chrome_type(
+    port: u16,
+    selector: Option<&str>,
+    text: &str,
+    clear: bool,
+    _submit: bool,
+) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
-    let selector_lit = selector.map(|s| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)));
+    let selector_lit =
+        selector.map(|s| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)));
     let target_lit = match &selector_lit {
         Some(sel) => format!("document.querySelector({sel})"),
         None => "document.activeElement".to_string(),
@@ -693,15 +780,21 @@ async fn chrome_type(port: u16, selector: Option<&str>, text: &str, clear: bool,
         text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
         clear = clear,
     );
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn chrome_wait(port: u16, selector: Option<&str>, timeout_ms: u64) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
-    let selector_lit = selector.map(|s| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)));
+    let selector_lit =
+        selector.map(|s| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)));
     let selector_expr = selector_lit.unwrap_or("null".to_string());
     let script = format!(
         r#"(async function() {{
@@ -717,9 +810,14 @@ async fn chrome_wait(port: u16, selector: Option<&str>, timeout_ms: u64) -> Resu
         sel = selector_expr,
         timeout = timeout_ms,
     );
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true, "awaitPromise": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true, "awaitPromise": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
@@ -753,9 +851,14 @@ async fn chrome_interactables(port: u16) -> Result<Value> {
         });
         return out;
     })()"#;
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
@@ -771,21 +874,36 @@ async fn chrome_list_frames(port: u16) -> Result<Value> {
         walk(window, 0);
         return out;
     })()"#;
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Return the currently active tab (the one the CDP page websocket is attached to).
 async fn chrome_get_active_tab(port: u16) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
-    let url = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": "location.href", "returnByValue": true
-    })).await?;
-    let title = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": "document.title", "returnByValue": true
-    })).await?;
+    let url = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": "location.href", "returnByValue": true
+        }),
+    )
+    .await?;
+    let title = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.title", "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(json!({
         "url": url.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
         "title": title.get("result").and_then(|v| v.get("value")).and_then(|v| v.as_str()).unwrap_or(""),
@@ -794,14 +912,22 @@ async fn chrome_get_active_tab(port: u16) -> Result<Value> {
 
 /// Activate a tab by its CDP target id (from list_tabs).
 async fn chrome_select_tab(port: u16, tab_id: i64) -> Result<Value> {
-    let targets = cdp_http_json(port, "/json").await.unwrap_or(Value::Array(vec![]));
+    let targets = cdp_http_json(port, "/json")
+        .await
+        .unwrap_or(Value::Array(vec![]));
     let list = targets.as_array().cloned().unwrap_or_default();
     let target = list.iter().find(|t| {
-        t.get("id").and_then(|v| v.as_str()).map(|s| s == tab_id.to_string()).unwrap_or(false)
+        t.get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s == tab_id.to_string())
+            .unwrap_or(false)
     });
     match target {
         Some(t) => {
-            let ws_url = t.get("webSocketDebuggerUrl").and_then(|v| v.as_str()).unwrap_or("");
+            let ws_url = t
+                .get("webSocketDebuggerUrl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             // Bring the tab to the foreground via the browser-level endpoint.
             let _ = cdp_http_json(port, &format!("/json/activate/{}", tab_id)).await;
             Ok(json!({
@@ -821,8 +947,13 @@ async fn chrome_fill_form(port: u16, fields: &[BrowserField]) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
     let mut results = Vec::new();
     for field in fields {
-        let selector_lit = serde_json::to_string(&field.selector).unwrap_or_else(|_| "\"\"".to_string());
-        let value_lit = field.value.as_deref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string())).unwrap_or_else(|| "null".to_string());
+        let selector_lit =
+            serde_json::to_string(&field.selector).unwrap_or_else(|_| "\"\"".to_string());
+        let value_lit = field
+            .value
+            .as_deref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string()))
+            .unwrap_or_else(|| "null".to_string());
         let checked = field.checked.unwrap_or(false);
         let script = format!(
             r#"(function() {{
@@ -855,9 +986,14 @@ async fn chrome_fill_form(port: u16, fields: &[BrowserField]) -> Result<Value> {
             value = value_lit,
             checked = checked,
         );
-        let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-            "expression": script, "returnByValue": true
-        })).await?;
+        let result = send_cdp(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({
+                "expression": script, "returnByValue": true
+            }),
+        )
+        .await?;
         results.push(result.get("result").cloned().unwrap_or(Value::Null));
     }
     Ok(json!({ "filled": results.len(), "results": results }))
@@ -885,9 +1021,14 @@ async fn chrome_select(port: u16, selector: &str, value: &str) -> Result<Value> 
         sel = selector_lit,
         value = value_lit,
     );
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
@@ -895,7 +1036,11 @@ async fn chrome_select(port: u16, selector: &str, value: &str) -> Result<Value> 
 async fn chrome_scroll(port: u16, input: &BrowserInput) -> Result<Value> {
     let mut ws = cdp_session(port).await?;
     let position = input.position.as_deref().unwrap_or("top");
-    let selector_lit = input.selector.as_deref().map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())).unwrap_or_else(|| "null".to_string());
+    let selector_lit = input
+        .selector
+        .as_deref()
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        .unwrap_or_else(|| "null".to_string());
     let (x, y) = match input.scroll_to.as_ref() {
         Some(st) => (st.x.unwrap_or(0.0), st.y.unwrap_or(0.0)),
         None => (0.0, 0.0),
@@ -918,9 +1063,14 @@ async fn chrome_scroll(port: u16, input: &BrowserInput) -> Result<Value> {
         x = x,
         y = y,
     );
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 
@@ -930,17 +1080,33 @@ async fn chrome_upload(port: u16, selector: &str, path: &str) -> Result<Value> {
     // Resolve the node id for the file input.
     let selector_lit = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
     let doc = send_cdp(&mut ws, "DOM.getDocument", json!({ "depth": -1 })).await?;
-    let root = doc.get("root").and_then(|r| r.get("nodeId")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let query = send_cdp(&mut ws, "DOM.querySelector", json!({
-        "nodeId": root, "selector": selector
-    })).await?;
+    let root = doc
+        .get("root")
+        .and_then(|r| r.get("nodeId"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let query = send_cdp(
+        &mut ws,
+        "DOM.querySelector",
+        json!({
+            "nodeId": root, "selector": selector
+        }),
+    )
+    .await?;
     let node_id = query.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
     if node_id == 0 {
-        return Ok(json!({ "uploaded": false, "selector": selector_lit, "error": "file input not found" }));
+        return Ok(
+            json!({ "uploaded": false, "selector": selector_lit, "error": "file input not found" }),
+        );
     }
-    let result = send_cdp(&mut ws, "DOM.setFileInputFiles", json!({
-        "nodeId": node_id, "files": [path]
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "DOM.setFileInputFiles",
+        json!({
+            "nodeId": node_id, "files": [path]
+        }),
+    )
+    .await?;
     Ok(json!({ "uploaded": true, "selector": selector_lit, "path": path, "result": result }))
 }
 
@@ -961,9 +1127,14 @@ async fn chrome_press(port: u16, key: &str) -> Result<Value> {
         }})()"#,
         key = key_lit,
     );
-    let result = send_cdp(&mut ws, "Runtime.evaluate", json!({
-        "expression": script, "returnByValue": true
-    })).await?;
+    let result = send_cdp(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({
+            "expression": script, "returnByValue": true
+        }),
+    )
+    .await?;
     Ok(result.get("result").cloned().unwrap_or(Value::Null))
 }
 

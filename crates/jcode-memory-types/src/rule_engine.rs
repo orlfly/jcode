@@ -161,21 +161,22 @@ pub fn evaluate_condition(cond: &Condition, ctx: &RuleContext) -> bool {
             .as_ref()
             .map(|id| ctx.graph.memories.contains_key(id))
             .unwrap_or(false),
-        Condition::NoExistingId => ctx.existing_id.is_none()
-            || !ctx.graph.memories.contains_key(ctx.existing_id.as_deref().unwrap_or("")),
+        Condition::NoExistingId => {
+            ctx.existing_id.is_none()
+                || !ctx
+                    .graph
+                    .memories
+                    .contains_key(ctx.existing_id.as_deref().unwrap_or(""))
+        }
         Condition::HasContent => !ctx.entry.content.trim().is_empty(),
         Condition::HasEmbedding => ctx.entry.embedding.is_some(),
-        Condition::ProvenanceAtLeast { min_rank } => ctx
-            .entry
-            .effective_provenance()
-            .method
-            .authority_rank()
-            >= *min_rank,
+        Condition::ProvenanceAtLeast { min_rank } => {
+            ctx.entry.effective_provenance().method.authority_rank() >= *min_rank
+        }
         Condition::ConfidenceAtLeast { min } => ctx.entry.confidence >= *min,
-        Condition::SimilarityAtLeast { threshold } => ctx
-            .similarity
-            .map(|s| s >= *threshold)
-            .unwrap_or(false),
+        Condition::SimilarityAtLeast { threshold } => {
+            ctx.similarity.map(|s| s >= *threshold).unwrap_or(false)
+        }
         Condition::Custom { expression } => match expression.as_str() {
             // Global-scope gate: only generalized, cross-project content may
             // be written to global memory. See `is_generalized_content`.
@@ -356,11 +357,7 @@ pub fn apply_entry_effects(plan: &RulePlan, entry: &mut MemoryEntry) -> Vec<Effe
 /// Apply graph-level effects to a `MemoryGraph`.  Returns the effects that
 /// were successfully applied.  Used by `MemoryManager` after
 /// `apply_entry_effects`.
-pub fn apply_graph_effects(
-    plan: &RulePlan,
-    new_id: &str,
-    graph: &mut MemoryGraph,
-) -> Vec<Effect> {
+pub fn apply_graph_effects(plan: &RulePlan, new_id: &str, graph: &mut MemoryGraph) -> Vec<Effect> {
     let mut applied = Vec::new();
     for effect in &plan.effects {
         match effect {
@@ -371,12 +368,18 @@ pub fn apply_graph_effects(
                 }
             }
             Effect::Supersede { old_id, new_id } => {
-                if old_id != "__self__" && new_id != "__self__" && graph.memories.contains_key(old_id) {
+                if old_id != "__self__"
+                    && new_id != "__self__"
+                    && graph.memories.contains_key(old_id)
+                {
                     graph.supersede(new_id, old_id);
                     applied.push(effect.clone());
                 }
             }
-            Effect::DeriveFrom { source_id, relation_kind } => {
+            Effect::DeriveFrom {
+                source_id,
+                relation_kind,
+            } => {
                 if graph.memories.contains_key(source_id) {
                     let edge_kind = match relation_kind.as_str() {
                         "relates_to" => crate::graph::EdgeKind::RelatesTo { weight: 0.5 },
@@ -550,7 +553,7 @@ mod generality_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ontology::{default_ontology, EVENT_REMEMBER, TYPE_FACT, TYPE_GOAL};
+    use crate::ontology::{EVENT_REMEMBER, TYPE_FACT, TYPE_GOAL, default_ontology};
     use crate::{MemoryCategory, MemoryEntry, MemoryGraph};
     use std::sync::Arc;
 
@@ -581,7 +584,11 @@ mod tests {
     fn fact_remember_adds_provenance_and_touch() {
         let ctx = ctx(EVENT_REMEMBER, TYPE_FACT);
         let plan = dispatch_event(&ctx);
-        assert!(plan.effects.iter().any(|e| matches!(e, Effect::SetProvenance { .. })));
+        assert!(
+            plan.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetProvenance { .. }))
+        );
         assert!(plan.effects.iter().any(|e| matches!(e, Effect::Touch)));
     }
 

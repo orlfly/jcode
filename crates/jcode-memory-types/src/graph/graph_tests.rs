@@ -324,7 +324,10 @@ fn test_archived_memory_excluded_from_active() {
     let active: Vec<_> = graph.active_memories().map(|m| m.id.clone()).collect();
     assert!(active.contains(&id));
     assert!(!active.contains(&archived_id));
-    assert_eq!(graph.memories.get(&archived_id).unwrap().lifecycle.status, MemoryStatus::Archived);
+    assert_eq!(
+        graph.memories.get(&archived_id).unwrap().lifecycle.status,
+        MemoryStatus::Archived
+    );
 }
 
 #[test]
@@ -371,14 +374,21 @@ fn test_archive_memory_soft_deletes() {
     let m = graph.get_memory(&id).unwrap();
     assert!(!m.active);
     assert_eq!(m.lifecycle.status, MemoryStatus::Archived);
-    assert_eq!(m.lifecycle.deprecated_reason.as_deref(), Some("user requested"));
+    assert_eq!(
+        m.lifecycle.deprecated_reason.as_deref(),
+        Some("user requested")
+    );
 }
 
 #[test]
 fn test_validate_empty_graph_is_clean() {
     let graph = MemoryGraph::new();
     let report = graph.validate();
-    assert!(report.is_valid(), "empty graph should validate: {:?}", report);
+    assert!(
+        report.is_valid(),
+        "empty graph should validate: {:?}",
+        report
+    );
 }
 
 #[test]
@@ -386,7 +396,11 @@ fn test_validate_detects_dangling_edge() {
     let mut graph = MemoryGraph::new();
     let id = graph.add_memory(make_test_memory("linked"));
     // Manually add an edge to a non-existent node.
-    graph.add_edge_internal(&id, "mem_does_not_exist", EdgeKind::RelatesTo { weight: 1.0 });
+    graph.add_edge_internal(
+        &id,
+        "mem_does_not_exist",
+        EdgeKind::RelatesTo { weight: 1.0 },
+    );
     let report = graph.validate();
     assert!(!report.is_valid());
     assert!(report.issues.iter().any(|i| i.code == "E31"));

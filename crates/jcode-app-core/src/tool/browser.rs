@@ -476,16 +476,12 @@ fn resolve_provider(browser: Option<&str>) -> Result<&'static dyn BrowserProvide
         return Ok(&FIREFOX_PROVIDER);
     }
 
-    anyhow::bail!(
-        "Unknown browser '{}'. Supported: {}.",
-        browser,
-        {
-            let mut supported: Vec<&str> = Vec::new();
-            supported.extend(CHROME_PROVIDER.supported_browsers());
-            supported.extend(FIREFOX_PROVIDER.supported_browsers());
-            supported.join(", ")
-        }
-    )
+    anyhow::bail!("Unknown browser '{}'. Supported: {}.", browser, {
+        let mut supported: Vec<&str> = Vec::new();
+        supported.extend(CHROME_PROVIDER.supported_browsers());
+        supported.extend(FIREFOX_PROVIDER.supported_browsers());
+        supported.join(", ")
+    })
 }
 
 fn status_metadata(

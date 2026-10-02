@@ -95,10 +95,7 @@ pub fn schedule(event: &ScheduleEvent, ontology: &Ontology) -> Vec<ScheduledActi
                         activity_id: activity.id.clone(),
                         steps: activity.steps.clone(),
                         session_state: Some("fresh_user_turn".to_string()),
-                        reason: format!(
-                            "turn_tick session={}",
-                            session_id
-                        ),
+                        reason: format!("turn_tick session={}", session_id),
                     });
                 }
             }
@@ -183,8 +180,8 @@ pub fn steps_of_kind<'a>(plan: &'a [ScheduledActivity], kind: &str) -> Vec<&'a A
 mod tests {
     use super::*;
     use crate::ontology::{
-        default_ontology, ACTIVITY_FINAL_EXTRACT, ACTIVITY_PER_TURN_RELEVANCE,
-        ACTIVITY_PERIODIC_EXTRACT, ACTIVITY_TOPIC_CHANGE_EXTRACT,
+        ACTIVITY_FINAL_EXTRACT, ACTIVITY_PER_TURN_RELEVANCE, ACTIVITY_PERIODIC_EXTRACT,
+        ACTIVITY_TOPIC_CHANGE_EXTRACT, default_ontology,
     };
 
     #[test]
@@ -230,10 +227,7 @@ mod tests {
             },
             &onto,
         );
-        assert!(
-            plan.iter()
-                .any(|p| p.activity_id == ACTIVITY_FINAL_EXTRACT)
-        );
+        assert!(plan.iter().any(|p| p.activity_id == ACTIVITY_FINAL_EXTRACT));
     }
 
     #[test]

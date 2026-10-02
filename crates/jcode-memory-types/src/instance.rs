@@ -210,7 +210,10 @@ impl IdentityMetadata {
 
     pub fn matches(&self, query: &str) -> bool {
         let q = query.to_lowercase();
-        self.keys.iter().chain(&self.aliases).any(|s| s.to_lowercase() == q)
+        self.keys
+            .iter()
+            .chain(&self.aliases)
+            .any(|s| s.to_lowercase() == q)
     }
 }
 
@@ -323,8 +326,14 @@ mod tests {
 
     #[test]
     fn provenance_authority_ordering() {
-        assert!(ExtractionMethod::UserStated.authority_rank() > ExtractionMethod::LlmExtraction.authority_rank());
-        assert!(ExtractionMethod::StructuredMapping.authority_rank() > ExtractionMethod::RuleInference.authority_rank());
+        assert!(
+            ExtractionMethod::UserStated.authority_rank()
+                > ExtractionMethod::LlmExtraction.authority_rank()
+        );
+        assert!(
+            ExtractionMethod::StructuredMapping.authority_rank()
+                > ExtractionMethod::RuleInference.authority_rank()
+        );
     }
 
     #[test]
@@ -332,10 +341,12 @@ mod tests {
         let user = ProvenanceRecord::new("chat", ExtractionMethod::UserStated).with_confidence(0.5);
         assert!(user.is_admissible());
 
-        let llm = ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction).with_confidence(0.6);
+        let llm = ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction)
+            .with_confidence(0.6);
         assert!(!llm.is_admissible());
 
-        let llm_ok = ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction).with_confidence(0.75);
+        let llm_ok = ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction)
+            .with_confidence(0.75);
         assert!(llm_ok.is_admissible());
     }
 
@@ -352,7 +363,8 @@ mod tests {
             .with_effective_to(Utc::now() - chrono::Duration::days(1));
         assert!(!window.is_retrievable_now());
 
-        let future = LifecycleMetadata::active().with_effective_from(Utc::now() + chrono::Duration::days(1));
+        let future =
+            LifecycleMetadata::active().with_effective_from(Utc::now() + chrono::Duration::days(1));
         assert!(!future.is_retrievable_now());
     }
 

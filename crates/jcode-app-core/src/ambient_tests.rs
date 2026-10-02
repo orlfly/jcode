@@ -329,8 +329,16 @@ fn test_build_ambient_system_prompt_minimal() {
         cycle_budget_desc: "stay under 50k tokens".into(),
     };
 
-    let prompt =
-        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &[], &budget, 0);
+    let prompt = build_ambient_system_prompt(
+        &state,
+        &queue,
+        &health,
+        &sessions,
+        &feedback,
+        &[],
+        &budget,
+        0,
+    );
 
     assert!(prompt.contains("ambient agent for jcode"));
     assert!(prompt.contains("## Current State"));
@@ -405,8 +413,16 @@ fn test_build_ambient_system_prompt_with_data() {
         cycle_budget_desc: "stay under 15k tokens".into(),
     };
 
-    let prompt =
-        build_ambient_system_prompt(&state, &queue, &health, &sessions, &feedback, &[], &budget, 2);
+    let prompt = build_ambient_system_prompt(
+        &state,
+        &queue,
+        &health,
+        &sessions,
+        &feedback,
+        &[],
+        &budget,
+        2,
+    );
 
     assert!(prompt.contains("15m ago"));
     assert!(prompt.contains("Active user sessions: 2"));
@@ -471,8 +487,20 @@ fn test_gather_global_promotion_candidates_filters_and_ranks() {
     // Project A: one strong generalized keeper, one env-specific reject.
     let mut g = MemoryGraph::new();
     for (id, content, strength, accesses, active) in [
-        ("keep1", "教训：绝不用 xargs 对容器全量删除，必须先列明确认", 3u32, 2u32, true),
-        ("env1", "部署机 = 192.168.6.33, live 容器 chat-node", 9u32, 9u32, true),
+        (
+            "keep1",
+            "教训：绝不用 xargs 对容器全量删除，必须先列明确认",
+            3u32,
+            2u32,
+            true,
+        ),
+        (
+            "env1",
+            "部署机 = 192.168.6.33, live 容器 chat-node",
+            9u32,
+            9u32,
+            true,
+        ),
         // Strength 1 + access 1: below the cross-context evidence bar.
         ("weak1", "更新记忆前必须核对事实准确性", 1u32, 1u32, true),
     ] {
@@ -491,7 +519,10 @@ fn test_gather_global_promotion_candidates_filters_and_ranks() {
 
     // Project B: same generalized keeper content (dedup across projects).
     let mut g2 = MemoryGraph::new();
-    let mut e2 = MemoryEntry::new(MemoryCategory::Correction, "教训：绝不用 xargs 对容器全量删除，必须先列明确认");
+    let mut e2 = MemoryEntry::new(
+        MemoryCategory::Correction,
+        "教训：绝不用 xargs 对容器全量删除，必须先列明确认",
+    );
     e2.id = "keep1b".to_string();
     e2.strength = 5;
     e2.access_count = 4;

@@ -11,17 +11,16 @@ pub use instance::{
 
 pub mod ontology;
 pub use ontology::{
-    Activity, ActivityStep, ActivityTrigger, Condition, Effect, Ontology, OntologyType,
-    PropertyDef, PropertyKind, RelationshipDef, Rule, ScoringPolicy, DecayPolicy,
-    LifecyclePolicy, LifecycleTransition, TrustMultiplier, WeightRange,
-    DEFAULT_ONTOLOGY_ID, DEFAULT_ONTOLOGY_VERSION, default_event_names, default_ontology,
-    validate_default_ontology, EVENT_DEDUP, EVENT_FINALIZE, EVENT_LINK, EVENT_REMEMBER,
-    EVENT_SUPERSEDE, EVENT_TAG, EVENT_TOPIC_CHANGE, EVENT_TURN_TICK, EVENT_UNTAG,
-    EVENT_UPSERT, EVENT_CONTRADICT, REL_CONTRADICTS, REL_DERIVED_FROM, REL_HAS_TAG,
-    REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES, RULE_DEDUP_REINFORCE, RULE_LINK,
-    RULE_REMEMBER, RULE_SUPERSEDE, RULE_TAG, RULE_UNTAG, RULE_UPSERT,
-    RULE_CONTRADICT, TYPE_CORRECTION, TYPE_ENTITY, TYPE_FACT, TYPE_GOAL, TYPE_NOTE,
-    TYPE_PREFERENCE, TYPE_SKILL,
+    Activity, ActivityStep, ActivityTrigger, Condition, DEFAULT_ONTOLOGY_ID,
+    DEFAULT_ONTOLOGY_VERSION, DecayPolicy, EVENT_CONTRADICT, EVENT_DEDUP, EVENT_FINALIZE,
+    EVENT_LINK, EVENT_REMEMBER, EVENT_SUPERSEDE, EVENT_TAG, EVENT_TOPIC_CHANGE, EVENT_TURN_TICK,
+    EVENT_UNTAG, EVENT_UPSERT, Effect, LifecyclePolicy, LifecycleTransition, Ontology,
+    OntologyType, PropertyDef, PropertyKind, REL_CONTRADICTS, REL_DERIVED_FROM, REL_HAS_TAG,
+    REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES, RULE_CONTRADICT, RULE_DEDUP_REINFORCE,
+    RULE_LINK, RULE_REMEMBER, RULE_SUPERSEDE, RULE_TAG, RULE_UNTAG, RULE_UPSERT, RelationshipDef,
+    Rule, ScoringPolicy, TYPE_CORRECTION, TYPE_ENTITY, TYPE_FACT, TYPE_GOAL, TYPE_NOTE,
+    TYPE_PREFERENCE, TYPE_SKILL, TrustMultiplier, WeightRange, default_event_names,
+    default_ontology, validate_default_ontology,
 };
 
 pub mod rule_engine;
@@ -31,9 +30,7 @@ pub use rule_engine::{
 };
 
 pub mod activity;
-pub use activity::{
-    ScheduleEvent, ScheduledActivity, describe_step, schedule, steps_of_kind,
-};
+pub use activity::{ScheduleEvent, ScheduledActivity, describe_step, schedule, steps_of_kind};
 
 pub mod actions;
 pub use actions::{
@@ -266,13 +263,13 @@ use std::borrow::Cow;
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TrustLevel {
-   /// User explicitly stated this
-   High,
-   /// Observed from user behavior
-   #[default]
-   Medium,
-   /// Inferred by the agent
-   Low,
+    /// User explicitly stated this
+    High,
+    /// Observed from user behavior
+    #[default]
+    Medium,
+    /// Inferred by the agent
+    Low,
 }
 
 impl TrustLevel {
@@ -466,7 +463,11 @@ impl MemoryEntry {
         self
     }
 
-    pub fn with_source_provenance(mut self, source: impl Into<String>, method: ExtractionMethod) -> Self {
+    pub fn with_source_provenance(
+        mut self,
+        source: impl Into<String>,
+        method: ExtractionMethod,
+    ) -> Self {
         self.provenance = Some(ProvenanceRecord::new(source, method));
         self
     }

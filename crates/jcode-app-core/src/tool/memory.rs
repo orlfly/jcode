@@ -1055,12 +1055,12 @@ mod tests {
 
         let tool = MemoryTool::new();
         for bad in [
-            "",            // empty
-            "   ",         // whitespace only
-            "has space",   // embedded whitespace
-            "has/slash",   // path separator
+            "",             // empty
+            "   ",          // whitespace only
+            "has space",    // embedded whitespace
+            "has/slash",    // path separator
             "has\nnewline", // control character
-            "has\"quote",  // JSON-relevant punctuation
+            "has\"quote",   // JSON-relevant punctuation
         ] {
             let result = tool
                 .execute(

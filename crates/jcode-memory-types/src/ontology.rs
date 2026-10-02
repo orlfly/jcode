@@ -175,12 +175,10 @@ impl Ontology {
 
     /// All activities that fire on `event`.
     pub fn activities_for_event(&self, event: &str) -> impl Iterator<Item = &Activity> {
-        self.activities
-            .iter()
-            .filter(move |a| match &a.trigger {
-                ActivityTrigger::OnEvent { event: e } => e == event,
-                _ => false,
-            })
+        self.activities.iter().filter(move |a| match &a.trigger {
+            ActivityTrigger::OnEvent { event: e } => e == event,
+            _ => false,
+        })
     }
 
     /// Periodic activities whose cadence has elapsed since `last_tick`.
@@ -430,7 +428,9 @@ impl LifecyclePolicy {
         if from == to {
             return true;
         }
-        self.transitions.iter().any(|t| t.from == from && t.to == to)
+        self.transitions
+            .iter()
+            .any(|t| t.from == from && t.to == to)
     }
 }
 
@@ -643,7 +643,10 @@ pub enum Effect {
     },
     /// Mark the instance as derived from another (typically used for
     /// cross-batch extraction edges).
-    DeriveFrom { source_id: String, relation_kind: String },
+    DeriveFrom {
+        source_id: String,
+        relation_kind: String,
+    },
     /// Reinforce the existing instance (strength++ + access_count++).
     Reinforce { source_label: String },
     /// Supersede the existing instance with the new one.
@@ -1230,11 +1233,7 @@ pub fn validate_default_ontology() -> Result<(), Vec<String>> {
         }
     }
 
-    if errs.is_empty() {
-        Ok(())
-    } else {
-        Err(errs)
-    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
 #[cfg(test)]

@@ -268,10 +268,9 @@ pub fn log_event(kind: &MemoryEventKind) {
             "rule_applied",
             Some(serde_json::json!({ "detail": detail })),
         ),
-        MemoryEventKind::RuleSkip { detail } => (
-            "rule_skip",
-            Some(serde_json::json!({ "detail": detail })),
-        ),
+        MemoryEventKind::RuleSkip { detail } => {
+            ("rule_skip", Some(serde_json::json!({ "detail": detail })))
+        }
     };
 
     write_log(event, detail);

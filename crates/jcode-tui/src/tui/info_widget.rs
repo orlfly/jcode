@@ -546,9 +546,7 @@ impl MemoryInfo {
         // this session. The auto-disabled state is the most important one to
         // surface — it explains why precision recall silently went away.
         !self.disabled
-            && (self.total_count > 0
-                || self.activity.is_some()
-                || self.sidecar_auto_disabled)
+            && (self.total_count > 0 || self.activity.is_some() || self.sidecar_auto_disabled)
     }
 
     pub(crate) fn should_show_activity(&self) -> bool {

@@ -860,10 +860,8 @@ input = ["text"]
             );
 
             // A key whose profile DOES declare the model still pins correctly.
-            let matching = MultiProvider::model_switch_request_for_session_model(
-                "glm-5.3",
-                Some("company"),
-            );
+            let matching =
+                MultiProvider::model_switch_request_for_session_model("glm-5.3", Some("company"));
             assert_eq!(matching, "company:glm-5.3");
         });
     }

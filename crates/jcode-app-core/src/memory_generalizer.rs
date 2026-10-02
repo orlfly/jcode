@@ -136,10 +136,7 @@ fn trigram_similarity(a: &str, b: &str) -> f32 {
 }
 
 /// Drop output rules that paraphrase something already in global scope.
-fn filter_paraphrases(
-    rules: Vec<(String, String)>,
-    existing: &[String],
-) -> Vec<(String, String)> {
+fn filter_paraphrases(rules: Vec<(String, String)>, existing: &[String]) -> Vec<(String, String)> {
     // Char-trigram Jaccard measured ~0.40 for a real rewording of the same
     // rule and <0.25 for unrelated rules; 0.35 sits between them.
     const PARAPHRASE_THRESHOLD: f32 = 0.35;
@@ -158,10 +155,7 @@ pub async fn run_generalization_pass() -> usize {
     if !crate::memory::memory_llm_judge_available() {
         return 0;
     }
-    if !crate::config::config()
-        .agents
-        .memory_background_generalize
-    {
+    if !crate::config::config().agents.memory_background_generalize {
         return 0;
     }
 
@@ -209,9 +203,7 @@ pub async fn run_generalization_pass() -> usize {
             // The gate is defense-in-depth; a rejection here means the model
             // sneaked environment detail past the post-filter. Log and drop.
             Err(e) => {
-                crate::logging::info(&format!(
-                    "memory generalization gate rejected a rule: {e}"
-                ));
+                crate::logging::info(&format!("memory generalization gate rejected a rule: {e}"));
             }
         }
     }
@@ -353,11 +345,13 @@ mod paraphrase_tests {
     fn similarity_catches_rewording_not_unrelated() {
         // Same lesson, different words: high overlap.
         let known = "Never merge pull requests yourself; leave a comment on the MR and let a human perform the merge";
-        let reworded = "never merge PRs yourself, post a comment summarizing changes and let a human merge";
+        let reworded =
+            "never merge PRs yourself, post a comment summarizing changes and let a human merge";
         assert!(trigram_similarity(reworded, known) >= 0.30);
 
         // Genuinely different lesson: low overlap.
-        let other = "Always write explicit acceptance criteria into task descriptions before creation";
+        let other =
+            "Always write explicit acceptance criteria into task descriptions before creation";
         assert!(trigram_similarity(other, known) < 0.30);
     }
 
@@ -367,8 +361,15 @@ mod paraphrase_tests {
             "Never merge pull requests yourself; leave a comment on the MR and let a human perform the merge".to_string(),
         ];
         let rules = vec![
-            ("correction".to_string(), "never merge PRs yourself, post a summary comment and let a human merge".to_string()),
-            ("fact".to_string(), "always verify artifact digests before shipping a deployment".to_string()),
+            (
+                "correction".to_string(),
+                "never merge PRs yourself, post a summary comment and let a human merge"
+                    .to_string(),
+            ),
+            (
+                "fact".to_string(),
+                "always verify artifact digests before shipping a deployment".to_string(),
+            ),
         ];
         let kept = filter_paraphrases(rules, &known);
         assert_eq!(kept.len(), 1);

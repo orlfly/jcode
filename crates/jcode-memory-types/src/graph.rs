@@ -419,7 +419,11 @@ impl MemoryGraph {
 
     /// Deprecate a memory, keeping it for history but hiding it from retrieval.
     /// Returns `None` if the memory does not exist.
-    pub fn deprecate_memory(&mut self, id: &str, reason: impl Into<String>) -> Option<&MemoryEntry> {
+    pub fn deprecate_memory(
+        &mut self,
+        id: &str,
+        reason: impl Into<String>,
+    ) -> Option<&MemoryEntry> {
         if let Some(m) = self.memories.get_mut(id) {
             m.lifecycle.deprecated = true;
             m.lifecycle.deprecated_reason = Some(reason.into());

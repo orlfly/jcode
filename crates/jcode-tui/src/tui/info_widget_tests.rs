@@ -1839,15 +1839,13 @@ fn memory_widget_shows_no_llm_badge_when_sidecar_auto_disabled() {
 
     // Also exercise the compact one-liner path used by the top status bar,
     // which has only enough room for the short ⚠ NO-LLM tag.
-    let compact_text: String = super::memory_render::render_memory_compact(
-        data.memory_info.as_ref().unwrap(),
-        40,
-    )
-    .iter()
-    .flat_map(|line| line.spans.iter())
-    .map(|span| span.content.as_ref())
-    .collect::<Vec<_>>()
-    .join("\n");
+    let compact_text: String =
+        super::memory_render::render_memory_compact(data.memory_info.as_ref().unwrap(), 40)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
     assert!(
         compact_text.contains("NO-LLM"),
         "auto-disabled badge missing from compact line: {compact_text:?}"

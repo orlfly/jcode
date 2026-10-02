@@ -1263,8 +1263,7 @@ pub(super) fn gather_memory_info(
     // set above — so the user can see why precision recall is silently
     // degraded.
     let sidecar_auto_disabled = memory_enabled && crate::memory::memory_sidecar_auto_disabled();
-    let sidecar_auto_disabled_after =
-        crate::memory_judge_metrics::consecutive_degradation_count();
+    let sidecar_auto_disabled_after = crate::memory_judge_metrics::consecutive_degradation_count();
 
     let finalize = |mut info: MemoryInfo| {
         info.activity = activity.clone();
@@ -1336,11 +1335,7 @@ fn fallback_memory_info(
     sidecar_auto_disabled_after: u64,
 ) -> Option<MemoryInfo> {
     // No cached counts yet. Show whatever live signal we have.
-    if activity.is_none()
-        && sidecar_model.is_none()
-        && memory_enabled
-        && !sidecar_auto_disabled
-    {
+    if activity.is_none() && sidecar_model.is_none() && memory_enabled && !sidecar_auto_disabled {
         return None;
     }
     Some(MemoryInfo {
@@ -1422,7 +1417,8 @@ fn gather_memory_info_inner(working_dir: Option<String>) -> Option<MemoryInfo> {
             activity,
             disabled: false,
             sidecar_auto_disabled: crate::memory::memory_sidecar_auto_disabled(),
-            sidecar_auto_disabled_after: crate::memory_judge_metrics::consecutive_degradation_count(),
+            sidecar_auto_disabled_after: crate::memory_judge_metrics::consecutive_degradation_count(
+            ),
             graph_nodes,
             graph_edges,
         })

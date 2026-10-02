@@ -76,7 +76,11 @@ const MEMORY_RELEVANCE_MAX_RESULTS: usize = 10;
 // Dormant since the upstream Jev merge rewired remember_project/global to
 // remember_in_graph; kept for the planned ontology-driven write path.
 #[allow(dead_code)]
-fn apply_plan(graph: &mut MemoryGraph, new_id: &str, plan: &jcode_memory_types::rule_engine::RulePlan) {
+fn apply_plan(
+    graph: &mut MemoryGraph,
+    new_id: &str,
+    plan: &jcode_memory_types::rule_engine::RulePlan,
+) {
     if let Some(entry) = graph.memories.get_mut(new_id) {
         jcode_memory_types::rule_engine::apply_entry_effects(plan, entry);
     }
@@ -549,8 +553,7 @@ impl MemoryManager {
         ctx.type_id = type_id.clone();
         ctx.scope = "global".to_string();
         let plan = registry.dispatch(&ctx);
-        let generalized =
-            jcode_memory_types::rule_engine::is_generalized_content(&entry.content);
+        let generalized = jcode_memory_types::rule_engine::is_generalized_content(&entry.content);
         if !generalized {
             return Some(format!(
                 "content is environment-specific (type_id={type_id})"
@@ -587,26 +590,26 @@ impl MemoryManager {
     /// Insert or update a memory with a stable ID in the project graph.
     /// Preserves existing inbound/outbound graph relationships while refreshing
     /// content and tags.
-   pub fn upsert_project_memory(&self, entry: MemoryEntry) -> Result<String> {
+    pub fn upsert_project_memory(&self, entry: MemoryEntry) -> Result<String> {
         crate::memory_types::validate_new_entry(&entry)
             .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
-       let mut graph = self.load_project_graph()?;
-       let id = self.upsert_memory_in_graph(&mut graph, entry);
-       self.save_project_graph(&graph)?;
-       Ok(id)
-   }
+        let mut graph = self.load_project_graph()?;
+        let id = self.upsert_memory_in_graph(&mut graph, entry);
+        self.save_project_graph(&graph)?;
+        Ok(id)
+    }
 
     /// Insert or update a memory with a stable ID in the global graph.
     /// Preserves existing inbound/outbound graph relationships while refreshing
     /// content and tags.
-   pub fn upsert_global_memory(&self, entry: MemoryEntry) -> Result<String> {
+    pub fn upsert_global_memory(&self, entry: MemoryEntry) -> Result<String> {
         crate::memory_types::validate_new_entry(&entry)
             .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
-       let mut graph = self.load_global_graph()?;
-       let id = self.upsert_memory_in_graph(&mut graph, entry);
-       self.save_global_graph(&graph)?;
-       Ok(id)
-   }
+        let mut graph = self.load_global_graph()?;
+        let id = self.upsert_memory_in_graph(&mut graph, entry);
+        self.save_global_graph(&graph)?;
+        Ok(id)
+    }
 
     fn upsert_memory_in_graph(
         &self,
@@ -816,14 +819,12 @@ impl MemoryManager {
 
         let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
         top_k_by_score(
-            fused
-                .into_iter()
-                .filter_map(|(idx, score)| {
-                    entries[idx].take().map(|e| {
-                        let s = prior(&e);
-                        (e, score + s)
-                    })
-                }),
+            fused.into_iter().filter_map(|(idx, score)| {
+                entries[idx].take().map(|e| {
+                    let s = prior(&e);
+                    (e, score + s)
+                })
+            }),
             limit,
         )
     }
@@ -1170,11 +1171,7 @@ impl MemoryManager {
     /// per-store search yields no hits — callers should fall back to
     /// the in-memory scan in that case so a partial backend failure
     /// is not visible to the user.
-    fn fts_search_scoped(
-        &self,
-        query: &str,
-        scope: MemoryScope,
-    ) -> Option<Vec<MemoryEntry>> {
+    fn fts_search_scoped(&self, query: &str, scope: MemoryScope) -> Option<Vec<MemoryEntry>> {
         use jcode_memory_types::StoreKey;
 
         let backend = if self.test_mode {
@@ -1257,9 +1254,7 @@ impl MemoryManager {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    crate::logging::warn(&format!(
-                        "fts_search_scoped project: {e}"
-                    ));
+                    crate::logging::warn(&format!("fts_search_scoped project: {e}"));
                 }
             }
         }
@@ -1278,9 +1273,7 @@ impl MemoryManager {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    crate::logging::warn(&format!(
-                        "fts_search_scoped global: {e}"
-                    ));
+                    crate::logging::warn(&format!("fts_search_scoped global: {e}"));
                 }
             }
         }
@@ -1687,8 +1680,7 @@ impl MemoryManager {
                         && graph.tags.is_empty()
                         && graph.clusters.is_empty()
                         && graph.edges.is_empty()
-                        && let Some(legacy) =
-                            self.load_legacy_project_json_for_migration()?
+                        && let Some(legacy) = self.load_legacy_project_json_for_migration()?
                     {
                         graph = legacy;
                         let _ = backend.save(&key, &graph);
@@ -1793,8 +1785,7 @@ impl MemoryManager {
                         && graph.tags.is_empty()
                         && graph.clusters.is_empty()
                         && graph.edges.is_empty()
-                        && let Some(legacy) =
-                            self.load_legacy_global_json_for_migration()?
+                        && let Some(legacy) = self.load_legacy_global_json_for_migration()?
                     {
                         graph = legacy;
                         let _ = backend.save(&key, &graph);
@@ -1868,34 +1859,38 @@ impl MemoryManager {
         }
     }
 
-   /// Save project memories as a MemoryGraph
-   pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
-       if crate::memory::active_backend_name() == "sqlite-gvec" {
-           let backend = if self.test_mode { crate::memory::test_backend() } else { crate::memory::graph_backend() };
-           let key = StoreKey::new(match self.get_project_dir() {
-               Some(d) => crate::memory::project_store_key(&d),
-               None => "project:none".to_string(),
-           });
-           if let Err(e) = backend.save(&key, graph) {
-               crate::logging::warn(&format!(
-                   "save_project_graph via {e}; falling back to JSON path"
-               ));
-               return self.save_project_graph_json(graph);
-           }
-           if !self.test_mode {
-               cache_graph_for_backend(backend.name(), &key, graph, 0);
-           }
-           return Ok(());
-       }
-       self.save_project_graph_json(graph)
-   }
+    /// Save project memories as a MemoryGraph
+    pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            let backend = if self.test_mode {
+                crate::memory::test_backend()
+            } else {
+                crate::memory::graph_backend()
+            };
+            let key = StoreKey::new(match self.get_project_dir() {
+                Some(d) => crate::memory::project_store_key(&d),
+                None => "project:none".to_string(),
+            });
+            if let Err(e) = backend.save(&key, graph) {
+                crate::logging::warn(&format!(
+                    "save_project_graph via {e}; falling back to JSON path"
+                ));
+                return self.save_project_graph_json(graph);
+            }
+            if !self.test_mode {
+                cache_graph_for_backend(backend.name(), &key, graph, 0);
+            }
+            return Ok(());
+        }
+        self.save_project_graph_json(graph)
+    }
 
-   /// Internal: write the project graph to the legacy JSON snapshot.
-   /// Kept separate so `save_project_graph` can route to either the
-   /// trait backend or this path without duplicating the validation /
-   /// cache-update code below.
-   fn save_project_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
-       if let Some(path) = self.project_memory_path()? {
+    /// Internal: write the project graph to the legacy JSON snapshot.
+    /// Kept separate so `save_project_graph` can route to either the
+    /// trait backend or this path without duplicating the validation /
+    /// cache-update code below.
+    fn save_project_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
+        if let Some(path) = self.project_memory_path()? {
             let report = graph.validate();
             if !report.is_valid() {
                 crate::logging::info(&format!(
@@ -1905,36 +1900,40 @@ impl MemoryManager {
                     report.errors()
                 ));
             }
-           storage::write_json(&path, graph)?;
-           if !self.test_mode {
-               cache_graph(path, graph);
-           }
-       }
-       Ok(())
-   }
+            storage::write_json(&path, graph)?;
+            if !self.test_mode {
+                cache_graph(path, graph);
+            }
+        }
+        Ok(())
+    }
 
-   /// Save global memories as a MemoryGraph
-   pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
-       if crate::memory::active_backend_name() == "sqlite-gvec" {
-           let backend = if self.test_mode { crate::memory::test_backend() } else { crate::memory::graph_backend() };
-           let key = StoreKey::new(crate::memory::global_store_key());
-           if let Err(e) = backend.save(&key, graph) {
-               crate::logging::warn(&format!(
-                   "save_global_graph via {e}; falling back to JSON path"
-               ));
-               return self.save_global_graph_json(graph);
-           }
-           if !self.test_mode {
-               cache_graph_for_backend(backend.name(), &key, graph, 0);
-           }
-           return Ok(());
-       }
-       self.save_global_graph_json(graph)
-   }
+    /// Save global memories as a MemoryGraph
+    pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            let backend = if self.test_mode {
+                crate::memory::test_backend()
+            } else {
+                crate::memory::graph_backend()
+            };
+            let key = StoreKey::new(crate::memory::global_store_key());
+            if let Err(e) = backend.save(&key, graph) {
+                crate::logging::warn(&format!(
+                    "save_global_graph via {e}; falling back to JSON path"
+                ));
+                return self.save_global_graph_json(graph);
+            }
+            if !self.test_mode {
+                cache_graph_for_backend(backend.name(), &key, graph, 0);
+            }
+            return Ok(());
+        }
+        self.save_global_graph_json(graph)
+    }
 
-   /// Internal: write the global graph to the legacy JSON snapshot.
-   fn save_global_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
-       let path = self.global_memory_path()?;
+    /// Internal: write the global graph to the legacy JSON snapshot.
+    fn save_global_graph_json(&self, graph: &MemoryGraph) -> Result<()> {
+        let path = self.global_memory_path()?;
         let report = graph.validate();
         if !report.is_valid() {
             crate::logging::info(&format!(
@@ -1944,12 +1943,12 @@ impl MemoryManager {
                 report.errors()
             ));
         }
-       storage::write_json(&path, graph)?;
-       if !self.test_mode {
-           cache_graph(path, graph);
-       }
-       Ok(())
-   }
+        storage::write_json(&path, graph)?;
+        if !self.test_mode {
+            cache_graph(path, graph);
+        }
+        Ok(())
+    }
 
     /// Add a tag to a memory
     pub fn tag_memory(&self, memory_id: &str, tag: &str) -> Result<()> {
@@ -2355,8 +2354,8 @@ pub fn test_backend() -> Arc<dyn GraphBackend> {
     {
         return b;
     }
-    let root = crate::memory::backend::JsonBackend::default_root()
-        .unwrap_or_else(|_| PathBuf::from("."));
+    let root =
+        crate::memory::backend::JsonBackend::default_root().unwrap_or_else(|_| PathBuf::from("."));
     Arc::new(crate::memory::backend::JsonBackend::new(root))
 }
 

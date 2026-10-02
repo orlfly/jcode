@@ -50,24 +50,13 @@ impl StoreKey {
 #[derive(Debug, Clone)]
 pub enum GraphMutation {
     /// Insert or replace a memory node by id.
-    UpsertMemory {
-        id: String,
-        json: String,
-    },
+    UpsertMemory { id: String, json: String },
     /// Delete a memory node and all edges that reference it.
-    DeleteMemory {
-        id: String,
-    },
+    DeleteMemory { id: String },
     /// Insert or replace a tag node.
-    UpsertTag {
-        id: String,
-        json: String,
-    },
+    UpsertTag { id: String, json: String },
     /// Insert or replace a cluster node.
-    UpsertCluster {
-        id: String,
-        json: String,
-    },
+    UpsertCluster { id: String, json: String },
     /// Insert or replace an edge from `from` -> `to`.
     /// `kind_json` is the serialized `EdgeKind` (e.g.
     /// `{"kind":"has_tag"}` or `{"kind":"relates_to","weight":0.7}`).
@@ -83,9 +72,7 @@ pub enum GraphMutation {
         kind_json: String,
     },
     /// Replace metadata.
-    ReplaceMetadata {
-        json: String,
-    },
+    ReplaceMetadata { json: String },
 }
 
 /// The set of operations the existing `memory.rs` call sites actually
@@ -218,7 +205,10 @@ pub fn apply_mutations_in_place(
                 let edge = Edge::new(to.clone(), kind);
                 let entry = graph.edges.entry(from.clone()).or_default();
                 // Replace an existing edge of the same kind.
-                if let Some(slot) = entry.iter_mut().find(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(&edge.kind)) {
+                if let Some(slot) = entry
+                    .iter_mut()
+                    .find(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(&edge.kind))
+                {
                     *slot = edge;
                 } else {
                     entry.push(edge);
@@ -237,7 +227,9 @@ pub fn apply_mutations_in_place(
                     .map_err(|e| anyhow::anyhow!("DeleteEdge({from}->{to}): {e}"))?;
                 let kind_disc = std::mem::discriminant(&kind);
                 if let Some(edges) = graph.edges.get_mut(from) {
-                    edges.retain(|e| std::mem::discriminant(&e.kind) != kind_disc || e.target != *to);
+                    edges.retain(|e| {
+                        std::mem::discriminant(&e.kind) != kind_disc || e.target != *to
+                    });
                 }
                 if let Some(sources) = graph.reverse_edges.get_mut(to) {
                     sources.retain(|s| s != from);

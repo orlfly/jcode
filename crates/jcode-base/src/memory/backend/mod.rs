@@ -16,7 +16,9 @@
 
 use crate::storage;
 use anyhow::{Context, Result};
-use jcode_memory_types::{GraphBackend, GraphMutation, MemoryGraph, StoreKey, apply_mutations_in_place};
+use jcode_memory_types::{
+    GraphBackend, GraphMutation, MemoryGraph, StoreKey, apply_mutations_in_place,
+};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +70,13 @@ impl JsonBackend {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -130,11 +138,7 @@ impl GraphBackend for JsonBackend {
         Ok(())
     }
 
-    fn apply_mutations(
-        &self,
-        key: &StoreKey,
-        mutations: &[GraphMutation],
-    ) -> Result<MemoryGraph> {
+    fn apply_mutations(&self, key: &StoreKey, mutations: &[GraphMutation]) -> Result<MemoryGraph> {
         let mut graph = self.load(key)?;
         apply_mutations_in_place(&mut graph, mutations)?;
         self.save(key, &graph)?;
@@ -165,10 +169,7 @@ mod tests {
         let empty = backend.load(&key).unwrap();
         assert_eq!(empty.memory_count(), 0);
 
-        let mut entry = MemoryEntry::new(
-            MemoryCategory::Fact,
-            "the rust programming language",
-        );
+        let mut entry = MemoryEntry::new(MemoryCategory::Fact, "the rust programming language");
         entry.id = "m1".into();
         entry.tags = vec!["alpha".into()];
 

@@ -80,9 +80,7 @@ impl SqliteGvecBackend {
     /// Open or create the default SQLite database at
     /// `<jcode_dir>/memory/backend-sqlite/gvec.sqlite`.
     pub fn open_default() -> Result<Self> {
-        let dir = storage::jcode_dir()?
-            .join("memory")
-            .join("backend-sqlite");
+        let dir = storage::jcode_dir()?.join("memory").join("backend-sqlite");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create SqliteGvecBackend dir {}", dir.display()))?;
         let file = dir.join("gvec.sqlite");
@@ -152,7 +150,13 @@ impl SqliteGvecBackend {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -247,7 +251,8 @@ fn upsert_edge(graph: &Graph, from: &str, to: &str, kind: &EdgeKind) -> Result<(
     // We store the EdgeKind payload under properties.kind with snake_case
     // discriminant (matching the JSON schema). The edge_type column gets
     // a short human-readable label.
-    let kind_json = serde_json::to_value(kind).map_err(|e| anyhow::anyhow!("encode EdgeKind: {e}"))?;
+    let kind_json =
+        serde_json::to_value(kind).map_err(|e| anyhow::anyhow!("encode EdgeKind: {e}"))?;
     let edge_type = match kind {
         EdgeKind::HasTag => "has_tag",
         EdgeKind::InCluster => "in_cluster",
@@ -473,11 +478,7 @@ impl GraphBackend for SqliteGvecBackend {
         Ok(())
     }
 
-    fn apply_mutations(
-        &self,
-        key: &StoreKey,
-        mutations: &[GraphMutation],
-    ) -> Result<MemoryGraph> {
+    fn apply_mutations(&self, key: &StoreKey, mutations: &[GraphMutation]) -> Result<MemoryGraph> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let g = self.graph(key)?;
         ensure_text_index(&g)?;
@@ -588,17 +589,15 @@ impl GraphBackend for SqliteGvecBackend {
     /// relevance; `score` is a non-negative float where larger means
     /// more relevant (we negate gvec's raw BM25 to make the order
     /// intuitive).
-    fn text_search(
-        &self,
-        key: &StoreKey,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<(String, f32)>> {
+    fn text_search(&self, key: &StoreKey, query: &str, k: usize) -> Result<Vec<(String, f32)>> {
         let g = self.graph(key)?;
         ensure_text_index(&g)?;
         let storage = &g.storage;
         let prefix = storage.prefix.clone();
-        if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             return Err(anyhow::anyhow!(
                 "text_search: refusing to query non-identifier prefix {prefix:?}"
             ));
@@ -668,7 +667,10 @@ fn ensure_text_index(graph: &Graph) -> Result<()> {
     // Identifiers are validated against gvec's prefix naming rules
     // when constructing the table via gvec (we only use plain
     // ASCII prefixes here).
-    if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(anyhow::anyhow!(
             "ensure_text_index: refusing to create FTS5 for non-identifier prefix {prefix:?}"
         ));
@@ -821,8 +823,7 @@ fn edge_properties_string(graph: &Graph, _rowid: gvec_core::ids::NodeId) -> Stri
 // apply_mutations API for future bulk-edit call sites.
 #[allow(dead_code)]
 pub fn apply_in_memory(mutations: &[GraphMutation], graph: &mut MemoryGraph) -> Result<()> {
-    apply_mutations_in_place(graph, mutations)
-        .map_err(|e| anyhow::anyhow!("apply_in_memory: {e}"))
+    apply_mutations_in_place(graph, mutations).map_err(|e| anyhow::anyhow!("apply_in_memory: {e}"))
 }
 
 #[cfg(test)]
@@ -947,7 +948,10 @@ mod tests {
             *score > 0.0,
             "expected positive BM25 score for 'rust' hit, got id={id:?} score={score}"
         );
-        assert!(id.starts_with("mem_"), "id should be a jcode memory id: {id:?}");
+        assert!(
+            id.starts_with("mem_"),
+            "id should be a jcode memory id: {id:?}"
+        );
 
         // And the other memory must NOT appear for the unrelated query.
         let py_hits = backend.text_search(&key, "python", 5).unwrap();
@@ -955,7 +959,10 @@ mod tests {
             !py_hits.is_empty(),
             "expected FTS5 to find the python memory"
         );
-        assert_ne!(hits[0].0, py_hits[0].0, "rust and python must hit distinct rows");
+        assert_ne!(
+            hits[0].0, py_hits[0].0,
+            "rust and python must hit distinct rows"
+        );
     }
 
     #[test]
@@ -980,9 +987,14 @@ mod tests {
         let key = StoreKey::new("upstream-repro".to_string());
         let g = backend.graph(&key).unwrap();
 
-        g.run(r#"CREATE (a:Doc {title: "Rust guide", body: "the rust programming language"})"#).unwrap();
-        g.run(r#"CREATE (b:Doc {title: "Python guide", body: "python is dynamic and high-level"})"#).unwrap();
-        g.run(r#"CREATE (c:Doc {title: "Rust async", body: "rust async runtime and tokio"})"#).unwrap();
+        g.run(r#"CREATE (a:Doc {title: "Rust guide", body: "the rust programming language"})"#)
+            .unwrap();
+        g.run(
+            r#"CREATE (b:Doc {title: "Python guide", body: "python is dynamic and high-level"})"#,
+        )
+        .unwrap();
+        g.run(r#"CREATE (c:Doc {title: "Rust async", body: "rust async runtime and tokio"})"#)
+            .unwrap();
 
         g.create_text_index("Doc", "body", None).unwrap();
         let hits = g.text_search("Doc", "body", "rust", 10).unwrap();

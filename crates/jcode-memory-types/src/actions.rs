@@ -231,7 +231,10 @@ pub fn evaluate_gates(proposal: ChangeProposal<'_>) -> Vec<ConfirmationGate> {
 
     // G1: critical data touched.
     let critical_old = proposal.target.map(|e| e.critical).unwrap_or(false);
-    let critical_new = proposal.new_entry.map(|e| e.critical).unwrap_or(critical_old);
+    let critical_new = proposal
+        .new_entry
+        .map(|e| e.critical)
+        .unwrap_or(critical_old);
     if critical_old || critical_new {
         gates.push(ConfirmationGate::CriticalData);
     }
@@ -241,7 +244,9 @@ pub fn evaluate_gates(proposal: ChangeProposal<'_>) -> Vec<ConfirmationGate> {
         let old_authoritative = old
             .provenance
             .as_ref()
-            .map(|p| p.method.authority_rank() >= ExtractionMethod::StructuredMapping.authority_rank())
+            .map(|p| {
+                p.method.authority_rank() >= ExtractionMethod::StructuredMapping.authority_rank()
+            })
             .unwrap_or(false);
         let new_value_different = old.content != new.content || old.tags != new.tags;
         if old_authoritative && new_value_different {
@@ -297,7 +302,9 @@ pub fn requires_confirmation(
 
     // System role may bypass non-critical gates, but never critical data.
     if role == MemoryRole::System {
-        return gates.iter().any(|g| matches!(g, ConfirmationGate::CriticalData));
+        return gates
+            .iter()
+            .any(|g| matches!(g, ConfirmationGate::CriticalData));
     }
 
     !gates.is_empty()
@@ -391,9 +398,13 @@ mod tests {
         let mut graph = MemoryGraph::new();
         let id = graph.add_memory(make_authoritative_entry("old value"));
         let target = graph.get_memory(&id).unwrap().clone();
-        let new = make_entry("new value")
-            .with_id(&target.id)
-            .with_provenance(ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction));
+        let new =
+            make_entry("new value")
+                .with_id(&target.id)
+                .with_provenance(ProvenanceRecord::new(
+                    "extraction",
+                    ExtractionMethod::LlmExtraction,
+                ));
         let proposal = ChangeProposal::new()
             .with_target(&target)
             .with_new_entry(&new);
@@ -437,7 +448,11 @@ mod tests {
         let proposal = ChangeProposal::new()
             .with_target(&target)
             .with_new_entry(&new);
-        assert!(requires_confirmation(&graph, proposal.clone(), MemoryRole::Agent));
+        assert!(requires_confirmation(
+            &graph,
+            proposal.clone(),
+            MemoryRole::Agent
+        ));
         assert!(!requires_confirmation(&graph, proposal, MemoryRole::System));
     }
 

@@ -66,7 +66,11 @@ const BACKUP_PRUNE_INTERVAL_SECS: u64 = 24 * 60 * 60;
 pub fn prune_old_session_backups() {
     if let Ok(base) = storage::jcode_dir() {
         let sessions_dir = base.join("sessions");
-        if !claim_prune_slot(&base, "sessions-bak-prune.stamp", BACKUP_PRUNE_INTERVAL_SECS) {
+        if !claim_prune_slot(
+            &base,
+            "sessions-bak-prune.stamp",
+            BACKUP_PRUNE_INTERVAL_SECS,
+        ) {
             return;
         }
         prune_old_session_backups_in(&sessions_dir, Local::now());
@@ -94,11 +98,7 @@ pub fn prune_scratch_dir() {
     if !scratch.exists() {
         return;
     }
-    if !claim_prune_slot(
-        &base,
-        "scratch-prune.stamp",
-        SCRATCH_PRUNE_INTERVAL_SECS,
-    ) {
+    if !claim_prune_slot(&base, "scratch-prune.stamp", SCRATCH_PRUNE_INTERVAL_SECS) {
         return;
     }
     prune_scratch_dir_in(&scratch, Local::now());
@@ -242,8 +242,7 @@ fn prune_old_session_backups_in(sessions_dir: &Path, now: DateTime<Local>) {
 
     // Group surviving .bak files by session_id, sorted newest-first within
     // each group. Files that fail to stat are skipped silently.
-    let mut groups: HashMap<String, Vec<(DateTime<Local>, std::path::PathBuf)>> =
-        HashMap::new();
+    let mut groups: HashMap<String, Vec<(DateTime<Local>, std::path::PathBuf)>> = HashMap::new();
     for entry in entries.flatten() {
         let path = entry.path();
         // Only prune the atomic-write backup files; never the .json transcripts
@@ -263,10 +262,7 @@ fn prune_old_session_backups_in(sessions_dir: &Path, now: DateTime<Local>) {
         };
         let modified: DateTime<Local> = modified.into();
         if let Some(session_id) = extract_session_id(&path) {
-            groups
-                .entry(session_id)
-                .or_default()
-                .push((modified, path));
+            groups.entry(session_id).or_default().push((modified, path));
         }
     }
 
@@ -551,7 +547,10 @@ mod tests {
 
         prune_scratch_dir_in(&dir, Local::now());
 
-        assert!(!old_cache.exists(), "old node-compile-cache must be removed");
+        assert!(
+            !old_cache.exists(),
+            "old node-compile-cache must be removed"
+        );
         assert!(fresh_cache.exists(), "fresh non-matching file must survive");
 
         fs::remove_dir_all(&dir).ok();
@@ -586,9 +585,18 @@ mod tests {
         clear_session_scratch_in(&dir, sid);
 
         assert!(!mine_dir.exists(), "session's own scratch must be cleared");
-        assert!(!mine_cache.exists(), "session's own compile cache must be cleared");
-        assert!(theirs_dir.exists(), "other session's scratch must be untouched");
-        assert!(shared_cache.exists(), "shared node-compile-cache must be untouched");
+        assert!(
+            !mine_cache.exists(),
+            "session's own compile cache must be cleared"
+        );
+        assert!(
+            theirs_dir.exists(),
+            "other session's scratch must be untouched"
+        );
+        assert!(
+            shared_cache.exists(),
+            "shared node-compile-cache must be untouched"
+        );
         assert!(other.exists(), "unrelated file must be untouched");
 
         fs::remove_dir_all(&dir).ok();

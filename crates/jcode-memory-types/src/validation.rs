@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{MemoryActionSpec, check_preconditions};
 use crate::graph::EdgeKind;
-use crate::instance::{MemoryStatus};
+use crate::instance::MemoryStatus;
 use crate::{MemoryEntry, MemoryGraph};
 
 /// Severity of a validation issue.
@@ -30,7 +30,11 @@ pub struct ValidationIssue {
 }
 
 impl ValidationIssue {
-    pub fn error(code: impl Into<String>, message: impl Into<String>, memory_id: Option<String>) -> Self {
+    pub fn error(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        memory_id: Option<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             severity: Severity::Error,
@@ -39,7 +43,11 @@ impl ValidationIssue {
         }
     }
 
-    pub fn warning(code: impl Into<String>, message: impl Into<String>, memory_id: Option<String>) -> Self {
+    pub fn warning(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        memory_id: Option<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             severity: Severity::Warning,
@@ -105,12 +113,19 @@ fn validate_structure(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
         if id.starts_with("tag:") || id.starts_with("cluster:") {
             issues.push(ValidationIssue::error(
                 "E01",
-                format!("Memory ID '{}' collides with reserved tag/cluster namespace", id),
+                format!(
+                    "Memory ID '{}' collides with reserved tag/cluster namespace",
+                    id
+                ),
                 Some(id.clone()),
             ));
         }
         if id.trim().is_empty() {
-            issues.push(ValidationIssue::error("E01", "Memory ID is empty".to_string(), Some(id.clone())));
+            issues.push(ValidationIssue::error(
+                "E01",
+                "Memory ID is empty".to_string(),
+                Some(id.clone()),
+            ));
         }
     }
 
@@ -146,7 +161,10 @@ fn validate_instances(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
         if prov.confidence < 0.0 || prov.confidence > 1.0 {
             issues.push(ValidationIssue::error(
                 "E23",
-                format!("Provenance confidence {:.2} is outside [0,1]", prov.confidence),
+                format!(
+                    "Provenance confidence {:.2} is outside [0,1]",
+                    prov.confidence
+                ),
                 Some(id.clone()),
             ));
         }
@@ -156,7 +174,8 @@ fn validate_instances(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
         if memory.critical && memory.provenance.is_none() {
             issues.push(ValidationIssue::warning(
                 "E24",
-                "Critical memory uses default heuristic provenance; prefer explicit source".to_string(),
+                "Critical memory uses default heuristic provenance; prefer explicit source"
+                    .to_string(),
                 Some(id.clone()),
             ));
         }
@@ -165,7 +184,10 @@ fn validate_instances(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
         if memory.confidence < 0.0 || memory.confidence > 1.0 {
             issues.push(ValidationIssue::error(
                 "E25",
-                format!("Memory confidence {:.2} is outside [0,1]", memory.confidence),
+                format!(
+                    "Memory confidence {:.2} is outside [0,1]",
+                    memory.confidence
+                ),
                 Some(id.clone()),
             ));
         }
@@ -175,7 +197,10 @@ fn validate_instances(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
 fn validate_edges(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
     // E30: dangling edges (source or target missing).
     for (source_id, edges) in &graph.edges {
-        if !source_id.starts_with("tag:") && !source_id.starts_with("cluster:") && !graph.memories.contains_key(source_id) {
+        if !source_id.starts_with("tag:")
+            && !source_id.starts_with("cluster:")
+            && !graph.memories.contains_key(source_id)
+        {
             issues.push(ValidationIssue::error(
                 "E30",
                 format!("Edge source '{}' does not exist", source_id),
@@ -183,7 +208,8 @@ fn validate_edges(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
             ));
         }
         for edge in edges {
-            let target_exists = edge.target.starts_with("tag:") && graph.tags.contains_key(&edge.target)
+            let target_exists = edge.target.starts_with("tag:")
+                && graph.tags.contains_key(&edge.target)
                 || edge.target.starts_with("cluster:") && graph.clusters.contains_key(&edge.target)
                 || graph.memories.contains_key(&edge.target);
             if !target_exists {
@@ -216,7 +242,11 @@ fn validate_edges(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
     // W01: reverse edges out of sync with forward edges.
     for (target_id, sources) in &graph.reverse_edges {
         for source_id in sources {
-            let forward = graph.edges.get(source_id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let forward = graph
+                .edges
+                .get(source_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             if !forward.iter().any(|e| e.target == *target_id) {
                 issues.push(ValidationIssue::warning(
                     "W01",
@@ -255,7 +285,10 @@ fn validate_lifecycle(graph: &MemoryGraph, issues: &mut Vec<ValidationIssue>) {
                 Some(id.clone()),
             ));
         }
-        if let (Some(from), Some(to)) = (memory.lifecycle.effective_from, memory.lifecycle.effective_to) {
+        if let (Some(from), Some(to)) = (
+            memory.lifecycle.effective_from,
+            memory.lifecycle.effective_to,
+        ) {
             if to < from {
                 issues.push(ValidationIssue::error(
                     "E41",
@@ -287,7 +320,11 @@ pub fn validate_action(
 pub fn validate_new_entry(entry: &MemoryEntry) -> Result<(), Vec<ValidationIssue>> {
     let mut issues = Vec::new();
     if entry.content.trim().is_empty() {
-        issues.push(ValidationIssue::error("E20", "Memory content is empty", Some(entry.id.clone())));
+        issues.push(ValidationIssue::error(
+            "E20",
+            "Memory content is empty",
+            Some(entry.id.clone()),
+        ));
     }
     let prov = entry.effective_provenance();
     if !prov.is_admissible() {
@@ -311,7 +348,7 @@ pub fn validate_new_entry(entry: &MemoryEntry) -> Result<(), Vec<ValidationIssue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::{MemoryActionSpec};
+    use crate::actions::MemoryActionSpec;
     use crate::instance::{ExtractionMethod, LifecycleMetadata, ProvenanceRecord};
     use crate::{MemoryCategory, MemoryEntry, MemoryGraph};
 
@@ -323,10 +360,8 @@ mod tests {
     fn valid_graph_has_no_errors() {
         let mut graph = MemoryGraph::new();
         graph.add_memory(
-            make_entry("valid").with_provenance(ProvenanceRecord::new(
-                "test",
-                ExtractionMethod::UserStated,
-            )),
+            make_entry("valid")
+                .with_provenance(ProvenanceRecord::new("test", ExtractionMethod::UserStated)),
         );
         let report = validate_graph(&graph);
         assert!(report.is_valid());
@@ -347,8 +382,10 @@ mod tests {
     #[test]
     fn inadmissible_provenance_is_error() {
         let mut graph = MemoryGraph::new();
-        let entry = make_entry("low confidence")
-            .with_provenance(ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction).with_confidence(0.5));
+        let entry = make_entry("low confidence").with_provenance(
+            ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.5),
+        );
         graph.add_memory(entry);
         let report = validate_graph(&graph);
         assert!(!report.is_valid());
@@ -384,7 +421,11 @@ mod tests {
     fn dangling_edge_is_error() {
         let mut graph = MemoryGraph::new();
         let id = graph.add_memory(make_entry("source"));
-        graph.add_edge(&id, "missing", crate::graph::EdgeKind::RelatesTo { weight: 0.5 });
+        graph.add_edge(
+            &id,
+            "missing",
+            crate::graph::EdgeKind::RelatesTo { weight: 0.5 },
+        );
         let report = validate_graph(&graph);
         assert!(!report.is_valid());
         assert!(report.errors().iter().any(|i| i.code == "E31"));
@@ -402,13 +443,18 @@ mod tests {
     fn validate_new_entry_allows_missing_provenance_with_heuristic_default() {
         let entry = make_entry("no provenance");
         let res = validate_new_entry(&entry);
-        assert!(res.is_ok(), "missing provenance should fall back to user_stated/0.5 heuristic");
+        assert!(
+            res.is_ok(),
+            "missing provenance should fall back to user_stated/0.5 heuristic"
+        );
     }
 
     #[test]
     fn validate_new_entry_rejects_low_confidence() {
-        let entry = make_entry("low confidence")
-            .with_provenance(ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction).with_confidence(0.5));
+        let entry = make_entry("low confidence").with_provenance(
+            ProvenanceRecord::new("extraction", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.5),
+        );
         let res = validate_new_entry(&entry);
         assert!(res.is_err());
         assert!(res.unwrap_err().iter().any(|i| i.code == "E22"));
