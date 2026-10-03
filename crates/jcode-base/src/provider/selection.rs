@@ -379,6 +379,59 @@ impl MultiProvider {
         }
     }
 
+    /// Qualify a bare model id with the session's persisted provider route.
+    ///
+    /// External drivers (ACP `session/set_model`, headless launches, reconcile
+    /// loops) can send a bare model id that carries no route identity. The
+    /// downstream `MultiProvider::set_model` bare-id path then rebinds the
+    /// request to whichever OpenAI-compatible profile currently advertises the
+    /// id — an arbitrary pick when several gateways serve the same model, and
+    /// a silent provider hop for a session that was previously pinned to a
+    /// specific route. When the session's persisted `provider_key` names a
+    /// profile whose declared routes actually serve the model, rewrite the
+    /// request to `<profile>:<model>` so the switch stays on the session's
+    /// route. Prefixed / `@`-pinned requests pass through untouched.
+    pub fn qualify_bare_model_request_with_session_key(
+        model: &str,
+        provider_key: Option<&str>,
+    ) -> String {
+        let model = model.trim();
+        if model.is_empty() {
+            return model.to_string();
+        }
+        // Anything with explicit route identity is already unambiguous.
+        if crate::provider::explicit_model_provider_prefix(model).is_some()
+            || model.contains('@')
+        {
+            return model.to_string();
+        }
+        if let Some((prefix, rest)) = model.split_once(':') {
+            let prefix = prefix.trim();
+            if !prefix.is_empty() && !rest.trim().is_empty() {
+                return model.to_string();
+            }
+        }
+        let Some(provider_key) = provider_key
+            .map(str::trim)
+            .filter(|provider_key| !provider_key.is_empty())
+        else {
+            return model.to_string();
+        };
+        let provider_key = Self::canonical_session_provider_key(provider_key);
+        // Only a user-defined named `[providers.<name>]` profile (or a
+        // catalogued OpenAI-compatible profile) can own an opaque bare id.
+        // Built-in keys route through their own prefixes and must not be
+        // folded here.
+        if crate::provider_catalog::resolve_openai_compatible_profile_selection(provider_key)
+            .is_some()
+            || Self::named_provider_profile_serves_model(provider_key, model)
+        {
+            format!("{provider_key}:{model}")
+        } else {
+            model.to_string()
+        }
+    }
+
     pub fn model_switch_request_for_session_model(
         model: &str,
         provider_key: Option<&str>,
@@ -568,6 +621,71 @@ impl MultiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_model_request_qualifies_with_session_profile_key() {
+        // Prefixed and @-pinned requests keep their explicit route identity.
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "openrouter:deepseek-v4.1-flash",
+                Some("company"),
+            ),
+            "openrouter:deepseek-v4.1-flash"
+        );
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "deepseek-v4.1-flash:cloud",
+                Some("company"),
+            ),
+            "deepseek-v4.1-flash:cloud"
+        );
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "z-ai/glm-5.2@Novita",
+                None,
+            ),
+            "z-ai/glm-5.2@Novita"
+        );
+        // No persisted key: bare ids pass through untouched.
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "deepseek-v4.1-flash",
+                None,
+            ),
+            "deepseek-v4.1-flash"
+        );
+        // A session key that names no configured profile cannot own the id.
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "deepseek-v4.1-flash",
+                Some("totally-unknown-profile"),
+            ),
+            "deepseek-v4.1-flash"
+        );
+        // Built-in keys must not fold onto their bare prefix.
+        assert_eq!(
+            MultiProvider::qualify_bare_model_request_with_session_key(
+                "some-unknown-model",
+                Some("claude"),
+            ),
+            "some-unknown-model"
+        );
+        // A configured named profile whose declared routes serve the model
+        // pins the request to the session's route (regression: ACP reconcile
+        // sent bare `deepseek-v4.1-flash` and the session hopped to whichever
+        // gateway happened to advertise the id).
+        if crate::config::config().providers.contains_key("company") {
+            let qualified = MultiProvider::qualify_bare_model_request_with_session_key(
+                "deepseek-v4.1-flash",
+                Some("company"),
+            );
+            if MultiProvider::named_provider_profile_serves_model("company", "deepseek-v4.1-flash") {
+                assert_eq!(qualified, "company:deepseek-v4.1-flash");
+            } else {
+                assert_eq!(qualified, "deepseek-v4.1-flash");
+            }
+        }
+    }
 
     #[test]
     fn login_provider_defaults_are_canonical_config_keys() {

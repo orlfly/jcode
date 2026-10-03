@@ -183,6 +183,16 @@ impl Agent {
         model: &str,
         source: crate::provider::ProviderModelSelectionSource,
     ) -> Result<()> {
+        // External drivers (ACP session/set_model, reconcile loops) can send a
+        // bare model id with no route identity. Without qualification the
+        // MultiProvider bare-id path rebinds the session to whichever
+        // OpenAI-compatible profile happens to advertise the id, silently
+        // hopping gateways on every reattach. Pin the request to the session's
+        // persisted provider route when that route serves the model.
+        let model = &crate::provider::MultiProvider::qualify_bare_model_request_with_session_key(
+            model,
+            self.session.provider_key.as_deref(),
+        );
         crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), model)?;
         let resolved_model = self.provider.model();
         self.session.provider_key =
