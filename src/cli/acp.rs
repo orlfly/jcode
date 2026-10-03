@@ -187,23 +187,47 @@ fn prompt_response(stop_reason: &str, usage: &TurnUsage) -> Value {
 /// Build the per-model provider display label used by the model picker.
 ///
 /// The catalog can offer the same model name through several upstream
-/// providers (e.g. an aggregating `open-ai-compatible` endpoint routing
-/// `glm-4.7` to six different vendors), so a bare model name in a client's
-/// picker is ambiguous. We key by model name and keep the provider label of
-/// the first route seen, which matches the order the daemon reports and
-/// therefore the route a bare name resolves to.
+/// providers (e.g. Z.AI and OpenCode Go both expose `glm-5.3-flash`), so a
+/// bare model name in a client's picker is ambiguous. Routes are keyed by
+/// model name; the label of the route belonging to the session's current
+/// provider wins when present, otherwise the first route seen (which matches
+/// the order the daemon reports and therefore the route a bare name resolves
+/// to).
 ///
 /// The label is display-only: model ids sent back on selection stay
 /// unqualified so existing routing behaviour is unchanged.
-fn model_provider_labels_from_routes(routes: &[ModelRoute]) -> HashMap<String, String> {
+fn model_provider_labels_from_routes(
+    routes: &[ModelRoute],
+    preferred_provider: Option<&str>,
+) -> HashMap<String, String> {
+    let preferred = preferred_provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_string);
     let mut labels = HashMap::new();
+    let display =
+        |route: &ModelRoute| cli_route_provider_display(&route.provider, &route.api_method);
+    // First pass: routes from the session's current provider claim the label.
+    if let Some(preferred) = &preferred {
+        for route in routes {
+            if route.model.is_empty() || route.provider.trim().is_empty() {
+                continue;
+            }
+            if &display(route) == preferred {
+                labels
+                    .entry(route.model.clone())
+                    .or_insert_with(|| display(route));
+            }
+        }
+    }
+    // Second pass: everything else, first-wins.
     for route in routes {
         if route.model.is_empty() || route.provider.trim().is_empty() {
             continue;
         }
         labels
             .entry(route.model.clone())
-            .or_insert_with(|| cli_route_provider_display(&route.provider, &route.api_method));
+            .or_insert_with(|| display(route));
     }
     labels
 }
@@ -839,10 +863,13 @@ impl AcpRuntime {
             } => (
                 session_id,
                 SessionUiState::from_history_fields(
-                    provider_name,
+                    provider_name.clone(),
                     provider_model,
                     available_models,
-                    model_provider_labels_from_routes(&available_model_routes),
+                    model_provider_labels_from_routes(
+                        &available_model_routes,
+                        provider_name.as_deref(),
+                    ),
                     reasoning_effort,
                 ),
             ),
@@ -901,10 +928,13 @@ impl AcpRuntime {
                 } => {
                     attached_id = session_id.clone();
                     ui_state = SessionUiState::from_history_fields(
-                        provider_name,
+                        provider_name.clone(),
                         provider_model,
                         available_models,
-                        model_provider_labels_from_routes(&available_model_routes),
+                        model_provider_labels_from_routes(
+                            &available_model_routes,
+                            provider_name.as_deref(),
+                        ),
                         reasoning_effort,
                     );
                     if replay_history {
@@ -1215,8 +1245,10 @@ impl AcpRuntime {
                     if provider_model.is_some() {
                         state.model = provider_model;
                     }
-                    state.model_provider_labels =
-                        model_provider_labels_from_routes(&available_model_routes);
+                    state.model_provider_labels = model_provider_labels_from_routes(
+                        &available_model_routes,
+                        state.provider_name.as_deref(),
+                    );
                     state.available_models = available_models;
                     (state.model.clone(), state.available_models.clone())
                 };
@@ -1553,7 +1585,8 @@ async fn apply_available_models_update_inner(session: &DaemonSession, event: &Se
     if provider_model.is_some() {
         state.model = provider_model.clone();
     }
-    state.model_provider_labels = model_provider_labels_from_routes(available_model_routes);
+    state.model_provider_labels =
+        model_provider_labels_from_routes(available_model_routes, state.provider_name.as_deref());
     let changed = state.available_models != *available_models;
     state.available_models = available_models.clone();
     changed
@@ -2057,6 +2090,36 @@ mod tests {
         assert_eq!(tool_kind("agentgrep"), "search");
         assert_eq!(tool_kind("webfetch"), "fetch");
         assert_eq!(tool_kind("swarm"), "other");
+    }
+
+    #[test]
+    fn model_labels_prefer_session_provider() {
+        let route = |model: &str, provider: &str| ModelRoute {
+            model: model.to_string(),
+            provider: provider.to_string(),
+            api_method: String::new(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+            usage: None,
+        };
+        let routes = vec![
+            route("glm-5.3-flash", "OpenCode Go"),
+            route("glm-5.3-flash", "Z.AI"),
+            route("glm-4.6", "Z.AI"),
+        ];
+        let labels = model_provider_labels_from_routes(&routes, Some("Z.AI"));
+        assert_eq!(
+            labels.get("glm-5.3-flash").map(String::as_str),
+            Some("Z.AI")
+        );
+        assert_eq!(labels.get("glm-4.6").map(String::as_str), Some("Z.AI"));
+        // Without a matching session provider, first-wins still applies.
+        let labels = model_provider_labels_from_routes(&routes, Some("Kimi"));
+        assert_eq!(
+            labels.get("glm-5.3-flash").map(String::as_str),
+            Some("OpenCode Go")
+        );
     }
 
     #[tokio::test]
