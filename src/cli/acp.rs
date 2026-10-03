@@ -935,6 +935,10 @@ impl AcpRuntime {
                     break;
                 }
                 other => {
+                    if let ServerEvent::AvailableModelsUpdated { .. } = other {
+                        apply_available_models_update_inner(&session, &other).await;
+                        continue;
+                    }
                     if self.profile.is_extended() {
                         self.write_jcode_extension_event(&attached_id, &other)
                             .await?;
@@ -1138,6 +1142,13 @@ impl AcpRuntime {
                     }
                 }
                 other => {
+                    // Daemon pushed a refreshed provider catalog (auth change,
+                    // live refresh): keep the ACP picker in sync instead of
+                    // silently dropping the event.
+                    if let ServerEvent::AvailableModelsUpdated { .. } = other {
+                        let _ = apply_available_models_update(self, &session, other).await;
+                        continue;
+                    }
                     for update in mapper.map_event(other) {
                         self.write_notification(
                             "session/update",
@@ -1358,6 +1369,9 @@ async fn request_history(session: &DaemonSession) -> Result<ServerEvent> {
                 message,
                 ..
             } if event_id == id => anyhow::bail!(message),
+            event @ ServerEvent::AvailableModelsUpdated { .. } => {
+                apply_available_models_update_inner(session, &event).await;
+            }
             _ => {}
         }
     }
@@ -1382,6 +1396,9 @@ async fn request_model_catalog(session: &DaemonSession) -> Result<ServerEvent> {
                 message,
                 ..
             } if event_id == id => anyhow::bail!(message),
+            event @ ServerEvent::AvailableModelsUpdated { .. } => {
+                apply_available_models_update_inner(session, &event).await;
+            }
             _ => {}
         }
     }
@@ -1519,6 +1536,44 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
     options
 }
 
+async fn apply_available_models_update_inner(session: &DaemonSession, event: &ServerEvent) -> bool {
+    let ServerEvent::AvailableModelsUpdated {
+        provider_name,
+        provider_model,
+        available_models,
+        available_model_routes,
+    } = event
+    else {
+        return false;
+    };
+    let mut state = session.ui_state.lock().await;
+    if provider_name.is_some() {
+        state.provider_name = provider_name.clone();
+    }
+    if provider_model.is_some() {
+        state.model = provider_model.clone();
+    }
+    state.model_provider_labels = model_provider_labels_from_routes(available_model_routes);
+    let changed = state.available_models != *available_models;
+    state.available_models = available_models.clone();
+    changed
+}
+
+async fn apply_available_models_update(
+    runtime: &AcpRuntime,
+    session: &Arc<DaemonSession>,
+    event: ServerEvent,
+) -> Result<bool> {
+    if !matches!(event, ServerEvent::AvailableModelsUpdated { .. }) {
+        return Ok(false);
+    }
+    let changed = apply_available_models_update_inner(session, &event).await;
+    if changed {
+        runtime.write_config_option_update(session).await?;
+    }
+    Ok(changed)
+}
+
 async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
         match session.read_event().await? {
@@ -1542,6 +1597,9 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
             }
             ServerEvent::Error { id, message, .. } if id == request_id => {
                 anyhow::bail!(message)
+            }
+            event @ ServerEvent::AvailableModelsUpdated { .. } => {
+                apply_available_models_update_inner(session, &event).await;
             }
             _ => {}
         }
@@ -1999,6 +2057,52 @@ mod tests {
         assert_eq!(tool_kind("agentgrep"), "search");
         assert_eq!(tool_kind("webfetch"), "fetch");
         assert_eq!(tool_kind("swarm"), "other");
+    }
+
+    #[tokio::test]
+    async fn available_models_update_refreshes_ui_state_and_reports_change() {
+        use jcode_provider_core::ModelRoute;
+        let (sock_a, _sock_b) = tokio::net::UnixStream::pair().unwrap();
+        let (sock_c, _sock_d) = tokio::net::UnixStream::pair().unwrap();
+        let reader = sock_a.into_split().0;
+        let writer = sock_c.into_split().1;
+        let session =
+            DaemonSession::new(String::new(), reader, writer, 1).with_ui_state(SessionUiState {
+                model: Some("stale-model".to_string()),
+                available_models: vec!["stale-model".to_string()],
+                ..SessionUiState::default()
+            });
+        let route = ModelRoute {
+            model: "live-model".to_string(),
+            provider: "openrouter".to_string(),
+            api_method: String::new(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+            usage: None,
+        };
+        let event = ServerEvent::AvailableModelsUpdated {
+            provider_name: Some("OpenRouter".to_string()),
+            provider_model: Some("live-model".to_string()),
+            available_models: vec!["live-model".to_string()],
+            available_model_routes: vec![route],
+        };
+        assert!(apply_available_models_update_inner(&session, &event).await);
+        let state = session.ui_state.lock().await;
+        assert_eq!(state.available_models, vec!["live-model".to_string()]);
+        assert_eq!(state.model.as_deref(), Some("live-model"));
+        assert_eq!(state.provider_name.as_deref(), Some("OpenRouter"));
+        assert_eq!(
+            state
+                .model_provider_labels
+                .get("live-model")
+                .map(String::as_str),
+            Some("openrouter")
+        );
+        // A repeated push with an unchanged catalog reports no change so
+        // callers do not spam config_option_update notifications.
+        drop(state);
+        assert!(!apply_available_models_update_inner(&session, &event).await);
     }
 
     #[test]

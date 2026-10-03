@@ -23,6 +23,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 const ATTACH_MODEL_PREFETCH_DEBOUNCE_SECS: u64 = 15;
+/// External drivers (ACP hosts, headless clients) attach sessions without ever
+/// running the TUI's `/refresh-model-list`. The disk caches left by earlier
+/// sessions make the catalog look non-empty, so the old empty-list predicate
+/// skipped the live refresh forever and those clients saw a stale picker.
+/// Refresh at most this often per provider instead.
+const ATTACH_MODEL_PREFETCH_MAX_AGE_SECS: u64 = 300;
 const RELOAD_RESTORE_MARKER_MAX_AGE: Duration = Duration::from_secs(60);
 
 fn optional_token_usage_totals(totals: TokenUsageTotals) -> Option<TokenUsageTotals> {
@@ -35,6 +41,26 @@ fn optional_total_tokens(totals: TokenUsageTotals) -> Option<(u64, u64)> {
 
 static LAST_ATTACH_MODEL_PREFETCH: LazyLock<StdMutex<HashMap<String, Instant>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Whether the provider's attach-time catalog refresh is overdue.
+///
+/// Providers that never ran a live refresh (no entry yet) are always stale.
+/// A successful prefetch stamps the entry via
+/// [`should_debounce_attach_model_prefetch`], so this doubles as the
+/// max-age bound: within [`ATTACH_MODEL_PREFETCH_MAX_AGE_SECS`] of the last
+/// refresh the cached catalog is trusted; past it, the next attach refreshes
+/// live again so external drivers converge on the provider's actual models.
+fn attach_model_prefetch_is_stale(provider_name: &str) -> bool {
+    let Ok(guard) = LAST_ATTACH_MODEL_PREFETCH.lock() else {
+        return true;
+    };
+    match guard.get(provider_name) {
+        Some(last_run) => {
+            last_run.elapsed() >= Duration::from_secs(ATTACH_MODEL_PREFETCH_MAX_AGE_SECS)
+        }
+        None => true,
+    }
+}
 
 fn should_debounce_attach_model_prefetch(provider_name: &str) -> bool {
     let Ok(mut guard) = LAST_ATTACH_MODEL_PREFETCH.lock() else {
@@ -965,6 +991,26 @@ mod tests {
     }
 
     #[test]
+    fn attach_prefetch_is_stale_without_a_prior_refresh_and_fresh_right_after_one() {
+        // A provider with no recorded refresh (external driver's first attach)
+        // must be treated as stale so the live catalog fetch runs even though
+        // disk caches make the list non-empty.
+        assert!(attach_model_prefetch_is_stale(
+            "acp-prefetch-staleness-test"
+        ));
+
+        // The debounce check stamps the refresh time; immediately after, the
+        // provider is within the max-age window and the cached catalog is
+        // trusted.
+        assert!(!should_debounce_attach_model_prefetch(
+            "acp-prefetch-staleness-test"
+        ));
+        assert!(!attach_model_prefetch_is_stale(
+            "acp-prefetch-staleness-test"
+        ));
+    }
+
+    #[test]
     fn history_provider_name_preserves_unknown_runtime_profile() {
         let session = session_with_provider_key(Some("remote-catalog"));
         assert_eq!(
@@ -1079,7 +1125,7 @@ pub(super) fn spawn_model_prefetch_update(provider: Arc<dyn Provider>, agent: Ar
             )
         };
 
-        if !initial_models.is_empty() {
+        if !initial_models.is_empty() && !attach_model_prefetch_is_stale(&provider_name) {
             return;
         }
 
