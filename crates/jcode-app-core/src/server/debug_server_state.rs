@@ -319,6 +319,12 @@ pub(super) async fn maybe_handle_server_state_command(
                 "detail": member.and_then(|m| m.detail.clone()),
                 "connected_secs_ago": info.connected_at.elapsed().as_secs(),
                 "last_seen_secs_ago": info.last_seen.elapsed().as_secs(),
+                // Key names only: values are host credentials.
+                "session_env_keys": info
+                    .session_env
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
             }));
         }
         return Ok(Some(

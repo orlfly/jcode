@@ -245,6 +245,27 @@ fn model_provider_labels_from_routes(
 /// provider's route (same policy as the label map). Values are the routing
 /// strings accepted by `set_model` (e.g. `zai:glm-5.3-flash`), so a client
 /// that echoes the value back binds BOTH provider and model id.
+/// Env vars the ACP host injected into this process that must reach the
+/// daemon-side tool shells. Only known host/integration namespaces travel
+/// over the wire — never the whole environment.
+fn host_session_env() -> Vec<(String, String)> {
+    const PREFIXES: [&str; 8] = [
+        "KANEO_",
+        "AIONUI_",
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "ZHIPU_",
+        "ZAI_",
+    ];
+    std::env::vars()
+        .filter(|(key, _)| PREFIXES.iter().any(|prefix| key.starts_with(prefix)))
+        .collect()
+}
+
+/// Qualified model spec per model name, preferring the session's current
+/// provider's route (same policy as the label map).
 fn model_route_specs_from_routes(
     routes: &[ModelRoute],
     preferred_provider: Option<&str>,
@@ -901,6 +922,7 @@ impl AcpRuntime {
                 client_has_local_history: false,
                 allow_session_takeover: false,
                 terminal_env: crate::terminal_launch::snapshot_client_terminal_env(),
+                session_env: host_session_env(),
             })
             .await?;
         wait_for_done(&session, subscribe_id).await?;
@@ -966,6 +988,7 @@ impl AcpRuntime {
                 client_has_local_history: false,
                 allow_session_takeover: false,
                 terminal_env: crate::terminal_launch::snapshot_client_terminal_env(),
+                session_env: host_session_env(),
             })
             .await?;
 
@@ -2537,6 +2560,37 @@ mod tests {
         assert!(cwd_from_params(&params).is_err());
         let params = json!({"cwd": "/tmp"});
         assert_eq!(cwd_from_params(&params).unwrap(), Path::new("/tmp"));
+    }
+
+    #[test]
+    fn host_session_env_forwards_only_host_namespaces() {
+        // SAFETY: single-threaded test process mutation of env vars for a
+        // narrowly-scoped assertion; restored before returning.
+        let original: Vec<(String, String)> = std::env::vars().collect();
+        unsafe {
+            std::env::set_var("KANEO_API_KEY", "probe-key");
+            std::env::set_var("KANEO_API_URL", "http://localhost:1337");
+            std::env::set_var("AIONUI_CONVERSATION_ID", "conv-1");
+            std::env::set_var("UNRELATED_SECRET", "must-not-travel");
+        }
+        let forwarded = host_session_env();
+        unsafe {
+            std::env::remove_var("KANEO_API_KEY");
+            std::env::remove_var("KANEO_API_URL");
+            std::env::remove_var("AIONUI_CONVERSATION_ID");
+            std::env::remove_var("UNRELATED_SECRET");
+            for (key, value) in original {
+                std::env::set_var(key, value);
+            }
+        }
+        let keys: Vec<&str> = forwarded.iter().map(|(key, _)| key.as_str()).collect();
+        assert!(keys.contains(&"KANEO_API_KEY"), "{keys:?}");
+        assert!(keys.contains(&"KANEO_API_URL"), "{keys:?}");
+        assert!(keys.contains(&"AIONUI_CONVERSATION_ID"), "{keys:?}");
+        assert!(
+            !keys.contains(&"UNRELATED_SECRET"),
+            "only host namespaces may travel over the wire: {keys:?}"
+        );
     }
 
     #[test]

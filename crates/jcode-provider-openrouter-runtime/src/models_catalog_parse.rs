@@ -89,7 +89,12 @@ pub(crate) fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
 /// contains `"vision"` / `"image"`. `None` means the catalog did not say, and
 /// callers fall back to provider-level heuristics.
 fn parse_supports_image_input(object: &serde_json::Map<String, Value>) -> Option<bool> {
-    for key in ["vision", "supports_vision", "image_input", "supports_image_input"] {
+    for key in [
+        "vision",
+        "supports_vision",
+        "image_input",
+        "supports_image_input",
+    ] {
         if let Some(value) = object.get(key) {
             if let Some(b) = value.as_bool() {
                 return Some(b);
@@ -98,8 +103,9 @@ fn parse_supports_image_input(object: &serde_json::Map<String, Value>) -> Option
     }
     if let Some(caps) = object.get("capabilities").and_then(Value::as_array) {
         let has_vision = caps.iter().any(|c| {
-            c.as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case("vision") || s.eq_ignore_ascii_case("image"))
+            c.as_str().is_some_and(|s| {
+                s.eq_ignore_ascii_case("vision") || s.eq_ignore_ascii_case("image")
+            })
         });
         return Some(has_vision);
     }

@@ -56,6 +56,10 @@ pub(super) struct ClientConnectionInfo {
     /// kitty/DISPLAY/...). Used to route spawn/focus hooks to the client's
     /// terminal instead of the long-lived server's stale startup env (#405).
     pub(super) terminal_env: Vec<(String, String)>,
+    /// Host-provided session env forwarded by this client (e.g. AionUi's
+    /// `KANEO_API_KEY`). Key names are surfaced for diagnostics; values are
+    /// never dumped.
+    pub(super) session_env: Vec<(String, String)>,
     pub(super) disconnect_tx: mpsc::UnboundedSender<()>,
 }
 

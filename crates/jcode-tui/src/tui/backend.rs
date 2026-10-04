@@ -371,6 +371,9 @@ impl RemoteConnection {
             } else {
                 crate::terminal_launch::snapshot_client_terminal_env()
             },
+            // The TUI runs in the same process scope it will later use for
+            // direct sessions; no host-injected env needs forwarding.
+            session_env: Vec::new(),
         })
         .await?;
         let subscribe_ms = subscribe_start.elapsed().as_millis();

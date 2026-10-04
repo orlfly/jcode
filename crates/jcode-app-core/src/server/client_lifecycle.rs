@@ -183,6 +183,13 @@ fn initial_subscribe_terminal_env(request: &Request) -> Vec<(String, String)> {
     }
 }
 
+fn initial_subscribe_session_env(request: &Request) -> Vec<(String, String)> {
+    match request {
+        Request::Subscribe { session_env, .. } => session_env.clone(),
+        _ => Vec::new(),
+    }
+}
+
 struct ProcessingMessage {
     id: u64,
     content: String,
@@ -573,6 +580,7 @@ pub(super) async fn handle_client(
             }
         };
     let mut active_terminal_env = initial_subscribe_terminal_env(&initial_request);
+    let active_session_env = initial_subscribe_session_env(&initial_request);
 
     // Per-client state
     let mut client_is_processing = false;
@@ -642,6 +650,7 @@ pub(super) async fn handle_client(
                 is_processing: false,
                 current_tool_name: None,
                 terminal_env: active_terminal_env.clone(),
+                session_env: active_session_env.clone(),
                 disconnect_tx: disconnect_tx.clone(),
             },
         );
@@ -1292,6 +1301,7 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                     &processing_done_tx,
                     active_terminal_env.clone(),
+                    active_session_env.clone(),
                     &SwarmStatusRefs {
                         members: &swarm_members,
                         swarms_by_id: &swarms_by_id,
@@ -1384,6 +1394,7 @@ pub(super) async fn handle_client(
                         &client_event_tx,
                         &processing_done_tx,
                         active_terminal_env.clone(),
+                        active_session_env.clone(),
                         &SwarmStatusRefs {
                             members: &swarm_members,
                             swarms_by_id: &swarms_by_id,
@@ -1633,6 +1644,7 @@ pub(super) async fn handle_client(
                 crash_on_disconnect: _,
                 continue_on_disconnect: requested_continuation,
                 terminal_env,
+                session_env: _,
             } => {
                 if let Err(message) =
                     validated_subscribe_working_dir(
@@ -2378,7 +2390,7 @@ pub(super) async fn handle_client(
             }
 
             Request::InputShell { id, command } => {
-                handle_input_shell(id, command, &agent, &client_event_tx);
+                handle_input_shell(id, command, &agent, &client_event_tx, active_session_env.clone());
             }
 
             // === Agent communication ===
@@ -3389,6 +3401,7 @@ async fn start_processing_message(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     processing_done_tx: &mpsc::UnboundedSender<(u64, Result<()>, Option<String>)>,
     client_terminal_env: Vec<(String, String)>,
+    session_env: Vec<(String, String)>,
     swarm: &SwarmStatusRefs<'_>,
 ) {
     let ProcessingMessage {
@@ -3475,9 +3488,12 @@ async fn start_processing_message(
     *state.task = Some(tokio::spawn(async move {
         let event_tx = tx.clone();
         let mut stop_reason = crate::protocol::TurnStopReason::Failure;
-        let result = match std::panic::AssertUnwindSafe(crate::hooks::with_client_terminal_env(
-            client_terminal_env,
-            process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
+        let result = match std::panic::AssertUnwindSafe(crate::hooks::with_session_env(
+            session_env,
+            crate::hooks::with_client_terminal_env(
+                client_terminal_env,
+                process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
+            ),
         ))
         .catch_unwind()
         .await

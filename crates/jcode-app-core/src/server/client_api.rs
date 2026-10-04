@@ -93,6 +93,7 @@ impl Client {
             crash_on_disconnect: false,
             continue_on_disconnect: false,
             terminal_env: crate::terminal_launch::snapshot_client_terminal_env(),
+            session_env: Vec::new(),
         };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;

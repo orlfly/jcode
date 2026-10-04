@@ -239,6 +239,7 @@ pub(super) fn handle_input_shell(
     command: String,
     agent: &Arc<Mutex<Agent>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    session_env: Vec<(String, String)>,
 ) {
     let agent = Arc::clone(agent);
     let tx = client_event_tx.clone();
@@ -251,6 +252,11 @@ pub(super) fn handle_input_shell(
 
         let started = Instant::now();
         let mut cmd = build_input_shell_command(&command);
+        // Host-provided session env reaches the daemon's own shell path too, so
+        // `!`-style commands and the agent's tools see the same environment.
+        for (key, value) in &session_env {
+            cmd.env(key, value);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

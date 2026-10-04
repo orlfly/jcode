@@ -815,6 +815,7 @@ fn subscribe_request(working_dir: Option<&str>) -> Request {
         crash_on_disconnect: false,
         continue_on_disconnect: false,
         terminal_env: Vec::new(),
+        session_env: Vec::new(),
     }
 }
 
@@ -967,6 +968,7 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
+            Vec::new(),
             &SwarmStatusRefs {
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
@@ -1067,6 +1069,7 @@ async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attac
         &agent,
         &origin_tx,
         &processing_done_tx,
+        Vec::new(),
         Vec::new(),
         &SwarmStatusRefs {
             members: &swarm_members,
@@ -1193,6 +1196,7 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
             &client_event_tx,
             &processing_done_tx,
             Vec::new(),
+            Vec::new(),
             &SwarmStatusRefs {
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
@@ -1292,6 +1296,7 @@ fn reload_starting_rejects_new_turns_for_multiple_sessions() {
                 &agent,
                 &client_event_tx,
                 &processing_done_tx,
+                Vec::new(),
                 Vec::new(),
                 &SwarmStatusRefs {
                     members: &swarm_members,

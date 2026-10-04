@@ -400,9 +400,7 @@ impl MultiProvider {
             return model.to_string();
         }
         // Anything with explicit route identity is already unambiguous.
-        if crate::provider::explicit_model_provider_prefix(model).is_some()
-            || model.contains('@')
-        {
+        if crate::provider::explicit_model_provider_prefix(model).is_some() || model.contains('@') {
             return model.to_string();
         }
         if let Some((prefix, rest)) = model.split_once(':') {
@@ -640,18 +638,12 @@ mod tests {
             "deepseek-v4.1-flash:cloud"
         );
         assert_eq!(
-            MultiProvider::qualify_bare_model_request_with_session_key(
-                "z-ai/glm-5.2@Novita",
-                None,
-            ),
+            MultiProvider::qualify_bare_model_request_with_session_key("z-ai/glm-5.2@Novita", None,),
             "z-ai/glm-5.2@Novita"
         );
         // No persisted key: bare ids pass through untouched.
         assert_eq!(
-            MultiProvider::qualify_bare_model_request_with_session_key(
-                "deepseek-v4.1-flash",
-                None,
-            ),
+            MultiProvider::qualify_bare_model_request_with_session_key("deepseek-v4.1-flash", None,),
             "deepseek-v4.1-flash"
         );
         // A session key that names no configured profile cannot own the id.
@@ -679,7 +671,8 @@ mod tests {
                 "deepseek-v4.1-flash",
                 Some("company"),
             );
-            if MultiProvider::named_provider_profile_serves_model("company", "deepseek-v4.1-flash") {
+            if MultiProvider::named_provider_profile_serves_model("company", "deepseek-v4.1-flash")
+            {
                 assert_eq!(qualified, "company:deepseek-v4.1-flash");
             } else {
                 assert_eq!(qualified, "deepseek-v4.1-flash");

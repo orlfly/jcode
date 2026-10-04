@@ -153,6 +153,7 @@ mod transcript_routing_tests {
             is_processing: false,
             current_tool_name: None,
             terminal_env: Vec::new(),
+            session_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         }
     }

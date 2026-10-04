@@ -351,6 +351,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         crash_on_disconnect: true,
         continue_on_disconnect: true,
         terminal_env: vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())],
+        session_env: vec![("KANEO_API_KEY".to_string(), "secret".to_string())],
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"type\":\"subscribe\""));
@@ -368,6 +369,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         crash_on_disconnect,
         continue_on_disconnect,
         terminal_env,
+        session_env,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -385,6 +387,11 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
     assert_eq!(
         terminal_env,
         vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())]
+    );
+    assert_eq!(
+        session_env,
+        vec![("KANEO_API_KEY".to_string(), "secret".to_string())],
+        "session-scoped env must survive the subscribe roundtrip"
     );
     Ok(())
 }
@@ -406,6 +413,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
         crash_on_disconnect,
         continue_on_disconnect,
         terminal_env,
+        session_env: _,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));

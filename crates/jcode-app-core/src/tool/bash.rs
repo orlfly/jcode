@@ -670,6 +670,9 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         // selects the documented quote handling used with this form.
         cmd.args(["/D", "/S", "/C"])
             .raw_arg(format!("\"{cmd_str}\""));
+        for (key, value) in crate::hooks::session_env_vars() {
+            cmd.env(key, value);
+        }
         cmd
     }
     #[cfg(not(windows))]
@@ -677,6 +680,13 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         let mut cmd = TokioCommand::new("bash");
         cmd.arg("-c").arg(cmd_str);
         configure_tool_scratch(&mut cmd);
+        // Host-provided session env (e.g. `KANEO_API_URL` injected by AionUi
+        // into the connecting CLI) must reach the agent's shell. The daemon
+        // runs tools in its own process, so without this projection the vars
+        // would never be visible. Scoped via task-local per turn.
+        for (key, value) in crate::hooks::session_env_vars() {
+            cmd.env(key, value);
+        }
         cmd
     }
 }
@@ -731,6 +741,54 @@ mod utf8_truncation_tests {
         let output = format_command_output(input, None);
         assert!(output.ends_with("\n... (output truncated)"));
         assert!(output.starts_with(&"a".repeat(29_999)));
+    }
+
+    /// The daemon runs tool shells from its own process environment, so
+    /// host-provided vars (AionUi injects `KANEO_API_KEY` into the connecting
+    /// ACP process) only reach the agent's command if the session env is
+    /// projected onto the child. Regression guard for the devops agent
+    /// reporting "missing Kaneo API key".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_shell_command_projects_session_env_to_children() {
+        let sentinel = "probe-sentinel-abc123";
+        let output = crate::hooks::with_session_env(
+            vec![
+                ("KANEO_API_KEY".to_string(), sentinel.to_string()),
+                (
+                    "KANEO_API_URL".to_string(),
+                    "http://localhost:1337".to_string(),
+                ),
+            ],
+            async {
+                build_shell_command("printf '%s\\n' \"$KANEO_API_KEY\" \"$KANEO_API_URL\"")
+                    .output()
+                    .await
+                    .expect("run shell command")
+            },
+        )
+        .await;
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(sentinel),
+            "session env must reach the tool shell: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("http://localhost:1337"),
+            "session env must reach the tool shell: {stdout:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_shell_command_omits_session_env_outside_the_scope() {
+        let output = build_shell_command("printf 'value=%s\\n' \"${KANEO_API_KEY:-unset}\"")
+            .output()
+            .await
+            .expect("run shell command");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("probe-sentinel-abc123"), "{stdout:?}");
     }
 
     #[cfg(windows)]

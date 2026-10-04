@@ -272,8 +272,7 @@ impl OpenRouterStream {
     /// taking the longest trailing run of `[A-Za-z0-9_-]`; drop the call when
     /// nothing plausible remains.
     fn sanitize_tool_name(raw: &str) -> Option<String> {
-        let ok =
-            |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        let ok = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
         if raw.bytes().all(|b| ok(b as char)) {
             return Some(raw.to_string());
         }

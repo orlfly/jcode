@@ -197,6 +197,7 @@ fn connection(name: &str, id: &str) -> ClientConnectionInfo {
         is_processing: false,
         current_tool_name: None,
         terminal_env: vec![],
+        session_env: Vec::new(),
         disconnect_tx,
     }
 }

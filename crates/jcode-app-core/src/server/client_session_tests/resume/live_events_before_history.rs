@@ -41,6 +41,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
             is_processing: false,
             current_tool_name: None,
             terminal_env: Vec::new(),
+            session_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));

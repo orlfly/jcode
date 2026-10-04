@@ -134,10 +134,9 @@ fn parse_vision_capability_from_show(body: &str) -> Result<Option<bool>> {
     let Some(caps) = value.get("capabilities").and_then(Value::as_array) else {
         return Ok(None);
     };
-    Ok(Some(
-        caps.iter()
-            .any(|c| c.as_str().is_some_and(|s| s.eq_ignore_ascii_case("vision"))),
-    ))
+    Ok(Some(caps.iter().any(|c| {
+        c.as_str().is_some_and(|s| s.eq_ignore_ascii_case("vision"))
+    })))
 }
 
 async fn fetch_server_default(client: &Client, root: &str) -> Result<Option<u64>> {
@@ -369,7 +368,10 @@ mod tests {
     #[test]
     fn parses_vision_capability_from_show_payload() {
         let vision = r#"{"capabilities":["completion","tools","thinking","vision"]}"#;
-        assert_eq!(parse_vision_capability_from_show(vision).unwrap(), Some(true));
+        assert_eq!(
+            parse_vision_capability_from_show(vision).unwrap(),
+            Some(true)
+        );
         let no_vision = r#"{"capabilities":["completion","tools","thinking"]}"#;
         assert_eq!(
             parse_vision_capability_from_show(no_vision).unwrap(),

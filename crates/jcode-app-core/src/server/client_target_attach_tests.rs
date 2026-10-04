@@ -60,6 +60,7 @@ fn subscribe(target: &str) -> Request {
         crash_on_disconnect: false,
         continue_on_disconnect: false,
         terminal_env: vec![],
+        session_env: vec![],
     }
 }
 

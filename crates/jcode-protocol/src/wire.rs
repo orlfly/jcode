@@ -185,6 +185,13 @@ pub enum Request {
         /// to the client's terminal instead of its own stale startup env (#405).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         terminal_env: Vec<(String, String)>,
+        /// Extra environment variables the connecting frontend wants projected
+        /// into this session's tool/shell child processes (e.g. host-injected
+        /// `KANEO_API_URL`/`KANEO_API_KEY`). The daemon runs tools in its own
+        /// process, so env set on the connecting CLI would otherwise never
+        /// reach the agent's shell. Scoped per turn via task-local.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        session_env: Vec<(String, String)>,
     },
 
     /// Declare that this client is intentionally detaching before its transport
