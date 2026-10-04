@@ -120,6 +120,9 @@ struct SessionUiState {
     /// the picker value may be this qualified spec (provider-bound) or the
     /// bare model name; both are accepted on `set_config_option`.
     model_route_specs: HashMap<String, String>,
+    /// Route catalog behind `available_models`; kept so labels/specs can be
+    /// recomputed when the session's provider changes mid-session.
+    available_model_routes: Vec<ModelRoute>,
     reasoning_effort: Option<String>,
 }
 
@@ -276,6 +279,7 @@ impl SessionUiState {
         available_models: Vec<String>,
         model_provider_labels: HashMap<String, String>,
         model_route_specs: HashMap<String, String>,
+        available_model_routes: Vec<ModelRoute>,
         reasoning_effort: Option<String>,
     ) -> Self {
         Self {
@@ -284,8 +288,19 @@ impl SessionUiState {
             available_models,
             model_provider_labels,
             model_route_specs,
+            available_model_routes,
             reasoning_effort,
         }
+    }
+
+    /// Recompute labels and route specs after the session's provider changed
+    /// so the picker values/labels follow the newly-active provider's routes.
+    fn refresh_route_derivations(&mut self) {
+        let preferred = self.provider_name.as_deref();
+        self.model_provider_labels =
+            model_provider_labels_from_routes(&self.available_model_routes, preferred);
+        self.model_route_specs =
+            model_route_specs_from_routes(&self.available_model_routes, preferred);
     }
 
     fn context_limit(&self) -> u64 {
@@ -913,6 +928,7 @@ impl AcpRuntime {
                         &available_model_routes,
                         provider_name.as_deref(),
                     ),
+                    available_model_routes,
                     reasoning_effort,
                 ),
             ),
@@ -982,6 +998,7 @@ impl AcpRuntime {
                             &available_model_routes,
                             provider_name.as_deref(),
                         ),
+                        available_model_routes,
                         reasoning_effort,
                     );
                     if replay_history {
@@ -1694,9 +1711,16 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
                     anyhow::bail!(error);
                 }
                 let mut state = session.ui_state.lock().await;
+                let provider_changed =
+                    provider_name.is_some() && state.provider_name != provider_name;
                 state.model = Some(model);
                 if provider_name.is_some() {
                     state.provider_name = provider_name;
+                }
+                if provider_changed {
+                    // The picker's labels/specs pinned the previous provider's
+                    // duplicate routes; follow the newly-active provider.
+                    state.refresh_route_derivations();
                 }
                 return Ok(());
             }
