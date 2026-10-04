@@ -3,6 +3,7 @@ use super::dispatch;
 use super::provider_init::ProviderChoice;
 use crate::protocol::{Request, ServerEvent};
 use crate::provider::ModelRoute;
+use crate::provider::RouteSelection;
 use crate::transport::{ReadHalf, WriteHalf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -114,6 +115,11 @@ struct SessionUiState {
     /// client's model picker when more than one provider offers the same
     /// catalog; the model id sent back on selection stays unqualified.
     model_provider_labels: HashMap<String, String>,
+    /// Qualified model spec per available model name (see
+    /// [`RouteSelection::routed_model_spec`]). When a client selects a model,
+    /// the picker value may be this qualified spec (provider-bound) or the
+    /// bare model name; both are accepted on `set_config_option`.
+    model_route_specs: HashMap<String, String>,
     reasoning_effort: Option<String>,
 }
 
@@ -232,12 +238,44 @@ fn model_provider_labels_from_routes(
     labels
 }
 
+/// Qualified model spec per model name, preferring the session's current
+/// provider's route (same policy as the label map). Values are the routing
+/// strings accepted by `set_model` (e.g. `zai:glm-5.3-flash`), so a client
+/// that echoes the value back binds BOTH provider and model id.
+fn model_route_specs_from_routes(
+    routes: &[ModelRoute],
+    preferred_provider: Option<&str>,
+) -> HashMap<String, String> {
+    let labels = model_provider_labels_from_routes(routes, preferred_provider);
+    let mut specs = HashMap::new();
+    let mut fallback = HashMap::new();
+    for route in routes {
+        if route.model.is_empty() || route.provider.trim().is_empty() {
+            continue;
+        }
+        let spec = RouteSelection::from_model_route(route).routed_model_spec();
+        if let Some(label) = labels.get(&route.model) {
+            let display = cli_route_provider_display(&route.provider, &route.api_method);
+            if &display == label {
+                specs.entry(route.model.clone()).or_insert(spec);
+                continue;
+            }
+        }
+        fallback.entry(route.model.clone()).or_insert(spec);
+    }
+    for (model, spec) in fallback {
+        specs.entry(model).or_insert(spec);
+    }
+    specs
+}
+
 impl SessionUiState {
     fn from_history_fields(
         provider_name: Option<String>,
         provider_model: Option<String>,
         available_models: Vec<String>,
         model_provider_labels: HashMap<String, String>,
+        model_route_specs: HashMap<String, String>,
         reasoning_effort: Option<String>,
     ) -> Self {
         Self {
@@ -245,6 +283,7 @@ impl SessionUiState {
             model: provider_model,
             available_models,
             model_provider_labels,
+            model_route_specs,
             reasoning_effort,
         }
     }
@@ -870,6 +909,10 @@ impl AcpRuntime {
                         &available_model_routes,
                         provider_name.as_deref(),
                     ),
+                    model_route_specs_from_routes(
+                        &available_model_routes,
+                        provider_name.as_deref(),
+                    ),
                     reasoning_effort,
                 ),
             ),
@@ -932,6 +975,10 @@ impl AcpRuntime {
                         provider_model,
                         available_models,
                         model_provider_labels_from_routes(
+                            &available_model_routes,
+                            provider_name.as_deref(),
+                        ),
+                        model_route_specs_from_routes(
                             &available_model_routes,
                             provider_name.as_deref(),
                         ),
@@ -1249,6 +1296,10 @@ impl AcpRuntime {
                         &available_model_routes,
                         state.provider_name.as_deref(),
                     );
+                    state.model_route_specs = model_route_specs_from_routes(
+                        &available_model_routes,
+                        state.provider_name.as_deref(),
+                    );
                     state.available_models = available_models;
                     (state.model.clone(), state.available_models.clone())
                 };
@@ -1526,14 +1577,33 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
         }
         let select_options: Vec<Value> = models
             .iter()
-            .map(|name| json!({ "value": name, "name": model_option_label(state, name) }))
+            .map(|name| {
+                // `value` is the provider-qualified spec when known (e.g.
+                // `zai:glm-5.3-flash`) so a client echoing the value back
+                // binds both provider and model id; `name` stays the
+                // human-readable `provider · model` label. Bare model names
+                // are still accepted on set for older clients.
+                let value = state
+                    .model_route_specs
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                json!({ "value": value, "name": model_option_label(state, name) })
+            })
             .collect();
+        // The current value must match one of the option values so clients
+        // can render the selection state.
+        let current_value = state
+            .model_route_specs
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_string());
         options.push(json!({
             "type": "select",
             "id": CONFIG_ID_MODEL,
             "name": "Model",
             "category": "model",
-            "currentValue": model,
+            "currentValue": current_value,
             "options": select_options,
         }));
     }
@@ -1587,6 +1657,8 @@ async fn apply_available_models_update_inner(session: &DaemonSession, event: &Se
     }
     state.model_provider_labels =
         model_provider_labels_from_routes(available_model_routes, state.provider_name.as_deref());
+    state.model_route_specs =
+        model_route_specs_from_routes(available_model_routes, state.provider_name.as_deref());
     let changed = state.available_models != *available_models;
     state.available_models = available_models.clone();
     changed
@@ -2090,6 +2162,36 @@ mod tests {
         assert_eq!(tool_kind("agentgrep"), "search");
         assert_eq!(tool_kind("webfetch"), "fetch");
         assert_eq!(tool_kind("swarm"), "other");
+    }
+
+    #[test]
+    fn model_route_specs_qualify_provider() {
+        let route = |model: &str, provider: &str, api: &str| ModelRoute {
+            model: model.to_string(),
+            provider: provider.to_string(),
+            api_method: api.to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+            usage: None,
+        };
+        let routes = vec![
+            route(
+                "glm-5.3-flash",
+                "OpenCode Go",
+                "openai-compatible:opencode-go",
+            ),
+            route("glm-5.3-flash", "Z.AI", "openai-compatible:zai"),
+        ];
+        let specs = model_route_specs_from_routes(&routes, None);
+        // First-wins (no session preference): OpenCode Go claims the spec.
+        assert_eq!(
+            specs.get("glm-5.3-flash").map(String::as_str),
+            Some("opencode-go:glm-5.3-flash")
+        );
+        // The spec must be a set_model-acceptable routing string that binds
+        // the provider, not the bare model id.
+        assert!(specs["glm-5.3-flash"].contains(':'));
     }
 
     #[test]
