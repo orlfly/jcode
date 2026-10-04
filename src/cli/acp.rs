@@ -1552,6 +1552,57 @@ fn model_option_label(state: &SessionUiState, model: &str) -> String {
     }
 }
 
+/// One picker entry per (provider, model) route.
+///
+/// Model names alone are not unique across providers (e.g. both Z.AI and
+/// OpenCode Go serve `glm-5.3-flash`), so entries are keyed by the qualified
+/// routing spec instead of the bare name. When no route catalog is available
+/// the bare model names are used with fallback labels, matching the legacy
+/// behavior. Returns `(value, label)` pairs; `value` is what the client sends
+/// back on `set_config_option` (bare names are also accepted there).
+fn model_picker_entries(state: &SessionUiState) -> Vec<(String, String)> {
+    if state.available_model_routes.is_empty() {
+        return state
+            .available_models
+            .iter()
+            .map(|name| (name.clone(), model_option_label(state, name)))
+            .collect();
+    }
+    let preferred = state.provider_name.as_deref();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let push_route = |route: &ModelRoute,
+                      entries: &mut Vec<(String, String)>,
+                      seen: &mut std::collections::HashSet<String>| {
+        if route.model.is_empty() || route.provider.trim().is_empty() || !route.available {
+            return;
+        }
+        let spec = RouteSelection::from_model_route(route).routed_model_spec();
+        if !seen.insert(spec.clone()) {
+            return;
+        }
+        let display = cli_route_provider_display(&route.provider, &route.api_method);
+        let label = if display.is_empty() {
+            route.model.clone()
+        } else {
+            format!("{display} \u{b7} {}", route.model)
+        };
+        entries.push((spec, label));
+    };
+    // The session's current provider's routes first so they sort to the top.
+    if let Some(preferred) = preferred.map(str::trim).filter(|p| !p.is_empty()) {
+        for route in &state.available_model_routes {
+            if &cli_route_provider_display(&route.provider, &route.api_method) == preferred {
+                push_route(route, &mut entries, &mut seen);
+            }
+        }
+    }
+    for route in &state.available_model_routes {
+        push_route(route, &mut entries, &mut seen);
+    }
+    entries
+}
+
 fn session_models(state: &SessionUiState) -> Option<Value> {
     let current = state.model.as_deref()?;
     let mut models = state.available_models.clone();
@@ -1588,26 +1639,7 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
     let mut options = Vec::new();
 
     if let Some(model) = state.model.as_deref() {
-        let mut models = state.available_models.clone();
-        if !models.iter().any(|candidate| candidate == model) {
-            models.insert(0, model.to_string());
-        }
-        let select_options: Vec<Value> = models
-            .iter()
-            .map(|name| {
-                // `value` is the provider-qualified spec when known (e.g.
-                // `zai:glm-5.3-flash`) so a client echoing the value back
-                // binds both provider and model id; `name` stays the
-                // human-readable `provider · model` label. Bare model names
-                // are still accepted on set for older clients.
-                let value = state
-                    .model_route_specs
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| name.clone());
-                json!({ "value": value, "name": model_option_label(state, name) })
-            })
-            .collect();
+        let mut entries = model_picker_entries(state);
         // The current value must match one of the option values so clients
         // can render the selection state.
         let current_value = state
@@ -1615,6 +1647,13 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
             .get(model)
             .cloned()
             .unwrap_or_else(|| model.to_string());
+        if !entries.iter().any(|(value, _)| value == &current_value) {
+            entries.insert(0, (current_value.clone(), model_option_label(state, model)));
+        }
+        let select_options: Vec<Value> = entries
+            .into_iter()
+            .map(|(value, name)| json!({ "value": value, "name": name }))
+            .collect();
         options.push(json!({
             "type": "select",
             "id": CONFIG_ID_MODEL,
@@ -2498,6 +2537,53 @@ mod tests {
         assert!(cwd_from_params(&params).is_err());
         let params = json!({"cwd": "/tmp"});
         assert_eq!(cwd_from_params(&params).unwrap(), Path::new("/tmp"));
+    }
+
+    #[test]
+    fn model_options_keep_one_entry_per_provider_route() {
+        // Both Z.AI and OpenCode Go serve `glm-5.3-flash`; the picker must
+        // offer both routes instead of collapsing to the first one seen.
+        let route = |model: &str, provider: &str, profile: &str| crate::provider::ModelRoute {
+            model: model.to_string(),
+            provider: provider.to_string(),
+            api_method: format!("openai-compatible:{profile}"),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+            usage: None,
+        };
+        let routes = vec![
+            route("glm-5.3-flash", "OpenCode Go", "opencode-go"),
+            route("glm-5.3-flash", "Z.AI", "zai"),
+        ];
+        let state = SessionUiState {
+            provider_name: Some("OpenCode Go".to_string()),
+            model: Some("glm-5.3-flash".to_string()),
+            available_models: vec!["glm-5.3-flash".to_string()],
+            model_provider_labels: model_provider_labels_from_routes(&routes, Some("OpenCode Go")),
+            model_route_specs: model_route_specs_from_routes(&routes, Some("OpenCode Go")),
+            available_model_routes: routes,
+            ..SessionUiState::default()
+        };
+        let options = session_config_options(&state);
+        let model = &options[0];
+        let values: Vec<&str> = model["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect();
+        assert!(
+            values.contains(&"zai:glm-5.3-flash"),
+            "Z.AI route must stay selectable: {values:?}"
+        );
+        assert!(
+            values.contains(&"opencode-go:glm-5.3-flash"),
+            "OpenCode Go route must stay selectable: {values:?}"
+        );
+        // The current model's spec must remain an option value so clients can
+        // render the selection state.
+        assert!(values.contains(&model["currentValue"].as_str().unwrap()));
     }
 
     #[test]
