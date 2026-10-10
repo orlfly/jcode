@@ -29,25 +29,6 @@ tokio::task_local! {
     /// Task-local storage keeps concurrent clients isolated without mutating
     /// the daemon's process-wide environment.
     static CLIENT_TERMINAL_ENV: Vec<(String, String)>;
-    /// Host-provided env vars (e.g. `KANEO_API_URL`) to project into this
-    /// session's tool/shell child processes. Scoped per turn so concurrent
-    /// sessions never see each other's credentials.
-    static SESSION_ENV: Vec<(String, String)>;
-}
-
-/// Run `future` with the given session-scoped env vars available to tool
-/// child processes (see [`session_env_vars`]).
-pub async fn with_session_env<F>(env: Vec<(String, String)>, future: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    SESSION_ENV.scope(env, future).await
-}
-
-/// The host-provided env vars for the current turn, if any. Empty outside a
-/// `with_session_env` scope.
-pub fn session_env_vars() -> Vec<(String, String)> {
-    SESSION_ENV.try_with(|env| env.clone()).unwrap_or_default()
 }
 
 /// Maximum bytes of JSON payload exported via `JCODE_HOOK_PAYLOAD`.
@@ -508,22 +489,6 @@ async fn run_pre_tool_command(
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn session_env_scoped_to_with_session_env() {
-        assert!(session_env_vars().is_empty(), "empty outside the scope");
-        with_session_env(
-            vec![("KANEO_API_KEY".to_string(), "secret".to_string())],
-            async {
-                assert_eq!(
-                    session_env_vars(),
-                    vec![("KANEO_API_KEY".to_string(), "secret".to_string())]
-                );
-            },
-        )
-        .await;
-        assert!(session_env_vars().is_empty(), "cleared after the scope");
-    }
 
     #[test]
     fn payload_json_includes_event_and_lowercased_fields() {

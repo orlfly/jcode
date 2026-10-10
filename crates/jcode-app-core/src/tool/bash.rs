@@ -670,9 +670,6 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         // selects the documented quote handling used with this form.
         cmd.args(["/D", "/S", "/C"])
             .raw_arg(format!("\"{cmd_str}\""));
-        for (key, value) in crate::hooks::session_env_vars() {
-            cmd.env(key, value);
-        }
         cmd
     }
     #[cfg(not(windows))]
@@ -680,14 +677,27 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         let mut cmd = TokioCommand::new("bash");
         cmd.arg("-c").arg(cmd_str);
         configure_tool_scratch(&mut cmd);
-        // Host-provided session env (e.g. `KANEO_API_URL` injected by AionUi
-        // into the connecting CLI) must reach the agent's shell. The daemon
-        // runs tools in its own process, so without this projection the vars
-        // would never be visible. Scoped via task-local per turn.
-        for (key, value) in crate::hooks::session_env_vars() {
-            cmd.env(key, value);
-        }
         cmd
+    }
+}
+
+/// Project the session's host-provided env (e.g. `KANEO_API_URL` injected by
+/// AionUi into the connecting CLI) onto a shell child process.
+///
+/// Tools run in the daemon, not in the host's frontend process, so these values
+/// have to be re-applied here. Looked up by session id at spawn time because an
+/// attaching client's environment must take effect even when the turn executes
+/// in the session's original context.
+fn apply_session_env(command: &mut TokioCommand, session_id: &str) {
+    for (key, value) in jcode_base::session_env::session_env_for(session_id) {
+        command.env(key, value);
+    }
+}
+
+#[cfg(unix)]
+fn apply_session_env_std(command: &mut StdCommand, session_id: &str) {
+    for (key, value) in jcode_base::session_env::session_env_for(session_id) {
+        command.env(key, value);
     }
 }
 
@@ -752,7 +762,9 @@ mod utf8_truncation_tests {
     #[tokio::test]
     async fn build_shell_command_projects_session_env_to_children() {
         let sentinel = "probe-sentinel-abc123";
-        let output = crate::hooks::with_session_env(
+        let session_id = "session_env_projection_test";
+        jcode_base::session_env::set_session_env(
+            session_id,
             vec![
                 ("KANEO_API_KEY".to_string(), sentinel.to_string()),
                 (
@@ -760,14 +772,12 @@ mod utf8_truncation_tests {
                     "http://localhost:1337".to_string(),
                 ),
             ],
-            async {
-                build_shell_command("printf '%s\\n' \"$KANEO_API_KEY\" \"$KANEO_API_URL\"")
-                    .output()
-                    .await
-                    .expect("run shell command")
-            },
-        )
-        .await;
+        );
+        let mut command =
+            build_shell_command("printf '%s\\n' \"$KANEO_API_KEY\" \"$KANEO_API_URL\"");
+        super::apply_session_env(&mut command, session_id);
+        let output = command.output().await.expect("run shell command");
+        jcode_base::session_env::clear_session_env(session_id);
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -778,6 +788,27 @@ mod utf8_truncation_tests {
             stdout.contains("http://localhost:1337"),
             "session env must reach the tool shell: {stdout:?}"
         );
+    }
+
+    /// An attaching client's env must win over whatever the session was created
+    /// with: the turn can run in the session's original context.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_session_env_uses_the_latest_registered_value() {
+        let session_id = "session_env_attach_test";
+        jcode_base::session_env::set_session_env(
+            session_id,
+            vec![("KANEO_API_KEY".to_string(), "stale".to_string())],
+        );
+        jcode_base::session_env::set_session_env(
+            session_id,
+            vec![("KANEO_API_KEY".to_string(), "rotated".to_string())],
+        );
+        let mut command = build_shell_command("printf '%s' \"$KANEO_API_KEY\"");
+        super::apply_session_env(&mut command, session_id);
+        let output = command.output().await.expect("run shell command");
+        jcode_base::session_env::clear_session_env(session_id);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "rotated");
     }
 
     #[cfg(unix)]
@@ -1070,6 +1101,7 @@ impl BashTool {
         let has_stdin_channel = ctx.stdin_request_tx.is_some();
 
         let mut command = build_shell_command(&params.command);
+        apply_session_env(&mut command, &ctx.session_id);
         command
             .env("JCODE_SESSION_ID", &ctx.session_id)
             .kill_on_drop(true)
@@ -1291,6 +1323,7 @@ impl BashTool {
         let display_name = summarize_background_command(params.intent.as_deref(), &params.command);
 
         let mut cmd = build_detached_shell_wrapper(&params.command);
+        apply_session_env_std(&mut cmd, &ctx.session_id);
         cmd.env("JCODE_SESSION_ID", &ctx.session_id);
         let stdout = OpenOptions::new()
             .create(true)
@@ -1434,6 +1467,7 @@ impl BashTool {
         let display_name = summarize_background_command(description.as_deref(), &command);
         let working_dir = ctx.working_dir.clone();
         let session_id_env = ctx.session_id.clone();
+        let session_env = jcode_base::session_env::session_env_for(&ctx.session_id);
         let timeout_ms = params.timeout.map(|timeout| timeout.min(600000));
         let timeout_duration = timeout_ms.map(Duration::from_millis);
 
@@ -1448,6 +1482,9 @@ impl BashTool {
                 wake,
 				move |output_path| async move {
 					let mut cmd = build_shell_command(&command);
+					for (key, value) in &session_env {
+						cmd.env(key, value);
+					}
 					cmd.env("JCODE_SESSION_ID", &session_id_env);
 					#[cfg(unix)]
 					unsafe {

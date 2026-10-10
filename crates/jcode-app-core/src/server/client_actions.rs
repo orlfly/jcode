@@ -239,10 +239,13 @@ pub(super) fn handle_input_shell(
     command: String,
     agent: &Arc<Mutex<Agent>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    session_env: Vec<(String, String)>,
+    client_session_id: &str,
 ) {
     let agent = Arc::clone(agent);
     let tx = client_event_tx.clone();
+    // Snapshot the session's host-provided env before spawning: the task cannot
+    // borrow `client_session_id`.
+    let session_env = jcode_base::session_env::session_env_for(client_session_id);
 
     tokio::spawn(async move {
         let cwd = {

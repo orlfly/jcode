@@ -1021,6 +1021,12 @@ pub(super) async fn handle_client(
         };
         let request_decoded_at = Instant::now();
         let request_id = request.id();
+        // Keep the session's host-provided tool env current. Registering on every
+        // request (not only the first subscribe) means an attach, a re-subscribe
+        // after credentials rotate, or a session switch all take effect for the
+        // commands spawned afterwards — even though the turn may execute in the
+        // session's original context.
+        jcode_base::session_env::set_session_env(&client_session_id, active_session_env.clone());
         let request_kind = request_type_from_line(&line);
         let request_lifecycle_logged = !request_type_is_read_only(&request_kind);
         let request_lifecycle_start = Instant::now();
@@ -1301,7 +1307,6 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                     &processing_done_tx,
                     active_terminal_env.clone(),
-                    active_session_env.clone(),
                     &SwarmStatusRefs {
                         members: &swarm_members,
                         swarms_by_id: &swarms_by_id,
@@ -1394,7 +1399,6 @@ pub(super) async fn handle_client(
                         &client_event_tx,
                         &processing_done_tx,
                         active_terminal_env.clone(),
-                        active_session_env.clone(),
                         &SwarmStatusRefs {
                             members: &swarm_members,
                             swarms_by_id: &swarms_by_id,
@@ -2390,7 +2394,7 @@ pub(super) async fn handle_client(
             }
 
             Request::InputShell { id, command } => {
-                handle_input_shell(id, command, &agent, &client_event_tx, active_session_env.clone());
+                handle_input_shell(id, command, &agent, &client_event_tx, &client_session_id);
             }
 
             // === Agent communication ===
@@ -3401,7 +3405,6 @@ async fn start_processing_message(
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     processing_done_tx: &mpsc::UnboundedSender<(u64, Result<()>, Option<String>)>,
     client_terminal_env: Vec<(String, String)>,
-    session_env: Vec<(String, String)>,
     swarm: &SwarmStatusRefs<'_>,
 ) {
     let ProcessingMessage {
@@ -3488,12 +3491,9 @@ async fn start_processing_message(
     *state.task = Some(tokio::spawn(async move {
         let event_tx = tx.clone();
         let mut stop_reason = crate::protocol::TurnStopReason::Failure;
-        let result = match std::panic::AssertUnwindSafe(crate::hooks::with_session_env(
-            session_env,
-            crate::hooks::with_client_terminal_env(
-                client_terminal_env,
-                process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
-            ),
+        let result = match std::panic::AssertUnwindSafe(crate::hooks::with_client_terminal_env(
+            client_terminal_env,
+            process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
         ))
         .catch_unwind()
         .await
