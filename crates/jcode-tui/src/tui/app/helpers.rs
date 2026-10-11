@@ -779,7 +779,7 @@ fn build_fresh_session_command(socket: Option<&str>) -> crate::terminal_launch::
         args.push(socket.to_string());
     }
     crate::terminal_launch::TerminalCommand::new(&exe, args)
-        .title("jcode · new session".to_string())
+        .title(format!("{} · new session", crate::tui::brand::app_name()))
         .kind("new-terminal")
         .fresh_spawn()
 }
@@ -805,9 +805,9 @@ fn resumed_window_title(session_id: &str) -> String {
     let fallback_label = if let Some(server_info) =
         crate::registry::find_server_by_socket_sync(&crate::server::socket_path())
     {
-        format!("jcode/{} {}", server_info.name, session_label)
+        format!("{}/{} {}", crate::tui::brand::app_name(), server_info.name, session_label)
     } else {
-        format!("jcode {}", session_label)
+        format!("{} {}", crate::tui::brand::app_name(), session_label)
     };
     crate::process_title::terminal_window_title(
         icon,

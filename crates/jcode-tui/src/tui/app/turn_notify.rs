@@ -225,7 +225,7 @@ pub(super) fn build_turn_notification(
     todos: &[TodoItem],
     last_assistant_text: Option<&str>,
 ) -> TurnNotification {
-    let mut title = String::from("jcode");
+    let mut title = String::from(crate::tui::brand::app_name());
     if let Some(name) = session_name {
         title.push_str(" · ");
         title.push_str(name);

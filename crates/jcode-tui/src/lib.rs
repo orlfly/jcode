@@ -22,6 +22,13 @@
 // they did before the split.
 pub use jcode_app_core::*;
 
+/// Application branding: the display name shown in the UI.
+///
+/// Downstream products that embed this TUI set `JCODE_APP_NAME` before startup
+/// (see [`branding`] for the rules, and for what is deliberately not renamed,
+/// such as vendor and service names).
+pub use jcode_tui_style::branding;
+
 // Presentation layer (kept in this crate).
 pub mod tui;
 pub mod video_export;

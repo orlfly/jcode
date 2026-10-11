@@ -87,6 +87,22 @@ impl SessionSpawnContext {
 }
 
 /// Compute the window/terminal title used when (re)launching a session.
+/// Application display name used in terminal window titles.
+///
+/// Deliberately a local read of `JCODE_APP_NAME` rather than a call into
+/// `jcode_tui_style::branding`: this crate is the non-presentation core and must
+/// not depend on the TUI style crates. Downstream products that embed this code
+/// (for example Gcode, which sets `JCODE_APP_NAME=gcode` at startup) get their
+/// own name; the default keeps the stock behaviour. Keep the default and the
+/// trimming rule in sync with `jcode_tui_style::branding`.
+fn app_name_for_titles() -> String {
+    std::env::var("JCODE_APP_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "jcode".to_string())
+}
+
 pub fn resumed_window_title(session_id: &str) -> String {
     let session_name = crate::process_title::session_name(session_id);
     let icon = id::session_icon(&session_name);
@@ -95,9 +111,9 @@ pub fn resumed_window_title(session_id: &str) -> String {
     let fallback_label = if let Some(server_info) =
         crate::registry::find_server_by_socket_sync(&server::socket_path())
     {
-        format!("jcode/{} {}", server_info.name, session_label)
+        format!("{}/{} {}", app_name_for_titles(), server_info.name, session_label)
     } else {
-        format!("jcode {}", session_label)
+        format!("{} {}", app_name_for_titles(), session_label)
     };
     crate::process_title::terminal_window_title(
         icon,

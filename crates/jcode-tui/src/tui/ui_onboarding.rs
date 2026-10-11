@@ -357,9 +357,12 @@ fn telemetry_header_lines(width: u16) -> Vec<Line<'static>> {
     let align = Alignment::Center;
     let dim = Style::default().fg(dim_color());
     let lines = vec![
-        "jcode collects anonymous usage statistics (version, OS, session",
-        "activity, and crash reasons). No code, prompts, or personal data.",
-        "Change anytime: /telemetry (or export JCODE_NO_TELEMETRY=1)",
+        format!(
+            "{} collects anonymous usage statistics (version, OS, session",
+            crate::tui::brand::app_name()
+        ),
+        "activity, and crash reasons). No code, prompts, or personal data.".to_string(),
+        "Change anytime: /telemetry (or export JCODE_NO_TELEMETRY=1)".to_string(),
     ];
     lines
         .into_iter()

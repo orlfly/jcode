@@ -147,10 +147,11 @@ pub(crate) fn build_repair_brief(
         .unwrap_or_else(|| "Logs:    ~/.jcode/logs/jcode-<date>.log".to_string());
 
     let mut brief = String::new();
-    brief.push_str(
-        "jcode (a terminal coding agent) could not import or validate a login \
+    brief.push_str(&format!(
+        "{} (a terminal coding agent) could not import or validate a login \
 during first-run onboarding. Please fix the login for the user.\n\n",
-    );
+        crate::tui::brand::app_name()
+    ));
     brief.push_str(&format!("Failure: {}\n", failure.trim()));
     brief.push_str(&format!("{log_line}\n\n"));
 

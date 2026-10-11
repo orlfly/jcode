@@ -1,9 +1,14 @@
+pub mod branding;
 pub mod color;
 pub mod harmony;
 pub mod palette;
 pub mod theme;
 pub mod theme_mode;
 
+pub use branding::{
+    APP_NAME_ENV, DEFAULT_APP_NAME, app_name, app_name_title, rebrand_ui_text,
+    rebrand_ui_text_as,
+};
 pub use color::{ColorCapability, clear_buf, color_capability, has_truecolor, indexed_to_rgb, rgb};
 pub use harmony::{Criterion, HarmonyReport, Oklab, analyze as analyze_harmony, analyze_active};
 pub use palette::{ALL_ROLES, Palette, Role, palette, role_color, set_palette};

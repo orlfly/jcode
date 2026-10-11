@@ -1,4 +1,5 @@
 pub mod account_picker;
+pub(crate) mod brand;
 pub(crate) mod app;
 
 #[derive(Clone)]

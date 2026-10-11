@@ -1150,10 +1150,11 @@ pub(super) fn handle_pending_ssh_remote_target(app: &mut App, name: String, inpu
 
 fn begin_ssh_target_prompt(app: &mut App, name: &str) {
     app.pending_ssh_remote_name = Some(name.to_string());
+    let app_name = crate::tui::brand::app_name_title();
     app.push_display_message(DisplayMessage::system(format!(
         "SSH setup: {}
 
-Step 1/4: Tell Jcode where to connect.
+Step 1/4: Tell {} where to connect.
 
 Enter only the SSH target, meaning the part after ssh:
 
@@ -1162,12 +1163,12 @@ Enter only the SSH target, meaning the part after ssh:
 You can also enter an SSH config alias like school.
 
 Security model
-  - Jcode stores this host/user target so you can run /ssh {} later.
-  - Jcode does not ask for or store your SSH password.
-  - If a password is needed, it will be typed into your system ssh prompt, not into Jcode.
+  - {app_name} stores this host/user target so you can run /ssh {} later.
+  - {app_name} does not ask for or store your SSH password.
+  - If a password is needed, it will be typed into your system ssh prompt, not into {app_name}.
 
 Type cancel to stop setup.",
-        name, name
+        name, name, name
     )));
     app.set_status_notice("SSH setup 1/4: enter target");
 }
@@ -1175,7 +1176,7 @@ Type cancel to stop setup.",
 fn show_ssh_remotes(app: &mut App) {
     match crate::ssh_remote::load_config() {
         Ok(config) if config.hosts.is_empty() => {
-            app.push_display_message(DisplayMessage::system(
+            app.push_display_message(DisplayMessage::system(format!(
                 "SSH remotes
 
 No SSH remotes are configured yet.
@@ -1184,9 +1185,9 @@ Start with:
 
   /ssh school
 
-Jcode will ask for the SSH target, then use your system SSH client for authentication. Jcode never stores SSH passwords."
-                    .to_string(),
-            ));
+{app} will ask for the SSH target, then use your system SSH client for authentication. {app} never stores SSH passwords.",
+                app = crate::tui::brand::app_name_title()
+            )));
         }
         Ok(config) => {
             let mut lines = vec!["SSH remotes".to_string(), "".to_string()];
@@ -1207,7 +1208,10 @@ Jcode will ask for the SSH target, then use your system SSH client for authentic
                     .to_string(),
             );
             lines.push("".to_string());
-            lines.push("Security: Jcode stores targets only, never SSH passwords.".to_string());
+            lines.push(format!(
+                "Security: {} stores targets only, never SSH passwords.",
+                crate::tui::brand::app_name_title()
+            ));
             app.push_display_message(DisplayMessage::system(lines.join("\n")));
         }
         Err(error) => app.push_display_message(DisplayMessage::error(format!(

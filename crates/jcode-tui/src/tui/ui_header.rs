@@ -596,9 +596,9 @@ fn semver_minor() -> String {
 
 #[cfg(test)]
 fn version_display_candidates() -> Vec<String> {
-    let full = format!("jcode {}", semver());
-    let core = format!("jcode {}", semver_core());
-    let minor = format!("jcode {}", semver_minor());
+    let full = format!("{} {}", crate::tui::brand::app_name(), semver());
+    let core = format!("{} {}", crate::tui::brand::app_name(), semver_core());
+    let minor = format!("{} {}", crate::tui::brand::app_name(), semver_minor());
     let shortest = semver_minor();
     vec![full, core, minor, shortest]
 }
@@ -699,11 +699,12 @@ fn build_persistent_header_with_auth(
         .as_deref()
         .map(|version| header_version_label(version, include_hash));
 
-    // First line: `jcode` (+ `self-dev` when running a dev/canary build),
+    // First line: the application name (+ `self-dev` when running a dev/canary
+    // build; downstream products set `JCODE_APP_NAME`),
     // followed by any remaining status badges rendered dimly.
     {
         let mut spans = vec![Span::styled(
-            "jcode".to_string(),
+            crate::tui::brand::app_name().to_string(),
             Style::default().fg(header_name_color()).bold(),
         )];
         if is_canary {
