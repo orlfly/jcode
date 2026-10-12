@@ -19,6 +19,8 @@ pub async fn run() -> Result<()> {
     // Parse once, before startup side effects. Invalid arguments and --help
     // must not harden credential files or create configuration/telemetry state.
     let args = Args::parse();
+    // Snapshot user-supplied provider env before provider init rewrites it.
+    super::provider_init::capture_user_openrouter_model_env();
     // Credential import must refuse existing stores without normal startup
     // hardening, migrations, telemetry, or provider discovery touching them.
     if args.ssh.is_none()
@@ -58,7 +60,16 @@ pub async fn run() -> Result<()> {
         .name("jcode-scratch-prune".to_string())
         .spawn(crate::session::prune_scratch_dir)
         .ok();
-    logging::info("jcode starting");
+    // Record which binary actually launched. Stale copies earlier on PATH (or a
+    // shortcut pinned to an old install) otherwise look identical to the
+    // updated launcher in logs, and keep re-offering the same update (#1626).
+    logging::info(&format!(
+        "jcode starting (version={}, exe={})",
+        jcode_build_meta::version(),
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    ));
 
     // Wire config-reload reactions without making config depend on auth/bus:
     // when the config cache reloads, invalidate the auth-status cache and

@@ -461,11 +461,10 @@ pub(super) fn draw_messages(
     } else {
         None
     };
-    let active_inline_edit_context = if app.diff_mode().is_inline() || expand_feedback_active {
-        active_file_diff_context(prepared.as_ref(), scroll, visible_height)
-    } else {
-        None
-    };
+    // The expand badge applies in every diff mode: from Off/File it opens the
+    // hidden diff in full inline, so resolve the visible edit regardless.
+    let active_inline_edit_context =
+        active_file_diff_context(prepared.as_ref(), scroll, visible_height);
 
     let visible_end = (scroll + visible_height).min(total_lines);
     let visible_user_start = lower_bound(wrapped_user_indices, scroll);
@@ -516,6 +515,9 @@ pub(super) fn draw_messages(
         // prompt preview) is synthetic (not part of the scrolled transcript), so
         // offset by it to keep the content rows aligned.
         scroll_top: scroll.saturating_sub(top_band_lines as usize),
+        content_churning: app.is_processing()
+            || !app.streaming_text().is_empty()
+            || app.has_pending_mouse_scroll_animation(),
         ..Default::default()
     };
     margins
@@ -998,6 +1000,16 @@ pub(super) fn draw_messages(
             let total_height = region.height;
             let image_end = region.end_line;
             let is_fit = region.render == jcode_tui_messages::ImageRegionRender::Fit;
+            // Scale fit images into the exact box layout reserved for them
+            // (`region.width` cols x `region.height` rows). Fitting into the
+            // full content width instead let the rounded-up row count upscale
+            // the picture a few cells wider than the margin carve assumed, so
+            // it drew over info widgets docked beside it.
+            let fit_cols = if region.width == 0 {
+                content_area.width
+            } else {
+                region.width.min(content_area.width)
+            };
 
             if let Some(native_latex) = crate::tui::markdown::handterm_native_latex_for_hash(hash) {
                 // Native math writes real terminal cells rather than an overlay,
@@ -1036,7 +1048,7 @@ pub(super) fn draw_messages(
             // the ones actually on screen get decoded/scaled, and a cold image
             // schedules background prep instead of stalling this frame.
             let fit_ready = if is_fit && image_end > scroll && abs_idx < visible_end {
-                super::inline_image_ui::ensure_drawable(hash, content_area.width, total_height)
+                super::inline_image_ui::ensure_drawable(hash, fit_cols, total_height)
             } else {
                 true
             };
@@ -1071,7 +1083,7 @@ pub(super) fn draw_messages(
                                 hash,
                                 image_area,
                                 frame.buffer_mut(),
-                                content_area.width,
+                                fit_cols,
                                 total_height,
                                 0,
                                 centered,
@@ -1128,7 +1140,7 @@ pub(super) fn draw_messages(
                                 hash,
                                 image_area,
                                 frame.buffer_mut(),
-                                content_area.width,
+                                fit_cols,
                                 total_height,
                                 skip_rows,
                                 centered,
@@ -1189,7 +1201,12 @@ pub(super) fn draw_messages(
                 if on_screen {
                     continue;
                 }
-                super::inline_image_ui::prefetch(region.hash, content_area.width, region.height);
+                let fit_cols = if region.width == 0 {
+                    content_area.width
+                } else {
+                    region.width.min(content_area.width)
+                };
+                super::inline_image_ui::prefetch(region.hash, fit_cols, region.height);
             }
         }
     }
@@ -1378,9 +1395,8 @@ fn windowed_min(widths: &[u16], window: usize) -> Vec<u16> {
     out
 }
 
-/// Lines for the pinned status band: optional todos followed by exactly one
-/// compact row per relevant background task. Completed tasks are shown briefly
-/// as confirmation, while running and failed tasks remain actionable.
+/// Lines for the pinned todo band. Background tasks render in the
+/// `background` info widget, not here.
 fn pinned_todo_band_lines(
     app: &dyn TuiState,
     width: u16,
@@ -1390,11 +1406,6 @@ fn pinned_todo_band_lines(
         return (Vec::new(), None);
     }
 
-    let task_lines: Vec<_> = app
-        .background_task_rows()
-        .iter()
-        .map(|task| active_background_task_line(task, width))
-        .collect();
     let card_lines = if crate::config::config().display.pin_todos {
         app.pinned_todos_payload()
             .map(|payload| {
@@ -1410,13 +1421,13 @@ fn pinned_todo_band_lines(
     } else {
         Vec::new()
     };
-    if card_lines.is_empty() && task_lines.is_empty() {
+    if card_lines.is_empty() {
         return (Vec::new(), None);
     }
 
     // Band budget: about a third of the viewport.
     let budget = ((viewport_height as usize) / 3).clamp(2, 12);
-    let content_budget = budget.saturating_sub(task_lines.len()).max(2);
+    let content_budget = budget.max(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let has_more = card_lines.len() > content_budget && !app.pinned_todos_expanded();
     let mut more_line = None;
@@ -1432,85 +1443,7 @@ fn pinned_todo_band_lines(
     } else {
         lines.extend(card_lines);
     }
-    lines.extend(task_lines);
     (lines, more_line)
-}
-
-fn active_background_task_line(task: &crate::tui::BackgroundTaskRow, width: u16) -> Line<'static> {
-    const BAR_WIDTH: usize = 6;
-    let (icon, task_color, percent) = match task.status {
-        crate::tui::BackgroundTaskRowStatus::Running => (
-            "◌",
-            accent_color(),
-            task.percent.unwrap_or(0.0).clamp(0.0, 100.0),
-        ),
-        crate::tui::BackgroundTaskRowStatus::Completed => ("✓", Color::Green, 100.0),
-        crate::tui::BackgroundTaskRowStatus::Failed => (
-            "×",
-            Color::Red,
-            task.percent.unwrap_or(0.0).clamp(0.0, 100.0),
-        ),
-    };
-    let rounded_percent = percent.round() as u8;
-    let status_label = if task.status == crate::tui::BackgroundTaskRowStatus::Failed {
-        "failed".to_string()
-    } else {
-        format!("{}%", rounded_percent)
-    };
-    let filled = ((percent / 100.0) * BAR_WIDTH as f32).round() as usize;
-    let (active_bar, remaining_bar) = if task.status == crate::tui::BackgroundTaskRowStatus::Failed
-    {
-        (
-            "━".repeat(filled.min(BAR_WIDTH)),
-            "─".repeat(BAR_WIDTH.saturating_sub(filled)),
-        )
-    } else if filled >= BAR_WIDTH {
-        ("━".repeat(BAR_WIDTH), String::new())
-    } else {
-        (
-            format!("{}╺", "━".repeat(filled)),
-            "─".repeat(BAR_WIDTH.saturating_sub(filled + 1)),
-        )
-    };
-
-    let fixed_width = UnicodeWidthStr::width(
-        format!("◌ bg   {} {}{}", active_bar, remaining_bar, status_label).as_str(),
-    );
-    let max_label_width = (width as usize).saturating_sub(fixed_width).max(1);
-    let label = truncate_background_task_label(&task.label, max_label_width);
-
-    Line::from(vec![
-        Span::styled(icon, Style::default().fg(task_color)),
-        Span::styled(" bg ", Style::default().fg(dim_color())),
-        Span::raw(label),
-        Span::raw("  "),
-        Span::styled(active_bar, Style::default().fg(task_color)),
-        Span::styled(remaining_bar, Style::default().fg(dim_color())),
-        Span::styled(
-            format!(" {}", status_label),
-            Style::default().fg(dim_color()),
-        ),
-    ])
-}
-
-fn truncate_background_task_label(label: &str, max_width: usize) -> String {
-    let label = label.replace(['\r', '\n'], " ");
-    if UnicodeWidthStr::width(label.as_str()) <= max_width {
-        return label;
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    let mut truncated = String::new();
-    for ch in label.chars() {
-        let candidate = format!("{}{}…", truncated, ch);
-        if UnicodeWidthStr::width(candidate.as_str()) > max_width {
-            break;
-        }
-        truncated.push(ch);
-    }
-    truncated.push('…');
-    truncated
 }
 
 static PINNED_TODO_MORE_AREA: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
