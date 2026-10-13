@@ -789,6 +789,7 @@ fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySubcommand {
         MemoryCommand::Stats => commands::MemorySubcommand::Stats,
         MemoryCommand::Forget { id } => commands::MemorySubcommand::Forget { id },
         MemoryCommand::ClearTest => commands::MemorySubcommand::ClearTest,
+        MemoryCommand::Reclassify { apply } => commands::MemorySubcommand::Reclassify { apply },
     }
 }
 

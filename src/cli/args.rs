@@ -1253,6 +1253,18 @@ pub(crate) enum MemoryCommand {
 
     /// Clear test memory storage (used by debug sessions)
     ClearTest,
+
+    /// Reclassify residual (v1 `fact`) memories into the v2 type split
+    ///
+    /// Rules, contracts and perishable environment facts become `process_rule`,
+    /// `contract` and `env_fact` respectively (see `classify_residual_type`).
+    /// Everything else stays in the residual `observation` bucket. Dry run
+    /// unless `--apply` is passed.
+    Reclassify {
+        /// Write the changes instead of reporting them
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[cfg(test)]

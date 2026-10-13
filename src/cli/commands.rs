@@ -1577,6 +1577,9 @@ pub enum MemorySubcommand {
         id: String,
     },
     ClearTest,
+    Reclassify {
+        apply: bool,
+    },
 }
 
 pub async fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
@@ -1825,6 +1828,24 @@ async fn run_memory_command_for_dir(
             println!("\nBy category:");
             for (cat, count) in &categories {
                 println!("  {}: {}", cat, count);
+            }
+        }
+
+        MemorySubcommand::Reclassify { apply } => {
+            let report = manager.reclassify_observations(apply)?;
+            println!(
+                "{} memory classification pass: {} store(s), {} instance(s) visited, {} residual, {} to change",
+                if report.dry_run { "Dry run:" } else { "Applied" },
+                report.stores,
+                report.scanned,
+                report.residual,
+                report.changed
+            );
+            for (target, count) in &report.by_type {
+                println!("  -> {target}: {count}");
+            }
+            if report.dry_run && report.changed > 0 {
+                println!("Re-run with --apply to write these changes.");
             }
         }
 

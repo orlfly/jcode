@@ -249,6 +249,92 @@ impl TtlGcReport {
     }
 }
 
+/// Outcome of a reclassification pass ([`MemoryManager::reclassify_observations`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReclassifyReport {
+    /// Stores visited by the pass.
+    pub stores: usize,
+    /// Active instances visited across all stores.
+    pub scanned: usize,
+    /// Of those, instances sitting in the residual (`fact` / `observation`)
+    /// bucket and therefore eligible for reclassification.
+    pub residual: usize,
+    /// Instances whose type would change (or did, when not a dry run).
+    pub changed: usize,
+    /// Target type -> number of instances.
+    pub by_type: std::collections::BTreeMap<String, usize>,
+    /// Whether this was a dry run.
+    pub dry_run: bool,
+}
+
+fn type_name_of(category: &MemoryCategory) -> &str {
+    match category {
+        MemoryCategory::Custom(name) => name.as_str(),
+        MemoryCategory::Fact => "fact",
+        MemoryCategory::Preference => "preference",
+        MemoryCategory::Entity => "entity",
+        MemoryCategory::Correction => "correction",
+    }
+}
+
+/// Deterministic classifier for residual (`fact` / `observation`) instances.
+///
+/// Order matters and mirrors what the corpus actually contains: procedures
+/// first (a rule that mentions an endpoint is still a rule), then interface
+/// contracts, then perishable environment facts. Returns `None` when the
+/// instance should stay in the residual bucket.
+pub fn classify_residual_type(content: &str) -> Option<&'static str> {
+    use jcode_memory_types::ontology::{TYPE_CONTRACT, TYPE_ENV_FACT, TYPE_PROCESS_RULE};
+    let lower = content.to_ascii_lowercase();
+    const RULE_MARKERS: [&str; 24] = [
+        "必须", "不得", "禁止", "应该", "正确做法", "约定", "流程", "规范", "always", "never",
+        "must ", "must\n", "do not", "instead of", "prefer ", "workflow", "rule ", "convention",
+        "should ", "required", "不允许", "只能", "务必", "禁止",
+    ];
+    if RULE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some(TYPE_PROCESS_RULE);
+    }
+    const CONTRACT_MARKERS: [&str; 16] = [
+        "/api/", "get ", "post ", "put ", "patch ", "delete ", "endpoint", "schema", "字段", "枚举",
+        "enum", "payload", "接口", "路由", "status code", "http ",
+    ];
+    if CONTRACT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some(TYPE_CONTRACT);
+    }
+    const ENV_MARKERS: [&str; 8] = [
+        "localhost:",
+        "127.0.0.1",
+        "/home/",
+        "/opt/workspace/",
+        "/tmp/",
+        "task #",
+        "session_",
+        "mem_",
+    ];
+    if ENV_MARKERS.iter().any(|m| lower.contains(m)) || looks_like_host_port(&lower) {
+        return Some(TYPE_ENV_FACT);
+    }
+    None
+}
+
+/// `host:port` or `ip:port` anywhere in the text.
+fn looks_like_host_port(lower: &str) -> bool {
+    lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')'))
+        .any(|token| {
+            let token = token.trim_matches(|c: char| c == ',' || c == ';');
+            let Some((host, port)) = token.rsplit_once(':') else {
+                return false;
+            };
+            !host.is_empty()
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+                && (host == "localhost"
+                    || host.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    || host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        })
+}
+
 /// Minimum number of agreeing evidence instances before a skill is proposed.
 const SKILL_DISTILL_MIN_EVIDENCE: usize = 3;
 /// Minimum number of distinct stores the evidence must span.
@@ -1640,6 +1726,121 @@ impl MemoryManager {
         Ok(report)
     }
 
+    /// Visit every persisted store graph, saving the ones the visitor changed.
+    ///
+    /// Two layouts have to be covered: the trait backend's own store root
+    /// (sqlite named graphs, JSON backend files) and the legacy
+    /// `<jcode_dir>/memory/projects/<hash>.json` files that JSON-mode writes
+    /// use. Cross-store passes need both, otherwise an install looks empty
+    /// depending on which backend it happens to run.
+    ///
+    /// The visitor returns `true` when it modified the graph; only those are
+    /// written back. Returns the number of stores visited.
+    fn for_each_store(
+        &self,
+        mut visit: impl FnMut(&str, &mut MemoryGraph) -> bool,
+    ) -> Result<usize> {
+        let backend = if self.test_mode {
+            test_backend()
+        } else {
+            graph_backend()
+        };
+        let mut visited = 0usize;
+        let mut backend_saves: Vec<(StoreKey, MemoryGraph)> = Vec::new();
+        for key in backend.list_keys().unwrap_or_default() {
+            let Ok(mut graph) = backend.load(&key) else {
+                continue;
+            };
+            visited += 1;
+            if visit(key.as_str(), &mut graph) {
+                backend_saves.push((key, graph));
+            }
+        }
+        if let Ok(base) = crate::storage::jcode_dir() {
+            let dir = base.join("memory").join("projects");
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Ok(mut graph) = crate::storage::read_json::<MemoryGraph>(&path) else {
+                        continue;
+                    };
+                    visited += 1;
+                    if visit(&format!("project:{stem}"), &mut graph) {
+                        crate::storage::write_json(&path, &graph)?;
+                    }
+                }
+            }
+        }
+        for (key, graph) in backend_saves {
+            if let Err(e) = backend.save(&key, &graph) {
+                crate::logging::warn(&format!("store save after maintenance failed: {e}"));
+            }
+        }
+        Ok(visited)
+    }
+
+    /// Reclassify residual instances into the v2 type split.
+    ///
+    /// Everything written before v2 is `fact`, which the ontology aliases to
+    /// `observation` (the residual bucket). The split only pays off once the
+    /// stored rows say `env_fact` / `contract` / `process_rule` themselves -
+    /// otherwise `env_fact` has no instances and no TTL applies to it.
+    ///
+    /// Deterministic rules only (no LLM): procedures, then contracts, then
+    /// perishable environment facts; everything else stays `observation`.
+    /// `apply = false` reports what would change without writing.
+    pub fn reclassify_observations(&self, apply: bool) -> Result<ReclassifyReport> {
+        let mut report = ReclassifyReport {
+            dry_run: !apply,
+            ..Default::default()
+        };
+        let ontology = self.ontology_registry().default_ontology();
+        let residual = jcode_memory_types::ontology::TYPE_OBSERVATION;
+        let mut changed = 0usize;
+        let visited = self.for_each_store(|_key, graph| {
+            let mut touched = false;
+            for entry in graph.memories.values_mut() {
+                if !entry.active {
+                    continue;
+                }
+                report.scanned += 1;
+                // Only residual rows are candidates: a correction stays a
+                // correction, and an already-typed row is left alone.
+                let is_residual = ontology
+                    .type_from_category(&entry.category)
+                    .is_some_and(|t| t == residual);
+                if !is_residual {
+                    continue;
+                }
+                report.residual += 1;
+                let Some(target) = classify_residual_type(&entry.content) else {
+                    continue;
+                };
+                if type_name_of(&entry.category) == target {
+                    continue;
+                }
+                *report.by_type.entry(target.to_string()).or_default() += 1;
+                changed += 1;
+                if apply {
+                    entry.category =
+                        MemoryCategory::Custom(target.to_string());
+                    entry.updated_at = Utc::now();
+                    touched = true;
+                }
+            }
+            touched
+        })?;
+        report.stores = visited;
+        report.changed = changed;
+        Ok(report)
+    }
+
     /// Record that a skill was invoked, closing the skill -> memory loop.
     ///
     /// Writes an `observation` instance keyed to the skill
@@ -1746,38 +1947,10 @@ impl MemoryManager {
         // and on this corpus it is the normal case (185 near-duplicate pairs
         // across stores). `list_keys` enumerates them from durable state, so a
         // store written weeks ago still counts.
-        let backend = if self.test_mode {
-            test_backend()
-        } else {
-            graph_backend()
-        };
-        let mut scanned = 0usize;
-        for key in backend.list_keys().unwrap_or_default() {
-            if let Ok(graph) = backend.load(&key) {
-                consider(key.as_str(), &graph);
-                scanned += 1;
-            }
-        }
-        // Legacy JSON layout: `<jcode_dir>/memory/projects/<hash>.json`. JSON
-        // mode writes there rather than through the trait backend's own root,
-        // so a JSON-backed install would otherwise look empty to this pass.
-        if let Ok(base) = crate::storage::jcode_dir()
-            && let Ok(entries) = std::fs::read_dir(base.join("memory").join("projects"))
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if let Ok(graph) = crate::storage::read_json::<MemoryGraph>(&path) {
-                    consider(&format!("project:{stem}"), &graph);
-                    scanned += 1;
-                }
-            }
-        }
+        let mut scanned = self.for_each_store(|key, graph| {
+            consider(key, graph);
+            false
+        })?;
         // Last resort: the manager's own scope (an in-memory-only store, or a
         // schema neither layout above could read).
         if scanned == 0 {
@@ -1785,9 +1958,11 @@ impl MemoryManager {
                 && let Ok(graph) = self.load_project_graph()
             {
                 consider(&project_store_key(&dir), &graph);
+                scanned += 1;
             }
             if let Ok(global) = self.load_global_graph() {
                 consider(crate::memory::global_store_key(), &global);
+                scanned += 1;
             }
         }
 

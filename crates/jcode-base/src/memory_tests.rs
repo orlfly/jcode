@@ -1651,3 +1651,91 @@ fn skill_distillation_aggregates_evidence_across_project_stores() {
         );
     });
 }
+
+#[test]
+fn residual_classifier_orders_rules_before_contracts_before_environment() {
+    use crate::memory::classify_residual_type;
+    use jcode_memory_types::ontology::{TYPE_CONTRACT, TYPE_ENV_FACT, TYPE_PROCESS_RULE};
+
+    // A rule that happens to mention an endpoint is still a rule.
+    assert_eq!(
+        classify_residual_type("You must call POST /api/task/claim with the team id"),
+        Some(TYPE_PROCESS_RULE)
+    );
+    assert_eq!(
+        classify_residual_type("Claiming must use the full internal id"),
+        Some(TYPE_PROCESS_RULE)
+    );
+    assert_eq!(
+        classify_residual_type("GET /api/task/tasks/{projectId} lists the tasks"),
+        Some(TYPE_CONTRACT)
+    );
+    assert_eq!(
+        classify_residual_type("The dev server listens on localhost:1337"),
+        Some(TYPE_ENV_FACT)
+    );
+    assert_eq!(
+        classify_residual_type("Task #157 shadow drill results were backfilled"),
+        Some(TYPE_ENV_FACT)
+    );
+    // Nothing stable to key on: stays in the residual bucket.
+    assert_eq!(classify_residual_type("The garden has red flowers"), None);
+}
+
+#[test]
+fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/reclassify");
+        let ids: Vec<String> = [
+            "Claiming must use the full internal id; truncated ids fail silently",
+            "GET /api/task/tasks/{projectId} lists the tasks for a project",
+            "The dev server listens on localhost:1337 in this workspace",
+            "The garden has red flowers",
+        ]
+        .into_iter()
+        .map(|content| {
+            manager
+                .remember_project(MemoryEntry::new(MemoryCategory::Fact, content))
+                .unwrap()
+        })
+        .collect();
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Correction,
+                "Claiming must use the full internal id - and it returns 404 otherwise",
+            ))
+            .unwrap();
+
+        let dry = manager.reclassify_observations(false).expect("dry run");
+        assert!(dry.dry_run);
+        assert_eq!(dry.scanned, 5, "every active instance is visited");
+        assert_eq!(dry.residual, 4, "the correction is not a candidate");
+        assert_eq!(dry.changed, 3, "rule + contract + env fact");
+        assert_eq!(dry.by_type.get("process_rule"), Some(&1));
+        assert_eq!(dry.by_type.get("contract"), Some(&1));
+        assert_eq!(dry.by_type.get("env_fact"), Some(&1));
+        // A dry run must not write.
+        let before = manager.list_all().unwrap();
+        for id in &ids {
+            let entry = before.iter().find(|e| &e.id == id).unwrap();
+            assert_eq!(entry.category, MemoryCategory::Fact);
+        }
+
+        let applied = manager.reclassify_observations(true).expect("apply");
+        assert_eq!(applied.changed, 3);
+        let after = manager.list_all().unwrap();
+        let label = |id: &str| {
+            after
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.category.to_string())
+                .unwrap()
+        };
+        assert_eq!(label(&ids[0]), "process_rule");
+        assert_eq!(label(&ids[1]), "contract");
+        assert_eq!(label(&ids[2]), "env_fact");
+        assert_eq!(label(&ids[3]), "fact", "prose stays residual");
+        // And the pass is idempotent: a second apply changes nothing.
+        assert_eq!(manager.reclassify_observations(true).unwrap().changed, 0);
+    });
+}
