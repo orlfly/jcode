@@ -404,6 +404,10 @@ mod tests {
 
     #[test]
     fn sustained_degradation_counter_increments_only_on_degradation() {
+        // Serialize against the only other test that records decisions (the
+        // fake-Jev acceptance test in memory_agent_tests); it holds the env
+        // lock, so taking it here in the same order keeps the streak stable.
+        let _env_lock = crate::storage::lock_test_env();
         let _guard = match STREAK_LOCK.lock() {
             Ok(g) => g,
             // A poisoned mutex means another test panicked while holding it.
@@ -434,6 +438,10 @@ mod tests {
 
     #[test]
     fn intended_conversions_cleared_consecutive_degradation_streak() {
+        // Serialize against the only other test that records decisions (the
+        // fake-Jev acceptance test in memory_agent_tests); it holds the env
+        // lock, so taking it here in the same order keeps the streak stable.
+        let _env_lock = crate::storage::lock_test_env();
         let _guard = match STREAK_LOCK.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -449,6 +457,10 @@ mod tests {
 
     #[test]
     fn explicit_opt_out_does_not_count_as_degradation() {
+        // Serialize against the only other test that records decisions (the
+        // fake-Jev acceptance test in memory_agent_tests); it holds the env
+        // lock, so taking it here in the same order keeps the streak stable.
+        let _env_lock = crate::storage::lock_test_env();
         let _guard = match STREAK_LOCK.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
