@@ -1706,7 +1706,7 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
             ))
             .unwrap();
 
-        let dry = manager.reclassify_observations(false).expect("dry run");
+        let dry = manager.reclassify_observations(false, false).expect("dry run");
         assert!(dry.dry_run);
         assert_eq!(dry.scanned, 5, "every active instance is visited");
         assert_eq!(dry.residual, 4, "the correction is not a candidate");
@@ -1721,7 +1721,7 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
             assert_eq!(entry.category, MemoryCategory::Fact);
         }
 
-        let applied = manager.reclassify_observations(true).expect("apply");
+        let applied = manager.reclassify_observations(true, false).expect("apply");
         assert_eq!(applied.changed, 3);
         let after = manager.list_all().unwrap();
         let label = |id: &str| {
@@ -1736,6 +1736,45 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
         assert_eq!(label(&ids[2]), "env_fact");
         assert_eq!(label(&ids[3]), "fact", "prose stays residual");
         // And the pass is idempotent: a second apply changes nothing.
-        assert_eq!(manager.reclassify_observations(true).unwrap().changed, 0);
+        assert_eq!(manager.reclassify_observations(true, false).unwrap().changed, 0);
+    });
+}
+
+#[test]
+fn reclassify_can_backfill_subject_keys() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/reclassify-keys");
+        let anchored = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "The dev server listens on localhost:1337",
+            ))
+            .unwrap();
+        let prose = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "The garden has red flowers",
+            ))
+            .unwrap();
+        // Simulate a pre-v2 row: written before the anchor field existed.
+        let mut graph = manager.load_project_graph().unwrap();
+        for id in [&anchored, &prose] {
+            graph.get_memory_mut(id).unwrap().subject_key = None;
+        }
+        manager.save_project_graph(&graph).unwrap();
+
+        let dry = manager.reclassify_observations(false, true).unwrap();
+        assert_eq!(dry.subject_keys, 1, "only the anchored row can be stamped");
+
+        manager.reclassify_observations(true, true).unwrap();
+        let after = manager.list_all().unwrap();
+        let key_of = |id: &str| {
+            after
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.subject_key.clone())
+        };
+        assert_eq!(key_of(&anchored).as_deref(), Some("host:localhost:1337"));
+        assert_eq!(key_of(&prose), None, "prose has no stable subject");
     });
 }

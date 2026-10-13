@@ -261,6 +261,8 @@ pub struct ReclassifyReport {
     pub residual: usize,
     /// Instances whose type would change (or did, when not a dry run).
     pub changed: usize,
+    /// Instances that would gain a derived `subject_key`.
+    pub subject_keys: usize,
     /// Target type -> number of instances.
     pub by_type: std::collections::BTreeMap<String, usize>,
     /// Whether this was a dry run.
@@ -1795,7 +1797,15 @@ impl MemoryManager {
     /// Deterministic rules only (no LLM): procedures, then contracts, then
     /// perishable environment facts; everything else stays `observation`.
     /// `apply = false` reports what would change without writing.
-    pub fn reclassify_observations(&self, apply: bool) -> Result<ReclassifyReport> {
+    /// `stamp_subject_keys` additionally derives a retrieval anchor for every
+    /// instance that has none yet - rows written before the field existed, which
+    /// on a real install is all of them. Without anchors L1 recall falls back to
+    /// term overlap, and write-time reconciliation cannot see "same subject".
+    pub fn reclassify_observations(
+        &self,
+        apply: bool,
+        stamp_subject_keys: bool,
+    ) -> Result<ReclassifyReport> {
         let mut report = ReclassifyReport {
             dry_run: !apply,
             ..Default::default()
@@ -1810,6 +1820,19 @@ impl MemoryManager {
                     continue;
                 }
                 report.scanned += 1;
+                if stamp_subject_keys
+                    && entry.subject_key.is_none()
+                    && let Some(key) =
+                        jcode_memory_types::reconcile::derive_subject_key(&entry.content)
+                {
+                    report.subject_keys += 1;
+                    changed += 1;
+                    if apply {
+                        entry.subject_key = Some(key);
+                        entry.updated_at = Utc::now();
+                        touched = true;
+                    }
+                }
                 // Only residual rows are candidates: a correction stays a
                 // correction, and an already-typed row is left alone.
                 let is_residual = ontology

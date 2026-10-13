@@ -1579,6 +1579,7 @@ pub enum MemorySubcommand {
     ClearTest,
     Reclassify {
         apply: bool,
+        subject_keys: bool,
     },
 }
 
@@ -1831,15 +1832,19 @@ async fn run_memory_command_for_dir(
             }
         }
 
-        MemorySubcommand::Reclassify { apply } => {
-            let report = manager.reclassify_observations(apply)?;
+        MemorySubcommand::Reclassify {
+            apply,
+            subject_keys,
+        } => {
+            let report = manager.reclassify_observations(apply, subject_keys)?;
             println!(
-                "{} memory classification pass: {} store(s), {} instance(s) visited, {} residual, {} to change",
+                "{} memory classification pass: {} store(s), {} instance(s) visited, {} residual, {} type change(s), {} subject key(s)",
                 if report.dry_run { "Dry run:" } else { "Applied" },
                 report.stores,
                 report.scanned,
                 report.residual,
-                report.changed
+                report.changed,
+                report.subject_keys
             );
             for (target, count) in &report.by_type {
                 println!("  -> {target}: {count}");

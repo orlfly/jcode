@@ -1264,6 +1264,11 @@ pub(crate) enum MemoryCommand {
         /// Write the changes instead of reporting them
         #[arg(long)]
         apply: bool,
+
+        /// Also stamp a derived retrieval anchor (`subject_key`) on instances
+        /// that have none, which is every row written before v2
+        #[arg(long)]
+        subject_keys: bool,
     },
 }
 
