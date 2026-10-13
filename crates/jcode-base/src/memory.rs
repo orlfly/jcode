@@ -242,11 +242,95 @@ pub struct TtlGcReport {
     pub purged: usize,
 }
 
+impl ReclassifyReport {
+    /// Everything this pass would write, types plus anchors.
+    pub fn total_changes(&self) -> usize {
+        self.type_changes + self.subject_keys
+    }
+
+    /// Human-readable one-liner shared by the CLI and the finalize log.
+    pub fn summary(&self) -> String {
+        let mut out = format!(
+            "{} store(s), {} visited, {} residual, {} type change(s), {} subject key(s)",
+            self.stores,
+            self.scanned,
+            self.residual,
+            self.type_changes,
+            self.subject_keys
+        );
+        if !self.by_type.is_empty() {
+            let detail: Vec<String> = self
+                .by_type
+                .iter()
+                .map(|(target, count)| format!("{target}: {count}"))
+                .collect();
+            out.push_str(&format!(" [{}]", detail.join(", ")));
+        }
+        out
+    }
+}
+
 impl TtlGcReport {
     fn merge(&mut self, other: TtlGcReport) {
         self.archived += other.archived;
         self.purged += other.purged;
     }
+}
+
+/// Classify every eligible instance in one graph.
+///
+/// Returns true when the graph was modified (and therefore needs saving).
+/// Shared by the all-stores pass and the per-project pass so both agree on the
+/// rules and the accounting.
+fn classify_graph(
+    graph: &mut MemoryGraph,
+    ontology: &jcode_memory_types::Ontology,
+    stamp_subject_keys: bool,
+    apply: bool,
+    report: &mut ReclassifyReport,
+) -> bool {
+    let residual = jcode_memory_types::ontology::TYPE_OBSERVATION;
+    let mut touched = false;
+    for entry in graph.memories.values_mut() {
+        if !entry.active {
+            continue;
+        }
+        report.scanned += 1;
+        if stamp_subject_keys
+            && entry.subject_key.is_none()
+            && let Some(key) = jcode_memory_types::reconcile::derive_subject_key(&entry.content)
+        {
+            report.subject_keys += 1;
+            if apply {
+                entry.subject_key = Some(key);
+                entry.updated_at = Utc::now();
+                touched = true;
+            }
+        }
+        // Only residual rows are type candidates: a correction stays a
+        // correction, and an already-typed row is left alone.
+        let is_residual = ontology
+            .type_from_category(&entry.category)
+            .is_some_and(|t| t == residual);
+        if !is_residual {
+            continue;
+        }
+        report.residual += 1;
+        let Some(target) = classify_residual_type(&entry.content) else {
+            continue;
+        };
+        if type_name_of(&entry.category) == target {
+            continue;
+        }
+        *report.by_type.entry(target.to_string()).or_default() += 1;
+        report.type_changes += 1;
+        if apply {
+            entry.category = MemoryCategory::Custom(target.to_string());
+            entry.updated_at = Utc::now();
+            touched = true;
+        }
+    }
+    touched
 }
 
 /// Outcome of a reclassification pass ([`MemoryManager::reclassify_observations`]).
@@ -259,9 +343,9 @@ pub struct ReclassifyReport {
     /// Of those, instances sitting in the residual (`fact` / `observation`)
     /// bucket and therefore eligible for reclassification.
     pub residual: usize,
-    /// Instances whose type would change (or did, when not a dry run).
-    pub changed: usize,
-    /// Instances that would gain a derived `subject_key`.
+    /// Instances whose *type* would change (or did, when not a dry run).
+    pub type_changes: usize,
+    /// Instances that gained a derived `subject_key`.
     pub subject_keys: usize,
     /// Target type -> number of instances.
     pub by_type: std::collections::BTreeMap<String, usize>,
@@ -1797,10 +1881,12 @@ impl MemoryManager {
     /// Deterministic rules only (no LLM): procedures, then contracts, then
     /// perishable environment facts; everything else stays `observation`.
     /// `apply = false` reports what would change without writing.
+    ///
     /// `stamp_subject_keys` additionally derives a retrieval anchor for every
     /// instance that has none yet - rows written before the field existed, which
-    /// on a real install is all of them. Without anchors L1 recall falls back to
-    /// term overlap, and write-time reconciliation cannot see "same subject".
+    /// on a real install is nearly all of them (measured: 3 of 4378). Without
+    /// anchors L1 recall falls back to term overlap and write-time
+    /// reconciliation cannot see "same subject".
     pub fn reclassify_observations(
         &self,
         apply: bool,
@@ -1811,56 +1897,32 @@ impl MemoryManager {
             ..Default::default()
         };
         let ontology = self.ontology_registry().default_ontology();
-        let residual = jcode_memory_types::ontology::TYPE_OBSERVATION;
-        let mut changed = 0usize;
-        let visited = self.for_each_store(|_key, graph| {
-            let mut touched = false;
-            for entry in graph.memories.values_mut() {
-                if !entry.active {
-                    continue;
-                }
-                report.scanned += 1;
-                if stamp_subject_keys
-                    && entry.subject_key.is_none()
-                    && let Some(key) =
-                        jcode_memory_types::reconcile::derive_subject_key(&entry.content)
-                {
-                    report.subject_keys += 1;
-                    changed += 1;
-                    if apply {
-                        entry.subject_key = Some(key);
-                        entry.updated_at = Utc::now();
-                        touched = true;
-                    }
-                }
-                // Only residual rows are candidates: a correction stays a
-                // correction, and an already-typed row is left alone.
-                let is_residual = ontology
-                    .type_from_category(&entry.category)
-                    .is_some_and(|t| t == residual);
-                if !is_residual {
-                    continue;
-                }
-                report.residual += 1;
-                let Some(target) = classify_residual_type(&entry.content) else {
-                    continue;
-                };
-                if type_name_of(&entry.category) == target {
-                    continue;
-                }
-                *report.by_type.entry(target.to_string()).or_default() += 1;
-                changed += 1;
-                if apply {
-                    entry.category =
-                        MemoryCategory::Custom(target.to_string());
-                    entry.updated_at = Utc::now();
-                    touched = true;
-                }
-            }
-            touched
+        report.stores = self.for_each_store(|_key, graph| {
+            classify_graph(graph, &ontology, stamp_subject_keys, apply, &mut report)
         })?;
-        report.stores = visited;
-        report.changed = changed;
+        Ok(report)
+    }
+
+    /// Same pass, restricted to the current project store.
+    ///
+    /// This is the one that runs at session finalize: it is bounded by a single
+    /// store (milliseconds) instead of walking every store on the machine
+    /// (seconds to minutes), and it is what keeps newly extracted rows typed
+    /// without waiting for the extraction prompt to emit v2 type names.
+    pub fn reclassify_project_store(&self, apply: bool) -> Result<ReclassifyReport> {
+        let mut report = ReclassifyReport {
+            dry_run: !apply,
+            ..Default::default()
+        };
+        let mut graph = match self.load_project_graph() {
+            Ok(graph) => graph,
+            Err(_) => return Ok(report),
+        };
+        report.stores = 1;
+        let ontology = self.ontology_registry().default_ontology();
+        if classify_graph(&mut graph, &ontology, true, apply, &mut report) {
+            self.save_project_graph(&graph)?;
+        }
         Ok(report)
     }
 

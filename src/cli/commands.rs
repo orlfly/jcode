@@ -1838,18 +1838,11 @@ async fn run_memory_command_for_dir(
         } => {
             let report = manager.reclassify_observations(apply, subject_keys)?;
             println!(
-                "{} memory classification pass: {} store(s), {} instance(s) visited, {} residual, {} type change(s), {} subject key(s)",
+                "{} memory classification pass: {}",
                 if report.dry_run { "Dry run:" } else { "Applied" },
-                report.stores,
-                report.scanned,
-                report.residual,
-                report.changed,
-                report.subject_keys
+                report.summary()
             );
-            for (target, count) in &report.by_type {
-                println!("  -> {target}: {count}");
-            }
-            if report.dry_run && report.changed > 0 {
+            if report.dry_run && report.total_changes() > 0 {
                 println!("Re-run with --apply to write these changes.");
             }
         }

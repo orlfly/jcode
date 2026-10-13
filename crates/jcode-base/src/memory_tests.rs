@@ -1710,7 +1710,7 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
         assert!(dry.dry_run);
         assert_eq!(dry.scanned, 5, "every active instance is visited");
         assert_eq!(dry.residual, 4, "the correction is not a candidate");
-        assert_eq!(dry.changed, 3, "rule + contract + env fact");
+        assert_eq!(dry.type_changes, 3, "rule + contract + env fact");
         assert_eq!(dry.by_type.get("process_rule"), Some(&1));
         assert_eq!(dry.by_type.get("contract"), Some(&1));
         assert_eq!(dry.by_type.get("env_fact"), Some(&1));
@@ -1722,7 +1722,7 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
         }
 
         let applied = manager.reclassify_observations(true, false).expect("apply");
-        assert_eq!(applied.changed, 3);
+        assert_eq!(applied.type_changes, 3);
         let after = manager.list_all().unwrap();
         let label = |id: &str| {
             after
@@ -1736,7 +1736,7 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
         assert_eq!(label(&ids[2]), "env_fact");
         assert_eq!(label(&ids[3]), "fact", "prose stays residual");
         // And the pass is idempotent: a second apply changes nothing.
-        assert_eq!(manager.reclassify_observations(true, false).unwrap().changed, 0);
+        assert_eq!(manager.reclassify_observations(true, false).unwrap().type_changes, 0);
     });
 }
 

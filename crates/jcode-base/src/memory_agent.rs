@@ -125,6 +125,16 @@ fn run_finalize_maintenance(working_dir: Option<&str>) {
         Ok(_) => {}
         Err(e) => crate::logging::info(&format!("Memory TTL sweep failed: {e}")),
     }
+    // Keep newly extracted rows typed without waiting for the extraction
+    // prompt to emit v2 type names: one store, deterministic, milliseconds.
+    if let Ok(report) = manager.reclassify_project_store(true)
+        && report.total_changes() > 0
+    {
+        crate::logging::info(&format!(
+            "Memory classification pass: {}",
+            report.summary()
+        ));
+    }
     if let Ok(proposals) = manager.distill_skill_evidence() {
         if !proposals.is_empty() {
             crate::logging::info(&format!(
