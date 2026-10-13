@@ -1605,3 +1605,49 @@ fn l1_recall_ignores_archived_instances() {
         assert!(hits.is_empty(), "archived rows must not be recalled");
     });
 }
+
+#[test]
+fn skill_distillation_aggregates_evidence_across_project_stores() {
+    with_temp_home(|_| {
+        // Three projects independently learned the same procedure. One item per
+        // store keeps the test about *aggregation*: two statements landing in
+        // the same store would reconcile with each other first (which is
+        // correct behaviour, just not what this test measures).
+        let evidence = [
+            ("/xstore-a", "session_xa_1", "task #42 requires the smoke suite before merge"),
+            ("/xstore-b", "session_xb_1", "task #42: merge is blocked until the smoke suite passes"),
+            ("/xstore-c", "session_xc_1", "task #42 merge gate requires a passing smoke suite"),
+        ];
+        for (dir, session, content) in evidence {
+            let manager = MemoryManager::new().with_project_dir(dir);
+            let mut entry = MemoryEntry::new(
+                MemoryCategory::Custom("process_rule".to_string()),
+                content,
+            );
+            entry.source = Some(session.to_string());
+            manager.remember_project(entry).unwrap();
+        }
+
+        // A fourth store only observes: evidence living in other projects is
+        // already enough for a proposal, which is the point of the cross-store
+        // scan (`min_stores = 2`).
+        let observer = MemoryManager::new().with_project_dir("/xstore-observer");
+        let proposals = observer.collect_skill_evidence().expect("evidence");
+        let proposal = proposals
+            .iter()
+            .find(|p| p.subject_key == "task:#42")
+            .unwrap_or_else(|| panic!("expected a cross-store proposal, got {proposals:#?}"));
+        assert_eq!(proposal.evidence.len(), 3);
+        assert!(
+            proposal.stores.len() >= 2,
+            "evidence must be attributed to several projects: {:?}",
+            proposal.stores
+        );
+        assert!(proposal.stores.iter().all(|s| s.starts_with("project:")));
+        assert_eq!(
+            proposal.sessions.len(),
+            3,
+            "each item carries its own session"
+        );
+    });
+}

@@ -1741,14 +1741,54 @@ impl MemoryManager {
             }
         };
 
-        if let Some(dir) = self.get_project_dir() {
-            let store = crate::memory::project_store_key(&dir);
-            if let Ok(graph) = self.load_project_graph() {
-                consider(&store, &graph);
+        // Cross-store scan: the design's promotion rule ("the same procedure
+        // learned in >=2 projects") is only observable by walking every store,
+        // and on this corpus it is the normal case (185 near-duplicate pairs
+        // across stores). `list_keys` enumerates them from durable state, so a
+        // store written weeks ago still counts.
+        let backend = if self.test_mode {
+            test_backend()
+        } else {
+            graph_backend()
+        };
+        let mut scanned = 0usize;
+        for key in backend.list_keys().unwrap_or_default() {
+            if let Ok(graph) = backend.load(&key) {
+                consider(key.as_str(), &graph);
+                scanned += 1;
             }
         }
-        if let Ok(global) = self.load_global_graph() {
-            consider(jcode_memory_types::ontology::LINK_SKILL, &global);
+        // Legacy JSON layout: `<jcode_dir>/memory/projects/<hash>.json`. JSON
+        // mode writes there rather than through the trait backend's own root,
+        // so a JSON-backed install would otherwise look empty to this pass.
+        if let Ok(base) = crate::storage::jcode_dir()
+            && let Ok(entries) = std::fs::read_dir(base.join("memory").join("projects"))
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if let Ok(graph) = crate::storage::read_json::<MemoryGraph>(&path) {
+                    consider(&format!("project:{stem}"), &graph);
+                    scanned += 1;
+                }
+            }
+        }
+        // Last resort: the manager's own scope (an in-memory-only store, or a
+        // schema neither layout above could read).
+        if scanned == 0 {
+            if let Some(dir) = self.get_project_dir()
+                && let Ok(graph) = self.load_project_graph()
+            {
+                consider(&project_store_key(&dir), &graph);
+            }
+            if let Ok(global) = self.load_global_graph() {
+                consider(crate::memory::global_store_key(), &global);
+            }
         }
 
         let mut out: Vec<SkillEvidenceProposal> = groups
