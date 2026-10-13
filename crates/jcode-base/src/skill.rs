@@ -16,6 +16,10 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// Memory ids this skill was distilled from (`evidence:` frontmatter, filled
+    /// in when a proposal is accepted). The mirror node records them as
+    /// `derived_from` edges so the graph can answer "why does this skill exist".
+    pub evidence: Vec<String>,
     pub content: String,
     pub path: PathBuf,
     /// Normalized search text, built on first use. Normalizing every skill
@@ -30,6 +34,10 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<AllowedTools>,
+    /// Evidence memories this skill was distilled from. Optional: hand-written
+    /// or imported skills have none.
+    #[serde(default)]
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,6 +531,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            evidence,
         } = frontmatter;
 
         let allowed_tools = allowed_tools.map(|tools| match tools {
@@ -536,6 +545,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            evidence,
             content: body,
             path: path.to_path_buf(),
             search_text: std::sync::OnceLock::new(),
@@ -1026,6 +1036,7 @@ pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&
                 written += 1;
             }
         }
+        written += link_skill_evidence(&manager, true, registry.skills.values());
     }
     if let Some(dir) = working_dir
         && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
@@ -1040,8 +1051,75 @@ pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&
                 written += 1;
             }
         }
+        written += link_skill_evidence(&manager, false, local.skills.values());
     }
     written
+}
+
+/// Record `skill:<name> -derived_from-> mem_*` for a skill's `evidence:`
+/// frontmatter.
+///
+/// This is the last step of the memory -> skill loop: a proposal's draft that
+/// gets accepted (copied into `skills/<name>/SKILL.md` with its `evidence:`
+/// list intact) becomes a skill whose graph node points back at the memories it
+/// came from. Evidence ids that are not in this store are skipped - an edge may
+/// only connect two nodes that exist.
+///
+/// Returns the number of new edges.
+fn link_skill_evidence<'a, I>(manager: &crate::memory::MemoryManager, global: bool, skills: I) -> usize
+where
+    I: Iterator<Item = &'a Skill>,
+{
+    let mut graph = if global {
+        manager.load_global_graph()
+    } else {
+        manager.load_project_graph()
+    };
+    let Ok(graph) = graph.as_mut() else {
+        return 0;
+    };
+    let mut linked = 0;
+    for skill in skills {
+        if skill.evidence.is_empty() {
+            continue;
+        }
+        let node = format!("skill:{}", skill.name);
+        if !graph.memories.contains_key(&node) {
+            continue;
+        }
+        for id in &skill.evidence {
+            if !graph.memories.contains_key(id) {
+                continue;
+            }
+            let already = graph
+                .get_edges(&node)
+                .iter()
+                .any(|edge| edge.target == *id && matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom));
+            if already {
+                continue;
+            }
+            graph.add_edge(&node, id, jcode_memory_types::EdgeKind::DerivedFrom);
+            linked += 1;
+        }
+        if linked > 0
+            && let Some(entry) = graph.get_memory_mut(&node)
+        {
+            entry.updated_at = chrono::Utc::now();
+        }
+    }
+    if linked == 0 {
+        return 0;
+    }
+    let saved = if global {
+        manager.save_global_graph(graph)
+    } else {
+        manager.save_project_graph(graph)
+    };
+    if let Err(e) = saved {
+        crate::logging::warn(&format!("recording skill evidence edges failed: {e}"));
+        return 0;
+    }
+    linked
 }
 
 fn build_skill_search_text(name: &str, description: &str, content: &str) -> String {
@@ -1076,6 +1154,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            evidence: Vec::new(),
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: std::sync::OnceLock::from(build_skill_search_text(

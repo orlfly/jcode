@@ -1539,6 +1539,76 @@ fn skill_mirrors_are_written_as_link_nodes() {
 }
 
 #[test]
+fn accepted_skill_records_derived_from_evidence_edges() {
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let manager = MemoryManager::new().with_project_dir(&project);
+        let evidence: Vec<String> = [
+            "task #42 requires the smoke suite before merge",
+            "task #42: merge is blocked until the smoke suite passes",
+        ]
+        .into_iter()
+        .map(|content| {
+            manager
+                .remember_project(MemoryEntry::new(
+                    MemoryCategory::Custom("process_rule".to_string()),
+                    content,
+                ))
+                .unwrap()
+        })
+        .collect();
+
+        // A proposal that has been accepted: the draft's `evidence:` list kept
+        // intact in the installed skill.
+        let skill_dir = project.join(".jcode").join("skills").join("task-42-merge-gate");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: task-42-merge-gate\ndescription: Merge gate for task #42\nevidence:\n  - {}\n  - {}\n  - mem_does_not_exist\n---\n\nRun the smoke suite.\n",
+                evidence[0], evidence[1]
+            ),
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::sync_skill_memory_mirrors(&registry, Some(&project));
+
+        let graph = manager.load_project_graph().unwrap();
+        let node = "skill:task-42-merge-gate";
+        assert!(graph.memories.contains_key(node), "mirror node present");
+        let targets: Vec<&str> = graph
+            .get_edges(node)
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        for id in &evidence {
+            assert!(
+                targets.contains(&id.as_str()),
+                "missing derived_from edge to {id}: {targets:?}"
+            );
+        }
+        assert!(
+            !targets.contains(&"mem_does_not_exist"),
+            "an edge may only connect nodes that exist"
+        );
+
+        // Idempotent: a second pass adds nothing.
+        let before = targets.len();
+        crate::skill::sync_skill_memory_mirrors(&registry, Some(&project));
+        let again = manager.load_project_graph().unwrap();
+        let after = again
+            .get_edges(node)
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .count();
+        assert_eq!(before, after, "evidence linking must be idempotent");
+    });
+}
+
+#[test]
 fn project_local_skill_mirrors_land_in_the_project_store() {
     with_temp_home(|home| {
         // A project-local procedure belongs to its workspace only, so its link

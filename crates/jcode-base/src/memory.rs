@@ -472,6 +472,14 @@ impl SkillEvidenceProposal {
             self.evidence.len(),
             self.stores.len()
         ));
+        // `evidence:` is the machine-readable half of accepting this draft:
+        // copy the file into `<workspace>/.jcode/skills/<name>/SKILL.md` (or
+        // `~/.jcode/skills/`) unchanged and the mirror node will record a
+        // `derived_from` edge to each evidence memory that still exists.
+        out.push_str("evidence:\n");
+        for id in self.evidence.iter().take(20) {
+            out.push_str(&format!("  - {id}\n"));
+        }
         out.push_str("---\n\n");
         out.push_str(&format!(
             "# {proposed_name}\n\nDerived from accumulated memory evidence.\n\n- subject: `{}`\n- evidence: {} instance(s)\n- stores: {}\n- sessions: {}\n- weight (corrections count double): {:.1}\n\n## Evidence\n",
