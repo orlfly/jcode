@@ -162,6 +162,8 @@ pub fn describe_step(step: &ActivityStep) -> &'static str {
         ActivityStep::Summarize { .. } => "summarize",
         ActivityStep::GcArchived { .. } => "gc_archived",
         ActivityStep::CheckContradictions { .. } => "check_contradictions",
+        ActivityStep::ReconcileOnWrite { .. } => "reconcile_on_write",
+        ActivityStep::DistillSkillEvidence { .. } => "distill_skill_evidence",
         ActivityStep::Emit { .. } => "emit",
         ActivityStep::TouchSurfaced => "touch_surfaced",
     }
@@ -180,45 +182,12 @@ pub fn steps_of_kind<'a>(plan: &'a [ScheduledActivity], kind: &str) -> Vec<&'a A
 mod tests {
     use super::*;
     use crate::ontology::{
-        ACTIVITY_FINAL_EXTRACT, ACTIVITY_PER_TURN_RELEVANCE, ACTIVITY_PERIODIC_EXTRACT,
-        ACTIVITY_TOPIC_CHANGE_EXTRACT, default_ontology,
+        ACTIVITY_FINAL_EXTRACT, ACTIVITY_PERIODIC_GC, ACTIVITY_SKILL_DISTILL,
+        ACTIVITY_WRITE_RECONCILE, default_ontology,
     };
 
     #[test]
-    fn turn_tick_schedules_per_turn_relevance() {
-        let onto = default_ontology();
-        let plan = schedule(
-            &ScheduleEvent::TurnTick {
-                session_id: "s1".to_string(),
-                working_dir: None,
-            },
-            &onto,
-        );
-        assert!(
-            plan.iter()
-                .any(|p| p.activity_id == ACTIVITY_PER_TURN_RELEVANCE)
-        );
-    }
-
-    #[test]
-    fn topic_change_schedules_topic_extract() {
-        let onto = default_ontology();
-        let plan = schedule(
-            &ScheduleEvent::TopicChange {
-                session_id: "s1".to_string(),
-                similarity: 0.1,
-                working_dir: None,
-            },
-            &onto,
-        );
-        assert!(
-            plan.iter()
-                .any(|p| p.activity_id == ACTIVITY_TOPIC_CHANGE_EXTRACT)
-        );
-    }
-
-    #[test]
-    fn finalize_schedules_final_extract() {
+    fn finalize_schedules_extract_gc_and_distill() {
         let onto = default_ontology();
         let plan = schedule(
             &ScheduleEvent::Finalize {
@@ -227,26 +196,55 @@ mod tests {
             },
             &onto,
         );
-        assert!(plan.iter().any(|p| p.activity_id == ACTIVITY_FINAL_EXTRACT));
+        for expected in [
+            ACTIVITY_FINAL_EXTRACT,
+            ACTIVITY_PERIODIC_GC,
+            ACTIVITY_SKILL_DISTILL,
+        ] {
+            assert!(
+                plan.iter().any(|p| p.activity_id == expected),
+                "finalize must schedule {expected}"
+            );
+        }
     }
 
     #[test]
-    fn periodic_tick_schedules_when_elapsed() {
+    fn turn_tick_no_longer_schedules_llm_relevance() {
+        // v2 moved recall off the scheduled-activity surface: the runtime
+        // serves it locally (L1) and the JEV judge is an optional reranker.
         let onto = default_ontology();
         let plan = schedule(
-            &ScheduleEvent::PeriodicTick {
-                last_tick: Some(Utc::now() - chrono::Duration::minutes(60)),
+            &ScheduleEvent::TurnTick {
+                session_id: "s1".to_string(),
+                working_dir: None,
             },
             &onto,
         );
+        assert!(plan.is_empty());
         assert!(
-            plan.iter()
-                .any(|p| p.activity_id == ACTIVITY_PERIODIC_EXTRACT)
+            onto.activities
+                .iter()
+                .any(|a| a.id == ACTIVITY_WRITE_RECONCILE && !a.steps.is_empty())
         );
     }
 
     #[test]
-    fn describe_step_covers_all_kinds() {
+    fn describe_step_covers_v2_kinds() {
+        assert_eq!(
+            describe_step(&ActivityStep::ReconcileOnWrite {
+                reinforce_at: 0.85,
+                supersede_at: 0.5,
+                relate_at: 0.3,
+            }),
+            "reconcile_on_write"
+        );
+        assert_eq!(
+            describe_step(&ActivityStep::DistillSkillEvidence {
+                min_evidence: 3,
+                min_stores: 2,
+            }),
+            "distill_skill_evidence"
+        );
         assert_eq!(
             describe_step(&ActivityStep::TouchSurfaced),
             "touch_surfaced"

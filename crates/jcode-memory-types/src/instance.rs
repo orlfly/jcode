@@ -198,6 +198,11 @@ impl IdentityMetadata {
         Self::default()
     }
 
+    /// Whether no identity key is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.aliases.is_empty()
+    }
+
     pub fn with_key(mut self, key: impl Into<String>) -> Self {
         self.keys.push(key.into());
         self

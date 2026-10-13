@@ -37,27 +37,71 @@ use crate::instance::{ExtractionMethod, MemoryStatus};
 /// Schema version of the `default_ontology()` payload below.  Bump this when
 /// the default ontology is changed in a way that may invalidate stored
 /// graphs (e.g. type ids renamed, rule semantics altered).
-pub const DEFAULT_ONTOLOGY_VERSION: u32 = 1;
+///
+/// v2 splits the overloaded `fact` bucket into `env_fact` / `contract` /
+/// `process_rule` / `observation`, drops the never-instantiated `note` and
+/// `skill` types (skills are an external artifact linked through
+/// [`LINK_SKILL`]), drops the never-maintained `in_cluster` relationship, and
+/// replaces the unused continuous decay with declarative TTLs.
+pub const DEFAULT_ONTOLOGY_VERSION: u32 = 2;
 pub const DEFAULT_ONTOLOGY_ID: &str = "jcode/default/v1";
 
-pub const TYPE_FACT: &str = "fact";
+// ---------------------------------------------------------------------------
+// Types. Every type declared here must have (a) a producer and (b) a runtime
+// consumer that enforces its policy. Types without either do not belong in the
+// ontology - that was the core defect of v1.
+// ---------------------------------------------------------------------------
+
+/// Perishable environment fact: a host, port, path, task id or key that is
+/// only true for one machine / workspace and rots quickly.
+pub const TYPE_ENV_FACT: &str = "env_fact";
+/// A durable interface contract: API route, field, enum, payload shape.
+pub const TYPE_CONTRACT: &str = "contract";
+/// A durable procedure: "must / never / the correct way" workflow knowledge.
+pub const TYPE_PROCESS_RULE: &str = "process_rule";
+/// Low-authority residual bucket for anything that cannot be classified.
+pub const TYPE_OBSERVATION: &str = "observation";
 pub const TYPE_PREFERENCE: &str = "preference";
 pub const TYPE_ENTITY: &str = "entity";
 pub const TYPE_CORRECTION: &str = "correction";
-pub const TYPE_NOTE: &str = "note";
-pub const TYPE_SKILL: &str = "skill";
-pub const TYPE_GOAL: &str = "goal";
+
+// ---------------------------------------------------------------------------
+// Link kinds. External artifacts (goals, skills) are mirrored into the graph
+// under a reserved id prefix. They are *not* extractable types: the owning
+// subsystem writes them, they carry a bounded pointer body, and they are
+// exempt from TTL collection.
+// ---------------------------------------------------------------------------
+
+pub const LINK_GOAL: &str = "goal";
+pub const LINK_SKILL: &str = "skill";
+
+/// Every reserved link prefix.
+pub const LINK_PREFIXES: [&str; 2] = ["goal:", "skill:"];
+
+/// Whether `id` is a link node (external artifact mirror) rather than a
+/// classic memory instance.
+pub fn is_link_id(id: &str) -> bool {
+    LINK_PREFIXES.iter().any(|prefix| id.starts_with(prefix))
+}
 
 pub const REL_HAS_TAG: &str = "has_tag";
 pub const REL_RELATES_TO: &str = "relates_to";
 pub const REL_SUPERSEDES: &str = "supersedes";
 pub const REL_CONTRADICTS: &str = "contradicts";
 pub const REL_DERIVED_FROM: &str = "derived_from";
+/// Deprecated. Kept so already-stored `in_cluster` edges stay resolvable and
+/// validate; no runtime producer creates new ones (v1 produced 11 in total and
+/// nothing ever maintained the cluster nodes).
 pub const REL_IN_CLUSTER: &str = "in_cluster";
 
 pub const RULE_REMEMBER: &str = "rule.remember";
 pub const RULE_REMEMBER_GLOBAL_GATE: &str = "rule.remember.global_gate";
 pub const RULE_UPSERT: &str = "rule.upsert";
+/// Write-time reconciliation: one FTS/lexical pass over the target store that
+/// decides between reinforce / supersede / contradict / relate / insert.
+pub const RULE_WRITE_RECONCILE: &str = "rule.write_reconcile";
+/// Noise gate: reject tool payloads, bare identifiers and stubs.
+pub const RULE_REJECT: &str = "rule.reject";
 pub const RULE_DEDUP_REINFORCE: &str = "rule.dedup_reinforce";
 pub const RULE_SUPERSEDE: &str = "rule.supersede";
 pub const RULE_CONTRADICT: &str = "rule.contradict";
@@ -65,12 +109,13 @@ pub const RULE_TAG: &str = "rule.tag";
 pub const RULE_UNTAG: &str = "rule.untag";
 pub const RULE_LINK: &str = "rule.link";
 
-pub const ACTIVITY_PER_TURN_RELEVANCE: &str = "activity.per_turn_relevance";
-pub const ACTIVITY_PERIODIC_EXTRACT: &str = "activity.periodic_extract";
-pub const ACTIVITY_TOPIC_CHANGE_EXTRACT: &str = "activity.topic_change_extract";
 pub const ACTIVITY_FINAL_EXTRACT: &str = "activity.final_extract";
-pub const ACTIVITY_GC_ARCHIVED: &str = "activity.gc_archived";
-pub const ACTIVITY_SUMMARIZE: &str = "activity.summarize";
+/// Synchronous write-time reconciliation (no LLM, no embedder).
+pub const ACTIVITY_WRITE_RECONCILE: &str = "activity.write_reconcile";
+/// TTL sweep: archive instances whose type TTL elapsed without access.
+pub const ACTIVITY_PERIODIC_GC: &str = "activity.periodic_gc";
+/// Aggregate evidence memories into skill proposals (memory -> skill).
+pub const ACTIVITY_SKILL_DISTILL: &str = "activity.skill_distill";
 
 pub const EVENT_REMEMBER: &str = "event.remember";
 pub const EVENT_REMEMBER_GLOBAL: &str = "event.remember.global";
@@ -214,6 +259,16 @@ pub struct OntologyType {
     pub lifecycle: LifecyclePolicy,
     pub scoring: ScoringPolicy,
     pub decay: DecayPolicy,
+    /// Hard time-to-live in days for this type. Instances of a type with a
+    /// `ttl_days` are archived by `activity.periodic_gc` once they have gone
+    /// unaccessed for that long, and physically dropped after a further grace
+    /// period. `None` means the instance is retained indefinitely.
+    ///
+    /// This is deliberately a discrete TTL rather than continuous decay: the
+    /// runtime can evaluate it without scoring every instance, and it stays
+    /// meaningful on machines with no embedder and no LLM judge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_days: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extraction_methods: Vec<ExtractionMethod>,
     /// Whether new instances of this type are persisted into the graph.
@@ -251,11 +306,18 @@ impl OntologyType {
             lifecycle: LifecyclePolicy::default(),
             scoring: ScoringPolicy::default(),
             decay: DecayPolicy::default(),
+            ttl_days: None,
             extraction_methods: vec![ExtractionMethod::UserStated],
             persistent: true,
             embeddable: true,
             present_in_prompt: true,
         }
+    }
+
+    /// Attach a hard TTL (days) for this type.
+    pub fn with_ttl_days(mut self, days: f32) -> Self {
+        self.ttl_days = Some(days);
+        self
     }
 
     pub fn with_parent(mut self, parent: impl Into<String>) -> Self {
@@ -804,6 +866,31 @@ pub enum ActivityStep {
         #[serde(default = "default_contradiction_threshold")]
         similarity_threshold: f32,
     },
+    /// Reconcile an incoming instance against its store at write time.
+    ///
+    /// Pure lexical/`subject_key` comparison over the target graph: no
+    /// embedder, no LLM. The thresholds mirror `rule.write_reconcile`.
+    ReconcileOnWrite {
+        #[serde(default = "default_reinforce_at")]
+        reinforce_at: f32,
+        #[serde(default = "default_supersede_at")]
+        supersede_at: f32,
+        #[serde(default = "default_relate_at")]
+        relate_at: f32,
+    },
+    /// Aggregate evidence memories sharing a `subject_key` into a skill
+    /// proposal.
+    ///
+    /// This is the memory -> skill learning path: `process_rule` and
+    /// `correction` instances accumulate as evidence; once `min_evidence`
+    /// instances spread across at least `min_stores` stores agree, a draft
+    /// skill is proposed for review (never written silently).
+    DistillSkillEvidence {
+        #[serde(default = "default_min_evidence")]
+        min_evidence: usize,
+        #[serde(default = "default_min_stores")]
+        min_stores: usize,
+    },
     /// Emit an event so other rules can chain on it.
     Emit { event: String },
     /// Touch memories surfaced inside the activity (used to mark them as
@@ -823,6 +910,21 @@ fn default_gc_age_days() -> u32 {
 fn default_contradiction_threshold() -> f32 {
     0.5
 }
+fn default_reinforce_at() -> f32 {
+    0.85
+}
+fn default_supersede_at() -> f32 {
+    0.5
+}
+fn default_relate_at() -> f32 {
+    0.3
+}
+fn default_min_evidence() -> usize {
+    3
+}
+fn default_min_stores() -> usize {
+    2
+}
 
 // ---------------------------------------------------------------------------
 // Built-in ontology
@@ -836,25 +938,74 @@ pub fn default_ontology() -> Ontology {
     let mut onto = Ontology::new(
         DEFAULT_ONTOLOGY_ID,
         DEFAULT_ONTOLOGY_VERSION,
-        "Default memory ontology for jcode: facts, preferences, entities, corrections, notes, skills, and goals.",
+        "Default memory ontology for jcode: environment facts, contracts, process rules, observations, preferences, entities and corrections. Goals and skills are external artifacts linked with `goal:` / `skill:` ids.",
     );
 
     // ---- Types -----------------------------------------------------------
-    let fact = OntologyType::new(TYPE_FACT, "Fact")
-        .with_legacy_category("fact")
+    //
+    // Authority ordering (v2): correction > process_rule > contract >
+    // observation > env_fact. `env_fact` and `observation` carry hard TTLs so
+    // the store converges instead of growing monotonically.
+    let env_fact = OntologyType::new(TYPE_ENV_FACT, "Environment Fact")
+        .with_legacy_category("env_fact")
+        .with_extraction_method(ExtractionMethod::UserStated)
+        .with_extraction_method(ExtractionMethod::StructuredMapping)
+        .with_extraction_method(ExtractionMethod::RuleExtraction)
+        .with_extraction_method(ExtractionMethod::LlmExtraction)
+        .with_scoring(ScoringPolicy {
+            base_score: 15.0,
+            ..Default::default()
+        })
+        .with_decay(DecayPolicy {
+            half_life_days: 7.0,
+            access_boost: true,
+        })
+        .with_ttl_days(30.0);
+
+    let contract = OntologyType::new(TYPE_CONTRACT, "Contract")
+        .with_legacy_category("contract")
+        .with_extraction_method(ExtractionMethod::UserStated)
+        .with_extraction_method(ExtractionMethod::StructuredMapping)
+        .with_extraction_method(ExtractionMethod::LlmExtraction)
+        .with_scoring(ScoringPolicy {
+            base_score: 40.0,
+            ..Default::default()
+        })
+        .with_decay(DecayPolicy {
+            half_life_days: 180.0,
+            access_boost: true,
+        });
+
+    let process_rule = OntologyType::new(TYPE_PROCESS_RULE, "Process Rule")
+        .with_legacy_category("process_rule")
+        .with_extraction_method(ExtractionMethod::UserStated)
+        .with_extraction_method(ExtractionMethod::LlmExtraction)
+        .with_extraction_method(ExtractionMethod::RuleInference)
+        .with_scoring(ScoringPolicy {
+            base_score: 45.0,
+            ..Default::default()
+        })
+        .with_decay(DecayPolicy {
+            half_life_days: 365.0,
+            access_boost: true,
+        });
+
+    let observation = OntologyType::new(TYPE_OBSERVATION, "Observation")
+        .with_legacy_category("observation")
         .with_extraction_method(ExtractionMethod::UserStated)
         .with_extraction_method(ExtractionMethod::StructuredMapping)
         .with_extraction_method(ExtractionMethod::RuleExtraction)
         .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_extraction_method(ExtractionMethod::RuleInference)
         .with_scoring(ScoringPolicy {
-            base_score: 20.0,
+            base_score: 10.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
-            half_life_days: 30.0,
+            half_life_days: 45.0,
             access_boost: true,
-        });
+        })
+        .with_ttl_days(90.0);
 
     let preference = OntologyType::new(TYPE_PREFERENCE, "Preference")
         .with_legacy_category("preference")
@@ -875,11 +1026,11 @@ pub fn default_ontology() -> Ontology {
         .with_extraction_method(ExtractionMethod::StructuredMapping)
         .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_scoring(ScoringPolicy {
-            base_score: 10.0,
+            base_score: 25.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
-            half_life_days: 60.0,
+            half_life_days: 180.0,
             access_boost: true,
         });
 
@@ -896,44 +1047,39 @@ pub fn default_ontology() -> Ontology {
             access_boost: true,
         });
 
-    let note = OntologyType::new(TYPE_NOTE, "Note")
-        .with_legacy_category("note")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_decay(DecayPolicy {
-            half_life_days: 45.0,
-            access_boost: true,
-        });
-
-    let skill = OntologyType::new(TYPE_SKILL, "Skill")
-        .with_legacy_category("Skills")
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_persistent(false)
-        .with_embeddable(true)
-        .with_present_in_prompt(false)
-        .with_decay(DecayPolicy {
-            half_life_days: 365.0,
-            access_boost: false,
-        });
-
-    let goal = OntologyType::new(TYPE_GOAL, "Goal")
-        .with_legacy_category("goal")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_embeddable(false)
-        .with_present_in_prompt(false)
-        .with_decay(DecayPolicy {
-            half_life_days: 30.0,
-            access_boost: true,
-        });
-
     onto = onto
-        .with_type(fact)
+        .with_type(env_fact)
+        .with_type(contract)
+        .with_type(process_rule)
+        .with_type(observation)
         .with_type(preference)
         .with_type(entity)
-        .with_type(correction)
-        .with_type(note)
-        .with_type(skill)
-        .with_type(goal);
+        .with_type(correction);
+
+    // Legacy `MemoryCategory` names -> v2 type ids. Old graphs and any
+    // not-yet-migrated producer keep working: the overloaded `fact` bucket
+    // lands in `observation` (the residual type), `Skills` lands in
+    // `process_rule` (a skill is a distilled procedure), and `note` also lands
+    // in `observation`. `goal:` / `skill:` ids are link nodes, not types.
+    onto.category_aliases.insert("fact".to_string(), TYPE_OBSERVATION.to_string());
+    onto.category_aliases
+        .insert("note".to_string(), TYPE_OBSERVATION.to_string());
+    onto.category_aliases
+        .insert("Skills".to_string(), TYPE_PROCESS_RULE.to_string());
+    onto.category_aliases
+        .insert("skill".to_string(), TYPE_PROCESS_RULE.to_string());
+    for type_id in [
+        TYPE_ENV_FACT,
+        TYPE_CONTRACT,
+        TYPE_PROCESS_RULE,
+        TYPE_OBSERVATION,
+        TYPE_PREFERENCE,
+        TYPE_ENTITY,
+        TYPE_CORRECTION,
+    ] {
+        onto.category_aliases
+            .insert(type_id.to_string(), type_id.to_string());
+    }
 
     // ---- Relationships ---------------------------------------------------
     let has_tag = RelationshipDef {
@@ -946,7 +1092,7 @@ pub fn default_ontology() -> Ontology {
     };
     let in_cluster = RelationshipDef {
         id: REL_IN_CLUSTER.to_string(),
-        display_name: "In Cluster".to_string(),
+        display_name: "In Cluster (deprecated, no producer)".to_string(),
         source_kinds: vec!["memory".to_string()],
         target_kinds: vec!["cluster".to_string()],
         weight: None,
@@ -1038,6 +1184,41 @@ pub fn default_ontology() -> Ontology {
         })
         .with_effect(Effect::Touch);
 
+    // Write-time reconciliation. Runs synchronously on every admit decision and
+    // is deliberately local: lexical/`subject_key` similarity over the target
+    // store, no embedder and no LLM. This is what makes `supersedes` /
+    // `contradicts` actually exist - v1 declared both relations but produced
+    // zero edges in 4.2k stored instances while 1.6k similarity>=0.5 pairs sat
+    // unlinked.
+    //
+    // The runtime implementation lives in `crate::reconcile`; the rule below is
+    // the declarative contract it must satisfy.
+    let write_reconcile_rule = Rule::new(RULE_WRITE_RECONCILE, EVENT_REMEMBER)
+        .with_description(
+            "Classify an incoming instance against its store: reinforce (>=0.85), supersede (>=0.5), contradict/relate (>=0.3) or insert.",
+        )
+        .with_condition(Condition::HasContent)
+        .with_effect(Effect::SetField {
+            property: "reconcile".to_string(),
+            value: Some(serde_json::json!({
+                "reinforce_at": 0.85,
+                "supersede_at": 0.5,
+                "relate_at": 0.3,
+            })),
+        });
+
+    // Noise gate. Tool payloads, bare identifiers and stubs are rejected before
+    // they reach the graph (v2 replaces the ad-hoc length check that let raw
+    // `#Tool: bash input: {...}` rows land in the store).
+    let reject_rule = Rule::new(RULE_REJECT, EVENT_REMEMBER)
+        .with_description("Reject tool payloads, bare identifiers and sub-threshold stubs.")
+        .with_condition(Condition::Custom {
+            expression: "content_is_noise".to_string(),
+        })
+        .with_effect(Effect::Abort {
+            reason: "content looks like extraction noise".to_string(),
+        });
+
     let supersede_rule = Rule::new(RULE_SUPERSEDE, EVENT_SUPERSEDE)
         .with_description("Mark the older instance as superseded.")
         .with_condition(Condition::SimilarityAtLeast { threshold: 0.5 })
@@ -1079,6 +1260,8 @@ pub fn default_ontology() -> Ontology {
         .with_rule(remember_rule)
         .with_rule(remember_global_gate_rule)
         .with_rule(upsert_rule)
+        .with_rule(write_reconcile_rule)
+        .with_rule(reject_rule)
         .with_rule(dedup_rule)
         .with_rule(supersede_rule)
         .with_rule(contradict_rule)
@@ -1087,36 +1270,20 @@ pub fn default_ontology() -> Ontology {
         .with_rule(link_rule);
 
     // ---- Activities ------------------------------------------------------
-    let per_turn_relevance = Activity::new(
-        ACTIVITY_PER_TURN_RELEVANCE,
-        "Compute relevance of stored memories against the current user turn.",
+    //
+    // v2 keeps only activities the runtime actually schedules. v1 declared
+    // seven; five of them (per-turn relevance, periodic extract, topic-change
+    // extract, summarize, contradiction sweep) had no `ActivityStep`
+    // implementation in the runtime at all, so they were documentation.
+    let write_reconcile = Activity::new(
+        ACTIVITY_WRITE_RECONCILE,
+        "Reconcile an incoming instance against its store (reinforce / supersede / contradict / relate / insert).",
     )
-    .on_event(EVENT_TURN_TICK)
-    .with_session_state("fresh_user_turn")
-    .with_step(ActivityStep::ComputeRelevance {
-        max_candidates: 30,
-        max_results: 10,
-        scope: Some("all".to_string()),
-    });
-
-    let periodic_extract = Activity::new(
-        ACTIVITY_PERIODIC_EXTRACT,
-        "Run LLM extraction every N turns to capture incremental memories.",
-    )
-    .periodic(12)
-    .with_step(ActivityStep::ExtractMemories {
-        scope: Some("project".to_string()),
-        reason: Some("periodic".to_string()),
-    });
-
-    let topic_change_extract = Activity::new(
-        ACTIVITY_TOPIC_CHANGE_EXTRACT,
-        "Run LLM extraction when the topic changes mid-session.",
-    )
-    .on_topic_change(0.3)
-    .with_step(ActivityStep::ExtractMemories {
-        scope: Some("project".to_string()),
-        reason: Some("topic_change".to_string()),
+    .on_event(EVENT_REMEMBER)
+    .with_step(ActivityStep::ReconcileOnWrite {
+        reinforce_at: 0.85,
+        supersede_at: 0.5,
+        relate_at: 0.3,
     });
 
     let final_extract = Activity::new(
@@ -1129,43 +1296,31 @@ pub fn default_ontology() -> Ontology {
         reason: Some("finalize".to_string()),
     });
 
-    let gc_archived = Activity::new(
-        ACTIVITY_GC_ARCHIVED,
-        "Garbage-collect archived memories that have aged out.",
+    let periodic_gc = Activity::new(
+        ACTIVITY_PERIODIC_GC,
+        "Archive instances whose type TTL elapsed without access.",
     )
-    .periodic(50)
+    .on_event(EVENT_FINALIZE)
     .with_step(ActivityStep::GcArchived {
-        age_days: 90,
+        age_days: 30,
         scope: Some("all".to_string()),
     });
 
-    let summarize = Activity::new(
-        ACTIVITY_SUMMARIZE,
-        "Summarize active memories to keep prompt payloads compact.",
+    let skill_distill = Activity::new(
+        ACTIVITY_SKILL_DISTILL,
+        "Aggregate evidence memories into skill proposals (memory -> skill learning).",
     )
-    .periodic(20)
-    .with_step(ActivityStep::Summarize {
-        scope: Some("all".to_string()),
-        target_type: None,
-    });
-
-    let check_contradictions = Activity::new(
-        "activity.check_contradictions",
-        "Re-check surface for contradictions via sidecar.",
-    )
-    .periodic(15)
-    .with_step(ActivityStep::CheckContradictions {
-        similarity_threshold: 0.5,
+    .on_event(EVENT_FINALIZE)
+    .with_step(ActivityStep::DistillSkillEvidence {
+        min_evidence: 3,
+        min_stores: 2,
     });
 
     onto = onto
-        .with_activity(per_turn_relevance)
-        .with_activity(periodic_extract)
-        .with_activity(topic_change_extract)
+        .with_activity(write_reconcile)
         .with_activity(final_extract)
-        .with_activity(gc_archived)
-        .with_activity(summarize)
-        .with_activity(check_contradictions);
+        .with_activity(periodic_gc)
+        .with_activity(skill_distill);
 
     onto
 }
@@ -1244,15 +1399,56 @@ mod tests {
     fn default_ontology_loads() {
         let onto = default_ontology();
         assert_eq!(onto.id, DEFAULT_ONTOLOGY_ID);
-        assert!(onto.types.contains_key(TYPE_FACT));
-        assert!(onto.types.contains_key(TYPE_PREFERENCE));
-        assert!(onto.types.contains_key(TYPE_GOAL));
-        assert!(onto.types.contains_key(TYPE_SKILL));
+        assert_eq!(onto.version, DEFAULT_ONTOLOGY_VERSION);
+        assert_eq!(onto.version, 2);
+        for type_id in [
+            TYPE_ENV_FACT,
+            TYPE_CONTRACT,
+            TYPE_PROCESS_RULE,
+            TYPE_OBSERVATION,
+            TYPE_PREFERENCE,
+            TYPE_ENTITY,
+            TYPE_CORRECTION,
+        ] {
+            assert!(onto.types.contains_key(type_id), "missing type {type_id}");
+        }
         assert!(onto.relationships.contains_key(REL_HAS_TAG));
         assert!(onto.relationships.contains_key(REL_RELATES_TO));
         assert!(onto.relationships.contains_key(REL_SUPERSEDES));
+        assert!(onto.rules.iter().any(|r| r.id == RULE_WRITE_RECONCILE));
+        assert!(onto.rules.iter().any(|r| r.id == RULE_REJECT));
         assert!(!onto.rules.is_empty());
         assert!(!onto.activities.is_empty());
+        // v2 rule: every declared type must carry a TTL or an explicit
+        // retention justification, and the TTL-bearing types are the two
+        // perishable ones.
+        assert_eq!(onto.types[TYPE_ENV_FACT].ttl_days, Some(30.0));
+        assert_eq!(onto.types[TYPE_OBSERVATION].ttl_days, Some(90.0));
+        assert_eq!(onto.types[TYPE_CONTRACT].ttl_days, None);
+        assert_eq!(onto.types[TYPE_PROCESS_RULE].ttl_days, None);
+        // Types with no producer/consumer were removed in v2.
+        for removed in ["note", "skill", "goal", "fact"] {
+            assert!(!onto.types.contains_key(removed), "{removed} must not be a type");
+        }
+    }
+
+    #[test]
+    fn v2_activities_are_the_scheduled_ones() {
+        let onto = default_ontology();
+        let ids: Vec<&str> = onto.activities.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&ACTIVITY_WRITE_RECONCILE));
+        assert!(ids.contains(&ACTIVITY_FINAL_EXTRACT));
+        assert!(ids.contains(&ACTIVITY_PERIODIC_GC));
+        assert!(ids.contains(&ACTIVITY_SKILL_DISTILL));
+        assert_eq!(ids.len(), 4, "v2 schedules exactly four activities");
+    }
+
+    #[test]
+    fn link_ids_are_recognized() {
+        assert!(is_link_id("goal:kia203"));
+        assert!(is_link_id("skill:optimization"));
+        assert!(!is_link_id("mem_1790_1234"));
+        assert_eq!(LINK_PREFIXES.len(), 2);
     }
 
     #[test]
@@ -1277,8 +1473,18 @@ mod tests {
     #[test]
     fn category_aliases_for_legacy_categories() {
         let onto = default_ontology();
-        let fact = MemoryCategory::Fact;
-        assert_eq!(onto.type_from_category(&fact), Some(TYPE_FACT));
+        // The overloaded v1 `fact` bucket migrates to the residual type,
+        // and `Skills` maps to the durable procedure type.
+        assert_eq!(onto.type_from_category(&MemoryCategory::Fact), Some(TYPE_OBSERVATION));
+        assert_eq!(
+            onto.type_from_category(&MemoryCategory::Custom("Skills".to_string())),
+            Some(TYPE_PROCESS_RULE)
+        );
+        assert_eq!(
+            onto.type_from_category(&MemoryCategory::Custom("env_fact".to_string())),
+            Some(TYPE_ENV_FACT)
+        );
+        assert_eq!(onto.type_from_category(&MemoryCategory::Correction), Some(TYPE_CORRECTION));
     }
 
     #[test]
