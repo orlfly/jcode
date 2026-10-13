@@ -304,20 +304,27 @@ impl MemoryAgent {
         {
             return Ok(());
         }
-        ss.last_query = Some(query);
+        ss.last_query = Some(query.clone());
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
         memory::clear_pending_memory(session_id);
-        if !memory::memory_runtime_active() {
-            return Ok(());
-        }
+        // Recall has two tiers. The judged path (Tier 2) is preferred when a
+        // Jev route exists; otherwise Tier 1 ranks locally. Before L1 existed
+        // this returned early and a machine without a Jev credential recalled
+        // nothing at all, even though it kept writing memories.
         let memory::MemoryRelevanceResult {
             prompt,
             display_prompt,
             selected_entries,
-        } = manager
-            .get_relevant_parallel(session_id, messages, None)
-            .await?;
+        } = if memory::memory_runtime_active() {
+            manager
+                .get_relevant_parallel(session_id, messages, None)
+                .await?
+        } else if memory::l1_recall_enabled() {
+            manager.l1_relevance_result(&query)
+        } else {
+            return Ok(());
+        };
         if let Some(prompt) = prompt {
             let count = selected_entries.len();
             memory::set_pending_memory_for_project_with_selection(

@@ -161,6 +161,63 @@ pub fn memory_runtime_active() -> bool {
     memory_sidecar_enabled() && crate::jev::JevClient::available()
 }
 
+/// Whether local (L1) recall may run when the Jev judge route is unavailable.
+///
+/// L1 needs no embedder, no LLM and no credential: it scores `subject_key`,
+/// tags and term overlap against the stored instances. Before it existed, a
+/// machine without a Jev route silently recalled nothing at all (measured: 0
+/// judge decisions and 11 injections across 214 real sessions in 15 days).
+pub fn l1_recall_enabled() -> bool {
+    crate::config::config().agents.memory_l1_recall
+}
+
+/// Minimum L1 score for an instance to be injected.
+///
+/// Chosen so a single keyword collision is not enough: the query has to share
+/// a subject anchor or at least two meaningful terms.
+pub const L1_MIN_SCORE: f32 = 0.34;
+/// Maximum instances L1 injects into one turn.
+pub const L1_MAX_RESULTS: usize = 3;
+
+/// Local relevance scoring (L1): deterministic, no network, no embedder.
+///
+/// Score is the best of three signals, in descending reliability:
+/// `subject_key` held by the query (1.0), a query term appearing in a tag
+/// (0.6), and term overlap with the instance's searchable text (up to 0.5).
+/// Returns entries ordered best-first.
+pub fn score_l1_relevance(entry: &MemoryEntry, query_terms: &[String], normalized_query: &str) -> f32 {
+    if !entry.active {
+        return 0.0;
+    }
+    if let Some(subject) = entry.subject_key.as_deref() {
+        let subject_head = subject.split(':').nth(1).unwrap_or(subject);
+        if !subject_head.is_empty() && normalized_query.contains(subject_head) {
+            return 1.0;
+        }
+    }
+    let mut tag_hits = 0usize;
+    for tag in &entry.tags {
+        let bare = tag.split(':').next_back().unwrap_or(tag);
+        if bare.len() >= 3 && normalized_query.contains(bare) {
+            tag_hits += 1;
+        }
+    }
+    if tag_hits > 0 {
+        return 0.6;
+    }
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let searchable = entry.searchable_text();
+    let hits = query_terms
+        .iter()
+        .filter(|term| searchable.contains(term.as_str()))
+        .count();
+    let ratio = hits as f32 / query_terms.len() as f32;
+    // Two independent terms are the floor for a lexical match.
+    if hits < 2 { 0.0 } else { ratio.min(0.5) }
+}
+
 /// Whether the sidecar is currently auto-disabled due to sustained judge
 /// failures. Exposed for the TUI status badge so the user can see why memory
 /// is silently running on the no-LLM path.
@@ -1439,6 +1496,53 @@ impl MemoryManager {
         let mut all = self.collect_memories_scoped(scope)?;
         all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(all)
+    }
+
+    /// Local (L1) recall: rank stored instances against `query` with no
+    /// network, no embedder and no credential.
+    ///
+    /// This is the recall path that remains available when the Jev judge route
+    /// is missing, which used to mean "recall returns nothing at all".
+    pub fn l1_relevant(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let normalized_query = normalize_search_text(query);
+        let terms: Vec<String> = collect_skill_query_terms(query).into_iter().collect();
+        let mut scored: Vec<(f32, MemoryEntry)> = self
+            .collect_memories_scoped(MemoryScope::All)?
+            .into_iter()
+            .filter_map(|entry| {
+                let score = score_l1_relevance(&entry, &terms, &normalized_query);
+                (score >= L1_MIN_SCORE).then_some((score, entry))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(limit.min(L1_MAX_RESULTS));
+        Ok(scored.into_iter().map(|(_, entry)| entry).collect())
+    }
+
+    /// L1 recall shaped as a [`MemoryRelevanceResult`] so the memory agent can
+    /// use it as a drop-in fallback for the judged path.
+    pub fn l1_relevance_result(&self, query: &str) -> MemoryRelevanceResult {
+        let entries = match self.l1_relevant(query, L1_MAX_RESULTS) {
+            Ok(entries) => entries,
+            Err(e) => {
+                crate::logging::info(&format!("L1 recall failed: {e}"));
+                Vec::new()
+            }
+        };
+        if entries.is_empty() {
+            return MemoryRelevanceResult {
+                prompt: None,
+                display_prompt: None,
+                selected_entries: Vec::new(),
+            };
+        }
+        let prompt = format_relevant_prompt(&entries, L1_MAX_RESULTS);
+        let display_prompt = format_relevant_display_prompt(&entries, L1_MAX_RESULTS);
+        MemoryRelevanceResult {
+            prompt,
+            display_prompt,
+            selected_entries: entries,
+        }
     }
 
     /// TTL maintenance pass (`activity.periodic_gc`).

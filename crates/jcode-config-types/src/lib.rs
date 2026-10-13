@@ -603,6 +603,18 @@ pub struct AgentsConfig {
     /// sidecar. Recall always uses Jev and is independent of this setting.
     #[serde(default = "default_memory_sidecar_enabled")]
     pub memory_sidecar_enabled: bool,
+    /// Allow local (L1) recall when the Jev judge route is unavailable.
+    ///
+    /// Recall used to require a Jev credential (`memory_runtime_active()` =
+    /// sidecar +`JevClient::available()`), so on a machine without one the
+    /// recall path returned nothing at all - measured: 0 judge decisions and 11
+    /// injections across 214 real sessions in 15 days, while 3.2k memories were
+    /// written. L1 scores subject_key / tag / term overlap locally with no
+    /// embedder, no LLM and no credential, and injects at most a few strongly
+    /// matching entries; the Jev judge remains the optional reranker on top.
+    /// Default: true.
+    #[serde(default = "default_memory_l1_recall")]
+    pub memory_l1_recall: bool,
     /// Enable the deterministic background generalizer: a daemon task that
     /// periodically distills repeatedly-reinforced project memories into
     /// short universal rules and writes them to global memory through the
@@ -680,6 +692,10 @@ fn default_memory_sidecar_enabled() -> bool {
     true
 }
 
+fn default_memory_l1_recall() -> bool {
+    true
+}
+
 fn default_memory_background_generalize() -> bool {
     true
 }
@@ -710,6 +726,7 @@ impl Default for AgentsConfig {
             memory_jev_threshold: default_memory_jev_threshold(),
             memory_model: None,
             memory_sidecar_enabled: default_memory_sidecar_enabled(),
+            memory_l1_recall: default_memory_l1_recall(),
             memory_background_generalize: default_memory_background_generalize(),
             memory_rerank_cadence: default_memory_rerank_cadence(),
             memory_rerank_votes: default_memory_rerank_votes(),

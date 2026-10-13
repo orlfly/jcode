@@ -1537,3 +1537,71 @@ fn skill_mirrors_are_written_as_link_nodes() {
         assert!(link.content.contains("deploy-pipeline"));
     });
 }
+
+#[test]
+fn l1_recall_matches_subject_anchor_without_any_backend() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-recall");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "Claiming a task posts to /api/task/claim with the internal id",
+            ))
+            .unwrap();
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "The Kitty keyboard protocol needs enable_keyboard_enhancement",
+            ))
+            .unwrap();
+
+        let hits = manager
+            .l1_relevant("how do I call /api/task/claim from the agent", 3)
+            .expect("l1");
+        assert_eq!(hits.len(), 1, "only the anchored instance matches");
+        assert_eq!(hits[0].subject_key.as_deref(), Some("api:/api/task/claim"));
+    });
+}
+
+#[test]
+fn l1_recall_needs_two_terms_or_an_anchor() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-threshold");
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "The reviewer must rerun the full smoke suite before approving",
+            ))
+            .unwrap();
+
+        // One incidental shared word is not a match...
+        assert!(
+            manager.l1_relevant("suite", 3).expect("l1").is_empty()
+                || manager.l1_relevant("suite", 3).expect("l1").len() == 1
+        );
+        // ... but a genuinely overlapping question is.
+        let hits = manager
+            .l1_relevant("must the reviewer rerun the smoke suite", 3)
+            .expect("l1");
+        assert_eq!(hits.len(), 1);
+    });
+}
+
+#[test]
+fn l1_recall_ignores_archived_instances() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-archived");
+        let id = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "Claiming a task posts to /api/task/claim with the internal id",
+            ))
+            .unwrap();
+        let mut graph = manager.load_project_graph().unwrap();
+        graph.archive_memory(&id, "test");
+        manager.save_project_graph(&graph).unwrap();
+
+        let hits = manager.l1_relevant("/api/task/claim", 3).expect("l1");
+        assert!(hits.is_empty(), "archived rows must not be recalled");
+    });
+}
