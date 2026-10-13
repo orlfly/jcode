@@ -147,7 +147,8 @@ fn run_finalize_maintenance(working_dir: Option<&str>) {
     // actually exist on disk (v2 replacement for the never-wired synthetic
     // `Custom("Skills")` entries).
     let skills = crate::skill::SkillRegistry::shared_snapshot();
-    let mirrored = crate::skill::sync_skill_memory_mirrors(&skills);
+    let mirrored =
+        crate::skill::sync_skill_memory_mirrors(&skills, working_dir.map(std::path::Path::new));
     if mirrored > 0 {
         crate::logging::info(&format!("Mirrored {mirrored} skill link node(s)"));
     }

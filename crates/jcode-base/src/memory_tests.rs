@@ -1522,7 +1522,7 @@ fn skill_mirrors_are_written_as_link_nodes() {
         .expect("write skill");
 
         let registry = crate::skill::SkillRegistry::load_global().expect("registry");
-        let written = crate::skill::sync_skill_memory_mirrors(&registry);
+        let written = crate::skill::sync_skill_memory_mirrors(&registry, None);
         assert!(written >= 1, "at least the on-disk skill is mirrored");
 
         let manager = MemoryManager::new();
@@ -1535,6 +1535,66 @@ fn skill_mirrors_are_written_as_link_nodes() {
         assert_eq!(link.subject_key.as_deref(), Some("skill:deploy-pipeline"));
         assert!(link.content.chars().count() <= 200);
         assert!(link.content.contains("deploy-pipeline"));
+    });
+}
+
+#[test]
+fn project_local_skill_mirrors_land_in_the_project_store() {
+    with_temp_home(|home| {
+        // A project-local procedure belongs to its workspace only, so its link
+        // node must not land in the global store.
+        let project = home.join("workspace");
+        let skill_dir = project.join(".jcode").join("skills").join("local-deploy");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: local-deploy\ndescription: Deploy this workspace\n---\n\nSteps.\n",
+        )
+        .expect("write skill");
+        let global_skills = home.join("skills").join("global-tune");
+        fs::create_dir_all(&global_skills).expect("mkdir");
+        fs::write(
+            global_skills.join("SKILL.md"),
+            "---\nname: global-tune\ndescription: Tune any project\n---\n\nSteps.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        let written = crate::skill::sync_skill_memory_mirrors(&registry, Some(&project));
+        assert!(written >= 2, "both scopes mirrored, got {written}");
+
+        // Inspect the stores themselves: `list_all` deliberately merges project
+        // and global scope, which would hide a wrong-scope write.
+        let project_manager = MemoryManager::new().with_project_dir(&project);
+        let project_ids: Vec<String> = project_manager
+            .load_project_graph()
+            .unwrap()
+            .memories
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            project_ids.contains(&"skill:local-deploy".to_string()),
+            "project skill mirrors into its own store: {project_ids:?}"
+        );
+        assert!(
+            !project_ids.contains(&"skill:global-tune".to_string()),
+            "global skills stay out of the project store"
+        );
+
+        let global_manager = MemoryManager::new();
+        let global_graph = global_manager.load_global_graph().unwrap();
+        let global_ids: Vec<&str> = global_graph
+            .memories
+            .keys()
+            .filter(|id| id.starts_with("skill:"))
+            .map(String::as_str)
+            .collect();
+        assert!(global_ids.contains(&"skill:global-tune"));
+        assert!(
+            !global_ids.contains(&"skill:local-deploy"),
+            "a workspace's procedure must not be indexed globally: {global_ids:?}"
+        );
     });
 }
 

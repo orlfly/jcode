@@ -1071,16 +1071,23 @@ Be conservative - only say "yes" if the memory would actually be useful for the 
         let mut system = String::from(
             r#"You are a memory extraction assistant. Extract important NEW learnings from the conversation that should be remembered for future sessions.
 
-Categories (use EXACTLY one of these):
-- fact: Technical facts about the codebase, architecture, patterns, dependencies, tools, environment
-- preference: User preferences, workflow habits, UX expectations, coding style, conventions, how they want the assistant to behave
-- correction: Mistakes that were corrected, bugs found and fixed, wrong assumptions, things the user corrected
-- entity: Named entities worth tracking - people, projects, services, repos, teams
+Types (use EXACTLY one of these):
+- process_rule: A durable procedure or constraint. Anything phrased as must / must not / never / always / the correct way to do X, plus workflow and review conventions.
+- contract: A durable interface shape. API routes, request/response fields, enums, status codes, schema and payload structure.
+- env_fact: Environment detail that is only true for this machine or workspace and will rot. Hosts and ports, absolute paths, task/issue numbers, credentials locations, service names of a specific deployment.
+- correction: Something that was wrong and got corrected - a bug found and fixed, a wrong assumption, a wrong procedure, a claim that turned out false.
+- preference: What the USER wants or how they like things - workflow habits, UX expectations, coding style, working agreements with the assistant.
+- entity: A named thing worth tracking - person, project, service, repo, team, environment.
+- observation: Anything durable and useful that fits none of the above.
 
 Categorization rules:
-- If it describes what the USER WANTS or HOW THEY LIKE THINGS, it is "preference", not "fact"
-- If it describes a BUG FIX or MISTAKE, it is "correction", not "fact"
-- "fact" is for objective technical information about code/systems, not user behavior
+- must / never / correct-way phrasing wins over everything else: "process_rule", even if it mentions an endpoint or a path.
+- Interface shapes are "contract"; a value that only exists on this machine (port, IP, path, task id) is "env_fact".
+- What the USER WANTS or HOW THEY LIKE THINGS is "preference", not "observation".
+- A BUG FIX, MISTAKE, or corrected claim is "correction", not "observation".
+- Use "observation" only when the knowledge is durable but genuinely unclassifiable.
+
+Write for retrieval: keep the concrete identifier in CONTENT (the route, the host:port, the file path, the task or MR id). A reader who only sees this one line must be able to tell what it is about without the surrounding conversation.
 
 IMPORTANT - Do NOT extract:
 - Transient debugging details, compile errors, or intermediate build steps
@@ -1092,10 +1099,10 @@ IMPORTANT - Do NOT extract:
 Quality bar: Only extract information that would ACTUALLY BE USEFUL if recalled in a future session on a different topic. Ask: "Would a developer benefit from knowing this weeks from now?"
 
 For each memory, output in this format (one per line):
-CATEGORY|CONTENT|TRUST
+TYPE|CONTENT|TRUST
 
 Where:
-- CATEGORY is one of: fact, preference, correction, entity
+- TYPE is one of: process_rule, contract, env_fact, correction, preference, entity, observation
 - CONTENT is a concise statement (1-2 sentences max, under 200 characters preferred)
 - TRUST is one of: high (user stated), medium (observed), low (inferred)
 

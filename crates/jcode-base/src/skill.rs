@@ -995,29 +995,50 @@ pub fn record_skill_invocation(skill_name: &str, working_dir: Option<&std::path:
     let _ = manager.remember_skill_invocation(skill_name);
 }
 
-/// Mirror every registered skill into the global memory graph as a
-/// `skill:<name>` link node.
+/// Mirror skills into the memory graph as `skill:<name>` link nodes.
 ///
 /// This is the skill -> memory half of the v2 linkage. It replaces the old
 /// `Custom("Skills")` synthetic entries, which were only ever wired up in tests:
 /// `register_synthetic_entry_provider` had no production caller and the skill
 /// type had zero instances in the live store.
 ///
+/// Scope is respected, because it decides who can see the skill:
+///
+/// * global skills (plugins, `~/.jcode/skills/`, `~/.agents/skills/`) become
+///   link nodes in the **global** store - they apply everywhere;
+/// * a workspace's project-local skills (`.jcode/skills/`, `.agents/skills/`,
+///   `.claude/skills/`) become link nodes in **that project's** store. A
+///   project-local procedure is only true for its workspace, so indexing it
+///   globally would surface one repository's procedure in every other one.
+///
 /// Best-effort and deliberately *not* called from `load_global` (which runs
 /// before the TUI's first frame): it does memory I/O, so callers should pick a
 /// non-latency-critical point such as session finalize.
-pub fn sync_skill_memory_mirrors(registry: &SkillRegistry) -> usize {
-    if registry.skills.is_empty() {
-        return 0;
-    }
-    let manager = crate::memory::MemoryManager::new();
+pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&Path>) -> usize {
     let mut written = 0;
-    for skill in registry.skills.values() {
-        if manager
-            .upsert_global_memory(skill.as_memory_entry())
-            .is_ok()
-        {
-            written += 1;
+    if !registry.skills.is_empty() {
+        let manager = crate::memory::MemoryManager::new();
+        for skill in registry.skills.values() {
+            if manager
+                .upsert_global_memory(skill.as_memory_entry())
+                .is_ok()
+            {
+                written += 1;
+            }
+        }
+    }
+    if let Some(dir) = working_dir
+        && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
+        && !local.skills.is_empty()
+    {
+        let manager = crate::memory::MemoryManager::new().with_project_dir(dir);
+        for skill in local.skills.values() {
+            if manager
+                .upsert_project_memory(skill.as_memory_entry())
+                .is_ok()
+            {
+                written += 1;
+            }
         }
     }
     written
