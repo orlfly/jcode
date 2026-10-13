@@ -844,11 +844,13 @@ fn retrieval_candidates_include_local_skills() {
                 .iter()
                 .any(|entry| entry.id == "skill:firefox-browser")
         );
+        // v2: the synthetic entry is a `skill:` link node with a bounded
+        // pointer body, not a `Custom("Skills")` instance carrying the whole
+        // SKILL.md text.
         assert!(candidates.iter().any(|entry| {
-            matches!(
-                entry.category,
-                MemoryCategory::Custom(ref name) if name == "Skills"
-            )
+            entry.id == "skill:firefox-browser"
+                && jcode_memory_types::is_link_node(entry)
+                && entry.content.chars().count() <= 200
         }));
     });
 }
@@ -1321,4 +1323,217 @@ fn jev_recall_prefilter_leaves_small_stores_untouched() {
         prefilter_for_jev(entries, "completely different words").len(),
         10
     );
+}
+
+// ---------------------------------------------------------------------------
+// v2: TTL maintenance, skill linkage, invocation evidence
+// ---------------------------------------------------------------------------
+
+fn backdated(category: MemoryCategory, content: &str, days: i64) -> MemoryEntry {
+    let then = Utc::now() - chrono::Duration::days(days);
+    MemoryEntry::new(category, content).with_timestamps(then, then)
+}
+
+#[test]
+fn ttl_sweep_archives_expired_env_facts_and_keeps_contracts() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ttl-sweep");
+        // env_fact declares a 30d TTL; contract is retained indefinitely.
+        manager
+            .upsert_project_memory(backdated(
+                MemoryCategory::Custom("env_fact".to_string()),
+                "Kaneo dev server listens on localhost:1337 for this workspace",
+                45,
+            ))
+            .unwrap();
+        manager
+            .upsert_project_memory(backdated(
+                MemoryCategory::Custom("env_fact".to_string()),
+                "Fresh environment detail recorded during the current session",
+                1,
+            ))
+            .unwrap();
+        manager
+            .upsert_project_memory(backdated(
+                MemoryCategory::Custom("contract".to_string()),
+                "Claiming a task is POST /api/task/claim/{taskId} with the team id",
+                400,
+            ))
+            .unwrap();
+
+        let report = manager.gc_expired_memories().expect("gc");
+        assert_eq!(report.archived, 1, "only the stale env_fact expires");
+
+        let all = manager.list_all().unwrap();
+        let archived = all
+            .iter()
+            .find(|e| e.content.contains("localhost:1337"))
+            .expect("stale env fact still present (archived, not deleted)");
+        assert!(!archived.active);
+        assert_eq!(
+            archived.lifecycle.status,
+            crate::memory_types::MemoryStatus::Archived
+        );
+        assert!(
+            archived
+                .lifecycle
+                .deprecated_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ttl elapsed")
+        );
+        let contract = all
+            .iter()
+            .find(|e| e.content.contains("/api/task/claim"))
+            .expect("contract kept");
+        assert!(contract.active, "typed retention must survive the sweep");
+    });
+}
+
+#[test]
+fn ttl_sweep_exempts_link_nodes() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new();
+        let mut link = backdated(MemoryCategory::Fact, "Skill `/deploy`: deploys things.", 999);
+        link.id = "skill:deploy".to_string();
+        manager.upsert_global_memory(link).unwrap();
+
+        let report = manager.gc_expired_memories().expect("gc");
+        assert_eq!(report.archived, 0);
+        let all = manager.list_all().unwrap();
+        let link = all
+            .iter()
+            .find(|e| e.id == "skill:deploy")
+            .expect("link node present");
+        assert!(link.active, "link nodes own their own lifecycle");
+    });
+}
+
+#[test]
+fn deprecated_fact_type_still_maps_to_a_ttl_bearing_type() {
+    // v1 `fact` is aliased to `observation` (90d TTL), so old rows converge too.
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ttl-legacy");
+        manager
+            .upsert_project_memory(backdated(
+                MemoryCategory::Fact,
+                "A legacy fact recorded long before the v2 ontology existed",
+                200,
+            ))
+            .unwrap();
+        let report = manager.gc_expired_memories().expect("gc");
+        assert_eq!(report.archived, 1);
+    });
+}
+
+#[test]
+fn skill_invocation_is_recorded_as_evidence() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/skill-invocation");
+        let first = manager.remember_skill_invocation("optimization").unwrap();
+        let again = manager.remember_skill_invocation("optimization").unwrap();
+        assert_eq!(first, again, "one row per skill, refreshed on re-invocation");
+
+        let entry = manager
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == first)
+            .expect("invocation memory");
+        assert_eq!(entry.subject_key.as_deref(), Some("skill:optimization"));
+        assert_eq!(entry.source.as_deref(), Some("skill:optimization"));
+        assert_eq!(
+            entry.effective_provenance().method,
+            ExtractionMethod::SkillInvocation
+        );
+        assert!(entry.tags.contains(&"skill:optimization".to_string()));
+    });
+}
+
+#[test]
+fn skill_distillation_proposes_from_agreeing_evidence() {
+    with_temp_home(|home| {
+        let manager = MemoryManager::new().with_project_dir("/skill-distill");
+        // Deliberately distinct wording: near-identical items would be folded
+        // into one row by write-time reconciliation (which is the point of that
+        // pass), and the test would then be measuring dedup instead of
+        // aggregation.
+        let evidence = [
+            (
+                "session_a_1",
+                "task #157: the drill log must be backfilled into the design doc",
+            ),
+            (
+                "session_b_2",
+                "task #157 acceptance needs at least 24h of shadow drill results",
+            ),
+            (
+                "session_c_3",
+                "task #157 条件③ requires the drill log attached before sign-off",
+            ),
+        ];
+        for (session, content) in evidence {
+            let mut entry = MemoryEntry::new(
+                MemoryCategory::Custom("process_rule".to_string()),
+                content,
+            );
+            entry.source = Some(session.to_string());
+            manager.remember_project(entry).unwrap();
+        }
+        // Only two evidence items: below the threshold.
+        let mut weak = MemoryEntry::new(
+            MemoryCategory::Custom("process_rule".to_string()),
+            "Unrelated procedure about task #999 ordering",
+        );
+        weak.source = Some("session_d_4".to_string());
+        manager.remember_project(weak).unwrap();
+
+        let proposals = manager.collect_skill_evidence().expect("evidence");
+        let drill = proposals
+            .iter()
+            .find(|p| p.subject_key == "task:#157")
+            .expect("aggregated evidence for task #157");
+        assert_eq!(drill.evidence.len(), 3);
+        assert!(drill.sessions.len() >= 3);
+        assert!(
+            !proposals.iter().any(|p| p.subject_key == "task:#999"),
+            "single-session evidence must not produce a proposal"
+        );
+
+        // The proposal pipeline writes a reviewable draft, never an install.
+        let written = manager.distill_skill_evidence().expect("distill");
+        assert!(written.iter().any(|p| p.subject_key == "task:#157"));
+        let draft = home.join("skills").join(".proposals").join("task-157.md");
+        let body = std::fs::read_to_string(&draft).expect("draft written");
+        assert!(body.contains("name: task-157"));
+        assert!(body.contains("task:#157"));
+    });
+}
+
+#[test]
+fn skill_mirrors_are_written_as_link_nodes() {
+    with_temp_home(|home| {
+        let skill_dir = home.join("skills").join("deploy-pipeline");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy-pipeline\ndescription: Ship a verified build\n---\n\nRun the gated deploy.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        let written = crate::skill::sync_skill_memory_mirrors(&registry);
+        assert!(written >= 1, "at least the on-disk skill is mirrored");
+
+        let manager = MemoryManager::new();
+        let all = manager.list_all().unwrap();
+        let link = all
+            .iter()
+            .find(|e| e.id == "skill:deploy-pipeline")
+            .expect("skill link node");
+        assert!(jcode_memory_types::is_link_node(link));
+        assert_eq!(link.subject_key.as_deref(), Some("skill:deploy-pipeline"));
+        assert!(link.content.chars().count() <= 200);
+        assert!(link.content.contains("deploy-pipeline"));
+    });
 }

@@ -299,9 +299,15 @@ pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
         ReconcileAction::Reinforce {
             existing_id: target.id.clone(),
         }
-    } else if (same || (correction && similarity >= SUPERSEDE_AT)) && authority_ok {
-        // Retiring what is stored needs at least equal authority: an LLM
-        // paraphrase must never replace something the user stated.
+    } else if (same || correction) && similarity >= SUPERSEDE_AT && authority_ok {
+        // Retiring what is stored needs a *deliberate* relationship: a
+        // correction, or an update to the same anchor that also overlaps
+        // materially. Sharing only a container anchor (a task id, a workspace)
+        // is not enough - a task accumulates many facts, and superseding them
+        // one by one would silently delete its history.
+        //
+        // It also needs at least equal authority: an LLM paraphrase must never
+        // replace something the user stated.
         ReconcileAction::Supersede {
             existing_id: best.0.id.clone(),
         }
@@ -565,8 +571,11 @@ pub fn prepare_for_write(mut entry: MemoryEntry) -> MemoryEntry {
     let sanitized = sanitize_tags(entry.tags.iter().map(String::as_str));
     if sanitized.len() != entry.tags.len() {
         entry.tags = sanitized;
-        entry.search_text.clear();
-        entry.search_text = crate::normalize_memory_search_text(&entry.content, &entry.tags);
+        // Link nodes carry a curated match text (a skill's full body) that must
+        // survive sanitization; regular instances derive it from content+tags.
+        if !crate::is_link_node(&entry) {
+            entry.search_text = crate::normalize_memory_search_text(&entry.content, &entry.tags);
+        }
     }
     // `entity` instances must carry an identity to be resolvable; without one
     // they are demoted to the residual type instead of polluting the entity

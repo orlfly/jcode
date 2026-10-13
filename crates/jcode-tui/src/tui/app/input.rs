@@ -4018,6 +4018,13 @@ impl App {
 
             if let Some(skill) = skill {
                 self.active_skill = Some(skill_name.clone());
+                crate::skill::record_skill_invocation(
+                    &skill_name,
+                    self.session
+                        .working_dir
+                        .as_deref()
+                        .map(std::path::Path::new),
+                );
                 self.push_display_message(DisplayMessage {
                     role: "system".to_string(),
                     content: format!("Activated skill: {} - {}", skill.name, skill.description),

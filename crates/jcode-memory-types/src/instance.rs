@@ -23,6 +23,11 @@ pub enum ExtractionMethod {
     LlmExtraction,
     /// Derived by rule inference from other memories.
     RuleInference,
+    /// Observed by actually executing a skill (`/name`). A skill run is a real
+    /// event, so it outranks LLM extraction, but it stays below a direct user
+    /// statement: the closed loop the v2 design relies on for memory -> skill
+    /// learning records these as evidence that a procedure is in use.
+    SkillInvocation,
 }
 
 impl ExtractionMethod {
@@ -35,6 +40,7 @@ impl ExtractionMethod {
             ExtractionMethod::RuleExtraction => 3,
             ExtractionMethod::LlmExtraction => 2,
             ExtractionMethod::RuleInference => 1,
+            ExtractionMethod::SkillInvocation => 3,
         }
     }
 
@@ -46,6 +52,7 @@ impl ExtractionMethod {
             ExtractionMethod::RuleExtraction => 0.7,
             ExtractionMethod::LlmExtraction => 0.7,
             ExtractionMethod::RuleInference => 0.8,
+            ExtractionMethod::SkillInvocation => 0.7,
         }
     }
 }

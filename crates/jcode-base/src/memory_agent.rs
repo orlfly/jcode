@@ -86,6 +86,12 @@ fn manager_for_working_dir(working_dir: Option<&str>) -> MemoryManager {
 }
 
 async fn run_final_extraction(transcript: String, session_id: String, working_dir: Option<String>) {
+    // v2 maintenance runs regardless of whether extraction is available: the
+    // TTL sweep and skill distillation are local, and finalize is the only
+    // lifecycle event the runtime actually emits (measured: 600 finalize
+    // extractions in 15 days, no scheduled periodic/maintenance ticks).
+    run_finalize_maintenance(working_dir.as_deref());
+
     // Extraction is optional. Its model/credentials never gate recall.
     if !memory::memory_llm_judge_available() {
         return;
@@ -100,6 +106,40 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
             memory::add_event(MemoryEventKind::ExtractionComplete { count: ids.len() });
         }
         Err(_) => crate::logging::info("Optional memory extraction failed"),
+    }
+}
+
+/// Local maintenance that runs at session finalize: TTL archival
+/// (`activity.periodic_gc`) and skill-evidence distillation
+/// (`activity.skill_distill`).
+///
+/// Neither pass needs an embedder, an LLM or a credential, so they run even on
+/// machines where recall itself is degraded.
+fn run_finalize_maintenance(working_dir: Option<&str>) {
+    let manager = manager_for_working_dir(working_dir);
+    match manager.gc_expired_memories() {
+        Ok(report) if report.archived > 0 => crate::logging::info(&format!(
+            "Memory TTL sweep archived {} instance(s)",
+            report.archived
+        )),
+        Ok(_) => {}
+        Err(e) => crate::logging::info(&format!("Memory TTL sweep failed: {e}")),
+    }
+    if let Ok(proposals) = manager.distill_skill_evidence() {
+        if !proposals.is_empty() {
+            crate::logging::info(&format!(
+                "Memory skill distillation produced {} proposal(s)",
+                proposals.len()
+            ));
+        }
+    }
+    // Refresh the `skill:<name>` link nodes so the graph indexes the skills that
+    // actually exist on disk (v2 replacement for the never-wired synthetic
+    // `Custom("Skills")` entries).
+    let skills = crate::skill::SkillRegistry::shared_snapshot();
+    let mirrored = crate::skill::sync_skill_memory_mirrors(&skills);
+    if mirrored > 0 {
+        crate::logging::info(&format!("Mirrored {mirrored} skill link node(s)"));
     }
 }
 

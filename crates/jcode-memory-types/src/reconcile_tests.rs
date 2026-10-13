@@ -82,10 +82,11 @@ fn duplicate_reinforces() {
 }
 
 #[test]
-fn same_subject_update_supersedes_when_content_differs() {
-    // Same anchor, materially different content: the newer description is the
-    // current truth about that subject, so it replaces the stored one instead
-    // of being folded into it.
+fn same_subject_without_overlap_keeps_both() {
+    // An anchor can be a *container* (a task id, a workspace) as well as a
+    // unique artefact. A task accumulates many facts over its life, so sharing
+    // its id must not make each new statement retire the previous one: only a
+    // material overlap (>= SUPERSEDE_AT) counts as an update.
     let mut existing = entry(
         MemoryCategory::Fact,
         "The API is reachable at /api/task/claim and needs a bearer token",
@@ -103,7 +104,7 @@ fn same_subject_update_supersedes_when_content_differs() {
     let outcome = reconcile(&candidate, &graph);
     assert_eq!(
         outcome.action,
-        ReconcileAction::Supersede {
+        ReconcileAction::Relate {
             existing_id: id.clone()
         },
         "sim={}",

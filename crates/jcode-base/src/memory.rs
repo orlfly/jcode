@@ -168,6 +168,130 @@ pub fn memory_sidecar_auto_disabled() -> bool {
     crate::memory_judge_metrics::sidecar_should_auto_disable()
 }
 
+/// Scope selector for the GC passes. Local to the manager so the public
+/// `MemoryScope` API stays unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcScope {
+    Project,
+    Global,
+}
+
+/// Outcome of a TTL maintenance pass (`activity.periodic_gc`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TtlGcReport {
+    /// Instances archived because their type TTL elapsed.
+    pub archived: usize,
+    /// Instances physically removed by [`MemoryManager::purge_archived_memories`].
+    pub purged: usize,
+}
+
+impl TtlGcReport {
+    fn merge(&mut self, other: TtlGcReport) {
+        self.archived += other.archived;
+        self.purged += other.purged;
+    }
+}
+
+/// Minimum number of agreeing evidence instances before a skill is proposed.
+const SKILL_DISTILL_MIN_EVIDENCE: usize = 3;
+/// Minimum number of distinct stores the evidence must span.
+const SKILL_DISTILL_MIN_STORES: usize = 2;
+
+/// A procedure that the memory store has accumulated enough evidence for.
+///
+/// Produced by [`MemoryManager::collect_skill_evidence`]: the memory -> skill
+/// half of the v2 linkage. `subject_key` is the anchor shared by the evidence
+/// instances (e.g. `api:/api/task/claim`), `weight` double-counts corrections
+/// because a corrected procedure is stronger evidence than a stated one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SkillEvidenceProposal {
+    pub subject_key: String,
+    pub evidence: Vec<String>,
+    pub stores: Vec<String>,
+    pub sessions: Vec<String>,
+    pub weight: f32,
+}
+
+impl SkillEvidenceProposal {
+    /// Stable file name for the draft, derived from the subject anchor.
+    fn slug(&self) -> String {
+        let raw = self.subject_key.replace([':', '/', '{', '}', '.', ' '], "-");
+        let mut slug: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(64)
+            .collect();
+        while slug.starts_with('-') {
+            slug.remove(0);
+        }
+        if slug.is_empty() {
+            "skill".to_string()
+        } else {
+            slug
+        }
+    }
+
+    /// Draft `SKILL.md` body for review. Deliberately a skeleton: the concrete
+    /// steps have to come from the evidence, and nothing is installed silently.
+    fn draft(&self, proposed_name: &str) -> String {
+        let mut out = String::new();
+        out.push_str("---\n");
+        out.push_str(&format!("name: {proposed_name}\n"));
+        out.push_str(&format!(
+            "description: Apply when working on {}. Derived from {} memory evidence item(s) across {} store(s).\n",
+            self.subject_key,
+            self.evidence.len(),
+            self.stores.len()
+        ));
+        out.push_str("---\n\n");
+        out.push_str(&format!(
+            "# {proposed_name}\n\nDerived from accumulated memory evidence.\n\n- subject: `{}`\n- evidence: {} instance(s)\n- stores: {}\n- sessions: {}\n- weight (corrections count double): {:.1}\n\n## Evidence\n",
+            self.subject_key,
+            self.evidence.len(),
+            self.stores.len(),
+            self.sessions.len(),
+            self.weight
+        ));
+        for id in &self.evidence {
+            out.push_str(&format!("- `{id}`\n"));
+        }
+        out.push_str("\n## TODO\n- [ ] Condense the evidence into concrete, checkable steps.\n- [ ] Set `allowed-tools` for the steps above.\n");
+        out
+    }
+}
+
+/// Rate limiter shared by the local maintenance passes. Returns true when the
+/// caller may run (and touches the stamp); false when the window is still open.
+fn claim_maintenance_slot(base: &Path, stamp: &str, interval_secs: u64) -> bool {
+    let path = base.join(stamp);
+    let now = std::time::SystemTime::now();
+    if let Ok(metadata) = std::fs::metadata(&path)
+        && let Ok(modified) = metadata.modified()
+        && let Ok(elapsed) = now.duration_since(modified)
+        && elapsed.as_secs() < interval_secs
+    {
+        return false;
+    }
+    let _ = std::fs::write(&path, b"");
+    true
+}
+
+/// Write draft skill proposals for review. Existing drafts are refreshed in
+/// place (they are derived, not authored), and nothing outside `.proposals/` is
+/// touched - installing a skill stays an explicit act.
+fn write_skill_proposals(base: &Path, proposals: &[SkillEvidenceProposal]) -> Result<()> {
+    if proposals.is_empty() {
+        return Ok(());
+    }
+    let dir = base.join("skills").join(".proposals");
+    std::fs::create_dir_all(&dir)?;
+    for proposal in proposals {
+        let slug = proposal.slug();
+        std::fs::write(dir.join(format!("{slug}.md")), proposal.draft(&slug))?;
+    }
+    Ok(())
+}
+
 /// Minimum meaningful content length (in chars) for an LLM-extracted memory.
 ///
 /// Kept as a re-export of the v2 constant so there is a single definition;
@@ -1317,6 +1441,229 @@ impl MemoryManager {
         Ok(all)
     }
 
+    /// TTL maintenance pass (`activity.periodic_gc`).
+    ///
+    /// Instances whose *type* declares a `ttl_days` and that have gone that
+    /// long without being touched are archived (not deleted), which removes
+    /// them from recall while keeping them recoverable. "Touched" means the
+    /// entry was written, reinforced or read through `touch()`, i.e. the TTL is
+    /// measured from `updated_at` exactly as the ontology describes it.
+    ///
+    /// Link nodes (`goal:` / `skill:`) are exempt: their lifecycle belongs to the
+    /// subsystem that owns the artifact.
+    pub fn gc_expired_memories(&self) -> Result<TtlGcReport> {
+        let mut report = self.gc_scope(GcScope::Project)?;
+        report.merge(self.gc_scope(GcScope::Global)?);
+        Ok(report)
+    }
+
+    fn gc_scope(&self, scope: GcScope) -> Result<TtlGcReport> {
+        let mut report = TtlGcReport::default();
+        let mut graph = match scope {
+            GcScope::Project => match self.load_project_graph() {
+                Ok(g) => g,
+                Err(_) => return Ok(report),
+            },
+            GcScope::Global => self.load_global_graph()?,
+        };
+        let ontology = self.ontology_registry().default_ontology();
+        let now = chrono::Utc::now();
+        let mut changed = false;
+        let candidates: Vec<(String, f32, String)> = graph
+            .active_memories()
+            .filter(|entry| !jcode_memory_types::is_link_node(entry))
+            .filter_map(|entry| {
+                let type_id = ontology.type_from_category(&entry.category)?;
+                let ttl = ontology.types.get(type_id)?.ttl_days?;
+                let age_days = (now - entry.updated_at).num_seconds().max(0) as f32 / 86_400.0;
+                (age_days > ttl).then(|| (entry.id.clone(), age_days, type_id.to_string()))
+            })
+            .collect();
+        for (id, age_days, type_id) in candidates {
+            let reason = format!("ttl elapsed: {type_id} idle {age_days:.1}d");
+            if graph.archive_memory(&id, reason).is_some() {
+                report.archived += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            match scope {
+                GcScope::Project => self.save_project_graph(&graph)?,
+                GcScope::Global => self.save_global_graph(&graph)?,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Physically drop instances that have been archived for longer than
+    /// `grace_days`. Not called by [`Self::gc_expired_memories`]: deletion is
+    /// opt-in so a TTL decision stays reversible by default.
+    pub fn purge_archived_memories(&self, grace_days: f32) -> Result<TtlGcReport> {
+        let mut report = TtlGcReport::default();
+        for scope in [GcScope::Project, GcScope::Global] {
+            let mut graph = match scope {
+                GcScope::Project => match self.load_project_graph() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                },
+                GcScope::Global => self.load_global_graph()?,
+            };
+            let now = chrono::Utc::now();
+            let doomed: Vec<String> = graph
+                .memories
+                .values()
+                .filter(|entry| {
+                    entry.lifecycle.status == crate::memory_types::MemoryStatus::Archived
+                        && !jcode_memory_types::is_link_node(entry)
+                        && (now - entry.updated_at).num_seconds().max(0) as f32 / 86_400.0
+                            > grace_days
+                })
+                .map(|entry| entry.id.clone())
+                .collect();
+            if doomed.is_empty() {
+                continue;
+            }
+            for id in &doomed {
+                if graph.remove_memory(id).is_some() {
+                    report.purged += 1;
+                }
+            }
+            match scope {
+                GcScope::Project => self.save_project_graph(&graph)?,
+                GcScope::Global => self.save_global_graph(&graph)?,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Record that a skill was invoked, closing the skill -> memory loop.
+    ///
+    /// Writes an `observation` instance keyed to the skill
+    /// (`subject_key = skill:<name>`), so "which skill ran, where and how often"
+    /// becomes a queryable fact instead of nothing (measured before this: 0
+    /// memories carried a `skill_registry` source or a `skill:` tag).
+    pub fn remember_skill_invocation(&self, skill_name: &str) -> Result<String> {
+        let name = skill_name.trim();
+        anyhow::ensure!(!name.is_empty(), "skill invocation needs a skill name");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Fact,
+            format!("Skill `/{name}` was invoked in this workspace."),
+        )
+        .with_id(format!("skill-invocation:{name}"))
+        .with_tags(vec![format!("skill:{name}"), "skill-invoked".to_string()])
+        .with_source(format!("skill:{name}"))
+        .with_provenance(
+            ProvenanceRecord::new(format!("skill:{name}"), ExtractionMethod::SkillInvocation)
+                .with_confidence(1.0),
+        );
+        // Idempotent by id: invoking the same skill again refreshes the row
+        // (and its timestamp) instead of piling up one memory per run.
+        let mut entry = entry;
+        entry.subject_key = Some(format!("skill:{name}"));
+        self.upsert_project_memory(entry)
+    }
+
+    /// Aggregate evidence memories into skill proposals (memory -> skill).
+    ///
+    /// This is the learning path the v2 ontology declares as
+    /// `activity.skill_distill`: `process_rule` and `correction` instances are
+    /// evidence that a procedure exists; when enough of them agree on one
+    /// `subject_key`, a draft `SKILL.md` is written to
+    /// `<jcode_dir>/skills/.proposals/` for review. Nothing is ever installed
+    /// silently - the proposal is a file a human or agent accepts.
+    ///
+    /// Rate-limited to one pass per day per machine (same stamp pattern as the
+    /// session-backup prune) because it walks every project store.
+    pub fn distill_skill_evidence(&self) -> Result<Vec<SkillEvidenceProposal>> {
+        let Ok(base) = crate::storage::jcode_dir() else {
+            return Ok(Vec::new());
+        };
+        if !claim_maintenance_slot(&base, "skill-distill.stamp", 24 * 60 * 60) {
+            return Ok(Vec::new());
+        }
+        let proposals = self.collect_skill_evidence()?;
+        write_skill_proposals(&base, &proposals)?;
+        Ok(proposals)
+    }
+
+    /// Evidence scan behind [`Self::distill_skill_evidence`].
+    pub fn collect_skill_evidence(&self) -> Result<Vec<SkillEvidenceProposal>> {
+        let ontology = self.ontology_registry().default_ontology();
+        let evidence_types = [
+            jcode_memory_types::ontology::TYPE_PROCESS_RULE,
+            jcode_memory_types::ontology::TYPE_CORRECTION,
+        ];
+        let mut groups: std::collections::BTreeMap<String, SkillEvidenceProposal> =
+            std::collections::BTreeMap::new();
+        let mut consider = |store: &str, graph: &MemoryGraph| {
+            for entry in graph.active_memories() {
+                if jcode_memory_types::is_link_node(entry) {
+                    continue;
+                }
+                let Some(type_id) = ontology.type_from_category(&entry.category) else {
+                    continue;
+                };
+                // A correction is stronger evidence than a plain rule: it means
+                // the procedure was tried and corrected.
+                let weight = if type_id == jcode_memory_types::ontology::TYPE_CORRECTION {
+                    2.0
+                } else if evidence_types.contains(&type_id) {
+                    1.0
+                } else {
+                    continue;
+                };
+                let Some(subject) = entry.subject_key.clone() else {
+                    continue;
+                };
+                let proposal = groups
+                    .entry(subject.clone())
+                    .or_insert_with(|| SkillEvidenceProposal {
+                        subject_key: subject.clone(),
+                        ..Default::default()
+                    });
+                if !proposal.evidence.contains(&entry.id) {
+                    proposal.evidence.push(entry.id.clone());
+                }
+                if !proposal.stores.contains(&store.to_string()) {
+                    proposal.stores.push(store.to_string());
+                }
+                if let Some(source) = entry.source.as_deref()
+                    && source.starts_with("session_")
+                    && !proposal.sessions.contains(&source.to_string())
+                {
+                    proposal.sessions.push(source.to_string());
+                }
+                proposal.weight += weight;
+            }
+        };
+
+        if let Some(dir) = self.get_project_dir() {
+            let store = crate::memory::project_store_key(&dir);
+            if let Ok(graph) = self.load_project_graph() {
+                consider(&store, &graph);
+            }
+        }
+        if let Ok(global) = self.load_global_graph() {
+            consider(jcode_memory_types::ontology::LINK_SKILL, &global);
+        }
+
+        let mut out: Vec<SkillEvidenceProposal> = groups
+            .into_values()
+            .filter(|p| {
+                p.evidence.len() >= SKILL_DISTILL_MIN_EVIDENCE
+                    && (p.stores.len() >= SKILL_DISTILL_MIN_STORES
+                        || p.sessions.len() >= SKILL_DISTILL_MIN_EVIDENCE)
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.evidence
+                .len()
+                .cmp(&a.evidence.len())
+                .then_with(|| b.weight.total_cmp(&a.weight))
+        });
+        Ok(out)
+    }
+
     pub fn forget(&self, id: &str) -> Result<bool> {
         // Try graph-based removal first (new format)
         let mut project_graph = self.load_project_graph()?;
@@ -1661,6 +2008,42 @@ impl MemoryManager {
         Ok(Some(graph))
     }
 
+    /// Stamp the active ontology onto `graph` and warn when the stored binding
+    /// disagrees with it.
+    ///
+    /// Also bumps `retrieval_count` so an eagerly-loaded store records that it
+    /// was read - the counter existed in `GraphMetadata` from the start but had
+    /// no writer.
+    fn bind_and_check_ontology(
+        &self,
+        key: &StoreKey,
+        backend: &std::sync::Arc<dyn jcode_memory_types::GraphBackend>,
+        graph: &mut MemoryGraph,
+    ) {
+        if self.test_mode {
+            return;
+        }
+        graph.metadata.retrieval_count = graph.metadata.retrieval_count.saturating_add(1);
+        let stored_id = graph.metadata.ontology_id.clone();
+        let stored_version = graph.metadata.ontology_version;
+        self.ontology_registry().bind_to_graph(graph);
+        let bound_id = graph.metadata.ontology_id.clone();
+        let bound_version = graph.metadata.ontology_version;
+        if (stored_id.is_empty() || stored_id == bound_id) && stored_version != bound_version {
+            crate::logging::info(&format!(
+                "Memory ontology drift for {}: stored v{} -> active v{}",
+                key.as_str(),
+                stored_version,
+                bound_version
+            ));
+        }
+        if stored_id != bound_id || stored_version != bound_version {
+            if let Err(e) = backend.save(key, graph) {
+                crate::logging::warn(&format!("ontology binding persist failed: {e}"));
+            }
+        }
+    }
+
     /// Load project memories as a MemoryGraph without generating embeddings.
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
         // When the sqlite-gvec backend is active, route everything
@@ -1702,6 +2085,11 @@ impl MemoryManager {
                     if self.import_legacy_notes_into_graph(&mut graph)? {
                         let _ = backend.save(&key, &graph);
                     }
+                    // Ontology binding + drift detection. Cheap here (the graph
+                    // was just allocated) and it makes the binding durable, which
+                    // is what lets a later load notice that the ontology the
+                    // store was authored against has changed.
+                    self.bind_and_check_ontology(&key, &backend, &mut graph);
                     if !self.test_mode {
                         cache_graph_for_backend(backend.name(), &key, &graph, 0);
                     }
@@ -1804,6 +2192,7 @@ impl MemoryManager {
                     if Self::normalize_graph_search_text(&mut graph) {
                         let _ = backend.save(&key, &graph);
                     }
+                    self.bind_and_check_ontology(&key, &backend, &mut graph);
                     if !self.test_mode {
                         cache_graph_for_backend(backend.name(), &key, &graph, 0);
                     }
