@@ -170,45 +170,26 @@ pub fn memory_sidecar_auto_disabled() -> bool {
 
 /// Minimum meaningful content length (in chars) for an LLM-extracted memory.
 ///
-/// Content shorter than this is almost always extraction noise (a bare
-/// identifier, a truncated path fragment, a lone symbol) that pollutes vector
-/// recall without adding semantic value. See the P0-3 noise audit.
-pub const MIN_MEANINGFUL_MEMORY_LEN: usize = 12;
+/// Kept as a re-export of the v2 constant so there is a single definition;
+/// the gate itself now lives in `jcode_memory_types::reconcile` and is applied
+/// by `rule.reject` / `validate_new_entry` (E23).
+pub const MIN_MEANINGFUL_MEMORY_LEN: usize =
+    jcode_memory_types::reconcile::MIN_MEANINGFUL_MEMORY_LEN;
 
 /// Classify a memory's content as low-value extraction noise.
 ///
-/// These are the patterns observed polluting the recall pool (P0-3 audit):
+/// These are the patterns observed polluting the recall pool (P0-3 audit) plus
+/// the ones the v2 ontology makes explicit:
+/// - empty content (validation handles this as E20)
 /// - content shorter than [`MIN_MEANINGFUL_MEMORY_LEN`] chars (bare ids, paths)
 /// - content with no alphabetic/digit substance (only symbols, e.g. "---", "::")
-/// - pure git commit hashes, which the extraction prompt already says to skip
+/// - pure git commit hashes
+/// - raw tool payloads (`#Tool: bash input: {"command": ...}`)
 ///
 /// Returns true when the content looks like noise that should NOT be stored.
 pub fn is_extraction_noise(content: &str) -> bool {
-    let c = content.trim();
-    if c.is_empty() {
-        return true;
-    }
-    if c.chars().count() < MIN_MEANINGFUL_MEMORY_LEN {
-        return true;
-    }
-    // Must have at least one "word-ish" character; content that is only
-    // whitespace/symbols (e.g. "----", ":::", "**") is not a real memory.
-    let has_word_chars = c
-        .chars()
-        .any(|ch| ch.is_alphabetic() || ch.is_ascii_digit());
-    if !has_word_chars {
-        return true;
-    }
-    // Pure commit-hash shaped strings (7-40 hex chars with no spaces) are
-    // transient git noise, not durable knowledge.
-    let trimmed_len = c.len();
-    let is_hex_hash = (7..=40).contains(&trimmed_len)
-        && !c.contains(char::is_whitespace)
-        && c.chars().all(|ch| ch.is_ascii_hexdigit());
-    if is_hex_hash {
-        return true;
-    }
-    false
+    content.trim().is_empty()
+        || jcode_memory_types::reconcile::noise_reason(content).is_some()
 }
 
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
@@ -570,21 +551,45 @@ impl MemoryManager {
     }
 
     fn remember_in_graph(graph: &mut MemoryGraph, entry: MemoryEntry) -> String {
-        let normalized = entry.content.trim();
-        let duplicate = graph
-            .active_memories()
-            .into_iter()
-            .find(|existing| {
-                existing.category == entry.category && existing.content.trim() == normalized
-            })
-            .map(|existing| existing.id.clone());
-        if let Some(id) = duplicate {
-            if let Some(existing) = graph.get_memory_mut(&id) {
-                existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
+        // v2 write path: sanitize (derived `subject_key`, tag vocabulary,
+        // identity-less entity demotion) and then reconcile against the store
+        // so `dedup` / `supersedes` / `contradicts` / `relates_to` are decided
+        // by one deterministic local pass instead of never running at all.
+        let entry = jcode_memory_types::reconcile::prepare_for_write(entry);
+        let outcome = jcode_memory_types::reconcile::reconcile(&entry, graph);
+        let source_label = entry.source.clone().unwrap_or_else(|| "reconcile".to_string());
+
+        match outcome.action {
+            jcode_memory_types::reconcile::ReconcileAction::Insert => graph.add_memory(entry),
+            jcode_memory_types::reconcile::ReconcileAction::Reinforce { existing_id } => {
+                if let Some(existing) = graph.get_memory_mut(&existing_id) {
+                    existing.reinforce(&source_label, 0);
+                }
+                // Fold in tags the incoming instance carried but the stored one
+                // lacks, so a re-statement can still enrich the existing row.
+                for tag in entry.tags.clone() {
+                    graph.tag_memory(&existing_id, &tag);
+                }
+                existing_id
             }
-            return id;
+            jcode_memory_types::reconcile::ReconcileAction::Supersede { existing_id } => {
+                let new_id = graph.add_memory(entry);
+                graph.supersede(&new_id, &existing_id);
+                new_id
+            }
+            jcode_memory_types::reconcile::ReconcileAction::Contradict { existing_id } => {
+                let new_id = graph.add_memory(entry);
+                graph.mark_contradiction(&new_id, &existing_id);
+                new_id
+            }
+            jcode_memory_types::reconcile::ReconcileAction::Relate { .. } => {
+                let new_id = graph.add_memory(entry);
+                for (related_id, similarity) in &outcome.related {
+                    graph.link_memories(&new_id, related_id, *similarity);
+                }
+                new_id
+            }
         }
-        graph.add_memory(entry)
     }
 
     /// Insert or update a memory with a stable ID in the project graph.
@@ -616,6 +621,10 @@ impl MemoryManager {
         graph: &mut crate::memory_graph::MemoryGraph,
         entry: MemoryEntry,
     ) -> String {
+        // Same sanitization as the insert path: link nodes (goals, skills) and
+        // explicit upserts still get a derived `subject_key` and a clean tag
+        // list, they just skip reconciliation because their id is authoritative.
+        let entry = jcode_memory_types::reconcile::prepare_for_write(entry);
         let id = entry.id.clone();
 
         let Some(existing_snapshot) = graph.get_memory(&id).cloned() else {

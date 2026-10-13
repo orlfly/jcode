@@ -31,6 +31,10 @@ use crate::{MemoryCategory, MemoryEntry};
 /// existing one (reinforce, do not create a second row).
 pub const REINFORCE_AT: f32 = 0.85;
 /// Similarity at or above this supersedes the existing instance.
+///
+/// Superseding additionally requires the incoming instance to be at least as
+/// authoritative as the stored one and to be either a `correction` or about the
+/// same `subject_key`; see [`reconcile`].
 pub const SUPERSEDE_AT: f32 = 0.5;
 /// Similarity at or above this links the two instances (relates_to, or
 /// contradicts when the content disagrees).
@@ -106,6 +110,25 @@ fn terms(text: &str) -> HashSet<String> {
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_string())
         .collect()
+}
+
+/// Whether two contents differ only in separators/punctuation.
+///
+/// Normalized tokenization intentionally drops separators, which is what makes
+/// word-order and punctuation-insensitive matching work. In a code corpus that
+/// same property would merge `path: foo/bar` with `path: foo-bar` - different
+/// spellings of different things. This guard keeps those apart: when the
+/// alphanumeric character streams are equal but the raw text differs, the pair
+/// is related rather than collapsed.
+pub fn spelling_variant_only(a: &str, b: &str) -> bool {
+    let squeeze = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let (x, y) = (a.trim(), b.trim());
+    x != y && squeeze(x) == squeeze(y)
 }
 
 /// Token-set Jaccard similarity over the searchable text of two entries.
@@ -241,36 +264,46 @@ pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
         .map(|(_, s)| *s)
         .unwrap_or(0.0);
 
-    // Order matters:
-    //   1. an explicit disagreement wins - a contradiction must not be
-    //      laundered into a "newer version of the same fact";
-    //   2. an equivalent instance (same subject, or near-identical text) is
-    //      reinforced instead of duplicated;
-    //   3. a close paraphrase supersedes, but only when the incoming instance is
-    //      at least as authoritative as the stored one;
-    //   4. otherwise the two are related but independent.
+    // A "restatement" is the same instance said again (or nearly enough): the
+    // only case that may collapse two rows into one. It is deliberately not
+    // just `similarity >= REINFORCE_AT`, because normalized tokenization drops
+    // separators and would otherwise merge `foo/bar` with `foo-bar`.
+    let is_restatement = |other: &MemoryEntry, sim: f32| {
+        sim >= REINFORCE_AT && !spelling_variant_only(&entry.content, &other.content)
+    };
+    // The top match may be a spelling variant while an exact duplicate sits
+    // further down the ranking; pick the duplicate as the dedup target.
+    let dedup_target = scored
+        .iter()
+        .find(|(other, sim)| is_restatement(other, *sim))
+        .copied();
+
+    let same = same_subject(entry, best.0) && !spelling_variant_only(&entry.content, &best.0.content);
+    let authority_ok = entry.effective_provenance().method.authority_rank()
+        >= best.0.effective_provenance().method.authority_rank();
+    let correction = entry.category == MemoryCategory::Correction;
+
+    // Order matters, and each branch answers a different question:
+    //   1. do they disagree? -> a contradiction must not be laundered into
+    //      "a newer version of the same fact";
+    //   2. is this the same instance restated? -> reinforce, never duplicate;
+    //   3. is a *deliberate* replacement the right move, i.e. same anchor with
+    //      materially different content (an update), or a correction of
+    //      something merely similar? -> supersede;
+    //   4. otherwise -> related but independent.
     let action = if detect_conflict(entry, best.0) {
         ReconcileAction::Contradict {
             existing_id: best.0.id.clone(),
         }
-    } else if same_subject(entry, best.0) || similarity >= REINFORCE_AT {
+    } else if let Some((target, _)) = dedup_target {
         ReconcileAction::Reinforce {
-            existing_id: best.0.id.clone(),
+            existing_id: target.id.clone(),
         }
-    } else if similarity >= SUPERSEDE_AT {
-        // Never let a weaker source replace a stronger one: an LLM paraphrase
-        // must not supersede something the user stated. Equal authority is
-        // fine - the incoming instance is the newer observation.
-        if entry.effective_provenance().method.authority_rank()
-            >= best.0.effective_provenance().method.authority_rank()
-        {
-            ReconcileAction::Supersede {
-                existing_id: best.0.id.clone(),
-            }
-        } else {
-            ReconcileAction::Relate {
-                existing_id: best.0.id.clone(),
-            }
+    } else if (same || (correction && similarity >= SUPERSEDE_AT)) && authority_ok {
+        // Retiring what is stored needs at least equal authority: an LLM
+        // paraphrase must never replace something the user stated.
+        ReconcileAction::Supersede {
+            existing_id: best.0.id.clone(),
         }
     } else {
         ReconcileAction::Relate {

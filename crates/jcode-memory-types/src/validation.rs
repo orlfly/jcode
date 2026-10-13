@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{MemoryActionSpec, check_preconditions};
 use crate::graph::EdgeKind;
-use crate::instance::MemoryStatus;
+use crate::instance::{ExtractionMethod, MemoryStatus};
 use crate::{MemoryEntry, MemoryGraph};
 
 /// Severity of a validation issue.
@@ -335,6 +335,21 @@ pub fn validate_new_entry(entry: &MemoryEntry) -> Result<(), Vec<ValidationIssue
                 prov.confidence,
                 prov.method.admission_threshold()
             ),
+            Some(entry.id.clone()),
+        ));
+    }
+    // Extraction noise gate (v2 / `rule.reject`). Scoped to LLM extraction on
+    // purpose: a deliberate write (a user statement or an agent tool call) is
+    // authoritative even when short, while LLM extraction is probabilistic and
+    // really does emit tool payloads, bare identifiers and stubs - the v1 store
+    // contained raw `#Tool: bash input: {...}` rows and seven empty stubs that
+    // this gate now keeps out.
+    if prov.method == ExtractionMethod::LlmExtraction
+        && let Some(reason) = crate::reconcile::noise_reason(&entry.content)
+    {
+        issues.push(ValidationIssue::error(
+            "E23",
+            format!("Content looks like extraction noise: {reason}"),
             Some(entry.id.clone()),
         ));
     }

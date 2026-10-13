@@ -82,7 +82,10 @@ fn duplicate_reinforces() {
 }
 
 #[test]
-fn same_subject_reinforces_even_when_wording_differs() {
+fn same_subject_update_supersedes_when_content_differs() {
+    // Same anchor, materially different content: the newer description is the
+    // current truth about that subject, so it replaces the stored one instead
+    // of being folded into it.
     let mut existing = entry(
         MemoryCategory::Fact,
         "The API is reachable at /api/task/claim and needs a bearer token",
@@ -100,6 +103,33 @@ fn same_subject_reinforces_even_when_wording_differs() {
     let outcome = reconcile(&candidate, &graph);
     assert_eq!(
         outcome.action,
+        ReconcileAction::Supersede {
+            existing_id: id.clone()
+        },
+        "sim={}",
+        outcome.similarity
+    );
+}
+
+#[test]
+fn same_subject_restatement_reinforces() {
+    let mut existing = entry(
+        MemoryCategory::Fact,
+        "Kaneo claim endpoint requires a full internal task id and the team id",
+    );
+    existing.subject_key = Some("api:/api/task/claim".to_string());
+    let id = existing.id.clone();
+    let graph = graph_with(vec![existing]);
+
+    let mut candidate = entry(
+        MemoryCategory::Fact,
+        "Kaneo claim endpoint requires a full internal task id and the team id",
+    );
+    candidate.subject_key = Some("api:/api/task/claim".to_string());
+
+    let outcome = reconcile(&candidate, &graph);
+    assert_eq!(
+        outcome.action,
         ReconcileAction::Reinforce {
             existing_id: id.clone()
         }
@@ -107,7 +137,7 @@ fn same_subject_reinforces_even_when_wording_differs() {
 }
 
 #[test]
-fn paraphrase_supersedes_when_authority_allows() {
+fn correction_supersedes_a_related_fact() {
     let existing = with_method(
         entry(
             MemoryCategory::Fact,
@@ -120,11 +150,69 @@ fn paraphrase_supersedes_when_authority_allows() {
 
     let candidate = with_method(
         entry(
-            MemoryCategory::Fact,
+            MemoryCategory::Correction,
             "Kaneo claim endpoint is POST /api/task/claim/{taskId}; truncated ids fail silently",
         ),
         ExtractionMethod::LlmExtraction,
     );
+    let outcome = reconcile(&candidate, &graph);
+    assert_eq!(
+        outcome.action,
+        ReconcileAction::Supersede {
+            existing_id: id.clone()
+        },
+        "sim={}",
+        outcome.similarity
+    );
+}
+
+#[test]
+fn loose_fact_paraphrase_links_instead_of_retiring_the_original() {
+    let existing = entry(
+        MemoryCategory::Fact,
+        "The deploy script copies the bundle to the host and restarts the service unit",
+    );
+    let graph = graph_with(vec![existing]);
+
+    let candidate = entry(
+        MemoryCategory::Fact,
+        "The release script copies the build output to the host before restarting the unit",
+    );
+    let outcome = reconcile(&candidate, &graph);
+    assert_eq!(
+        outcome.action.label(),
+        "relate",
+        "a 0.5-0.65 fact overlap must not auto-retire the stored instance (sim={})",
+        outcome.similarity
+    );
+}
+
+#[test]
+fn spelling_variants_of_a_code_identifier_are_not_merged() {
+    // `foo/bar` and `foo-bar` are different spellings of different things; a
+    // token-level comparison that dropped the separator would merge them.
+    let existing = entry(MemoryCategory::Fact, "path: foo/bar");
+    let graph = graph_with(vec![existing]);
+    let candidate = entry(MemoryCategory::Fact, "path: foo-bar");
+    let outcome = reconcile(&candidate, &graph);
+    assert_ne!(
+        outcome.action.label(),
+        "reinforce",
+        "separator-only differences must stay distinct (sim={})",
+        outcome.similarity
+    );
+}
+
+#[test]
+fn same_subject_update_supersedes() {
+    let mut existing = entry(MemoryCategory::Fact, "The API base is http://localhost:1337");
+    existing.subject_key = Some("host:localhost:1337".to_string());
+    let id = existing.id.clone();
+    let graph = graph_with(vec![existing]);
+
+    let mut candidate = entry(MemoryCategory::Fact, "The API now runs on http://localhost:1337");
+    candidate.subject_key = Some("host:localhost:1337".to_string());
+
     let outcome = reconcile(&candidate, &graph);
     assert_eq!(
         outcome.action,
