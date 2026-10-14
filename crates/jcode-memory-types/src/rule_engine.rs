@@ -62,6 +62,10 @@ impl RuleContext {
             crate::MemoryCategory::Preference => crate::ontology::TYPE_PREFERENCE,
             crate::MemoryCategory::Entity => crate::ontology::TYPE_ENTITY,
             crate::MemoryCategory::Correction => crate::ontology::TYPE_CORRECTION,
+            crate::MemoryCategory::EnvFact => crate::ontology::TYPE_ENV_FACT,
+            crate::MemoryCategory::Contract => crate::ontology::TYPE_CONTRACT,
+            crate::MemoryCategory::ProcessRule => crate::ontology::TYPE_PROCESS_RULE,
+            crate::MemoryCategory::Observation => crate::ontology::TYPE_OBSERVATION,
             crate::MemoryCategory::Custom(_) => "custom",
         };
         Self {

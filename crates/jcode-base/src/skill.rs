@@ -1005,6 +1005,71 @@ pub fn record_skill_invocation(skill_name: &str, working_dir: Option<&std::path:
     let _ = manager.remember_skill_invocation(skill_name);
 }
 
+/// Accept a skill proposal draft: copy it into the installed skills directory
+/// with its `evidence:` list intact, delete the draft, and record the
+/// `skill:<name> -derived_from-> mem_*` edges plus one skill-invocation row so
+/// the memory -> skill loop closes immediately (not on the next finalize).
+///
+/// The draft keeps the body produced by distillation; the reviewer edits it
+/// in place afterwards if they want. Refuses to overwrite an existing skill
+/// with the same name -- updating an installed skill stays a human edit, and
+/// the draft's TODO body should not silently replace a refined one.
+pub fn accept_skill_proposal(
+    proposal_path: &std::path::Path,
+    working_dir: Option<&std::path::Path>,
+) -> anyhow::Result<AcceptedSkill> {
+    let raw = std::fs::read_to_string(proposal_path)?;
+    let skill = SkillRegistry::parse_skill(proposal_path)?;
+    if skill.evidence.is_empty() {
+        anyhow::bail!(
+            "{} carries no `evidence:` list; refusing to install an unverifiable draft (regenerate it with `jcode memory distill`)",
+            proposal_path.display()
+        );
+    }
+    let (skills_dir, global) = match working_dir {
+        Some(dir) => (dir.join(".jcode").join("skills"), false),
+        None => (
+            crate::storage::jcode_dir()?.join("skills"),
+            true,
+        ),
+    };
+    let target_dir = skills_dir.join(&skill.name);
+    let target = target_dir.join("SKILL.md");
+    if target.exists() {
+        anyhow::bail!(
+            "skill '{}' already exists at {}; not overwriting an installed skill with a draft body",
+            skill.name,
+            target.display()
+        );
+    }
+    std::fs::create_dir_all(&target_dir)?;
+    std::fs::write(&target, &raw)?;
+
+    // Close the loop in memory, best-effort: the file is the source of truth,
+    // memory only mirrors it.
+    let manager = if global {
+        crate::memory::MemoryManager::new()
+    } else {
+        crate::memory::MemoryManager::new().with_project_dir(working_dir.unwrap())
+    };
+    let mem_ids = manager.record_accepted_skill(&skill.name, &skill.evidence);
+    let _ = std::fs::remove_file(proposal_path);
+    Ok(AcceptedSkill {
+        name: skill.name,
+        path: target,
+        evidence_linked: mem_ids,
+    })
+}
+
+/// Result of [`accept_skill_proposal`], for the CLI report.
+#[derive(Debug)]
+pub struct AcceptedSkill {
+    pub name: String,
+    pub path: PathBuf,
+    /// Evidence ids that actually became `derived_from` edges.
+    pub evidence_linked: usize,
+}
+
 /// Mirror skills into the memory graph as `skill:<name>` link nodes.
 ///
 /// This is the skill -> memory half of the v2 linkage. It replaces the old

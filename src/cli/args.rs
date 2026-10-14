@@ -1258,6 +1258,13 @@ pub(crate) enum MemoryCommand {
         dry_run: bool,
     },
 
+    /// Accept a skill proposal draft: install it into skills/ and link its
+    /// evidence memories (`derived_from` edges + an invocation row)
+    SkillAccept {
+        /// Path to the draft in `<jcode_dir>/skills/.proposals/` (or any .md draft)
+        draft: String,
+    },
+
     /// Show memory statistics
     Stats,
 

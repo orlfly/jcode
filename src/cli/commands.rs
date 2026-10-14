@@ -1576,6 +1576,9 @@ pub enum MemorySubcommand {
     Distill {
         dry_run: bool,
     },
+    SkillAccept {
+        draft: String,
+    },
     Forget {
         id: String,
     },
@@ -1858,9 +1861,51 @@ async fn run_memory_command_for_dir(
             }
             if !dry_run && !proposals.is_empty() {
                 println!(
-                    "Review drafts in {}/skills/.proposals/ (keep the `evidence:` list when installing a skill)",
+                    "Review drafts in {}/skills/.proposals/ (install one with `jcode memory skill-accept <draft>.md`)",
                     storage::jcode_dir()?.display()
                 );
+            }
+        }
+
+        MemorySubcommand::SkillAccept { draft } => {
+            let path = std::path::PathBuf::from(&draft);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                // A bare name is resolved against the proposals dir; an
+                // explicit relative path stays relative to cwd.
+                let bare = path.to_string_lossy().replace('\\', "/");
+                if bare.contains('/') {
+                    path
+                } else {
+                    storage::jcode_dir()?
+                        .join("skills")
+                        .join(".proposals")
+                        .join(path)
+                }
+            };
+            println!("Accepting draft {}...", path.display());
+            match crate::skill::accept_skill_proposal(&path, None) {
+                Ok(accepted) => {
+                    println!(
+                        "Installed skill '{}' at {}",
+                        accepted.name,
+                        accepted.path.display()
+                    );
+                    println!(
+                        "Linked {} evidence memo(ries) via derived_from edges; recorded one skill invocation",
+                        accepted.evidence_linked
+                    );
+                    if accepted.evidence_linked == 0 {
+                        println!(
+                            "Warning: no evidence ids resolved in this store's global graph - the draft's evidence list may reference other projects."
+                        );
+                    }
+                    println!("New/updated skills are picked up by the next session start (or /skills to verify).");
+                }
+                Err(e) => {
+                    anyhow::bail!("{e}");
+                }
             }
         }
 

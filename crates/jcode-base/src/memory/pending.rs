@@ -505,6 +505,33 @@ fn store_pending_memory(
 pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
     crate::memory_log::log_marked_injected(session_id, ids);
     insert_injected_ids(session_id, ids);
+    record_memory_retrieval(ids);
+}
+
+/// Count one retrieval for each ID that was actually injected.
+///
+/// This is the read-side feedback every decay/recency/TTL mechanism in the
+/// ontology depends on: before this hook, `access_count` stayed zero for the
+/// entire store (measured 2026-10-14: all 4321 instances had never been
+/// accessed), so `touch()`-based TTL refresh and access-boosted confidence
+/// decay had no data to work with. Best-effort and fire-and-forget: a failed
+/// or slow graph save must not delay the injection it is accounting for, so
+/// the write happens on a detached task.
+fn record_memory_retrieval(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids = ids.to_vec();
+    let _ = std::thread::Builder::new()
+        .name("memory-retrieval-writeback".to_string())
+        .spawn(move || {
+            let manager = super::MemoryManager::new();
+            if let Err(e) = manager.record_retrievals(&ids) {
+                crate::logging::info(&format!(
+                    "memory retrieval writeback failed: {e}"
+                ));
+            }
+        });
 }
 
 /// Mark memory IDs as already KNOWN to a session without them having been

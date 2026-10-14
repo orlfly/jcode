@@ -788,6 +788,9 @@ fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySubcommand {
         },
         MemoryCommand::Stats => commands::MemorySubcommand::Stats,
         MemoryCommand::Distill { dry_run } => commands::MemorySubcommand::Distill { dry_run },
+        MemoryCommand::SkillAccept { draft } => {
+            commands::MemorySubcommand::SkillAccept { draft }
+        }
         MemoryCommand::Forget { id } => commands::MemorySubcommand::Forget { id },
         MemoryCommand::ClearTest => commands::MemorySubcommand::ClearTest,
         MemoryCommand::Reclassify {

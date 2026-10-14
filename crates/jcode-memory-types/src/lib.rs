@@ -454,6 +454,12 @@ impl MemoryEntry {
             MemoryCategory::Preference => 90.0,
             MemoryCategory::Fact => 30.0,
             MemoryCategory::Entity => 60.0,
+            // v2 decay policies live in the ontology; these are the same
+            // values inlined so confidence math stays available without it.
+            MemoryCategory::EnvFact => 30.0,
+            MemoryCategory::Contract => 180.0,
+            MemoryCategory::ProcessRule => 120.0,
+            MemoryCategory::Observation => 45.0,
             MemoryCategory::Custom(_) => 45.0, // Default for custom categories
         };
 
@@ -629,6 +635,14 @@ pub enum MemoryCategory {
     Preference,
     Entity,
     Correction,
+    /// v2 ontology types. Stored as first-class variants (not `Custom`) so
+    /// enum matches see them; serialization stays lowercase strings, which
+    /// round-trips both the variants and every string ever written as
+    /// `Custom` (older graphs keep loading unchanged).
+    EnvFact,
+    Contract,
+    ProcessRule,
+    Observation,
     Custom(String),
 }
 
@@ -637,6 +651,10 @@ impl std::fmt::Display for MemoryCategory {
         match self {
             MemoryCategory::Fact => write!(f, "fact"),
             MemoryCategory::Preference => write!(f, "preference"),
+            MemoryCategory::EnvFact => write!(f, "env_fact"),
+            MemoryCategory::Contract => write!(f, "contract"),
+            MemoryCategory::ProcessRule => write!(f, "process_rule"),
+            MemoryCategory::Observation => write!(f, "observation"),
             MemoryCategory::Entity => write!(f, "entity"),
             MemoryCategory::Correction => write!(f, "correction"),
             MemoryCategory::Custom(s) => write!(f, "{}", s),
@@ -653,6 +671,10 @@ impl std::str::FromStr for MemoryCategory {
             "preference" => MemoryCategory::Preference,
             "entity" => MemoryCategory::Entity,
             "correction" => MemoryCategory::Correction,
+            "env_fact" | "envfact" => MemoryCategory::EnvFact,
+            "contract" => MemoryCategory::Contract,
+            "process_rule" | "processrule" => MemoryCategory::ProcessRule,
+            "observation" => MemoryCategory::Observation,
             other => MemoryCategory::Custom(other.to_string()),
         })
     }
@@ -668,7 +690,10 @@ impl MemoryCategory {
             "preference" | "preferences" | "pref" => MemoryCategory::Preference,
             "correction" | "corrections" | "fix" | "bug" => MemoryCategory::Correction,
             "entity" | "entities" => MemoryCategory::Entity,
-            "observation" | "lesson" | "learning" => MemoryCategory::Fact,
+            "env_fact" | "envfact" | "environment" | "environment_fact" => MemoryCategory::EnvFact,
+            "contract" | "contracts" | "api_contract" => MemoryCategory::Contract,
+            "process_rule" | "processrule" | "rule" | "procedure" => MemoryCategory::ProcessRule,
+            "observation" | "lesson" | "learning" => MemoryCategory::Observation,
             _ => MemoryCategory::Fact,
         }
     }
@@ -775,6 +800,10 @@ pub fn memory_score(entry: &MemoryEntry) -> f64 {
         MemoryCategory::Preference => 30.0,
         MemoryCategory::Fact => 20.0,
         MemoryCategory::Entity => 10.0,
+        MemoryCategory::Contract => 25.0,
+        MemoryCategory::ProcessRule => 40.0,
+        MemoryCategory::EnvFact => 15.0,
+        MemoryCategory::Observation => 5.0,
         MemoryCategory::Custom(_) => 5.0,
     };
     score *= match entry.trust {
@@ -873,6 +902,10 @@ fn format_entries_for_prompt_with_header(
                 MemoryCategory::Fact => "Facts",
                 MemoryCategory::Preference => "Preferences",
                 MemoryCategory::Entity => "Entities",
+                MemoryCategory::EnvFact => "Environment Facts",
+                MemoryCategory::Contract => "Contracts",
+                MemoryCategory::ProcessRule => "Process Rules",
+                MemoryCategory::Observation => "Observations",
                 MemoryCategory::Custom(_) => "Custom",
             };
             write_section(title, items);

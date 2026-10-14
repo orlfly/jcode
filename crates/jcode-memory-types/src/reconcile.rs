@@ -619,6 +619,21 @@ pub fn prepare_for_write(mut entry: MemoryEntry) -> MemoryEntry {
     if entry.subject_key.is_none() {
         entry.subject_key = derive_subject_key(&entry.content);
     }
+    // Collapse `Custom("env_fact")`-shaped categories (written by the migration
+    // before the enum had v2 variants) into the real variants, so every store
+    // converges on canonical rows instead of carrying both spellings forever.
+    if let MemoryCategory::Custom(name) = &entry.category {
+        let canonical = match name.as_str() {
+            "env_fact" | "envfact" => Some(MemoryCategory::EnvFact),
+            "contract" => Some(MemoryCategory::Contract),
+            "process_rule" | "processrule" => Some(MemoryCategory::ProcessRule),
+            "observation" => Some(MemoryCategory::Observation),
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            entry.category = canonical;
+        }
+    }
     let sanitized = sanitize_tags(entry.tags.iter().map(String::as_str));
     if sanitized.len() != entry.tags.len() {
         entry.tags = sanitized;

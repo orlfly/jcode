@@ -1963,6 +1963,167 @@ fn slugs_read_cleanly() {
 }
 
 #[test]
+fn accepting_a_proposal_installs_the_skill_and_links_its_evidence() {
+    with_temp_home(|home| {
+        use jcode_memory_types::EdgeKind;
+
+        // Two evidence instances in the global store.
+        let manager = MemoryManager::new();
+        let mut rule =
+            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/merge/gate requires the smoke suite before merge");
+        rule.source = Some("session_a_1".to_string());
+        let id1 = manager.remember_global(rule).unwrap();
+        let mut rule2 =
+            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/merge/gate blocks merge until the smoke suite passes");
+        rule2.source = Some("session_b_2".to_string());
+        let id2 = manager.remember_global(rule2).unwrap();
+
+        // A draft proposal in the distillation output shape, including one
+        // evidence id that does not exist (stale draft) - it must be skipped.
+        let proposals = home.join("skills").join(".proposals");
+        fs::create_dir_all(&proposals).unwrap();
+        let draft = proposals.join("api-api-merge-gate.md");
+        let body = format!(
+            "---\nname: api-api-merge-gate\ndescription: Merge gate procedure.\nevidence:\n  - {id1}\n  - {id2}\n  - mem_missing_evidence_id\n---\n\n# api-api-merge-gate\n\nSteps.\n"
+        );
+        fs::write(&draft, &body).unwrap();
+
+        let accepted = crate::skill::accept_skill_proposal(&draft, None).unwrap();
+        assert_eq!(accepted.name, "api-api-merge-gate");
+        assert!(accepted.path.is_file(), "skill installed on disk");
+        assert_eq!(fs::read_to_string(&accepted.path).unwrap(), body, "draft body installed verbatim");
+        assert!(!draft.exists(), "draft removed after acceptance");
+        assert_eq!(accepted.evidence_linked, 2, "only existing ids linked");
+
+        // The mirror node records the derived_from edges.
+        let graph = manager.load_global_graph().unwrap();
+        let mirror = graph.get_memory("skill:api-api-merge-gate").expect("mirror");
+        assert_eq!(mirror.subject_key.as_deref(), Some("skill:api-api-merge-gate"));
+        let derived = graph
+            .get_edges("skill:api-api-merge-gate")
+            .iter()
+            .filter(|edge| matches!(edge.kind, EdgeKind::DerivedFrom))
+            .count();
+        assert_eq!(derived, 2, "both evidence ids linked");
+
+        // One invocation row (acceptance itself is the first use evidence).
+        // The invocation is written into the same (global) store as the mirror.
+        assert!(
+            graph.get_memory("skill-invocation:api-api-merge-gate").is_some(),
+            "invocation recorded alongside the mirror"
+        );
+    });
+}
+
+#[test]
+fn acceptance_refuses_drafts_without_evidence_and_existing_skill_names() {
+    with_temp_home(|home| {
+        let proposals = home.join("skills").join(".proposals");
+        fs::create_dir_all(&proposals).unwrap();
+
+        // Draft without evidence: refuse.
+        let no_evidence = proposals.join("no-evidence.md");
+        fs::write(&no_evidence, "---\nname: no-evidence\ndescription: x\n---\n\nBody.\n").unwrap();
+        let err = crate::skill::accept_skill_proposal(&no_evidence, None)
+            .expect_err("no-evidence draft must be refused");
+        assert!(err.to_string().contains("evidence:"), "{err}");
+        assert!(no_evidence.exists(), "refused draft is not deleted");
+
+        // Existing skill with the same name: refuse and keep the draft.
+        let manager = MemoryManager::new();
+        let mut rule =
+            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/gate/keep requires care");
+        rule.source = Some("session_c_3".to_string());
+        let id = manager.remember_global(rule).unwrap();
+        let dup = proposals.join("existing-skill.md");
+        fs::write(
+            &dup,
+            format!("---\nname: existing-skill\ndescription: x\nevidence:\n  - {id}\n---\n\nBody.\n"),
+        )
+        .unwrap();
+        let skills = home.join("skills").join("existing-skill");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(
+            skills.join("SKILL.md"),
+            "---\nname: existing-skill\ndescription: existing\n---\n\nReal body.\n",
+        )
+        .unwrap();
+        let err = crate::skill::accept_skill_proposal(&dup, None)
+            .expect_err("existing skill must not be overwritten");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(dup.exists(), "draft kept when refused");
+    });
+}
+
+#[test]
+fn retrieval_writeback_counts_access_on_injection() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new();
+        let mut entry =
+            MemoryEntry::new(MemoryCategory::Contract, "POST /api/count writes a row");
+        entry.source = Some("session_w_1".to_string());
+        let id = manager.remember_global(entry).unwrap();
+
+        assert_eq!(manager.load_global_graph().unwrap().get_memory(&id).unwrap().access_count, 0);
+        manager.record_retrievals(&[id.clone()]).unwrap();
+        manager.record_retrievals(&[id.clone(), id.clone()]).unwrap();
+        let graph = manager.load_global_graph().unwrap();
+        let counted = graph.get_memory(&id).unwrap();
+        // One retrieval per injection event: duplicate IDs in one event
+        // (the set is deduped) count once.
+        assert_eq!(counted.access_count, 2, "one count per call, not per list entry");
+        assert_eq!(counted.strength, 1, "access is not reinforcement (default strength stays)");
+    });
+}
+
+#[test]
+fn v2_categories_are_real_variants_and_round_trip_lowercase() {
+    for (text, expected) in [
+        ("env_fact", MemoryCategory::EnvFact),
+        ("contract", MemoryCategory::Contract),
+        ("process_rule", MemoryCategory::ProcessRule),
+        ("observation", MemoryCategory::Observation),
+    ] {
+        let parsed: MemoryCategory = text.parse().unwrap_or(MemoryCategory::Fact);
+        assert_eq!(parsed, expected, "{text}");
+        assert_eq!(parsed.to_string(), text, "{text} display is the disk form");
+    }
+    // Older graphs written as strings keep loading: `Custom("env_fact")`
+    // parses into the variant, unknown names stay custom (lowercased by
+    // FromStr, matching the v1 behavior).
+    assert_eq!(
+        "env_fact".parse::<MemoryCategory>().unwrap(),
+        MemoryCategory::EnvFact
+    );
+    assert_eq!(
+        "Skills".parse::<MemoryCategory>().unwrap().to_string(),
+        "skills"
+    );
+}
+
+#[test]
+fn prepare_for_write_canonicalizes_dict_shaped_categories() {
+    let entry = MemoryEntry::new(
+        MemoryCategory::Custom("env_fact".to_string()),
+        "localhost:1337 serves kananeo staging",
+    );
+    let prepared = jcode_memory_types::reconcile::prepare_for_write(entry);
+    assert_eq!(prepared.category, MemoryCategory::EnvFact);
+
+    let entry = MemoryEntry::new(
+        MemoryCategory::Custom("process_rule".to_string()),
+        "POST /api/x requires care",
+    );
+    let prepared = jcode_memory_types::reconcile::prepare_for_write(entry);
+    assert_eq!(prepared.category, MemoryCategory::ProcessRule);
+
+    // Unknown custom labels are preserved as-is.
+    let entry = MemoryEntry::new(MemoryCategory::Custom("Skills".to_string()), "x".repeat(32));
+    let prepared = jcode_memory_types::reconcile::prepare_for_write(entry);
+    assert_eq!(prepared.category, MemoryCategory::Custom("Skills".to_string()));
+}
+
+#[test]
 fn colliding_proposal_slugs_do_not_overwrite_each_other() {
     with_temp_home(|home| {
         // Two distinct *canonical* subjects whose slugs collide: the slug maps

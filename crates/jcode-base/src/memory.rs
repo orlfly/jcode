@@ -325,7 +325,9 @@ fn classify_graph(
         *report.by_type.entry(target.to_string()).or_default() += 1;
         report.type_changes += 1;
         if apply {
-            entry.category = MemoryCategory::Custom(target.to_string());
+            // Parse (not `Custom(target)`) so the store converges on real
+            // enum variants instead of string-shaped categories.
+            entry.category = target.parse().unwrap_or(MemoryCategory::Fact);
             entry.updated_at = Utc::now();
             touched = true;
         }
@@ -360,6 +362,10 @@ fn type_name_of(category: &MemoryCategory) -> &str {
         MemoryCategory::Preference => "preference",
         MemoryCategory::Entity => "entity",
         MemoryCategory::Correction => "correction",
+        MemoryCategory::EnvFact => "env_fact",
+        MemoryCategory::Contract => "contract",
+        MemoryCategory::ProcessRule => "process_rule",
+        MemoryCategory::Observation => "observation",
     }
 }
 
@@ -1452,6 +1458,119 @@ impl MemoryManager {
         Ok((generated, failed))
     }
 
+    /// Mirror-side half of accepting a skill proposal: write the mirror link
+    /// node and one `skill:<name> -derived_from-> mem_*` edge per evidence id
+    /// that exists, then record a first invocation so the loop is observable.
+    /// Returns the number of evidence ids actually linked.
+    ///
+    /// Skill mirrors always live in the **global** store even when the draft
+    /// was accepted from a project's `.proposals/`: the file is installed into
+    /// the global skills dir (or a workspace's project-local dir, see
+    /// `accept_skill_proposal`), and the mirror's scope must match where the
+    /// skill file lives, not where the evidence came from.
+    pub fn record_accepted_skill(&self, skill_name: &str, evidence_ids: &[String]) -> usize {
+        use jcode_memory_types::ontology::TYPE_OBSERVATION;
+        let name = skill_name.trim();
+        if name.is_empty() {
+            return 0;
+        }
+        let mut graph = match self.load_global_graph() {
+            Ok(g) => g,
+            Err(e) => {
+                crate::logging::warn(&format!("skill acceptance mirror failed: {e}"));
+                return 0;
+            }
+        };
+        // Idempotent mirror (same id refreshes, reconciler skips link nodes).
+        let mut mirror = crate::memory::MemoryEntry::new(
+            MemoryCategory::Custom(TYPE_OBSERVATION.to_string()),
+            format!("Skill `/{name}` distilled from memory evidence; invoke with `/{name}`."),
+        )
+        .with_id(format!("skill:{name}"))
+        .with_tags(vec![format!("skill:{name}"), "skill-accepted".to_string()])
+        .with_source("skill_registry")
+        .with_trust(crate::memory::TrustLevel::High);
+        mirror.subject_key = Some(format!("skill:{name}"));
+        graph.add_memory(mirror);
+
+        let mut linked = 0usize;
+        for id in evidence_ids {
+            if !graph.memories.contains_key(id) {
+                continue;
+            }
+            graph.add_edge(&format!("skill:{name}"), id, jcode_memory_types::EdgeKind::DerivedFrom);
+            linked += 1;
+        }
+        if let Err(e) = self.save_global_graph(&graph) {
+            crate::logging::warn(&format!("skill acceptance mirror save failed: {e}"));
+            return linked;
+        }
+        // One invocation row: the acceptance itself is evidence the skill is in
+        // use (the reviewer just acted on this workspace's own evidence). It
+        // goes into the same store as the mirror: invocation without a working
+        // dir cannot reach the project store (`remember_skill_invocation`
+        // routes there), so write the row directly alongside the mirror.
+        if graph.get_memory(&format!("skill-invocation:{name}")).is_none() {
+            let mut invocation = crate::memory::MemoryEntry::new(
+                MemoryCategory::Fact,
+                format!("Skill `/{name}` was accepted from distilled memory evidence."),
+            )
+            .with_id(format!("skill-invocation:{name}"))
+            .with_tags(vec![format!("skill:{name}"), "skill-invoked".to_string()])
+            .with_source(format!("skill:{name}"))
+            .with_provenance(
+                crate::memory::ProvenanceRecord::new(
+                    format!("skill:{name}"),
+                    crate::memory::ExtractionMethod::SkillInvocation,
+                )
+                .with_confidence(1.0),
+            );
+            invocation.subject_key = Some(format!("skill:{name}"));
+            let mut graph = self.load_global_graph().unwrap_or_default();
+            graph.add_memory(invocation);
+            let _ = self.save_global_graph(&graph);
+        }
+        linked
+    }
+
+    /// Count one retrieval for each ID (project and global stores).
+    ///
+    /// Unlike [`Self::touch_entries`] this is deliberately quiet: it fires on
+    /// every injection, so it neither logs nor needs a return report. Entries
+    /// that do not exist are silently skipped (the injection validator already
+    /// guarantees they existed at selection time).
+    pub fn record_retrievals(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id_set: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+
+        let mut project = self.load_project_graph()?;
+        let mut project_changed = false;
+        for entry in project.memories.values_mut() {
+            if id_set.contains(entry.id.as_str()) {
+                entry.touch();
+                project_changed = true;
+            }
+        }
+        if project_changed {
+            self.save_project_graph(&project)?;
+        }
+
+        let mut global = self.load_global_graph()?;
+        let mut global_changed = false;
+        for entry in global.memories.values_mut() {
+            if id_set.contains(entry.id.as_str()) {
+                entry.touch();
+                global_changed = true;
+            }
+        }
+        if global_changed {
+            self.save_global_graph(&global)?;
+        }
+        Ok(())
+    }
+
     pub fn touch_entries(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -1754,7 +1873,20 @@ impl MemoryManager {
                 Vec::new()
             }
         };
+        // Mirror nodes make skills recallable by the ordinary memory path; the
+        // pointer line closes the loop the linkage design calls "retrieval side
+        // linkage": when the recalled context (or the query itself) matches a
+        // skill that exists on disk, say so in one bounded line instead of
+        // silently remembering that a skill is available.
+        let skill_hint = self.skill_pointer_hint(query, &entries);
         if entries.is_empty() {
+            if let Some(hint) = skill_hint {
+                return MemoryRelevanceResult {
+                    display_prompt: Some(hint.clone()),
+                    prompt: Some(hint),
+                    selected_entries: Vec::new(),
+                };
+            }
             return MemoryRelevanceResult {
                 prompt: None,
                 display_prompt: None,
@@ -1762,12 +1894,46 @@ impl MemoryManager {
             };
         }
         let prompt = format_relevant_prompt(&entries, L1_MAX_RESULTS);
+        let prompt = match (prompt, skill_hint) {
+            (Some(p), Some(hint)) => Some(format!("{p}\n{hint}")),
+            (p, hint) => p.or(hint),
+        };
         let display_prompt = format_relevant_display_prompt(&entries, L1_MAX_RESULTS);
         MemoryRelevanceResult {
             prompt,
             display_prompt,
             selected_entries: entries,
         }
+    }
+
+    /// One-line "a skill already covers this" hint, or `None`.
+    ///
+    /// Fires when the query matches a `skill:<name>` mirror that L1 recall did
+    /// *not* already surface as a selected entry. The hint text is bounded
+    /// (mirror contents are bounded the same way), so adding it cannot blow up
+    /// the injection budget.
+    fn skill_pointer_hint(&self, query: &str, selected: &[MemoryEntry]) -> Option<String> {
+        let normalized = normalize_search_text(query);
+        if normalized.is_empty() {
+            return None;
+        }
+        let selected_ids: std::collections::HashSet<&str> =
+            selected.iter().map(|entry| entry.id.as_str()).collect();
+        let terms = collect_skill_query_terms(query).into_iter().collect::<Vec<_>>();
+        let skill = self
+            .collect_memories_scoped(MemoryScope::All)
+            .ok()?
+            .into_iter()
+            .find(|entry| {
+                entry.id.starts_with("skill:")
+                    && !selected_ids.contains(entry.id.as_str())
+                    && score_l1_relevance(entry, &terms, &normalized) >= L1_MIN_SCORE
+            })?;
+        let mut pointer = skill.content.trim().to_string();
+        if pointer.chars().count() > 200 {
+            pointer = pointer.chars().take(200).collect::<String>();
+        }
+        Some(format!("\n# Available Skill\n\n{pointer}"))
     }
 
     /// TTL maintenance pass (`activity.periodic_gc`).
