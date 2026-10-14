@@ -328,6 +328,31 @@ mod tests {
     /// test that asserts streak values.
     static STREAK_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Take every process-wide lock a decision-recording test needs, in the one
+    /// order that cannot deadlock, and hold them for the whole test body.
+    ///
+    /// `COUNTS` and the consecutive-degradation streak are process-global, and
+    /// `record` resets the streak on every non-degradation decision. A test that
+    /// records decisions while missing either lock therefore corrupts a
+    /// *different* test's streak: `snapshot_computes_rates` recorded two
+    /// `JudgeRan` verdicts and cleared the streak between the two
+    /// `AllJudgesFailed` records that
+    /// `intended_conversions_cleared_consecutive_degradation_streak` had just
+    /// made, so that test observed a count of 1 instead of 2.
+    fn serialize_decision_recording() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let env_guard = crate::storage::lock_test_env();
+        let streak_guard = match STREAK_LOCK.lock() {
+            Ok(guard) => guard,
+            // A poisoned mutex means another test panicked while holding it.
+            // Recover by clearing the poison and proceeding.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (env_guard, streak_guard)
+    }
+
     #[test]
     fn all_array_matches_enum_and_indices() {
         // ALL is complete and indices are unique + in range.
@@ -370,6 +395,9 @@ mod tests {
 
     #[test]
     fn snapshot_computes_rates() {
+        // Recording here clears the streak, so serialize against the streak
+        // tests that assert absolute counts.
+        let _locks = serialize_decision_recording();
         // The COUNTS table is process-global, so a parallel test can race
         // us. Snapshot *before* and *after* recording, then verify the deltas
         // line up with the rates we expect.
@@ -404,16 +432,7 @@ mod tests {
 
     #[test]
     fn sustained_degradation_counter_increments_only_on_degradation() {
-        // Serialize against the only other test that records decisions (the
-        // fake-Jev acceptance test in memory_agent_tests); it holds the env
-        // lock, so taking it here in the same order keeps the streak stable.
-        let _env_lock = crate::storage::lock_test_env();
-        let _guard = match STREAK_LOCK.lock() {
-            Ok(g) => g,
-            // A poisoned mutex means another test panicked while holding it.
-            // Recover by clearing the poison and proceeding.
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _locks = serialize_decision_recording();
 
         // Reset the streak so we can reason about absolute counts.
         reset_consecutive_degradations();
@@ -438,14 +457,7 @@ mod tests {
 
     #[test]
     fn intended_conversions_cleared_consecutive_degradation_streak() {
-        // Serialize against the only other test that records decisions (the
-        // fake-Jev acceptance test in memory_agent_tests); it holds the env
-        // lock, so taking it here in the same order keeps the streak stable.
-        let _env_lock = crate::storage::lock_test_env();
-        let _guard = match STREAK_LOCK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _locks = serialize_decision_recording();
         reset_consecutive_degradations();
 
         record(JudgeDecision::AllJudgesFailed, "s", 5);
@@ -457,14 +469,7 @@ mod tests {
 
     #[test]
     fn explicit_opt_out_does_not_count_as_degradation() {
-        // Serialize against the only other test that records decisions (the
-        // fake-Jev acceptance test in memory_agent_tests); it holds the env
-        // lock, so taking it here in the same order keeps the streak stable.
-        let _env_lock = crate::storage::lock_test_env();
-        let _guard = match STREAK_LOCK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _locks = serialize_decision_recording();
         reset_consecutive_degradations();
 
         // OptedOut is "intended", so the sidecar must not auto-disable even
