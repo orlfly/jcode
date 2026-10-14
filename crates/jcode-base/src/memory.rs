@@ -1927,13 +1927,18 @@ impl MemoryManager {
         // linkage": when the recalled context (or the query itself) matches a
         // skill that exists on disk, say so in one bounded line instead of
         // silently remembering that a skill is available.
-        let skill_hint = self.skill_pointer_hint(query, &entries);
+        let skill_mirror = self.skill_pointer_hint(query, &entries);
+        let skill_hint = skill_mirror.as_ref().map(Self::skill_hint_text);
         if entries.is_empty() {
-            if let Some(hint) = skill_hint {
+            // Hint-only hit: the mirror itself becomes the selected entry so
+            // the pending publication has an ID to validate (an empty ID set
+            // would be discarded at publication).
+            if let Some(mirror) = skill_mirror {
+                let hint = Self::skill_hint_text(&mirror);
                 return MemoryRelevanceResult {
                     display_prompt: Some(hint.clone()),
                     prompt: Some(hint),
-                    selected_entries: Vec::new(),
+                    selected_entries: vec![mirror],
                 };
             }
             return MemoryRelevanceResult {
@@ -1955,13 +1960,14 @@ impl MemoryManager {
         }
     }
 
-    /// One-line "a skill already covers this" hint, or `None`.
+    /// The matching un-selected `skill:` mirror and its bounded pointer line,
+    /// or `None`.
     ///
     /// Fires when the query matches a `skill:<name>` mirror that L1 recall did
     /// *not* already surface as a selected entry. The hint text is bounded
     /// (mirror contents are bounded the same way), so adding it cannot blow up
     /// the injection budget.
-    fn skill_pointer_hint(&self, query: &str, selected: &[MemoryEntry]) -> Option<String> {
+    fn skill_pointer_hint(&self, query: &str, selected: &[MemoryEntry]) -> Option<MemoryEntry> {
         let normalized = normalize_search_text(query);
         if normalized.is_empty() {
             return None;
@@ -1978,11 +1984,16 @@ impl MemoryManager {
                     && !selected_ids.contains(entry.id.as_str())
                     && score_l1_relevance(entry, &terms, &normalized) >= L1_MIN_SCORE
             })?;
-        let mut pointer = skill.content.trim().to_string();
+        Some(skill)
+    }
+
+    /// The one-line hint body for a mirror (bounded pointer text).
+    fn skill_hint_text(mirror: &MemoryEntry) -> String {
+        let mut pointer = mirror.content.trim().to_string();
         if pointer.chars().count() > 200 {
             pointer = pointer.chars().take(200).collect::<String>();
         }
-        Some(format!("\n# Available Skill\n\n{pointer}"))
+        format!("\n# Available Skill\n\n{pointer}")
     }
 
     /// TTL maintenance pass (`activity.periodic_gc`).

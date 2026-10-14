@@ -1672,6 +1672,47 @@ fn project_local_skill_mirrors_land_in_the_project_store() {
 }
 
 #[test]
+fn l1_hint_surface_a_matching_skill_mirror() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-hint");
+        // A skill mirror (global-store link node with a bounded pointer).
+        let mut mirror = MemoryEntry::new(
+            MemoryCategory::Custom("observation".to_string()),
+            "Skill `/api-api-task-param`: Apply when working on api:/api/task/{param}. Invoke with `/api-api-task-param` (Skill /api-api-task-param).",
+        )
+        .with_id("skill:api-api-task-param")
+        .with_source("skill_registry");
+        mirror.subject_key = Some("skill:api-api-task-param".to_string());
+        manager.remember_global(mirror).unwrap();
+        // Unrelated knowledge, so the L1 selection itself is empty.
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "The Kitty keyboard protocol needs enable_keyboard_enhancement",
+            ))
+            .unwrap();
+
+        // The mirror is what matches (query contains the anchor head of the
+        // subject_key). L1 itself selects it, so the prompt is the regular
+        // formatted one; the skill hint adds its bounded pointer line.
+        let result = manager.l1_relevance_result("how do I accept work on /api/api-task-param");
+        let prompt = result.prompt.expect("hint prompt");
+        assert!(
+            prompt.contains("/api-api-task-param"),
+            "mirror surfaced: {prompt}"
+        );
+        // Hint-and-selection: the mirror itself is the selected entry (so
+        // publication has an ID to validate and the access feedback counts it).
+        assert_eq!(result.selected_entries.len(), 1);
+        assert_eq!(
+            result.selected_entries[0].id,
+            "skill:api-api-task-param"
+        );
+        assert!(prompt.chars().count() < 400, "bounded: {prompt}");
+    });
+}
+
+#[test]
 fn l1_recall_matches_subject_anchor_without_any_backend() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/l1-recall");
