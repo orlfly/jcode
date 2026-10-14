@@ -191,7 +191,18 @@ pub fn score_l1_relevance(entry: &MemoryEntry, query_terms: &[String], normalize
     }
     if let Some(subject) = entry.subject_key.as_deref() {
         let subject_head = subject.split(':').nth(1).unwrap_or(subject);
-        if !subject_head.is_empty() && normalized_query.contains(subject_head) {
+        // Both sides get the query normalization: the normalizer maps `-` /
+        // `/` / `:` to spaces, so comparing the raw head (e.g.
+        // `api-api-task-param`) against the normalized query would never
+        // match, and anchored recall silently lost every dashed subject
+        // (measured: the live two-turn check scored 0 where the anchor was
+        // spelled the same way).
+        let subject_norm = if subject_head.contains(['-', '/', '.', '_']) {
+            normalize_search_text(subject_head)
+        } else {
+            subject_head.to_string()
+        };
+        if !subject_norm.is_empty() && normalized_query.contains(&subject_norm) {
             return 1.0;
         }
     }

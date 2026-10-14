@@ -163,13 +163,27 @@ fn snapshot_selected_memories(
         Some(project) => super::MemoryManager::new().with_project_dir(project),
         None => super::MemoryManager::new(),
     };
-    let project = match manager.project_memory_path()? {
-        Some(path) => read_validation_graph(&path)?,
-        None => crate::memory_graph::MemoryGraph::new(),
+    // Backend-aware snapshot sources. The previous implementation read the
+    // legacy JSON files only; on the sqlite backend (`active_backend_name()
+    // == "sqlite-gvec"`) there is no global JSON, so every selection that
+    // included a global-store memory failed validation here and was silently
+    // discarded. Which file exists still decides the failure mode: a source
+    // that is *present but unreadable/corrupt* must fail closed (the
+    // corruption tests), only an absent source degrades to an empty graph.
+    let project = match manager.project_memory_path() {
+        Ok(Some(path)) if path.exists() => read_validation_graph(&path)?,
+        _ => manager.load_project_graph().unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new()),
     };
-    // Do not swallow a corrupt/unreadable store, even if the other store has
-    // matching IDs. Ambiguous duplicate IDs are likewise rejected below.
-    let global = read_validation_graph(&manager.global_memory_path()?)?;
+    let global = {
+        let path = manager.global_memory_path()?;
+        if path.exists() {
+            read_validation_graph(&path)?
+        } else {
+            manager
+                .load_global_graph()
+                .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new())
+        }
+    };
     let mut snapshots = HashMap::new();
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
@@ -420,6 +434,12 @@ fn publish_scoped_memory(
             session_id,
             "cannot validate selected memory at publication",
         );
+        crate::logging::info(&format!(
+            "[pending] validation failed at publication: ids={:?} project={:?} err={:?}",
+            memory_ids,
+            project_dir,
+            snapshot_selected_memories(project_dir, &memory_ids).err().map(|e| e.to_string())
+        ));
         return;
     };
     if let Some(selected) = selected_entries {

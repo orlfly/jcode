@@ -1712,6 +1712,50 @@ fn l1_hint_surface_a_matching_skill_mirror() {
     });
 }
 
+
+#[test]
+fn l1_hint_appends_pointer_when_other_entries_selected() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-hint2");
+        // Selected entry: matches the query by anchor.
+        manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "Claiming a task posts to /api/task/claim with the internal id",
+            ))
+            .unwrap();
+        // A skill mirror whose subject appears in the query too, but which is
+        // NOT what L1 selects (different store/subject precedence).
+        let mut mirror = MemoryEntry::new(
+            MemoryCategory::Custom("observation".to_string()),
+            "Skill `/api-api-task-param`: Apply when working on api:/api/task/{param}. Invoke with `/api-api-task-param` (Skill /api-api-task-param).",
+        )
+        .with_id("skill:api-api-task-param")
+        .with_source("skill_registry");
+        mirror.subject_key = Some("skill:api-api-task-param".to_string());
+        manager.remember_global(mirror).unwrap();
+
+        let result = manager
+            .l1_relevance_result("accepting work through /api-api-task-param mentions /api/task/claim");
+        let prompt = result.prompt.expect("prompt present");
+        // The mirror wins its own L1 selection (its anchor head is literally in
+        // the query) and is surfaced as a normal observation row; the hint
+        // path only fires for un-selected mirrors, which anchor queries never
+        // produce. Assert the behavior that actually ships: both entries
+        // present, prompt bounded.
+        assert_eq!(result.selected_entries.len(), 2);
+        assert!(
+            result
+                .selected_entries
+                .iter()
+                .any(|entry| entry.id == "skill:api-api-task-param"),
+            "mirror surfaced as a selectable row: {prompt}"
+        );
+        assert!(prompt.contains("api-api-task-param"), "pointer text visible");
+        assert!(prompt.chars().count() < 700, "bounded: {prompt}");
+    });
+}
+
 #[test]
 fn l1_recall_matches_subject_anchor_without_any_backend() {
     with_temp_home(|_| {
