@@ -1920,7 +1920,26 @@ impl MemoryManager {
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(limit.min(L1_MAX_RESULTS));
-        Ok(scored.into_iter().map(|(_, entry)| entry).collect())
+        // Link-node ids are deliberately mirrored into every scope that uses
+        // the artifact, so the same id (e.g. `skill:<name>`) legitimately
+        // appears once per store in the scan. One row per id: publication
+        // rejects duplicate ids outright ("duplicate selected memory ID"),
+        // which previously dropped the whole selection.
+        // A link node's id may come from several scopes with slightly different
+        // tag sets. The publication snapshot resolves an id duplicate to the
+        // GLOBAL copy (`snapshot_selected_memories`), so the dedupe must keep
+        // that same copy: collect order is project-then-global, and a stable
+        // sort on score keeps that relative order for equal scores, so keeping
+        // the LAST occurrence per id selects the global copy. (Regular memories
+        // have unique ids; this only rewrites duplicated link-node rows.)
+        let mut by_id: Vec<(String, MemoryEntry)> = Vec::new();
+        for (_, entry) in scored {
+            match by_id.iter_mut().find(|(id, _)| *id == entry.id) {
+                Some(slot) => slot.1 = entry,
+                None => by_id.push((entry.id.clone(), entry)),
+            }
+        }
+        Ok(by_id.into_iter().map(|(_, entry)| entry).collect())
     }
 
     /// L1 recall shaped as a [`MemoryRelevanceResult`] so the memory agent can
