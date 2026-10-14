@@ -1461,15 +1461,15 @@ fn skill_distillation_proposes_from_agreeing_evidence() {
         let evidence = [
             (
                 "session_a_1",
-                "task #157: the drill log must be backfilled into the design doc",
+                "POST /api/drill/sign-off: the drill log must be backfilled into the design doc",
             ),
             (
                 "session_b_2",
-                "task #157 acceptance needs at least 24h of shadow drill results",
+                "POST /api/drill/sign-off acceptance needs at least 24h of shadow drill",
             ),
             (
                 "session_c_3",
-                "task #157 条件③ requires the drill log attached before sign-off",
+                "POST /api/drill/sign-off 条件③ requires the drill log before sign-off",
             ),
         ];
         for (session, content) in evidence {
@@ -1483,7 +1483,7 @@ fn skill_distillation_proposes_from_agreeing_evidence() {
         // Only two evidence items: below the threshold.
         let mut weak = MemoryEntry::new(
             MemoryCategory::Custom("process_rule".to_string()),
-            "Unrelated procedure about task #999 ordering",
+            "Unrelated procedure about POST /api/drill/other ordering",
         );
         weak.source = Some("session_d_4".to_string());
         manager.remember_project(weak).unwrap();
@@ -1491,22 +1491,25 @@ fn skill_distillation_proposes_from_agreeing_evidence() {
         let proposals = manager.collect_skill_evidence().expect("evidence");
         let drill = proposals
             .iter()
-            .find(|p| p.subject_key == "task:#157")
-            .expect("aggregated evidence for task #157");
+            .find(|p| p.subject_key == "api:/api/drill/sign-off")
+            .expect("aggregated evidence for the drill sign-off route");
         assert_eq!(drill.evidence.len(), 3);
         assert!(drill.sessions.len() >= 3);
         assert!(
-            !proposals.iter().any(|p| p.subject_key == "task:#999"),
+            !proposals.iter().any(|p| p.subject_key == "api:/api/drill/other"),
             "single-session evidence must not produce a proposal"
         );
 
         // The proposal pipeline writes a reviewable draft, never an install.
         let written = manager.distill_skill_evidence().expect("distill");
-        assert!(written.iter().any(|p| p.subject_key == "task:#157"));
-        let draft = home.join("skills").join(".proposals").join("task-157.md");
+        assert!(written.iter().any(|p| p.subject_key == "api:/api/drill/sign-off"));
+        let draft = home
+            .join("skills")
+            .join(".proposals")
+            .join("api-api-drill-sign-off.md");
         let body = std::fs::read_to_string(&draft).expect("draft written");
-        assert!(body.contains("name: task-157"));
-        assert!(body.contains("task:#157"));
+        assert!(body.contains("name: api-api-drill-sign-off"));
+        assert!(body.contains("api:/api/drill/sign-off"));
     });
 }
 
@@ -1744,9 +1747,21 @@ fn skill_distillation_aggregates_evidence_across_project_stores() {
         // the same store would reconcile with each other first (which is
         // correct behaviour, just not what this test measures).
         let evidence = [
-            ("/xstore-a", "session_xa_1", "task #42 requires the smoke suite before merge"),
-            ("/xstore-b", "session_xb_1", "task #42: merge is blocked until the smoke suite passes"),
-            ("/xstore-c", "session_xc_1", "task #42 merge gate requires a passing smoke suite"),
+            (
+                "/xstore-a",
+                "session_xa_1",
+                "POST /api/merge/gate requires the smoke suite before merge",
+            ),
+            (
+                "/xstore-b",
+                "session_xb_1",
+                "POST /api/merge/gate is blocked until the smoke suite passes",
+            ),
+            (
+                "/xstore-c",
+                "session_xc_1",
+                "POST /api/merge/gate needs a passing smoke suite first",
+            ),
         ];
         for (dir, session, content) in evidence {
             let manager = MemoryManager::new().with_project_dir(dir);
@@ -1765,7 +1780,7 @@ fn skill_distillation_aggregates_evidence_across_project_stores() {
         let proposals = observer.collect_skill_evidence().expect("evidence");
         let proposal = proposals
             .iter()
-            .find(|p| p.subject_key == "task:#42")
+            .find(|p| p.subject_key == "api:/api/merge/gate")
             .unwrap_or_else(|| panic!("expected a cross-store proposal, got {proposals:#?}"));
         assert_eq!(proposal.evidence.len(), 3);
         assert!(
@@ -1910,6 +1925,44 @@ fn reclassify_can_backfill_subject_keys() {
 }
 
 #[test]
+fn proposal_subjects_must_name_reusable_things() {
+    use crate::memory::proposal_eligible_subject as eligible;
+
+    // Interfaces and code locations are reusable subjects.
+    assert!(eligible("api:/api/task/{param}"));
+    assert!(eligible("api:/api/task/claim-next"));
+    assert!(eligible("file:src/app/main.rs"));
+    assert!(eligible("file:.gitlab-ci.yml"));
+    assert!(eligible("file:AGENTS.md"));
+    assert!(eligible("file:openapi/shared/*.yaml"));
+
+    // Instances and environment details are not, even though they are good
+    // retrieval anchors for the memory itself.
+    assert!(!eligible("task:#117"), "a single task is not a skill");
+    assert!(!eligible("mr:!387"), "a single merge request is not a skill");
+    assert!(!eligible("host:localhost:1337"));
+    // A bare JS-ecosystem name is usually a dependency, not a repo file ...
+    assert!(!eligible("file:Next.js"));
+    assert!(!eligible("file:react.ts"));
+    // ... but the same name with a path is a real location.
+    assert!(eligible("file:src/pages/index.js"));
+}
+
+#[test]
+fn slugs_read_cleanly() {
+    let proposal = SkillEvidenceProposal {
+        subject_key: "api:/api/task/{param}".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(proposal.slug(), "api-api-task-param");
+    let proposal = SkillEvidenceProposal {
+        subject_key: "file:.gitlab-ci.yml".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(proposal.slug(), "file-gitlab-ci-yml");
+}
+
+#[test]
 fn colliding_proposal_slugs_do_not_overwrite_each_other() {
     with_temp_home(|home| {
         // Two distinct *canonical* subjects whose slugs collide: the slug maps
@@ -1965,9 +2018,21 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
         // material overlap supersedes), which is correct but not what this test
         // is about.
         for (dir, session, content) in [
-            ("/distill-rate-a", "session_r1", "task #77 requires the smoke suite before merge"),
-            ("/distill-rate-b", "session_r2", "task #77: merge is blocked until the smoke suite passes"),
-            ("/distill-rate-c", "session_r3", "task #77 merge gate requires a passing smoke suite"),
+            (
+                "/distill-rate-a",
+                "session_r1",
+                "POST /api/merge/gate requires the smoke suite before merge",
+            ),
+            (
+                "/distill-rate-b",
+                "session_r2",
+                "POST /api/merge/gate is blocked until the smoke suite passes",
+            ),
+            (
+                "/distill-rate-c",
+                "session_r3",
+                "POST /api/merge/gate needs a passing smoke suite first",
+            ),
         ] {
             let mut entry = MemoryEntry::new(
                 MemoryCategory::Custom("process_rule".to_string()),
@@ -1984,7 +2049,7 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
         // A finalize pass claims the slot and writes the drafts.
         let first = manager.distill_skill_evidence().unwrap();
         assert!(
-            first.iter().any(|p| p.subject_key == "task:#77"),
+            first.iter().any(|p| p.subject_key == "api:/api/merge/gate"),
             "cross-store evidence must qualify: {first:#?}"
         );
         assert!(
@@ -2000,6 +2065,6 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
 
         // ... while an explicit request (the `memory distill` CLI) still writes.
         let explicit = manager.write_skill_proposals_now().unwrap();
-        assert!(explicit.iter().any(|p| p.subject_key == "task:#77"));
+        assert!(explicit.iter().any(|p| p.subject_key == "api:/api/merge/gate"));
     });
 }

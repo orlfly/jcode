@@ -421,6 +421,29 @@ fn looks_like_host_port(lower: &str) -> bool {
         })
 }
 
+/// Whether an anchor can name a reusable procedure, i.e. whether it is worth
+/// turning accumulated evidence about it into a skill.
+///
+/// `task:*`, `mr:*` and `host:*` are instance or environment identifiers: a
+/// skill about "task #117" or "localhost:1337" is not reusable, even though the
+/// anchor is an excellent retrieval key for the memory itself. Bare
+/// JS-ecosystem filenames are usually dependency or product names ("Next.js"),
+/// so a file anchor only counts when it carries a path or names a
+/// configuration/source file that a repository actually owns.
+fn proposal_eligible_subject(key: &str) -> bool {
+    match key.split_once(':') {
+        Some(("api", _)) => true,
+        Some(("file", rest)) => {
+            rest.contains('/')
+                || !matches!(
+                    rest.rsplit_once('.').map(|(_, ext)| ext),
+                    Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Minimum number of agreeing evidence instances before a skill is proposed.
 const SKILL_DISTILL_MIN_EVIDENCE: usize = 3;
 /// Minimum number of distinct stores the evidence must span.
@@ -445,13 +468,23 @@ impl SkillEvidenceProposal {
     /// Stable file name for the draft, derived from the subject anchor.
     fn slug(&self) -> String {
         let raw = self.subject_key.replace([':', '/', '{', '}', '.', ' '], "-");
-        let mut slug: String = raw
+        let filtered: String = raw
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .take(64)
             .collect();
-        while slug.starts_with('-') {
-            slug.remove(0);
+        // Collapse runs and trim both ends: `api:/api/task/{param}` should read
+        // `api-api-task-param`, not `api--api-task--param-`.
+        let mut slug = String::with_capacity(filtered.len());
+        for ch in filtered.chars() {
+            if ch == '-' && slug.ends_with('-') {
+                continue;
+            }
+            slug.push(ch);
+        }
+        let slug: String = slug.trim_matches('-').chars().take(64).collect();
+        let mut slug = slug;
+        while slug.ends_with('-') {
+            slug.pop();
         }
         if slug.is_empty() {
             "skill".to_string()
@@ -2042,6 +2075,9 @@ impl MemoryManager {
                 // extractors (param spelling, trailing punctuation) still land
                 // in the same cluster as today's rows.
                 let subject = jcode_memory_types::reconcile::normalize_subject_key(&subject);
+                if !proposal_eligible_subject(&subject) {
+                    continue;
+                }
                 let proposal = groups
                     .entry(subject.clone())
                     .or_insert_with(|| SkillEvidenceProposal {
