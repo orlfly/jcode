@@ -176,6 +176,18 @@ fn snapshot_selected_memories(
         let (entry, is_global) = match (project.get_memory(id), global.get_memory(id)) {
             (Some(entry), None) => (entry, false),
             (None, Some(entry)) => (entry, true),
+            // Skill mirrors are link nodes whose id can exist in several
+            // scopes at once by design (the finalize sync mirrors a global
+            // skill into each project's store that uses it). Snapshot on the
+            // global copy: an id-for-id duplicate of the same pointer artifact
+            // is not ambiguity, and treating it as one made every
+            // accepted-skill hint undeliverable (observed: 'cannot validate
+            // selected memory at publication', three turns in a row).
+            (Some(_), Some(_)) if jcode_memory_types::is_link_id(id) => {
+                let entry = global.get_memory(id).expect("checked above");
+                entries.push(entry.clone());
+                continue;
+            }
             _ => anyhow::bail!("selected memory is absent or ambiguous"),
         };
         anyhow::ensure!(
