@@ -1248,6 +1248,16 @@ pub(crate) enum MemoryCommand {
         id: String,
     },
 
+    /// Distill accumulated memory evidence into draft skills for review
+    ///
+    /// Runs the same pass the session finalize runs, without the once-a-day
+    /// rate limit, and writes drafts to `<jcode_dir>/skills/.proposals/`.
+    Distill {
+        /// Report what would be proposed without writing drafts
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Show memory statistics
     Stats,
 

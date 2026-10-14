@@ -1979,6 +1979,19 @@ impl MemoryManager {
         if !claim_maintenance_slot(&base, "skill-distill.stamp", 24 * 60 * 60) {
             return Ok(Vec::new());
         }
+        self.write_skill_proposals_now()
+    }
+
+    /// Run the distillation pass without the once-a-day rate limit.
+    ///
+    /// Used both by [`Self::distill_skill_evidence`] (after claiming the slot)
+    /// and by `jcode memory distill`, where the user asking for it explicitly is
+    /// the intent: waiting for a session finalize to regenerate drafts is not a
+    /// usable workflow for reviewing what the store has learned so far.
+    pub fn write_skill_proposals_now(&self) -> Result<Vec<SkillEvidenceProposal>> {
+        let Ok(base) = crate::storage::jcode_dir() else {
+            return Ok(Vec::new());
+        };
         let proposals = self.collect_skill_evidence()?;
         write_skill_proposals(&base, &proposals)?;
         Ok(proposals)

@@ -1908,3 +1908,50 @@ fn reclassify_can_backfill_subject_keys() {
         assert_eq!(key_of(&prose), None, "prose has no stable subject");
     });
 }
+
+#[test]
+fn explicit_distill_bypasses_the_daily_rate_limit() {
+    with_temp_home(|home| {
+        // One item per store: three statements about the same task landing in
+        // one store would reconcile with each other first (same anchor plus
+        // material overlap supersedes), which is correct but not what this test
+        // is about.
+        for (dir, session, content) in [
+            ("/distill-rate-a", "session_r1", "task #77 requires the smoke suite before merge"),
+            ("/distill-rate-b", "session_r2", "task #77: merge is blocked until the smoke suite passes"),
+            ("/distill-rate-c", "session_r3", "task #77 merge gate requires a passing smoke suite"),
+        ] {
+            let mut entry = MemoryEntry::new(
+                MemoryCategory::Custom("process_rule".to_string()),
+                content,
+            );
+            entry.source = Some(session.to_string());
+            MemoryManager::new()
+                .with_project_dir(dir)
+                .remember_project(entry)
+                .unwrap();
+        }
+        let manager = MemoryManager::new().with_project_dir("/distill-rate-observer");
+
+        // A finalize pass claims the slot and writes the drafts.
+        let first = manager.distill_skill_evidence().unwrap();
+        assert!(
+            first.iter().any(|p| p.subject_key == "task:#77"),
+            "cross-store evidence must qualify: {first:#?}"
+        );
+        assert!(
+            home.join("skill-distill.stamp").exists(),
+            "the rate-limit stamp is written by the finalize path"
+        );
+
+        // ... so the same call a moment later is suppressed ...
+        assert!(
+            manager.distill_skill_evidence().unwrap().is_empty(),
+            "the daily pass must not run twice"
+        );
+
+        // ... while an explicit request (the `memory distill` CLI) still writes.
+        let explicit = manager.write_skill_proposals_now().unwrap();
+        assert!(explicit.iter().any(|p| p.subject_key == "task:#77"));
+    });
+}

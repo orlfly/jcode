@@ -1573,6 +1573,9 @@ pub enum MemorySubcommand {
         overwrite: bool,
     },
     Stats,
+    Distill {
+        dry_run: bool,
+    },
     Forget {
         id: String,
     },
@@ -1829,6 +1832,35 @@ async fn run_memory_command_for_dir(
             println!("\nBy category:");
             for (cat, count) in &categories {
                 println!("  {}: {}", cat, count);
+            }
+        }
+
+        MemorySubcommand::Distill { dry_run } => {
+            let proposals = if dry_run {
+                manager.collect_skill_evidence()?
+            } else {
+                manager.write_skill_proposals_now()?
+            };
+            println!(
+                "{} {} skill proposal(s) from accumulated evidence",
+                if dry_run { "Would write" } else { "Wrote" },
+                proposals.len()
+            );
+            for proposal in proposals.iter().take(20) {
+                println!(
+                    "  {:<34} evidence={:<3} stores={:<2} sessions={:<3} weight={:.0}",
+                    proposal.subject_key,
+                    proposal.evidence.len(),
+                    proposal.stores.len(),
+                    proposal.sessions.len(),
+                    proposal.weight
+                );
+            }
+            if !dry_run && !proposals.is_empty() {
+                println!(
+                    "Review drafts in {}/skills/.proposals/ (keep the `evidence:` list when installing a skill)",
+                    storage::jcode_dir()?.display()
+                );
             }
         }
 
