@@ -163,19 +163,45 @@ fn snapshot_selected_memories(
         Some(project) => super::MemoryManager::new().with_project_dir(project),
         None => super::MemoryManager::new(),
     };
-    let project = match manager.project_memory_path()? {
-        Some(path) => read_validation_graph(&path)?,
-        None => crate::memory_graph::MemoryGraph::new(),
+    // Backend-aware snapshot sources. The previous implementation read the
+    // legacy JSON files only; on the sqlite backend (`active_backend_name()
+    // == "sqlite-gvec"`) there is no global JSON, so every selection that
+    // included a global-store memory failed validation here and was silently
+    // discarded. Which file exists still decides the failure mode: a source
+    // that is *present but unreadable/corrupt* must fail closed (the
+    // corruption tests), only an absent source degrades to an empty graph.
+    let project = match manager.project_memory_path() {
+        Ok(Some(path)) if path.exists() => read_validation_graph(&path)?,
+        _ => manager.load_project_graph().unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new()),
     };
-    // Do not swallow a corrupt/unreadable store, even if the other store has
-    // matching IDs. Ambiguous duplicate IDs are likewise rejected below.
-    let global = read_validation_graph(&manager.global_memory_path()?)?;
+    let global = {
+        let path = manager.global_memory_path()?;
+        if path.exists() {
+            read_validation_graph(&path)?
+        } else {
+            manager
+                .load_global_graph()
+                .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new())
+        }
+    };
     let mut snapshots = HashMap::new();
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
         let (entry, is_global) = match (project.get_memory(id), global.get_memory(id)) {
             (Some(entry), None) => (entry, false),
             (None, Some(entry)) => (entry, true),
+            // Skill mirrors are link nodes whose id can exist in several
+            // scopes at once by design (the finalize sync mirrors a global
+            // skill into each project's store that uses it). Snapshot on the
+            // global copy: an id-for-id duplicate of the same pointer artifact
+            // is not ambiguity, and treating it as one made every
+            // accepted-skill hint undeliverable (observed: 'cannot validate
+            // selected memory at publication', three turns in a row).
+            (Some(_), Some(_)) if jcode_memory_types::is_link_id(id) => {
+                let entry = global.get_memory(id).expect("checked above");
+                entries.push(entry.clone());
+                continue;
+            }
             _ => anyhow::bail!("selected memory is absent or ambiguous"),
         };
         anyhow::ensure!(
@@ -408,6 +434,12 @@ fn publish_scoped_memory(
             session_id,
             "cannot validate selected memory at publication",
         );
+        crate::logging::info(&format!(
+            "[pending] validation failed at publication: ids={:?} project={:?} err={:?}",
+            memory_ids,
+            project_dir,
+            snapshot_selected_memories(project_dir, &memory_ids).err().map(|e| e.to_string())
+        ));
         return;
     };
     if let Some(selected) = selected_entries {
@@ -505,6 +537,33 @@ fn store_pending_memory(
 pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
     crate::memory_log::log_marked_injected(session_id, ids);
     insert_injected_ids(session_id, ids);
+    record_memory_retrieval(ids);
+}
+
+/// Count one retrieval for each ID that was actually injected.
+///
+/// This is the read-side feedback every decay/recency/TTL mechanism in the
+/// ontology depends on: before this hook, `access_count` stayed zero for the
+/// entire store (measured 2026-10-14: all 4321 instances had never been
+/// accessed), so `touch()`-based TTL refresh and access-boosted confidence
+/// decay had no data to work with. Best-effort and fire-and-forget: a failed
+/// or slow graph save must not delay the injection it is accounting for, so
+/// the write happens on a detached task.
+fn record_memory_retrieval(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids = ids.to_vec();
+    let _ = std::thread::Builder::new()
+        .name("memory-retrieval-writeback".to_string())
+        .spawn(move || {
+            let manager = super::MemoryManager::new();
+            if let Err(e) = manager.record_retrievals(&ids) {
+                crate::logging::info(&format!(
+                    "memory retrieval writeback failed: {e}"
+                ));
+            }
+        });
 }
 
 /// Mark memory IDs as already KNOWN to a session without them having been

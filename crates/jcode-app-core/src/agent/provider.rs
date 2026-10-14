@@ -117,6 +117,15 @@ impl Agent {
         }
     }
 
+    /// The context window the server resolves for the active route.
+    ///
+    /// Sent to clients on `ModelChanged` so a remote panel does not have to
+    /// derive it from its own inert provider, which carries no model catalog and
+    /// therefore always answers the generic default.
+    pub fn provider_context_window(&self) -> usize {
+        self.provider.context_window()
+    }
+
     #[cfg(test)]
     pub(crate) async fn compaction_token_budget(&self) -> usize {
         self.registry.compaction().read().await.token_budget()
@@ -247,6 +256,11 @@ impl Agent {
         self.log_env_snapshot("set_reasoning_effort");
         self.session.save()?;
         Ok(current)
+    }
+
+    pub fn set_agent_model_override(&mut self, target: &str, model: Option<String>) -> Result<()> {
+        self.session.save_prepared()?;
+        self.session.set_agent_model_override(target, model)
     }
 
     pub fn subagent_model(&self) -> Option<String> {

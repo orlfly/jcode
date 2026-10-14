@@ -359,6 +359,12 @@ impl GraphBackend for SqliteGvecBackend {
     fn load(&self, key: &StoreKey) -> Result<MemoryGraph> {
         let graph = self.graph(key)?;
         let mut out = MemoryGraph::new();
+        // Graph metadata (ontology binding, counters) is stored beside the node
+        // tables. Before this existed `ReplaceMetadata` was a silent no-op, so
+        // the ontology a store was authored against could never be recorded.
+        if let Some(metadata) = load_metadata(&graph)? {
+            out.metadata = metadata;
+        }
 
         // Memory nodes
         for (id, props) in list_nodes_by_label(&graph, "Memory")? {
@@ -475,6 +481,7 @@ impl GraphBackend for SqliteGvecBackend {
                 upsert_edge(&g, from, &edge.target, &edge.kind)?;
             }
         }
+        save_metadata(&g, &graph.metadata)?;
         Ok(())
     }
 
@@ -518,11 +525,14 @@ impl GraphBackend for SqliteGvecBackend {
                         .map_err(|e| anyhow::anyhow!("DeleteEdge({from}->{to}): {e}"))?;
                     delete_edge(&g, from, to, &kind)?;
                 }
-                GraphMutation::ReplaceMetadata { .. } => {
-                    // Metadata is part of MemoryGraph but gvec has no
-                    // dedicated node for it; ignore for the PoC and
-                    // re-derive on the next load via the in-memory
-                    // graph path.
+                GraphMutation::ReplaceMetadata { json } => {
+                    // Metadata is part of `MemoryGraph` but gvec has no node for
+                    // it, so it is persisted in the side table instead of being
+                    // dropped (see `save_metadata`).
+                    let metadata: jcode_memory_types::graph::GraphMetadata =
+                        serde_json::from_str(json)
+                            .map_err(|e| anyhow::anyhow!("ReplaceMetadata({json}): {e}"))?;
+                    save_metadata(&g, &metadata)?;
                 }
             }
         }
@@ -747,6 +757,71 @@ fn ensure_text_index(graph: &Graph) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("ensure_text_index create trig_del: {e}"))?;
     exec.execute(&au, &[])
         .map_err(|e| anyhow::anyhow!("ensure_text_index create trig_upd: {e}"))?;
+    Ok(())
+}
+
+/// Side table holding one row of `GraphMetadata` per named graph.
+///
+/// Keyed by the gvec storage prefix (`g_project_<hash>`, `g_global`), which is
+/// exactly the `StoreKey` the backend was opened with.
+const META_TABLE: &str = "jcode_graph_meta";
+
+fn ensure_meta_table(graph: &Graph) -> Result<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {META_TABLE} (store TEXT PRIMARY KEY, json TEXT NOT NULL)"
+    );
+    graph
+        .storage
+        .exec_ref()
+        .execute(&sql, &[])
+        .map_err(|e| anyhow::anyhow!("ensure_meta_table: {e}"))?;
+    Ok(())
+}
+
+fn load_metadata(graph: &Graph) -> Result<Option<jcode_memory_types::graph::GraphMetadata>> {
+    ensure_meta_table(graph)?;
+    let sql = format!("SELECT json FROM {META_TABLE} WHERE store = ?1");
+    let row = graph
+        .storage
+        .exec_ref()
+        .query_one_json(&sql, &[gvec_core::sql::SqlValue::from(graph.storage.prefix.as_str())])
+        .map_err(|e| anyhow::anyhow!("load_metadata: {e}"))?;
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    let Some(value) = row.pop() else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Ok(None);
+    };
+    match serde_json::from_str(raw) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) => {
+            crate::logging::warn(&format!(
+                "SqliteGvecBackend: ignoring corrupt graph metadata for {}: {e}",
+                graph.storage.prefix
+            ));
+            Ok(None)
+        }
+    }
+}
+
+fn save_metadata(graph: &Graph, metadata: &jcode_memory_types::graph::GraphMetadata) -> Result<()> {
+    ensure_meta_table(graph)?;
+    let json = serde_json::to_string(metadata)?;
+    let sql = format!("INSERT OR REPLACE INTO {META_TABLE} (store, json) VALUES (?1, ?2)");
+    graph
+        .storage
+        .exec_ref()
+        .execute(
+            &sql,
+            &[
+                gvec_core::sql::SqlValue::from(graph.storage.prefix.as_str()),
+                gvec_core::sql::SqlValue::from(json.as_str()),
+            ],
+        )
+        .map_err(|e| anyhow::anyhow!("save_metadata: {e}"))?;
     Ok(())
 }
 

@@ -91,6 +91,8 @@ async fn automatic_recall_uses_jev_http_without_embeddings_or_sidecar() {
                 }
                 Err(error) => panic!("{error}"),
             };
+            // On BSD/macOS an accepted socket can inherit the listener's nonblocking flag.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
@@ -199,4 +201,117 @@ async fn automatic_recall_uses_jev_http_without_embeddings_or_sidecar() {
     assert!(!dir.path().join("embeddings").exists());
     memory::clear_pending_memory(sid);
     memory::clear_injected_memories(sid);
+}
+
+/// The recall tier that used to be missing entirely: with no Jev route at all,
+/// recall still has to surface a matching memory instead of silently returning
+/// nothing (measured before this: 0 judge decisions and 11 injections across
+/// 214 real sessions, while those same sessions wrote 3.2k memories).
+#[tokio::test]
+async fn missing_jev_access_falls_back_to_local_recall() {
+    let _lock = crate::storage::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let _env = TestEnv::set(&[
+        ("JCODE_HOME", dir.path().to_str().unwrap()),
+        ("JCODE_MEMORY_JEV_PROVIDER", "disabled-for-test"),
+        ("JCODE_MEMORY_L1_RECALL", "true"),
+    ]);
+    assert!(
+        !memory::memory_runtime_active(),
+        "fixture must have no Jev route"
+    );
+    assert!(memory::l1_recall_enabled());
+
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_dir = project.to_str().unwrap();
+    let manager = manager_for_working_dir(Some(project_dir));
+    let id = manager
+        .remember_project(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "Run cargo test to test this Rust project.",
+        ))
+        .unwrap();
+    manager
+        .remember_project(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "The garden has red flowers.",
+        ))
+        .unwrap();
+
+    let (_, rx) = mpsc::channel(1);
+    let mut agent = MemoryAgent::new(rx);
+    let sid = "l1-agent-fallback";
+    agent.sessions.insert(
+        sid.into(),
+        SessionState {
+            working_dir: Some(project_dir.to_string()),
+            ..Default::default()
+        },
+    );
+    agent
+        .process_context(
+            sid,
+            &[crate::message::Message::user(
+                "How do I test this Rust project with cargo test?",
+            )],
+        )
+        .await
+        .expect("local recall must not error");
+
+    let pending = memory::take_pending_memory_for_project(sid, Some(project_dir))
+        .expect("L1 must prepare a pending memory without any Jev route");
+    assert_eq!(pending.memory_ids, vec![id]);
+    assert!(pending.prompt.contains("cargo test"));
+    assert!(
+        !pending.prompt.contains("red flowers"),
+        "an unrelated stored memory must not be injected"
+    );
+    memory::clear_pending_memory(sid);
+    memory::clear_injected_memories(sid);
+}
+
+/// Same fixture, with L1 switched off: the configured kill switch must restore
+/// the old "no recall without a judge" behaviour.
+#[tokio::test]
+async fn local_recall_kill_switch_disables_the_fallback() {
+    let _lock = crate::storage::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let _env = TestEnv::set(&[
+        ("JCODE_HOME", dir.path().to_str().unwrap()),
+        ("JCODE_MEMORY_JEV_PROVIDER", "disabled-for-test"),
+        ("JCODE_MEMORY_L1_RECALL", "false"),
+    ]);
+    assert!(!memory::l1_recall_enabled());
+
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_dir = project.to_str().unwrap();
+    manager_for_working_dir(Some(project_dir))
+        .remember_project(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "Run cargo test to test this Rust project.",
+        ))
+        .unwrap();
+
+    let (_, rx) = mpsc::channel(1);
+    let mut agent = MemoryAgent::new(rx);
+    let sid = "l1-agent-disabled";
+    agent.sessions.insert(
+        sid.into(),
+        SessionState {
+            working_dir: Some(project_dir.to_string()),
+            ..Default::default()
+        },
+    );
+    agent
+        .process_context(
+            sid,
+            &[crate::message::Message::user(
+                "How do I test this Rust project with cargo test?",
+            )],
+        )
+        .await
+        .expect("disabled recall is not an error");
+    assert!(!memory::has_pending_memory(sid));
 }

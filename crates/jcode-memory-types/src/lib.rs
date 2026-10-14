@@ -14,13 +14,21 @@ pub use ontology::{
     Activity, ActivityStep, ActivityTrigger, Condition, DEFAULT_ONTOLOGY_ID,
     DEFAULT_ONTOLOGY_VERSION, DecayPolicy, EVENT_CONTRADICT, EVENT_DEDUP, EVENT_FINALIZE,
     EVENT_LINK, EVENT_REMEMBER, EVENT_SUPERSEDE, EVENT_TAG, EVENT_TOPIC_CHANGE, EVENT_TURN_TICK,
-    EVENT_UNTAG, EVENT_UPSERT, Effect, LifecyclePolicy, LifecycleTransition, Ontology,
-    OntologyType, PropertyDef, PropertyKind, REL_CONTRADICTS, REL_DERIVED_FROM, REL_HAS_TAG,
-    REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES, RULE_CONTRADICT, RULE_DEDUP_REINFORCE,
-    RULE_LINK, RULE_REMEMBER, RULE_SUPERSEDE, RULE_TAG, RULE_UNTAG, RULE_UPSERT, RelationshipDef,
-    Rule, ScoringPolicy, TYPE_CORRECTION, TYPE_ENTITY, TYPE_FACT, TYPE_GOAL, TYPE_NOTE,
-    TYPE_PREFERENCE, TYPE_SKILL, TrustMultiplier, WeightRange, default_event_names,
-    default_ontology, validate_default_ontology,
+    EVENT_UNTAG, EVENT_UPSERT, Effect, LINK_GOAL, LINK_PREFIXES, LINK_SKILL, LifecyclePolicy,
+    LifecycleTransition, Ontology, OntologyType, PropertyDef, PropertyKind, REL_CONTRADICTS,
+    REL_DERIVED_FROM, REL_HAS_TAG, REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES,
+    RULE_CONTRADICT, RULE_DEDUP_REINFORCE, RULE_LINK, RULE_REJECT, RULE_REMEMBER, RULE_SUPERSEDE,
+    RULE_TAG, RULE_UNTAG, RULE_UPSERT, RULE_WRITE_RECONCILE, RelationshipDef, Rule, ScoringPolicy,
+    TYPE_CONTRACT, TYPE_CORRECTION, TYPE_ENTITY, TYPE_ENV_FACT, TYPE_OBSERVATION, TYPE_PREFERENCE,
+    TYPE_PROCESS_RULE, TrustMultiplier, WeightRange, default_event_names, default_ontology,
+    is_link_id, validate_default_ontology,
+};
+
+pub mod reconcile;
+pub use reconcile::{
+    MAX_RELATED, MIN_MEANINGFUL_MEMORY_LEN, RELATE_AT, REINFORCE_AT, ReconcileAction,
+    ReconcileOutcome, SUPERSEDE_AT, derive_subject_key, detect_conflict, is_admitted_tag,
+    lexical_similarity, noise_reason, prepare_for_write, reconcile, same_subject, sanitize_tags,
 };
 
 pub mod rule_engine;
@@ -346,6 +354,16 @@ pub struct MemoryEntry {
     /// Identity keys and aliases for entity disambiguation.
     #[serde(default)]
     pub identity: IdentityMetadata,
+    /// Normalized retrieval key for this instance, e.g. `api:/api/task/claim`,
+    /// `host:localhost:1337`, `file:crates/jcode-base/src/memory.rs`,
+    /// `task:#157`, `mr:!358`, `skill:optimization`.
+    ///
+    /// Stamped at write time by `reconcile::prepare_for_write` when absent. It
+    /// is the deterministic anchor that local (L1) recall and write-time
+    /// reconciliation use instead of embeddings: two instances with the same
+    /// subject are about the same thing even when their wording differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_key: Option<String>,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -407,6 +425,7 @@ impl MemoryEntry {
             lifecycle: LifecycleMetadata::active(),
             critical: false,
             identity: IdentityMetadata::empty(),
+            subject_key: None,
         }
     }
 
@@ -435,6 +454,12 @@ impl MemoryEntry {
             MemoryCategory::Preference => 90.0,
             MemoryCategory::Fact => 30.0,
             MemoryCategory::Entity => 60.0,
+            // v2 decay policies live in the ontology; these are the same
+            // values inlined so confidence math stays available without it.
+            MemoryCategory::EnvFact => 30.0,
+            MemoryCategory::Contract => 180.0,
+            MemoryCategory::ProcessRule => 120.0,
+            MemoryCategory::Observation => 45.0,
             MemoryCategory::Custom(_) => 45.0, // Default for custom categories
         };
 
@@ -610,6 +635,14 @@ pub enum MemoryCategory {
     Preference,
     Entity,
     Correction,
+    /// v2 ontology types. Stored as first-class variants (not `Custom`) so
+    /// enum matches see them; serialization stays lowercase strings, which
+    /// round-trips both the variants and every string ever written as
+    /// `Custom` (older graphs keep loading unchanged).
+    EnvFact,
+    Contract,
+    ProcessRule,
+    Observation,
     Custom(String),
 }
 
@@ -618,6 +651,10 @@ impl std::fmt::Display for MemoryCategory {
         match self {
             MemoryCategory::Fact => write!(f, "fact"),
             MemoryCategory::Preference => write!(f, "preference"),
+            MemoryCategory::EnvFact => write!(f, "env_fact"),
+            MemoryCategory::Contract => write!(f, "contract"),
+            MemoryCategory::ProcessRule => write!(f, "process_rule"),
+            MemoryCategory::Observation => write!(f, "observation"),
             MemoryCategory::Entity => write!(f, "entity"),
             MemoryCategory::Correction => write!(f, "correction"),
             MemoryCategory::Custom(s) => write!(f, "{}", s),
@@ -634,6 +671,10 @@ impl std::str::FromStr for MemoryCategory {
             "preference" => MemoryCategory::Preference,
             "entity" => MemoryCategory::Entity,
             "correction" => MemoryCategory::Correction,
+            "env_fact" | "envfact" => MemoryCategory::EnvFact,
+            "contract" => MemoryCategory::Contract,
+            "process_rule" | "processrule" => MemoryCategory::ProcessRule,
+            "observation" => MemoryCategory::Observation,
             other => MemoryCategory::Custom(other.to_string()),
         })
     }
@@ -649,7 +690,10 @@ impl MemoryCategory {
             "preference" | "preferences" | "pref" => MemoryCategory::Preference,
             "correction" | "corrections" | "fix" | "bug" => MemoryCategory::Correction,
             "entity" | "entities" => MemoryCategory::Entity,
-            "observation" | "lesson" | "learning" => MemoryCategory::Fact,
+            "env_fact" | "envfact" | "environment" | "environment_fact" => MemoryCategory::EnvFact,
+            "contract" | "contracts" | "api_contract" => MemoryCategory::Contract,
+            "process_rule" | "processrule" | "rule" | "procedure" => MemoryCategory::ProcessRule,
+            "observation" | "lesson" | "learning" => MemoryCategory::Observation,
             _ => MemoryCategory::Fact,
         }
     }
@@ -756,6 +800,10 @@ pub fn memory_score(entry: &MemoryEntry) -> f64 {
         MemoryCategory::Preference => 30.0,
         MemoryCategory::Fact => 20.0,
         MemoryCategory::Entity => 10.0,
+        MemoryCategory::Contract => 25.0,
+        MemoryCategory::ProcessRule => 40.0,
+        MemoryCategory::EnvFact => 15.0,
+        MemoryCategory::Observation => 5.0,
         MemoryCategory::Custom(_) => 5.0,
     };
     score *= match entry.trust {
@@ -854,6 +902,10 @@ fn format_entries_for_prompt_with_header(
                 MemoryCategory::Fact => "Facts",
                 MemoryCategory::Preference => "Preferences",
                 MemoryCategory::Entity => "Entities",
+                MemoryCategory::EnvFact => "Environment Facts",
+                MemoryCategory::Contract => "Contracts",
+                MemoryCategory::ProcessRule => "Process Rules",
+                MemoryCategory::Observation => "Observations",
                 MemoryCategory::Custom(_) => "Custom",
             };
             write_section(title, items);
@@ -917,6 +969,17 @@ pub fn is_skill_memory(entry: &MemoryEntry) -> bool {
             &entry.category,
             MemoryCategory::Custom(name) if name.eq_ignore_ascii_case("Skills")
         )
+}
+
+/// Whether `entry` is a link node: an external artifact (goal, skill) mirrored
+/// into the memory graph under a reserved id prefix rather than an extractable
+/// memory instance.
+///
+/// Link nodes are written by the owning subsystem, carry a bounded pointer body
+/// and are exempt from TTL collection (the artifact has its own lifecycle; the
+/// graph only indexes it).
+pub fn is_link_node(entry: &MemoryEntry) -> bool {
+    crate::ontology::is_link_id(&entry.id)
 }
 
 pub fn collect_skill_query_terms(query_text: &str) -> HashSet<String> {

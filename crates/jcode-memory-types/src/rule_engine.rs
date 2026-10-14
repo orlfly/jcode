@@ -54,17 +54,19 @@ impl RuleContext {
     /// Construct a minimal context for testing or scripted callers.
     pub fn minimal(entry: MemoryEntry, event: impl Into<String>) -> Self {
         let ontology = crate::ontology::default_ontology();
+        // `goal:` / `skill:` link nodes and any unrecognized custom label fall
+        // through to the generic `custom` type id: link kinds are not types, and
+        // the registry resolves them by id prefix instead.
         let type_id = match &entry.category {
-            crate::MemoryCategory::Fact => crate::ontology::TYPE_FACT,
+            crate::MemoryCategory::Fact => crate::ontology::TYPE_OBSERVATION,
             crate::MemoryCategory::Preference => crate::ontology::TYPE_PREFERENCE,
             crate::MemoryCategory::Entity => crate::ontology::TYPE_ENTITY,
             crate::MemoryCategory::Correction => crate::ontology::TYPE_CORRECTION,
-            crate::MemoryCategory::Custom(label) => match label.as_str() {
-                "goal" => crate::ontology::TYPE_GOAL,
-                "note" => crate::ontology::TYPE_NOTE,
-                "skill" | "Skills" => crate::ontology::TYPE_SKILL,
-                _ => "custom",
-            },
+            crate::MemoryCategory::EnvFact => crate::ontology::TYPE_ENV_FACT,
+            crate::MemoryCategory::Contract => crate::ontology::TYPE_CONTRACT,
+            crate::MemoryCategory::ProcessRule => crate::ontology::TYPE_PROCESS_RULE,
+            crate::MemoryCategory::Observation => crate::ontology::TYPE_OBSERVATION,
+            crate::MemoryCategory::Custom(_) => "custom",
         };
         Self {
             entry,
@@ -184,6 +186,17 @@ pub fn evaluate_condition(cond: &Condition, ctx: &RuleContext) -> bool {
                 ctx.scope == "global" && is_generalized_content(&ctx.entry.content)
                     || ctx.scope != "global"
             }
+            // Noise gate: tool payloads, bare identifiers and stubs must not
+            // reach the graph. Empty content is deliberately excluded here -
+            // `validate_new_entry` already rejects it as E20, and keeping the
+            // two checks disjoint means an empty candidate trips exactly one
+            // gate instead of two.
+            "content_is_noise" => {
+                !ctx.entry.content.trim().is_empty()
+                    && crate::reconcile::noise_reason(&ctx.entry.content).is_some()
+            }
+            // Unknown expressions stay permissive so new expressions can be
+            // added incrementally without breaking stored ontologies.
             _ => true,
         },
     }
@@ -553,7 +566,7 @@ mod generality_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ontology::{EVENT_REMEMBER, TYPE_FACT, TYPE_GOAL, default_ontology};
+    use crate::ontology::{EVENT_REMEMBER, TYPE_OBSERVATION, TYPE_PROCESS_RULE, default_ontology};
     use crate::{MemoryCategory, MemoryEntry, MemoryGraph};
     use std::sync::Arc;
 
@@ -574,7 +587,7 @@ mod tests {
 
     #[test]
     fn empty_content_skips_remember() {
-        let mut ctx = ctx(EVENT_REMEMBER, TYPE_FACT);
+        let mut ctx = ctx(EVENT_REMEMBER, TYPE_OBSERVATION);
         ctx.entry.content = "   ".to_string();
         let plan = dispatch_event(&ctx);
         assert!(plan.effects.is_empty());
@@ -582,7 +595,7 @@ mod tests {
 
     #[test]
     fn fact_remember_adds_provenance_and_touch() {
-        let ctx = ctx(EVENT_REMEMBER, TYPE_FACT);
+        let ctx = ctx(EVENT_REMEMBER, TYPE_OBSERVATION);
         let plan = dispatch_event(&ctx);
         assert!(
             plan.effects
@@ -594,15 +607,15 @@ mod tests {
 
     #[test]
     fn rule_applies_to_type_filters() {
-        // TYPE_GOAL rule has no applies_to restriction, so it should match.
-        let ctx = ctx(EVENT_REMEMBER, TYPE_GOAL);
+        // The remember rule has no applies_to restriction, so any type matches.
+        let ctx = ctx(EVENT_REMEMBER, TYPE_PROCESS_RULE);
         let plan = dispatch_event(&ctx);
         assert!(!plan.applied_rules.is_empty());
     }
 
     #[test]
     fn apply_entry_effects_touches_entry() {
-        let ctx = ctx(EVENT_REMEMBER, TYPE_FACT);
+        let ctx = ctx(EVENT_REMEMBER, TYPE_OBSERVATION);
         let mut entry = ctx.entry.clone();
         let plan = dispatch_event(&ctx);
         let before = entry.updated_at;

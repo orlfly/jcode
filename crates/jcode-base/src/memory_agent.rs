@@ -86,6 +86,12 @@ fn manager_for_working_dir(working_dir: Option<&str>) -> MemoryManager {
 }
 
 async fn run_final_extraction(transcript: String, session_id: String, working_dir: Option<String>) {
+    // v2 maintenance runs regardless of whether extraction is available: the
+    // TTL sweep and skill distillation are local, and finalize is the only
+    // lifecycle event the runtime actually emits (measured: 600 finalize
+    // extractions in 15 days, no scheduled periodic/maintenance ticks).
+    run_finalize_maintenance(working_dir.as_deref());
+
     // Extraction is optional. Its model/credentials never gate recall.
     if !memory::memory_llm_judge_available() {
         return;
@@ -100,6 +106,51 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
             memory::add_event(MemoryEventKind::ExtractionComplete { count: ids.len() });
         }
         Err(_) => crate::logging::info("Optional memory extraction failed"),
+    }
+}
+
+/// Local maintenance that runs at session finalize: TTL archival
+/// (`activity.periodic_gc`) and skill-evidence distillation
+/// (`activity.skill_distill`).
+///
+/// Neither pass needs an embedder, an LLM or a credential, so they run even on
+/// machines where recall itself is degraded.
+fn run_finalize_maintenance(working_dir: Option<&str>) {
+    let manager = manager_for_working_dir(working_dir);
+    match manager.gc_expired_memories() {
+        Ok(report) if report.archived > 0 => crate::logging::info(&format!(
+            "Memory TTL sweep archived {} instance(s)",
+            report.archived
+        )),
+        Ok(_) => {}
+        Err(e) => crate::logging::info(&format!("Memory TTL sweep failed: {e}")),
+    }
+    // Keep newly extracted rows typed without waiting for the extraction
+    // prompt to emit v2 type names: one store, deterministic, milliseconds.
+    if let Ok(report) = manager.reclassify_project_store(true)
+        && report.total_changes() > 0
+    {
+        crate::logging::info(&format!(
+            "Memory classification pass: {}",
+            report.summary()
+        ));
+    }
+    if let Ok(proposals) = manager.distill_skill_evidence() {
+        if !proposals.is_empty() {
+            crate::logging::info(&format!(
+                "Memory skill distillation produced {} proposal(s)",
+                proposals.len()
+            ));
+        }
+    }
+    // Refresh the `skill:<name>` link nodes so the graph indexes the skills that
+    // actually exist on disk (v2 replacement for the never-wired synthetic
+    // `Custom("Skills")` entries).
+    let skills = crate::skill::SkillRegistry::shared_snapshot();
+    let mirrored =
+        crate::skill::sync_skill_memory_mirrors(&skills, working_dir.map(std::path::Path::new));
+    if mirrored > 0 {
+        crate::logging::info(&format!("Mirrored {mirrored} skill link node(s)"));
     }
 }
 
@@ -264,20 +315,27 @@ impl MemoryAgent {
         {
             return Ok(());
         }
-        ss.last_query = Some(query);
+        ss.last_query = Some(query.clone());
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
         memory::clear_pending_memory(session_id);
-        if !memory::memory_runtime_active() {
-            return Ok(());
-        }
+        // Recall has two tiers. The judged path (Tier 2) is preferred when a
+        // Jev route exists; otherwise Tier 1 ranks locally. Before L1 existed
+        // this returned early and a machine without a Jev credential recalled
+        // nothing at all, even though it kept writing memories.
         let memory::MemoryRelevanceResult {
             prompt,
             display_prompt,
             selected_entries,
-        } = manager
-            .get_relevant_parallel(session_id, messages, None)
-            .await?;
+        } = if memory::memory_runtime_active() {
+            manager
+                .get_relevant_parallel(session_id, messages, None)
+                .await?
+        } else if memory::l1_recall_enabled() {
+            manager.l1_relevance_result(&query)
+        } else {
+            return Ok(());
+        };
         if let Some(prompt) = prompt {
             let count = selected_entries.len();
             memory::set_pending_memory_for_project_with_selection(

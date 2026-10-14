@@ -450,7 +450,7 @@ impl RemoteConnection {
                 content.len(),
                 content.chars().count()
             )),
-            Request::CancelSoftInterrupts { id } => Some(base("cancel_soft_interrupts", *id)),
+            Request::CancelSoftInterrupts { id, .. } => Some(base("cancel_soft_interrupts", *id)),
             Request::BackgroundTool { id } => Some(base("background_tool", *id)),
             _ => None,
         }
@@ -795,6 +795,26 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Set a worker model on the server, for this session or (with `global`)
+    /// as the server's own default.
+    pub async fn set_agent_model(
+        &mut self,
+        target: String,
+        model: Option<String>,
+        global: bool,
+    ) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::SetAgentModel {
+            id,
+            target,
+            model,
+            global,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Launch a subagent immediately on the active remote session.
     pub async fn run_subagent(
         &mut self,
@@ -971,6 +991,7 @@ impl RemoteConnection {
             content,
             images,
             urgent,
+            client_id: None,
         };
         self.next_request_id += 1;
         self.send_request_with_interrupt_trigger(request, Some("soft_interrupt"))
@@ -981,6 +1002,7 @@ impl RemoteConnection {
     pub async fn cancel_soft_interrupts(&mut self) -> Result<()> {
         let request = Request::CancelSoftInterrupts {
             id: self.next_request_id,
+            client_ids: None,
         };
         self.next_request_id += 1;
         self.send_request_with_interrupt_trigger(request, Some("cancel_soft_interrupts"))

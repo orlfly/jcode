@@ -59,9 +59,14 @@ mod tests {
                     name: (*name).to_string(),
                     description: "Test skill".to_string(),
                     allowed_tools: None,
+                    evidence: Vec::new(),
                     content: "content".to_string(),
                     path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
-                    search_text: build_skill_search_text(name, "Test skill", "content"),
+                    search_text: std::sync::OnceLock::from(build_skill_search_text(
+                        name,
+                        "Test skill",
+                        "content",
+                    )),
                 },
             );
         }

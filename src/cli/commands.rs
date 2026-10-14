@@ -1573,10 +1573,20 @@ pub enum MemorySubcommand {
         overwrite: bool,
     },
     Stats,
+    Distill {
+        dry_run: bool,
+    },
+    SkillAccept {
+        draft: String,
+    },
     Forget {
         id: String,
     },
     ClearTest,
+    Reclassify {
+        apply: bool,
+        subject_keys: bool,
+    },
 }
 
 pub async fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
@@ -1825,6 +1835,92 @@ async fn run_memory_command_for_dir(
             println!("\nBy category:");
             for (cat, count) in &categories {
                 println!("  {}: {}", cat, count);
+            }
+        }
+
+        MemorySubcommand::Distill { dry_run } => {
+            let proposals = if dry_run {
+                manager.collect_skill_evidence()?
+            } else {
+                manager.write_skill_proposals_now()?
+            };
+            println!(
+                "{} {} skill proposal(s) from accumulated evidence",
+                if dry_run { "Would write" } else { "Wrote" },
+                proposals.len()
+            );
+            for proposal in proposals.iter().take(20) {
+                println!(
+                    "  {:<34} evidence={:<3} stores={:<2} sessions={:<3} weight={:.0}",
+                    proposal.subject_key,
+                    proposal.evidence.len(),
+                    proposal.stores.len(),
+                    proposal.sessions.len(),
+                    proposal.weight
+                );
+            }
+            if !dry_run && !proposals.is_empty() {
+                println!(
+                    "Review drafts in {}/skills/.proposals/ (install one with `jcode memory skill-accept <draft>.md`)",
+                    storage::jcode_dir()?.display()
+                );
+            }
+        }
+
+        MemorySubcommand::SkillAccept { draft } => {
+            let path = std::path::PathBuf::from(&draft);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                // A bare name is resolved against the proposals dir; an
+                // explicit relative path stays relative to cwd.
+                let bare = path.to_string_lossy().replace('\\', "/");
+                if bare.contains('/') {
+                    path
+                } else {
+                    storage::jcode_dir()?
+                        .join("skills")
+                        .join(".proposals")
+                        .join(path)
+                }
+            };
+            println!("Accepting draft {}...", path.display());
+            match crate::skill::accept_skill_proposal(&path, None) {
+                Ok(accepted) => {
+                    println!(
+                        "Installed skill '{}' at {}",
+                        accepted.name,
+                        accepted.path.display()
+                    );
+                    println!(
+                        "Linked {} evidence memo(ries) via derived_from edges; recorded one skill invocation",
+                        accepted.evidence_linked
+                    );
+                    if accepted.evidence_linked == 0 {
+                        println!(
+                            "Warning: no evidence ids resolved in this store's global graph - the draft's evidence list may reference other projects."
+                        );
+                    }
+                    println!("New/updated skills are picked up by the next session start (or /skills to verify).");
+                }
+                Err(e) => {
+                    anyhow::bail!("{e}");
+                }
+            }
+        }
+
+        MemorySubcommand::Reclassify {
+            apply,
+            subject_keys,
+        } => {
+            let report = manager.reclassify_observations(apply, subject_keys)?;
+            println!(
+                "{} memory classification pass: {}",
+                if report.dry_run { "Dry run:" } else { "Applied" },
+                report.summary()
+            );
+            if report.dry_run && report.total_changes() > 0 {
+                println!("Re-run with --apply to write these changes.");
             }
         }
 
@@ -2550,11 +2646,9 @@ pub async fn run_single_message_command(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
-    let provider = if emit_json || emit_ndjson {
-        super::provider_init::init_provider_quiet(choice, model).await?
-    } else {
-        super::provider_init::init_provider_for_validation(choice, model).await?
-    };
+    let provider =
+        super::provider_init::init_provider_for_run(choice, model, emit_json || emit_ndjson)
+            .await?;
     let registry = crate::tool::Registry::new(provider.clone()).await;
     // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
     // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
@@ -2584,6 +2678,29 @@ pub async fn run_single_message_command(
     run_single_message_with_agent(&mut agent, provider, message, emit_json, emit_ndjson).await
 }
 
+/// Provider id for `jcode run --json`/`--ndjson` output.
+///
+/// Every direct OpenAI-compatible profile (Ollama, LM Studio, DeepSeek, custom
+/// endpoints, ...) runs on the OpenRouter transport, whose `name()` is the
+/// fixed slot id `openrouter`. Reporting that attributed purely local runs to
+/// a paid third-party aggregator (#804). The session already records the
+/// resolved route identity, so prefer it for that slot and leave every other
+/// provider's established value unchanged.
+fn run_report_provider_name(
+    provider: &dyn crate::provider::Provider,
+    session_provider_key: Option<&str>,
+) -> String {
+    let name = provider.name();
+    if name.eq_ignore_ascii_case("openrouter")
+        && let Some(key) = session_provider_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    {
+        return key.to_string();
+    }
+    name.to_string()
+}
+
 async fn run_single_message_with_agent(
     agent: &mut crate::agent::Agent,
     provider: std::sync::Arc<dyn crate::provider::Provider>,
@@ -2596,7 +2713,10 @@ async fn run_single_message_with_agent(
             let text = run_single_message_command_capture_with_auto_poke(agent, message).await?;
             let report = RunCommandReport {
                 session_id: agent.session_id().to_string(),
-                provider: provider.name().to_string(),
+                provider: run_report_provider_name(
+                    provider.as_ref(),
+                    agent.session_provider_key().as_deref(),
+                ),
                 model: provider.model(),
                 text,
                 usage: agent.last_usage().clone(),
@@ -3046,6 +3166,8 @@ async fn run_single_message_command_ndjson(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let session_id = agent.session_id().to_string();
+    let provider_name =
+        run_report_provider_name(provider.as_ref(), agent.session_provider_key().as_deref());
     let mut stdout = std::io::stdout().lock();
     let mut state = NdjsonRunState {
         session_id: Some(session_id.clone()),
@@ -3056,7 +3178,7 @@ async fn run_single_message_command_ndjson(
         &serde_json::json!({
             "type": "start",
             "session_id": session_id,
-            "provider": provider.name(),
+            "provider": provider_name,
             "model": provider.model(),
         }),
     )?;
@@ -3200,7 +3322,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "done",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "text": state.text,
                     "usage": state.usage,
@@ -3218,7 +3340,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "error",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "message": format!("{err:#}"),
                 }),
@@ -3386,6 +3508,7 @@ fn emit_ndjson_event(
             display_role,
             point,
             tools_skipped,
+            client_ids,
         } => write_json_line(
             stdout,
             &serde_json::json!({
@@ -3394,6 +3517,7 @@ fn emit_ndjson_event(
                 "display_role": display_role,
                 "point": point,
                 "tools_skipped": tools_skipped,
+                "client_ids": client_ids,
             }),
         ),
         ServerEvent::BatchProgress { progress } => write_json_line(

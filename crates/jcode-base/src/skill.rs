@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,9 +16,16 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// Memory ids this skill was distilled from (`evidence:` frontmatter, filled
+    /// in when a proposal is accepted). The mirror node records them as
+    /// `derived_from` edges so the graph can answer "why does this skill exist".
+    pub evidence: Vec<String>,
     pub content: String,
     pub path: PathBuf,
-    search_text: String,
+    /// Normalized search text, built on first use. Normalizing every skill
+    /// body eagerly dominated `load_global` (the TUI loads it before its first
+    /// frame), yet only memory-entry conversion ever reads it.
+    search_text: std::sync::OnceLock<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +34,10 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<AllowedTools>,
+    /// Evidence memories this skill was distilled from. Optional: hand-written
+    /// or imported skills have none.
+    #[serde(default)]
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +531,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            evidence,
         } = frontmatter;
 
         let allowed_tools = allowed_tools.map(|tools| match tools {
@@ -530,15 +541,14 @@ impl SkillRegistry {
                 .collect(),
             AllowedTools::Sequence(tools) => tools,
         });
-        let search_text = build_skill_search_text(&name, &description, &body);
-
         Ok(Skill {
             name,
             description,
             allowed_tools,
+            evidence,
             content: body,
             path: path.to_path_buf(),
-            search_text,
+            search_text: std::sync::OnceLock::new(),
         })
     }
 
@@ -936,25 +946,245 @@ impl Skill {
         Ok(std::fs::read_to_string(file_path)?)
     }
 
+    /// Memory-graph link node for this skill.
+    ///
+    /// v2 removed the `skill` *type* from the ontology: a skill is an external
+    /// artifact (a file with frontmatter plus an invocation surface), not a
+    /// memory instance. What the graph keeps is a bounded pointer under the
+    /// reserved `skill:<name>` id, mirroring how goals are linked with
+    /// `goal:<id>`. The body stays on disk and is only loaded on invocation, so
+    /// recall can surface "there is a skill for this" without paying for the
+    /// full text in every prompt.
     pub fn as_memory_entry(&self) -> crate::memory::MemoryEntry {
-        let now = Utc::now() - chrono::Duration::days(365);
-        let mut entry = crate::memory::MemoryEntry::new(
-            crate::memory::MemoryCategory::Custom("Skills".to_string()),
-            format!(
-                "Use skill `/{} ` when relevant.\n\n{}",
-                self.name,
-                self.get_prompt()
-            ),
-        )
-        .with_id(format!("skill:{}", self.name))
-        .with_tags(vec!["skill".to_string(), self.name.clone()])
-        .with_source("skill_registry")
-        .with_trust(crate::memory::TrustLevel::Medium)
-        .with_timestamps(now, now);
-        // Use the precomputed skill search text rather than the tag-derived one.
-        entry.search_text = self.search_text.clone();
+        const MAX_POINTER_CHARS: usize = 200;
+        let mut pointer = format!(
+            "Skill `/{name}`: {description} Invoke with `/{name}`.",
+            name = self.name,
+            description = self.description.trim()
+        );
+        if pointer.chars().count() > MAX_POINTER_CHARS {
+            pointer = pointer
+                .chars()
+                .take(MAX_POINTER_CHARS - 1)
+                .collect::<String>();
+            pointer.push('…');
+        }
+        let mut entry =
+            crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, pointer)
+                .with_id(format!("skill:{}", self.name))
+                .with_tags(vec![format!("skill:{}", self.name)])
+                .with_source("skill_registry")
+                .with_trust(crate::memory::TrustLevel::High);
+        // Keep the full skill text as *match* text (never injected): the pointer
+        // is the body, this is what retrieval scores against.
+        entry.search_text = self
+            .search_text
+            .get_or_init(|| build_skill_search_text(&self.name, &self.description, &self.content))
+            .clone();
+        // The anchor for this artefact: recall and evidence aggregation both key
+        // off `skill:<name>` (the id happens to be the subject, but stating it
+        // explicitly keeps link nodes consistent with regular instances).
+        entry.subject_key = Some(format!("skill:{}", self.name));
         entry
     }
+}
+
+/// Record a skill activation into project memory (best-effort).
+///
+/// Closes the skill -> memory loop: the v2 ontology treats a skill run as real
+/// evidence that a procedure is in use, so it is stored with
+/// `ExtractionMethod::SkillInvocation` (authority above LLM extraction, below a
+/// direct user statement) and keyed by `subject_key = skill:<name>`.
+///
+/// Best-effort by design: never let memory bookkeeping break an invocation.
+pub fn record_skill_invocation(skill_name: &str, working_dir: Option<&std::path::Path>) {
+    let manager = match working_dir {
+        Some(dir) => crate::memory::MemoryManager::new().with_project_dir(dir),
+        None => crate::memory::MemoryManager::new(),
+    };
+    let _ = manager.remember_skill_invocation(skill_name);
+}
+
+/// Accept a skill proposal draft: copy it into the installed skills directory
+/// with its `evidence:` list intact, delete the draft, and record the
+/// `skill:<name> -derived_from-> mem_*` edges plus one skill-invocation row so
+/// the memory -> skill loop closes immediately (not on the next finalize).
+///
+/// The draft keeps the body produced by distillation; the reviewer edits it
+/// in place afterwards if they want. Refuses to overwrite an existing skill
+/// with the same name -- updating an installed skill stays a human edit, and
+/// the draft's TODO body should not silently replace a refined one.
+pub fn accept_skill_proposal(
+    proposal_path: &std::path::Path,
+    working_dir: Option<&std::path::Path>,
+) -> anyhow::Result<AcceptedSkill> {
+    let raw = std::fs::read_to_string(proposal_path)?;
+    let skill = SkillRegistry::parse_skill(proposal_path)?;
+    if skill.evidence.is_empty() {
+        anyhow::bail!(
+            "{} carries no `evidence:` list; refusing to install an unverifiable draft (regenerate it with `jcode memory distill`)",
+            proposal_path.display()
+        );
+    }
+    let (skills_dir, global) = match working_dir {
+        Some(dir) => (dir.join(".jcode").join("skills"), false),
+        None => (
+            crate::storage::jcode_dir()?.join("skills"),
+            true,
+        ),
+    };
+    let target_dir = skills_dir.join(&skill.name);
+    let target = target_dir.join("SKILL.md");
+    if target.exists() {
+        anyhow::bail!(
+            "skill '{}' already exists at {}; not overwriting an installed skill with a draft body",
+            skill.name,
+            target.display()
+        );
+    }
+    std::fs::create_dir_all(&target_dir)?;
+    std::fs::write(&target, &raw)?;
+
+    // Close the loop in memory, best-effort: the file is the source of truth,
+    // memory only mirrors it.
+    let manager = if global {
+        crate::memory::MemoryManager::new()
+    } else {
+        crate::memory::MemoryManager::new().with_project_dir(working_dir.unwrap())
+    };
+    let mem_ids = manager.record_accepted_skill(&skill.name, &skill.evidence);
+    let _ = std::fs::remove_file(proposal_path);
+    Ok(AcceptedSkill {
+        name: skill.name,
+        path: target,
+        evidence_linked: mem_ids,
+    })
+}
+
+/// Result of [`accept_skill_proposal`], for the CLI report.
+#[derive(Debug)]
+pub struct AcceptedSkill {
+    pub name: String,
+    pub path: PathBuf,
+    /// Evidence ids that actually became `derived_from` edges.
+    pub evidence_linked: usize,
+}
+
+/// Mirror skills into the memory graph as `skill:<name>` link nodes.
+///
+/// This is the skill -> memory half of the v2 linkage. It replaces the old
+/// `Custom("Skills")` synthetic entries, which were only ever wired up in tests:
+/// `register_synthetic_entry_provider` had no production caller and the skill
+/// type had zero instances in the live store.
+///
+/// Scope is respected, because it decides who can see the skill:
+///
+/// * global skills (plugins, `~/.jcode/skills/`, `~/.agents/skills/`) become
+///   link nodes in the **global** store - they apply everywhere;
+/// * a workspace's project-local skills (`.jcode/skills/`, `.agents/skills/`,
+///   `.claude/skills/`) become link nodes in **that project's** store. A
+///   project-local procedure is only true for its workspace, so indexing it
+///   globally would surface one repository's procedure in every other one.
+///
+/// Best-effort and deliberately *not* called from `load_global` (which runs
+/// before the TUI's first frame): it does memory I/O, so callers should pick a
+/// non-latency-critical point such as session finalize.
+pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&Path>) -> usize {
+    let mut written = 0;
+    if !registry.skills.is_empty() {
+        let manager = crate::memory::MemoryManager::new();
+        for skill in registry.skills.values() {
+            if manager
+                .upsert_global_memory(skill.as_memory_entry())
+                .is_ok()
+            {
+                written += 1;
+            }
+        }
+        written += link_skill_evidence(&manager, true, registry.skills.values());
+    }
+    if let Some(dir) = working_dir
+        && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
+        && !local.skills.is_empty()
+    {
+        let manager = crate::memory::MemoryManager::new().with_project_dir(dir);
+        for skill in local.skills.values() {
+            if manager
+                .upsert_project_memory(skill.as_memory_entry())
+                .is_ok()
+            {
+                written += 1;
+            }
+        }
+        written += link_skill_evidence(&manager, false, local.skills.values());
+    }
+    written
+}
+
+/// Record `skill:<name> -derived_from-> mem_*` for a skill's `evidence:`
+/// frontmatter.
+///
+/// This is the last step of the memory -> skill loop: a proposal's draft that
+/// gets accepted (copied into `skills/<name>/SKILL.md` with its `evidence:`
+/// list intact) becomes a skill whose graph node points back at the memories it
+/// came from. Evidence ids that are not in this store are skipped - an edge may
+/// only connect two nodes that exist.
+///
+/// Returns the number of new edges.
+fn link_skill_evidence<'a, I>(manager: &crate::memory::MemoryManager, global: bool, skills: I) -> usize
+where
+    I: Iterator<Item = &'a Skill>,
+{
+    let mut graph = if global {
+        manager.load_global_graph()
+    } else {
+        manager.load_project_graph()
+    };
+    let Ok(graph) = graph.as_mut() else {
+        return 0;
+    };
+    let mut linked = 0;
+    for skill in skills {
+        if skill.evidence.is_empty() {
+            continue;
+        }
+        let node = format!("skill:{}", skill.name);
+        if !graph.memories.contains_key(&node) {
+            continue;
+        }
+        for id in &skill.evidence {
+            if !graph.memories.contains_key(id) {
+                continue;
+            }
+            let already = graph
+                .get_edges(&node)
+                .iter()
+                .any(|edge| edge.target == *id && matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom));
+            if already {
+                continue;
+            }
+            graph.add_edge(&node, id, jcode_memory_types::EdgeKind::DerivedFrom);
+            linked += 1;
+        }
+        if linked > 0
+            && let Some(entry) = graph.get_memory_mut(&node)
+        {
+            entry.updated_at = chrono::Utc::now();
+        }
+    }
+    if linked == 0 {
+        return 0;
+    }
+    let saved = if global {
+        manager.save_global_graph(graph)
+    } else {
+        manager.save_project_graph(graph)
+    };
+    if let Err(e) = saved {
+        crate::logging::warn(&format!("recording skill evidence edges failed: {e}"));
+        return 0;
+    }
+    linked
 }
 
 fn build_skill_search_text(name: &str, description: &str, content: &str) -> String {
@@ -962,19 +1192,22 @@ fn build_skill_search_text(name: &str, description: &str, content: &str) -> Stri
 }
 
 fn normalize_skill_search_text(text: &str) -> String {
-    text.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
-                ' '
+    // Single pass: lowercase, map non-alphanumerics to separators, and
+    // collapse whitespace runs. Equivalent to lowercase -> map -> split -> join.
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for c in text.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
             }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+            pending_space = false;
+            out.push(c);
+        } else {
+            pending_space = true;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -986,9 +1219,14 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            evidence: Vec::new(),
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
-            search_text: build_skill_search_text(name, description, content),
+            search_text: std::sync::OnceLock::from(build_skill_search_text(
+                name,
+                description,
+                content,
+            )),
         }
     }
 
@@ -1179,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_as_memory_entry_formats_invocation_and_prompt() {
+    fn skill_as_memory_entry_is_a_bounded_link_node() {
         let skill = test_skill(
             "firefox-browser",
             "Control Firefox browser sessions and logged-in pages",
@@ -1188,14 +1426,33 @@ mod tests {
 
         let entry = skill.as_memory_entry();
 
+        // v2: the graph holds a pointer under the reserved `skill:` id, not a
+        // `Custom("Skills")` memory instance carrying the whole body.
         assert_eq!(entry.id, "skill:firefox-browser");
-        assert!(matches!(
-            entry.category,
-            crate::memory::MemoryCategory::Custom(ref name) if name == "Skills"
-        ));
-        assert!(entry.content.contains("/firefox-browser"));
-        assert!(entry.content.contains("# Skill: firefox-browser"));
+        assert!(jcode_memory_types::is_link_node(&entry));
+        assert_eq!(entry.tags, vec!["skill:firefox-browser".to_string()]);
         assert_eq!(entry.source.as_deref(), Some("skill_registry"));
+        assert!(entry.content.contains("/firefox-browser"));
+        assert!(
+            entry.content.chars().count() <= 200,
+            "pointer must stay bounded, got {} chars",
+            entry.content.chars().count()
+        );
+        assert!(
+            !entry.content.contains("Use this skill when you need to open websites"),
+            "the skill body must not be inlined into the injected pointer"
+        );
+        // ... while the full body stays available as match text.
+        assert!(entry.searchable_text().contains("logged in"), "{}", entry.searchable_text());
+    }
+
+    #[test]
+    fn oversized_skill_pointer_is_truncated() {
+        let long_description = "x".repeat(500);
+        let skill = test_skill("huge", &long_description, "body");
+        let entry = skill.as_memory_entry();
+        assert!(entry.content.chars().count() <= 200);
+        assert!(entry.content.ends_with('…'));
     }
 
     #[test]
