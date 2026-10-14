@@ -33,6 +33,7 @@ const PEEK_LIMIT: u64 = 12;
 /// `peek_session` and `list_sessions` are deliberately absent: they are served
 /// from stored records precisely so a client can look around before attaching.
 const REQUIRES_ATTACH: &[&str] = &[
+    "runtime_command",
     "detach_session",
     "configure_tools",
     "list_tools",
@@ -54,6 +55,7 @@ const REQUIRES_ATTACH: &[&str] = &[
     "set_session_saved",
     "get_runtime_info",
     "fork_session",
+    "transfer_session",
     "read_file",
     "find_files",
     "search_text",
@@ -112,6 +114,9 @@ static NEXT_TEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Per-connection translation state.
 #[derive(Debug, Default)]
 pub struct BridgeState {
+    /// Refreshed from an authoritative source-daemon Ping before each list.
+    pub user_connected_sessions: std::collections::HashSet<String>,
+    pub runtime_commands_supported: bool,
     /// Set only after a safe legacy ping capability probe succeeds.
     pub session_tools_supported: bool,
     /// The daemon accepts soft interrupt ids and per-id cancellation, and
@@ -121,6 +126,8 @@ pub struct BridgeState {
     pending_soft_interrupts_at_done: Option<u32>,
     /// Whether an unannounced transport loss should crash the attached session.
     pub crash_on_disconnect: bool,
+    /// Client-side inline response renderer, negotiated in Hello.
+    pub supports_user_response: bool,
     /// Session id assigned by the daemon for this connection.
     pub session_id: Option<String>,
     /// Legacy id of the in-flight `message` request, so `done` maps to
@@ -294,6 +301,7 @@ impl From<&RecentSessionIndexEntry> for PersistedSessionMetadata {
 
 #[derive(Debug, Clone, PartialEq)]
 enum SimpleKind {
+    RuntimeCommand,
     Detach,
     Tools,
     ToolControl,
@@ -427,6 +435,41 @@ impl BridgeState {
             ))];
         }
 
+        if req == "runtime_command" {
+            if !self.runtime_commands_supported {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "This daemon does not support runtime commands. Update and restart the daemon.",
+                );
+            }
+            let parsed = serde_json::from_value::<jcode_harness_api::ApiRequest>(request.clone());
+            let Ok(jcode_harness_api::ApiRequest::RuntimeCommand {
+                command,
+                args,
+                session_id,
+            }) = parsed
+            else {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "Invalid runtime command request",
+                );
+            };
+            if session_id.is_empty() {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "session_id must not be empty",
+                );
+            }
+            let id = self.legacy_id();
+            self.pending_simple
+                .push((id, api_id, SimpleKind::RuntimeCommand));
+            return vec![Outbound::Legacy(
+                json!({"type": "runtime_command", "id": id, "command": command, "args": args}),
+            )];
+        }
         if matches!(req, "configure_tools" | "list_tools" | "tool_result") {
             // Validate the typed surface even though this bridge accepts raw JSON.
             // Never coerce a malformed result/configuration into a valid mutation.
@@ -559,6 +602,7 @@ impl BridgeState {
                     "type": "subscribe",
                     "id": id,
                     "supports_pdf_panels": true,
+                    "supports_user_response": self.supports_user_response,
                 });
                 if self.crash_on_disconnect {
                     subscribe["crash_on_disconnect"] = json!(true);
@@ -638,6 +682,11 @@ impl BridgeState {
                 let id = self.legacy_id();
                 self.pending_fork_id = Some((id, api_id));
                 vec![Outbound::Legacy(json!({"type": "split", "id": id}))]
+            }
+            "transfer_session" => {
+                let id = self.legacy_id();
+                self.pending_fork_id = Some((id, api_id));
+                vec![Outbound::Legacy(json!({"type": "transfer", "id": id}))]
             }
             "cancel" => {
                 let id = self.legacy_id();
@@ -741,6 +790,9 @@ impl BridgeState {
                     recent.truncate(limit);
                     ids = recent.into_iter().collect();
                 }
+                // Connected user clients must remain discoverable even when
+                // their idle session is older than the persisted recency page.
+                ids.extend(self.user_connected_sessions.iter().cloned());
                 // Titles are deliberately not cached. A rename is persisted
                 // before `SessionRenamed` is broadcast, and every list call
                 // should reflect that newest canonical value even on another
@@ -787,7 +839,9 @@ impl BridgeState {
                     let cutoff = Self::now_ms().saturating_sub(u64::from(days) * 86_400_000);
                     let mut changed = false;
                     for id in &ids {
-                        if self.session_id.as_ref() == Some(id) || archive.sessions.contains_key(id)
+                        if self.session_id.as_ref() == Some(id)
+                            || self.user_connected_sessions.contains(id)
+                            || archive.sessions.contains_key(id)
                         {
                             continue;
                         }
@@ -807,6 +861,7 @@ impl BridgeState {
                         include_archived || !archive.sessions.contains_key(session_id)
                     })
                     .map(|session_id| SessionInfo {
+                        user_connected: self.user_connected_sessions.contains(&session_id),
                         edit_stats: None,
                         parent_session_id: None,
                         agent_label: None,
@@ -1397,6 +1452,35 @@ impl BridgeState {
         })]
     }
 
+    fn replace_text_suffix(&mut self, old_text: &str, new_text: &str) -> Vec<ServerFrame> {
+        if old_text.is_empty() {
+            return vec![];
+        }
+        // Citation annotations arrive at output_item.done, immediately before
+        // TextDone. Correct only the active message, never redistribute text
+        // across earlier messages using their pre-correction byte lengths.
+        let Some(id) = self.text_message_id.as_ref() else {
+            return vec![];
+        };
+        let Some((_, text, _)) = self.text_attempt.iter_mut().find(|(key, _, _)| key == id) else {
+            return vec![];
+        };
+        let Some(prefix) = text.strip_suffix(old_text) else {
+            return vec![];
+        };
+        if old_text == new_text {
+            return vec![];
+        }
+        let prefix_len = prefix.len();
+        text.truncate(prefix_len);
+        text.push_str(new_text);
+        vec![ServerFrame::event(ApiEvent::TextReplace {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            message_id: Some(id.clone()),
+            text: text.clone(),
+        })]
+    }
+
     fn replace_text(&mut self, replacement: &str) -> Vec<ServerFrame> {
         // Legacy replacements cover the entire provider response, including
         // text messages already closed by output_item.done. Distribute the
@@ -1450,6 +1534,32 @@ impl BridgeState {
     /// Translate one legacy server event (raw JSON) into API frames.
     pub fn legacy_event_to_api(&mut self, event: &Value) -> Vec<ServerFrame> {
         let kind = event["type"].as_str().unwrap_or("");
+        if kind == "runtime_command_result" {
+            let Some(api_id) = self.take_simple(
+                event["id"].as_u64().unwrap_or(0),
+                SimpleKind::RuntimeCommand,
+            ) else {
+                return vec![];
+            };
+            let Ok(command) = serde_json::from_value(event["command"].clone()) else {
+                return vec![ServerFrame::reply(
+                    api_id,
+                    ApiEvent::Error {
+                        code: ErrorCode::Internal,
+                        message: "Invalid runtime command response".into(),
+                    },
+                )];
+            };
+            return vec![ServerFrame::reply(
+                api_id,
+                ApiEvent::RuntimeCommandResult {
+                    session_id: self.session_id.clone().unwrap_or_default(),
+                    command,
+                    data: event["data"].clone(),
+                    message: event["message"].as_str().unwrap_or("").into(),
+                },
+            )];
+        }
         // Filter stale owner callbacks before updating any turn/text state.
         if kind == "tool_call"
             && (self.session_id.is_none()
@@ -1608,6 +1718,7 @@ impl BridgeState {
                         api_id,
                         ApiEvent::Attached {
                             session: SessionInfo {
+                                user_connected: self.user_connected_sessions.contains(&session_id),
                                 edit_stats: None,
                                 parent_session_id: None,
                                 agent_label: None,
@@ -1700,6 +1811,14 @@ impl BridgeState {
                 frames
             }
             "text_replace" => self.replace_text(event["text"].as_str().unwrap_or("")),
+            "text_suffix_replace" => {
+                match (event["old_text"].as_str(), event["new_text"].as_str()) {
+                    (Some(old_text), Some(new_text)) => {
+                        self.replace_text_suffix(old_text, new_text)
+                    }
+                    _ => vec![],
+                }
+            }
             "retry_rollback" => {
                 let frames = self.replace_text("");
                 self.text_message_id = None;
@@ -1919,6 +2038,7 @@ impl BridgeState {
                     api_id,
                     ApiEvent::SessionForked {
                         session: SessionInfo {
+                            user_connected: self.user_connected_sessions.contains(&session_id),
                             edit_stats: None,
                             parent_session_id: None,
                             agent_label: None,
@@ -3672,3 +3792,7 @@ impl BridgeState {
 #[cfg(test)]
 #[path = "translate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "user_response_capability_tests.rs"]
+mod user_response_capability_tests;

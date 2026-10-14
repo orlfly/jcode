@@ -40,6 +40,8 @@ pub struct ConnectOptions {
     /// On by default: an app that only works once the user has launched two
     /// daemons by hand is indistinguishable from a broken one.
     pub ensure_runtime: bool,
+    /// Desktop inline Markdown response renderer. Other clients leave false.
+    pub supports_user_response: bool,
 }
 
 impl Default for ConnectOptions {
@@ -49,6 +51,7 @@ impl Default for ConnectOptions {
             client_name: concat!("jcode-sdk-rs/", env!("CARGO_PKG_VERSION")).to_string(),
             request_timeout: Some(Duration::from_secs(30)),
             ensure_runtime: true,
+            supports_user_response: false,
         }
     }
 }
@@ -410,6 +413,7 @@ impl JcodeClient {
         let connect = ConnectOptions {
             socket_path: None,
             client_name: options.client_name.clone(),
+            supports_user_response: options.supports_user_response,
             request_timeout: options.request_timeout,
             ensure_runtime: false,
         };
@@ -458,6 +462,7 @@ impl JcodeClient {
         let instance = Arc::new(launch_instance(&options)?);
         let connect = ConnectOptions {
             socket_path: Some(instance.socket_path.clone()),
+            supports_user_response: false,
             client_name: options.client_name.clone(),
             request_timeout: options.request_timeout,
             ensure_runtime: false,
@@ -539,6 +544,7 @@ impl JcodeClient {
                 min_version: API_VERSION_MAJOR,
                 max_version: API_VERSION_MAJOR,
                 client: options.client_name.clone(),
+                supports_user_response: options.supports_user_response,
             },
             hello_timeout,
         )?;
@@ -802,6 +808,18 @@ impl JcodeClient {
     }
 
     /// Clone a session's complete persisted context into a new idle session.
+    pub fn transfer_session(&self, session_id: &str) -> Result<SessionInfo> {
+        match self
+            .request_ok(ApiRequest::TransferSession {
+                session_id: session_id.into(),
+            })?
+            .event
+        {
+            ApiEvent::SessionForked { session } => Ok(session),
+            other => Err(unexpected("session_forked", &other)),
+        }
+    }
+
     pub fn fork_session(&self, session_id: &str) -> Result<SessionInfo> {
         match self
             .request_ok(ApiRequest::ForkSession {
@@ -847,13 +865,30 @@ impl JcodeClient {
         images: Vec<(String, String)>,
         wait_for_accept: Option<Duration>,
     ) -> Result<()> {
+        self.send_message_with_reminder(session_id, content, images, None, wait_for_accept)
+    }
+
+    /// [`send_message`](Self::send_message) with a hidden system reminder
+    /// for this turn only, such as a collection's instructions. The reminder
+    /// guides the model without appearing in the visible transcript.
+    pub fn send_message_with_reminder(
+        &self,
+        session_id: &str,
+        content: &str,
+        images: Vec<(String, String)>,
+        system_reminder: Option<&str>,
+        wait_for_accept: Option<Duration>,
+    ) -> Result<()> {
         // Subscribe *before* writing: an ack that lands between the write and
         // the subscribe would otherwise be missed and time out a healthy turn.
         let stream = wait_for_accept.map(|_| self.events(Some(session_id)));
         self.notify(ApiRequest::SendMessage {
             session_id: session_id.to_string(),
             content: content.to_string(),
-            system_reminder: None,
+            system_reminder: system_reminder
+                .map(str::trim)
+                .filter(|reminder| !reminder.is_empty())
+                .map(str::to_owned),
             images,
             no_reply: false,
         })?;
@@ -1004,6 +1039,41 @@ impl JcodeClient {
 
     /// Runtime identity, route catalog, protocol metadata, and a live health
     /// check for a session.
+    pub fn runtime_command(
+        &self,
+        session_id: &str,
+        command: jcode_harness_api::RuntimeCommand,
+        args: Vec<String>,
+    ) -> Result<jcode_harness_api::RuntimeCommandOutput> {
+        if !self.supports("runtime_commands") {
+            return Err(Error::new(
+                ErrorKind::Harness(jcode_harness_api::ErrorCode::UnknownRequest),
+                "This runtime does not support structured commands. Update and restart the daemon and bridge.",
+            ));
+        }
+        match self
+            .request_ok(ApiRequest::RuntimeCommand {
+                session_id: session_id.into(),
+                command,
+                args,
+            })?
+            .event
+        {
+            ApiEvent::RuntimeCommandResult {
+                session_id,
+                command,
+                data,
+                message,
+            } => Ok(jcode_harness_api::RuntimeCommandOutput {
+                session_id,
+                command,
+                data,
+                message,
+            }),
+            other => Err(unexpected("runtime_command_result", &other)),
+        }
+    }
+
     pub fn get_runtime_info(&self, session_id: &str) -> Result<RuntimeInfo> {
         self.ping()?;
         match self
@@ -1776,6 +1846,7 @@ fn start_global_child(parent: &JcodeClient, control: &Arc<GlobalEventControl>, s
         JcodeClient::connect_ssh(options)
     } else {
         JcodeClient::connect(ConnectOptions {
+            supports_user_response: false,
             socket_path: Some(parent.inner.socket_path.clone()),
             client_name: format!("{}/global-events", parent.inner.client_name),
             request_timeout: parent.inner.request_timeout,

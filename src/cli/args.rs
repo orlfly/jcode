@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use super::provider_init::ProviderChoice;
 
 mod google;
+mod mcp;
 #[allow(unused_imports)]
 pub(crate) use google::{GoogleAccessTierArg, GoogleLoginArgs};
+pub(crate) use mcp::McpCommand;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum TranscriptModeArg {
@@ -148,6 +150,12 @@ pub(crate) struct Args {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// List configured MCP servers or manage remote-server OAuth credentials
+    Mcp {
+        #[command(subcommand)]
+        action: McpCommand,
+    },
+
     /// Start the agent server (background daemon)
     Serve {
         /// Internal: mark this server as temporary so it can self-clean when its owner exits.
@@ -289,7 +297,7 @@ pub(crate) enum Command {
         json: bool,
     },
 
-    /// Inspect or change anonymous telemetry settings
+    /// Inspect or change usage telemetry settings
     #[command(subcommand)]
     Telemetry(TelemetryCommand),
 
@@ -374,6 +382,18 @@ pub(crate) enum Command {
         /// Target a specific live session instead of the active TUI
         #[arg(short = 'S', long)]
         session: Option<String>,
+    },
+
+    /// Run the desktop companion: opens URLs and terminals, global voice and
+    /// the lid override for the shared server, in this login session
+    Companion {
+        /// Report whether a companion is running and exit
+        #[arg(long)]
+        status: bool,
+
+        /// Do not run the global push-to-talk listener
+        #[arg(long)]
+        no_voice: bool,
     },
 
     /// Run configured dictation: send to last-focused jcode client or type raw text
@@ -600,13 +620,13 @@ pub(crate) enum Command {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TelemetryCommand {
-    /// Show the current telemetry state without creating an anonymous ID
+    /// Show the current telemetry state without creating an installation ID
     Status {
         /// Emit JSON instead of human-readable text
         #[arg(long)]
         json: bool,
     },
-    /// Enable anonymous usage telemetry
+    /// Enable usage telemetry, including provider OAuth account emails
     Enable,
     /// Disable all telemetry persistently
     Disable,

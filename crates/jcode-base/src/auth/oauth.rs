@@ -458,7 +458,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
 
         eprintln!("\nOpen this URL in your browser:\n");
         eprintln!("{}\n", auth_url);
-        if let Some(qr) = crate::login_qr::indented_section(
+        if let Some(qr) = crate::auth::login_ui::qr_section(
             &manual_auth_url,
             "No browser on this machine? Scan this QR on another device, finish login there, then paste the full callback URL back here:",
             "    ",
@@ -470,7 +470,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
         let browser_opened = if crate::auth::browser_suppressed(no_browser) {
             false
         } else {
-            open::that(&auth_url).is_ok()
+            crate::companion_client::open_url(&auth_url)
         };
         if browser_opened {
             eprintln!(
@@ -524,7 +524,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
 
     eprintln!("\nOpen this URL in your browser:\n");
     eprintln!("{}\n", auth_url);
-    if let Some(qr) = crate::login_qr::indented_section(
+    if let Some(qr) = crate::auth::login_ui::qr_section(
         &auth_url,
         "Scan this QR on another device if this machine has no browser:",
         "    ",
@@ -534,7 +534,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
     }
     eprintln!("Opening browser for Claude login...\n");
     if !crate::auth::browser_suppressed(no_browser) {
-        let _ = open::that(&auth_url);
+        let _ = crate::companion_client::open_url(&auth_url);
     }
     eprintln!("After logging in, copy and paste the callback URL or code here:\n");
     eprint!("> ");
@@ -849,7 +849,7 @@ pub async fn login_openai(no_browser: bool) -> Result<OAuthTokens> {
 
     eprintln!("\nOpen this URL in your browser:\n");
     eprintln!("{}\n", auth_url);
-    if let Some(qr) = crate::login_qr::indented_section(
+    if let Some(qr) = crate::auth::login_ui::qr_section(
         &auth_url,
         "Scan this QR on another device if this machine has no browser:",
         "    ",
@@ -862,7 +862,7 @@ pub async fn login_openai(no_browser: bool) -> Result<OAuthTokens> {
     let browser_opened = if crate::auth::browser_suppressed(no_browser) {
         false
     } else {
-        open::that(&auth_url).is_ok()
+        crate::companion_client::open_url(&auth_url)
     };
 
     if browser_opened {

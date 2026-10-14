@@ -593,6 +593,7 @@ pub(super) async fn handle_client(
     let mut continue_on_disconnect = false;
     let mut model_usage_updates_enabled = false;
     let mut supports_pdf_panels = false;
+    let mut supports_user_response = false;
     // Client selfdev status is determined by Subscribe request, not server's env
     let mut client_selfdev = false;
 
@@ -1288,6 +1289,7 @@ pub(super) async fn handle_client(
                         info.current_tool_name = None;
                     }
                 }
+                let peer_content = content.clone();
                 start_processing_message(
                     ProcessingMessage {
                         id,
@@ -1316,6 +1318,20 @@ pub(super) async fn handle_client(
                     },
                 )
                 .await;
+                // Other windows attached to this session only see the turn's
+                // stream events, never the message that started it. Tell them
+                // so the prompt (or auto-poke notice) shows up everywhere.
+                if processing_message_id == Some(id) && !peer_content.trim().is_empty() {
+                    super::state::fanout_peer_client_event(
+                        &swarm_members,
+                        &client_session_id,
+                        &client_connection_id,
+                        ServerEvent::PeerUserMessage {
+                            content: peer_content,
+                        },
+                    )
+                    .await;
+                }
             }
 
             Request::Cancel { id } => {
@@ -1626,7 +1642,8 @@ pub(super) async fn handle_client(
             }
 
             Request::Ping { id } => {
-                let json = encode_event(&ServerEvent::Pong { id, native_ssh_protocol: Some(1), capabilities: vec!["session_tools".into(), "soft_interrupt_ids".into()] });
+                let event = super::session_connections::connection_presence_pong(id, &client_connections, &swarm_members).await;
+                let json = encode_event(&event);
                 let mut w = writer.lock().await;
                 if w.write_all(json.as_bytes()).await.is_err() {
                     break;
@@ -1662,6 +1679,7 @@ pub(super) async fn handle_client(
                 id,
                 system_prompt,
                 supports_pdf_panels: requested_pdf_panels,
+                supports_user_response: requested_user_response,
                 working_dir: subscribe_working_dir,
                 selfdev,
                 target_session_id,
@@ -1699,6 +1717,7 @@ pub(super) async fn handle_client(
                 // rather than retaining a prior pane's values.
                 continue_on_disconnect = requested_continuation;
                 supports_pdf_panels = requested_pdf_panels;
+                supports_user_response = requested_user_response;
                 active_terminal_env = terminal_env;
                 current_client_instance_id = client_instance_id.clone();
                 {
@@ -1869,6 +1888,11 @@ pub(super) async fn handle_client(
                     // front of the client's GetHistory, delaying first paint.
                     last_available_models_snapshot = None;
                 }
+                super::client_session::apply_or_defer_desktop_response_capability(
+                    &agent,
+                    supports_user_response,
+                )
+                .await;
                 client_subscribed = true;
                 provisional_session = false;
             }
@@ -2018,6 +2042,11 @@ pub(super) async fn handle_client(
                 if client_session_id != pre_resume_session_id {
                     provisional_session = false;
                 }
+                super::client_session::apply_or_defer_desktop_response_capability(
+                    &agent,
+                    supports_user_response,
+                )
+                .await;
                 session_control = refresh_session_control_handle(
                     &client_session_id,
                     &agent,
@@ -2060,8 +2089,8 @@ pub(super) async fn handle_client(
                 handle_set_model(id, model, &agent, &client_event_tx).await;
             }
 
-            Request::SetRoute { id, selection } => {
-                handle_set_route(id, selection, &agent, &client_event_tx).await;
+            Request::SetRoute { id, selection, automatic_failover } => {
+                handle_set_route(id, selection, automatic_failover, &agent, &client_event_tx).await;
             }
 
             Request::SetAgentModel { id, target, model, global } => {
@@ -2335,6 +2364,72 @@ pub(super) async fn handle_client(
                 let _ = client_event_tx.send(ServerEvent::Done { id });
             }
 
+            Request::RuntimeCommand { id, command, args } => {
+                let result: anyhow::Result<(serde_json::Value, String)> = async {
+                    let parsed: jcode_harness_api::RuntimeCommand = serde_json::from_value(serde_json::json!(command))?;
+                    if parsed == jcode_harness_api::RuntimeCommand::ServerReload {
+                        if !args.is_empty() { anyhow::bail!("Server reload accepts no arguments. Forced reload is intentionally not exposed."); }
+                        let _ = client_event_tx.send(ServerEvent::RuntimeCommandResult { id, command: command.clone(),
+                            data: serde_json::json!({"requested": true, "force": false}),
+                            message: "Requested a state-preserving server upgrade if a newer binary is available. Watch reload progress for completion.".into() });
+                        handle_reload(id, false, &client_session_id, &agent, &swarm_members, &client_event_tx).await;
+                        return Ok((serde_json::Value::Null, String::new()));
+                    }
+                    if matches!(parsed, jcode_harness_api::RuntimeCommand::Continue | jcode_harness_api::RuntimeCommand::ResumeAll) {
+                        if !args.is_empty() { anyhow::bail!("This command accepts no arguments"); }
+                        let (tx, mut rx) = mpsc::unbounded_channel();
+                        super::client_actions::handle_resume_all_sessions(id, &sessions, &swarm_members, &swarms_by_id,
+                            &event_history, &event_counter, &swarm_event_tx, &tx).await;
+                        while let Ok(event) = rx.try_recv() {
+                            if let ServerEvent::ResumeAllResult { resumed, skipped, message, resumed_sessions, .. } = event {
+                                return Ok((serde_json::json!({"resumed": resumed, "skipped": skipped, "resumed_sessions": resumed_sessions}), message));
+                            }
+                        }
+                        anyhow::bail!("Runtime did not report continuation outcome");
+                    }
+                    if parsed == jcode_harness_api::RuntimeCommand::RefreshModelList {
+                        if !args.is_empty() { anyhow::bail!("This command accepts no arguments"); }
+                        provider.refresh_model_catalog().await?;
+                        crate::bus::Bus::global().publish_models_updated();
+                        let guard = agent.try_lock().map_err(|_| anyhow::anyhow!("Catalog refreshed, but session is busy. Open the model picker after the turn."))?;
+                        let data = serde_json::json!({"refreshed": true, "models": guard.available_models_for_switching(), "routes": guard.model_routes()});
+                        return Ok((data, "Provider model catalog refreshed.".into()));
+                    }
+                    if parsed == jcode_harness_api::RuntimeCommand::Swarm {
+                        if let Some(enabled) = super::runtime_commands::boolean_action(&args, swarm_enabled, false)? {
+                            if reject_if_agent_busy_for_request(id, "runtime_command", &client_session_id, client_is_processing, &agent, &client_event_tx) {
+                                return Ok((serde_json::Value::Null, String::new()));
+                            }
+                            let (tx, mut rx) = mpsc::unbounded_channel();
+                            handle_set_feature(id, crate::protocol::FeatureToggle::Swarm, enabled, &agent, &client_session_id, &friendly_name,
+                                &mut swarm_enabled, &swarm_members, &swarms_by_id, &swarm_coordinators,
+                                &channel_subscriptions, &channel_subscriptions_by_session, &swarm_plans, &tx).await;
+                            while let Ok(event) = rx.try_recv() {
+                                if let ServerEvent::Error { message, .. } = event { anyhow::bail!("{message}"); }
+                            }
+                        }
+                        let members = swarm_members.read().await;
+                        let member = members.get(&client_session_id);
+                        let data = serde_json::json!({"enabled": swarm_enabled, "config_default": crate::config::config().features.swarm,
+                            "swarm_id": member.and_then(|m| m.swarm_id.as_deref()), "role": member.map(|m| &m.role)});
+                        return Ok((data.clone(), serde_json::to_string_pretty(&data)?));
+                    }
+                    if parsed == jcode_harness_api::RuntimeCommand::Subscription {
+                        if !args.is_empty() && args != ["status".to_string()] { anyhow::bail!("Usage: subscription [status]"); }
+                        let data = if crate::subscription_catalog::has_credentials() {
+                            serde_json::to_value(crate::subscription_api::fetch_subscription_me().await?)?
+                        } else { serde_json::json!({"signed_in": false, "status": "not_signed_in"}) };
+                        return Ok((data.clone(), serde_json::to_string_pretty(&data)?));
+                    }
+                    let mut guard = agent.try_lock().map_err(|_| anyhow::anyhow!("Session is busy. Retry this runtime command after the current turn."))?;
+                    super::runtime_commands::execute(&mut guard, parsed, &args, swarm_enabled, serde_json::Value::Null).await
+                }.await;
+                match result {
+                    Ok((data, message)) if !data.is_null() => { let _ = client_event_tx.send(ServerEvent::RuntimeCommandResult { id, command, data, message }); },
+                    Ok(_) => {},
+                    Err(error) => { let _ = client_event_tx.send(ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None }); },
+                }
+            }
             Request::AgentContext { id } => {
                 let _ = client_event_tx.send(ServerEvent::Done { id });
             }

@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn runtime_commands_are_capability_gated_and_never_send_a_prompt() {
+    let request = json!({"id": 501, "req": "runtime_command", "session_id": "s1", "command": "memory", "args": ["status"]});
+    let mut state = BridgeState {
+        session_id: Some("s1".into()),
+        ..Default::default()
+    };
+    let output = state.api_request_to_legacy(&request);
+    assert!(matches!(
+        &output[..],
+        [Outbound::Reply(ServerFrame {
+            event: ApiEvent::Error { .. },
+            ..
+        })]
+    ));
+    state.runtime_commands_supported = true;
+    let output = state.api_request_to_legacy(&request);
+    let [Outbound::Legacy(legacy)] = &output[..] else {
+        panic!("expected native runtime command")
+    };
+    assert_eq!(legacy["type"], "runtime_command");
+    assert_eq!(legacy["command"], "memory");
+    assert_eq!(legacy["args"], json!(["status"]));
+    assert!(legacy.get("content").is_none());
+    let frames = state.legacy_event_to_api(&json!({"type": "runtime_command_result", "id": legacy["id"], "command": "memory", "data": {"enabled": true}, "message": "Memory on"}));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].reply_to, Some(501));
+    assert!(
+        matches!(&frames[0].event, ApiEvent::RuntimeCommandResult { session_id, command: jcode_harness_api::RuntimeCommand::Memory, .. } if session_id == "s1")
+    );
+}
+
+#[test]
+fn runtime_commands_reject_wrong_session_unknown_commands_and_malformed_args() {
+    let mut state = BridgeState {
+        session_id: Some("s1".into()),
+        runtime_commands_supported: true,
+        ..Default::default()
+    };
+    for request in [
+        json!({"id": 1, "req": "runtime_command", "session_id": "s2", "command": "memory"}),
+        json!({"id": 2, "req": "runtime_command", "session_id": "s1", "command": "nonexistent"}),
+        json!({"id": 3, "req": "runtime_command", "session_id": "s1", "command": "memory", "args": "on"}),
+    ] {
+        let output = state.api_request_to_legacy(&request);
+        assert!(matches!(
+            &output[..],
+            [Outbound::Reply(ServerFrame {
+                event: ApiEvent::Error { .. },
+                ..
+            })]
+        ));
+    }
+    assert!(state.pending_simple.is_empty());
+}
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -1883,6 +1939,61 @@ fn unattached_list_sessions_handles_no_session_candidates() {
 }
 
 #[test]
+fn user_connections_are_global_independent_and_fresh_in_list_metadata() {
+    let home = ScopedJcodeHome::new("global-user-presence");
+    for id in [
+        "connected-idle",
+        "connected-busy",
+        "loaded-history",
+        "headless",
+    ] {
+        write_session_record(&home.path, id, &home.path);
+    }
+    let mut state = BridgeState {
+        user_connected_sessions: ["connected-idle".into(), "connected-busy".into()]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let ApiEvent::Sessions { sessions } =
+        only_reply_event(state.api_request_to_legacy(&json!({"req":"list_sessions","id":7})))
+    else {
+        panic!("expected list");
+    };
+    for session in sessions {
+        assert_eq!(
+            session.user_connected,
+            session.session_id.starts_with("connected-")
+        );
+        assert_eq!(
+            session.status, "idle",
+            "connection truth must not overwrite lifecycle/attachment status"
+        );
+    }
+    let ApiEvent::Sessions { sessions: limited } = only_reply_event(
+        state.api_request_to_legacy(&json!({"req":"list_sessions","id":9,"limit":0})),
+    ) else {
+        panic!("expected list");
+    };
+    assert_eq!(
+        limited.len(),
+        2,
+        "connected idle users survive an empty recency page"
+    );
+    assert!(limited.iter().all(|session| session.user_connected));
+    state.user_connected_sessions.clear();
+    let ApiEvent::Sessions { sessions } =
+        only_reply_event(state.api_request_to_legacy(&json!({"req":"list_sessions","id":8})))
+    else {
+        panic!("expected list");
+    };
+    assert!(sessions.iter().all(|session| !session.user_connected));
+    let legacy: SessionInfo =
+        serde_json::from_value(json!({"session_id":"legacy","status":"idle"})).unwrap();
+    assert!(!legacy.user_connected);
+}
+
+#[test]
 fn unattached_list_sessions_discovers_all_persisted_records() {
     let home = ScopedJcodeHome::new("persisted-discovery");
     let first_root = home.path.join("first-project");
@@ -2034,6 +2145,46 @@ fn runtime_info_reports_the_active_provider_and_complete_route_catalog() {
     assert_eq!(routes.len(), 2);
     assert_eq!(routes[1].provider, "gemini");
     assert!(!routes[1].available);
+}
+
+#[test]
+fn retention_never_archives_users_connected_in_other_windows() {
+    let home = ScopedJcodeHome::new("connected-retention");
+    let old_time = SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    for id in ["old-connected", "old-disconnected"] {
+        let path = write_session_record(&home.path, id, &home.path);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+    }
+    let mut state = BridgeState {
+        user_connected_sessions: ["old-connected".into()].into_iter().collect(),
+        ..Default::default()
+    };
+    only_reply_event(state.api_request_to_legacy(
+        &json!({"req":"set_retention_policy","id":1,"archive_after_days":1}),
+    ));
+    let ApiEvent::Sessions { sessions } = only_reply_event(
+        state.api_request_to_legacy(&json!({"req":"list_sessions","id":2,"include_archived":true})),
+    ) else {
+        panic!("expected list");
+    };
+    let connected = sessions
+        .iter()
+        .find(|session| session.session_id == "old-connected")
+        .unwrap();
+    assert!(connected.user_connected);
+    assert!(!connected.archived);
+    assert!(
+        sessions
+            .iter()
+            .find(|session| session.session_id == "old-disconnected")
+            .unwrap()
+            .archived
+    );
 }
 
 #[test]
@@ -3371,6 +3522,168 @@ fn text_framing_preserves_chunks_and_reasoning_then_separates_messages() {
             ..
         }]
     ));
+}
+
+#[test]
+fn citation_suffix_replacements_preserve_messages_across_native_search_and_retry() {
+    let mut state = state_with_session();
+    let first = state.legacy_event_to_api(&json!({"type":"text_delta","text":"Checking sources."}));
+    let ApiEvent::TextDelta {
+        message_id: Some(first_id),
+        ..
+    } = &first[0].event
+    else {
+        panic!("missing first message id")
+    };
+    state.legacy_event_to_api(&json!({"type":"text_done"}));
+    state.legacy_event_to_api(&json!({"type":"tool_start","id":"ws_1","name":"web_search"}));
+    state.legacy_event_to_api(&json!({"type":"tool_exec","id":"ws_1","name":"web_search"}));
+    state.legacy_event_to_api(
+        &json!({"type":"tool_done","id":"ws_1","name":"web_search","output":"Rust documentation"}),
+    );
+
+    let mut corrected_ids = Vec::new();
+    let mut corrected_texts = Vec::new();
+    for (raw, corrected) in [
+        (
+            "Install Rust. RAW_A",
+            "Install Rust. [Rust](https://www.rust-lang.org/tools/install)",
+        ),
+        (
+            "Read docs. RAW_B",
+            "Read docs. [Docs](https://doc.rust-lang.org/)",
+        ),
+    ] {
+        let delta = state.legacy_event_to_api(&json!({"type":"text_delta","text":raw}));
+        let ApiEvent::TextDelta {
+            message_id: Some(id),
+            ..
+        } = &delta[0].event
+        else {
+            panic!("missing citation message id")
+        };
+        assert_ne!(id, first_id);
+        assert!(!corrected_ids.contains(id));
+        let replacement = state.legacy_event_to_api(&json!({
+            "type":"text_suffix_replace","old_text":raw,"new_text":corrected
+        }));
+        assert!(matches!(replacement.as_slice(), [ServerFrame {
+            event: ApiEvent::TextReplace { session_id, message_id: Some(next), text, .. }, ..
+        }] if session_id == "s1" && next == id && text == corrected));
+        let done = state.legacy_event_to_api(&json!({"type":"text_done"}));
+        assert!(matches!(done.as_slice(), [ServerFrame {
+            event: ApiEvent::TextDone { message_id: Some(next), .. }, ..
+        }] if next == id));
+        corrected_ids.push(id.clone());
+        corrected_texts.push(corrected.to_string());
+    }
+    assert_eq!(state.text_attempt.len(), 3);
+    assert_eq!(state.text_attempt[0].1, "Checking sources.");
+    for (index, text) in corrected_texts.iter().enumerate() {
+        assert_eq!(&state.text_attempt[index + 1].1, text);
+        assert!(state.text_attempt[index + 1].2);
+    }
+    assert!(
+        state
+            .legacy_event_to_api(&json!({"type":"message_end"}))
+            .is_empty()
+    );
+
+    // Corrections retain the attempt ledger so a failed request retracts every
+    // completed message under its original correlation id, not just the last.
+    let rollback = state.legacy_event_to_api(&json!({"type":"retry_rollback","attempt":2,"max":3}));
+    assert_eq!(rollback.len(), 3);
+    for (frame, id) in rollback
+        .iter()
+        .zip(std::iter::once(first_id).chain(corrected_ids.iter()))
+    {
+        assert!(matches!(&frame.event, ApiEvent::TextReplace {
+            message_id: Some(next), text, ..
+        } if next == id && text.is_empty()));
+    }
+    assert!(state.text_attempt.is_empty());
+    let retry = state.legacy_event_to_api(&json!({"type":"text_delta","text":"Retried answer"}));
+    assert!(matches!(&retry[0].event, ApiEvent::TextDelta {
+        message_id: Some(next), ..
+    } if next != first_id && !corrected_ids.contains(next)));
+}
+
+#[test]
+fn citation_suffix_replacement_preserves_unicode_prefix_and_accepts_empty_retraction() {
+    let mut state = state_with_session();
+    state.legacy_event_to_api(&json!({"type":"text_delta","text":"Préface 🦀. "}));
+    let delta = state.legacy_event_to_api(&json!({"type":"text_delta","text":"日本語 RAW"}));
+    let ApiEvent::TextDelta { message_id, .. } = &delta[0].event else {
+        panic!("missing text delta")
+    };
+    let corrected = state.legacy_event_to_api(&json!({
+        "type":"text_suffix_replace","old_text":"日本語 RAW","new_text":"日本語 [source](https://example.com/)"
+    }));
+    assert!(matches!(corrected.as_slice(), [ServerFrame {
+        event: ApiEvent::TextReplace { message_id: next, text, .. }, ..
+    }] if next == message_id && text == "Préface 🦀. 日本語 [source](https://example.com/)"));
+    assert!(
+        state
+            .legacy_event_to_api(&json!({
+                "type":"text_suffix_replace","old_text":"日本語 [source](https://example.com/)",
+                "new_text":"日本語 [source](https://example.com/)"
+            }))
+            .is_empty()
+    );
+    let retracted = state.legacy_event_to_api(&json!({
+        "type":"text_suffix_replace","old_text":"Préface 🦀. 日本語 [source](https://example.com/)","new_text":""
+    }));
+    assert!(matches!(retracted.as_slice(), [ServerFrame {
+        event: ApiEvent::TextReplace { message_id: next, text, .. }, ..
+    }] if next == message_id && text.is_empty()));
+    assert!(
+        state
+            .legacy_event_to_api(&json!({"type":"text_done"}))
+            .is_empty()
+    );
+}
+
+#[test]
+fn citation_suffix_replacement_ignores_malformed_mismatched_and_closed_messages() {
+    let mut state = state_with_session();
+    let correction = json!({"type":"text_suffix_replace","old_text":"raw","new_text":"corrected"});
+    assert!(state.legacy_event_to_api(&correction).is_empty());
+    assert!(state.text_attempt.is_empty());
+    state.legacy_event_to_api(&json!({"type":"text_delta","text":"raw"}));
+    state.legacy_event_to_api(&json!({"type":"text_done"}));
+    assert!(state.legacy_event_to_api(&correction).is_empty());
+    state.legacy_event_to_api(&json!({"type":"text_delta","text":"current answer"}));
+    // A matching earlier message must never be selected over the active one.
+    for event in [
+        correction,
+        json!({"type":"text_suffix_replace","old_text":"","new_text":"injected"}),
+        json!({"type":"text_suffix_replace","old_text":"current","new_text":"wrong"}),
+        json!({"type":"text_suffix_replace","old_text":null,"new_text":"wrong"}),
+        json!({"type":"text_suffix_replace","old_text":"current answer"}),
+        json!({"type":"text_suffix_replace","old_text":"current answer","new_text":7}),
+    ] {
+        assert!(state.legacy_event_to_api(&event).is_empty());
+        assert_eq!(state.text_attempt[0].1, "raw");
+        assert_eq!(state.text_attempt[1].1, "current answer");
+    }
+    state.legacy_event_to_api(&json!({"type":"message_end"}));
+    assert!(
+        state
+            .legacy_event_to_api(&json!({
+                "type":"text_suffix_replace","old_text":"current answer","new_text":"wrong"
+            }))
+            .is_empty()
+    );
+    assert_eq!(state.text_attempt[1].1, "current answer");
+    state.legacy_event_to_api(&json!({"type":"kv_cache_request"}));
+    assert!(
+        state
+            .legacy_event_to_api(&json!({
+                "type":"text_suffix_replace","old_text":"","new_text":"phantom"
+            }))
+            .is_empty()
+    );
+    assert!(state.text_attempt.is_empty());
 }
 
 #[test]

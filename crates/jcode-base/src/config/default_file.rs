@@ -146,6 +146,12 @@ timeout_secs = 90
 # A custom command must print raw mono 16 kHz signed 16-bit little-endian PCM.
 # recorder = "arecord -q -t raw -f S16_LE -r 16000 -c 1 -"
 
+# Copilot-key push-to-talk in `jcode companion` (Linux). List keyboard evdev
+# nodes to watch, e.g. ["/dev/input/by-id/usb-Foo-event-kbd"]. Holding the key
+# while a Jcode terminal is focused sends the transcript to that session, even
+# without Jcode Desktop. Empty disables it.
+# global_devices = []
+
 [display]
 # Diff display mode: "off", "inline" (default), "full-inline", or "file"
 diff_mode = "inline"
@@ -321,7 +327,7 @@ update_channel = "stable"
 # key. Providers without native search use the local engines below.
 # Anthropic API keys are billed about $10 per 1,000 searches.
 prefer_native = true
-# Local websearch engine: "duckduckgo", "bing", "searxng", or "native"
+# Local websearch engine: "duckduckgo", "bing", "searxng", "custom", or "native"
 # ("native" forces prefer_native on and otherwise runs fallback_engines).
 engine = "duckduckgo"
 # Keyless HTML engines to try if the preferred engine fails. Default falls back to Bing HTML.
@@ -349,6 +355,22 @@ bing_market = "en-US"
 # Anthropic tool version. "web_search_20260209" and newer are sent with
 # allowed_callers = ["direct"].
 # native_anthropic_tool_version = "web_search_20250305"
+
+# Custom HTTP JSON search: set engine = "custom" and prefer_native = false above.
+# Set fallback_engines = [] above if private queries must not reach Bing on failure.
+# See docs/custom-web-search.md for GET/POST, authentication and JSON pointers.
+# [websearch.custom]
+# endpoint = "https://search.example.org/api"
+# method = "GET"
+# query_param = "q"
+# count_param = "count" # optional; omit to send no count parameter
+# params = { format = "json" }
+# headers = { Accept = "application/json" }
+# header_env = { Authorization = "SEARCH_AUTH" } # complete value, e.g. Bearer ...
+# results_pointer = "/results"
+# title_pointer = "/title"
+# url_pointer = "/url"
+# snippet_pointer = "/snippet"
 
 [tools]
 # Controls which built-in tools are sent to the model.

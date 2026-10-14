@@ -30,5 +30,6 @@ pub use jcode_app_core::*;
 pub use jcode_tui_style::branding;
 
 // Presentation layer (kept in this crate).
+pub mod swarm_compose;
 pub mod tui;
 pub mod video_export;

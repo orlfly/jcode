@@ -36,6 +36,9 @@ pub enum ApiRequest {
         max_version: u32,
         /// Client name and version, e.g. "external-client/0.1.0".
         client: String,
+        /// Opt in only when this client renders user_response tool calls.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_user_response: bool,
     },
 
     /// List sessions visible to this client.
@@ -76,6 +79,10 @@ pub enum ApiRequest {
 
     /// Clone an attached session's transcript into a new, idle session.
     ForkSession { session_id: String },
+
+    /// Create a fresh session containing a runtime-compacted handoff.
+    /// The parent remains unchanged. Replies with `SessionForked`.
+    TransferSession { session_id: String },
 
     /// Detach from the currently attached session.
     DetachSession { session_id: String },
@@ -175,6 +182,15 @@ pub enum ApiRequest {
 
     /// Provider routes and active runtime identity for the attached session.
     GetRuntimeInfo { session_id: String },
+
+    /// Execute a runtime-backed command without a model turn. Requires
+    /// `runtime_commands`. Invalid or unavailable actions return an error.
+    RuntimeCommand {
+        session_id: String,
+        command: crate::RuntimeCommand,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
 
     /// Persist an API-key credential in jcode's owner-only provider store and
     /// notify the daemon to reload it. OAuth tokens are intentionally excluded.
