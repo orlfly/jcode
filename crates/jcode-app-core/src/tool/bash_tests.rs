@@ -997,6 +997,10 @@ fn gate_ctx(working_dir: &str) -> ToolContext {
 #[tokio::test]
 async fn bash_refuses_to_delete_the_home_directory() {
     // The #604 incident, at the real tool boundary.
+    // `HOME` is process-global and several suites sandbox it, so take the shared
+    // test-env lock: without it a concurrent test can swap `HOME` between the
+    // write below and the gate's own lookup.
+    let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("temp home");
     let home = temp.path().to_string_lossy().to_string();
     let previous = std::env::var("HOME").ok();
@@ -1106,6 +1110,9 @@ async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
     // reimplementing it, so the gate lives at the only chokepoint. Assert that
     // directly: calling execute for a background job (the one path that returns
     // early) is still gated.
+    // `HOME` is process-global; see the note in
+    // `bash_refuses_to_delete_the_home_directory`.
+    let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("temp home");
     let home = temp.path().to_string_lossy().to_string();
     let previous = std::env::var("HOME").ok();

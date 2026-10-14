@@ -1632,6 +1632,39 @@ mod tests {
         }
     }
 
+    /// Clears the runtime provider env vars for the duration of a test session
+    /// build, restoring them on drop.
+    struct AmbientProviderEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl AmbientProviderEnvGuard {
+        fn clear() -> Self {
+            const KEYS: [&str; 3] = [
+                "JCODE_ACTIVE_PROVIDER",
+                "JCODE_OPENROUTER_CACHE_NAMESPACE",
+                "JCODE_RUNTIME_PROVIDER",
+            ];
+            let previous = KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+            for key in KEYS {
+                crate::env::remove_var(key);
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for AmbientProviderEnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in &self.0 {
+                match previous {
+                    Some(value) => crate::env::set_var(key, value),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     async fn test_agent(
         session_id: &str,
     ) -> (
@@ -1640,6 +1673,14 @@ mod tests {
         mpsc::UnboundedSender<ServerEvent>,
         mpsc::UnboundedReceiver<ServerEvent>,
     ) {
+        // `derive_session_provider_key` consults the runtime provider env, so a
+        // developer shell configured for a real provider leaks into these
+        // tests: the mock session would inherit e.g. `opencode-go` as its route
+        // and a later bare `set_model` would be qualified to
+        // `opencode-go:<model>` instead of the mock provider's own model string.
+        // Clear it while the session is built so the tests keep exercising the
+        // mock provider's route identity.
+        let _ambient_provider_env = AmbientProviderEnvGuard::clear();
         let provider = Arc::new(TestEffortProvider::default());
         let provider_dyn: Arc<dyn Provider> = provider.clone();
         let registry = crate::tool::Registry::new(Arc::clone(&provider_dyn)).await;

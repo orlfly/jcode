@@ -3382,6 +3382,9 @@ fn bm25_rank(entries: &[MemoryEntry], query_text: &str, limit: usize) -> Vec<(us
 pub fn active_backend_name() -> &'static str {
     static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
+        if test_build_pins_json_backend() {
+            return "json";
+        }
         let raw = std::env::var("JCODE_MEMORY_BACKEND").unwrap_or_default();
         match raw.to_lowercase().as_str() {
             "" => default_backend_name(),
@@ -3397,17 +3400,29 @@ pub fn active_backend_name() -> &'static str {
     })
 }
 
+/// Whether this build is a test build that must ignore an ambient backend.
+///
+/// Test targets — this crate's own, and dependent crates' compiled with the
+/// `test-support` feature — sandbox `JCODE_HOME` per case, but the active
+/// backend is resolved once per process and cached. Inheriting a *runtime*
+/// backend choice from the ambient environment (a developer shell exporting
+/// `JCODE_MEMORY_BACKEND=sqlite-gvec`) freezes the first case's store into every
+/// later case, so such builds are pinned to the JSON backend, whose path is
+/// resolved per call. SQLite-only cases must skip in those builds instead of
+/// opting in through the environment.
+fn test_build_pins_json_backend() -> bool {
+    cfg!(any(test, feature = "test-support"))
+}
+
 /// Resolve the backend used when `JCODE_MEMORY_BACKEND` is unset.
 ///
-/// - In test builds the default is pinned to `json`: tests spin up many
-///   processes-within-a-process against per-test `JCODE_HOME` sandboxes, and
-///   the backend name/path is resolved once per process via `OnceLock`, so an
-///   sqlite default makes test ordering contaminate stores.
+/// - In test builds the default is pinned to `json` (see
+///   [`test_build_pins_json_backend`]).
 /// - At runtime, existing installs keep their `sqlite-gvec` store when its
 ///   database file is present (the pre-upstream-merge default); fresh installs
 ///   with no database start on `json`.
 fn default_backend_name() -> &'static str {
-    if cfg!(test) {
+    if test_build_pins_json_backend() {
         return "json";
     }
     if let Ok(dir) = crate::storage::jcode_dir() {

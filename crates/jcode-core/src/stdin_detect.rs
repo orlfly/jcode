@@ -39,8 +39,12 @@ pub mod linux {
                 let fd = parts[1];
                 // read syscall: 0 on x86_64, 63 on aarch64
                 let is_read = syscall_nr == "0" || syscall_nr == "63";
-                let is_stdin = fd == "0x0";
-                if is_read && is_stdin {
+                // fd 0 is the common case. Some readers duplicate stdin to
+                // another descriptor and read that instead (uutils coreutils'
+                // `head` reads a dup at fd 3), so a read on a descriptor that
+                // points at the same pipe/pty endpoint as fd 0 also counts.
+                let is_stdin_read = is_read && (fd == "0x0" || fd_aliases_stdin(pid, fd));
+                if is_stdin_read {
                     return StdinState::Reading;
                 }
             }
@@ -52,10 +56,14 @@ pub mod linux {
         // the child shares the parent's stdin pipe before calling strict mode.
         if let Ok(wchan) = std::fs::read_to_string(format!("/proc/{}/wchan", pid)) {
             let wchan = wchan.trim();
+            // `anon_pipe_read` is the symbol newer kernels report for a read
+            // blocked on an anonymous pipe; older kernels report `pipe_read` /
+            // `pipe_wait_readable`.
             if (wchan == "n_tty_read"
                 || wchan == "wait_woken"
                 || wchan == "pipe_read"
                 || wchan == "pipe_wait_readable"
+                || wchan == "anon_pipe_read"
                 || wchan == "unix_stream_read_generic")
                 && stdin_is_pipe_or_pty(pid)
             {
@@ -68,6 +76,26 @@ pub mod linux {
             StdinState::NotReading
         } else {
             StdinState::Unknown
+        }
+    }
+
+    /// Whether `fd_hex` (the first syscall argument, hex) is an alias of
+    /// stdin: a read on it can only be satisfied by the same endpoint fd 0
+    /// refers to, so the process is waiting on its standard input.
+    fn fd_aliases_stdin(pid: u32, fd_hex: &str) -> bool {
+        let Ok(fd) = u32::from_str_radix(fd_hex.trim_start_matches("0x"), 16) else {
+            return false;
+        };
+        if fd == 0 {
+            return true;
+        }
+        let link = |fd: u32| std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)).ok();
+        match (link(0), link(fd)) {
+            (Some(stdin), Some(other)) if stdin == other => {
+                let path = stdin.to_string_lossy();
+                path.contains("pipe") || path.contains("pts") || path.contains("ptmx")
+            }
+            _ => false,
         }
     }
 

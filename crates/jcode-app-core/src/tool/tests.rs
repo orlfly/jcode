@@ -687,6 +687,8 @@ async fn tool_descriptions_stay_under_token_cap() {
     // applet carries the whole view-node vocabulary inline, since the model has
     // no other way to learn which node types and props the host renders.
     // codemode documents its sandbox API; compile_remote a credit/consent notice.
+    // bash carries the repository-search hint (prefer agentgrep/rg over grep -r,
+    // and --hidden --no-ignore for ignored files) added deliberately for #1804.
     const EXEMPT: &[&str] = &[
         "integration_tools",
         "swarm",
@@ -696,6 +698,7 @@ async fn tool_descriptions_stay_under_token_cap() {
         "applet",
         "codemode",
         "compile_remote",
+        "bash",
     ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
@@ -1920,6 +1923,11 @@ async fn post_tool_feedback_hook_appends_stdout_to_tool_result() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let previous = std::env::var_os("JCODE_HOOK_POST_TOOL_FEEDBACK");
     crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK", &script);
+    // The config cache returns early for a short interval without re-checking
+    // its fingerprint, so under parallel load another test can keep the hook
+    // list stale and this hook never runs. Force a reload so the env override is
+    // observed deterministically.
+    crate::config::invalidate_config_cache();
 
     let registry = Registry::new(Arc::new(MockProvider) as Arc<dyn Provider>).await;
     let mut ctx = mcp_test_context(dir.path());
@@ -1932,6 +1940,9 @@ async fn post_tool_feedback_hook_appends_stdout_to_tool_result() {
         Some(value) => crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK", value),
         None => crate::env::remove_var("JCODE_HOOK_POST_TOOL_FEEDBACK"),
     }
+    // Drop the hook from the cached config as well, so later tests in this
+    // process do not inherit a script whose tempdir is about to be removed.
+    crate::config::invalidate_config_cache();
     let output = result.expect("read should succeed").output;
     assert!(output.contains("hello"), "{output}");
     assert!(output.contains("[post_tool_feedback]"), "{output}");

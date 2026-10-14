@@ -1839,7 +1839,9 @@ async fn sdk_socket_workflow(response_only: bool) {
     let mut other_session =
         crate::session::Session::create_with_id("sdk_other_session".into(), None, None);
     other_session.working_dir = Some(home._home.path().to_string_lossy().into_owned());
-    other_session.save().unwrap();
+    // `save()` skips an empty root, which would leave B eligible for the 30s
+    // idle reconnect grace and stall the disconnect assertions below.
+    other_session.save_prepared().unwrap();
     let other_registry = Registry::new(provider_template.clone()).await;
     sessions.write().await.insert(
         "sdk_other_session".into(),
@@ -1909,6 +1911,15 @@ async fn sdk_socket_workflow(response_only: bool) {
     })
     .await;
     assert!(matches!(event, ServerEvent::ToolCall { session_id, .. } if session_id == session_a));
+    // An unsaved empty root is deliberately retained across a 30s idle
+    // reconnect grace, which would swamp the assertions below. Persist A before
+    // either client disconnects so the disconnect takes the immediate cleanup
+    // path and the test measures what it is about: a pending callback must not
+    // hold the connection for its 120s deadline.
+    let mut persisted = crate::session::Session::create_with_id(session_a.clone(), None, None);
+    // `save()` skips empty roots; `save_prepared()` is the explicit "exists on
+    // disk even before its first message" variant.
+    persisted.save_prepared().expect("persist session A");
     drop(observer_writer);
     drop(observer_reader);
     tokio::time::timeout(Duration::from_secs(5), observer_task)
