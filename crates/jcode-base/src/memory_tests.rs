@@ -1910,6 +1910,54 @@ fn reclassify_can_backfill_subject_keys() {
 }
 
 #[test]
+fn colliding_proposal_slugs_do_not_overwrite_each_other() {
+    with_temp_home(|home| {
+        // Two distinct *canonical* subjects whose slugs collide: the slug maps
+        // both '.' and '-' to '-', so `file:a.b` and `file:a-b` reduce to the
+        // same file name. Each item lives in its own store so write-time
+        // reconciliation cannot fold them together.
+        let items = [
+            ("file:a.b", "alpha rule: always run the smoke suite before merge"),
+            ("file:a.b", "beta rule: merge needs the smoke suite result attached"),
+            ("file:a.b", "gamma rule: smoke suite must pass on the merge target"),
+            ("file:a-b", "delta rule: never merge without the guard suite green"),
+            ("file:a-b", "epsilon rule: the guard suite gates every merge"),
+            ("file:a-b", "zeta rule: guard suite failures block the merge path"),
+        ];
+        for (index, (subject, content)) in items.into_iter().enumerate() {
+            let mut entry = MemoryEntry::new(
+                MemoryCategory::Custom("process_rule".to_string()),
+                content,
+            );
+            entry.source = Some(format!("session_slug_{index}"));
+            entry.subject_key = Some(subject.to_string());
+            MemoryManager::new()
+                .with_project_dir(format!("/slug-collision-{index}"))
+                .remember_project(entry)
+                .unwrap();
+        }
+
+        let observer = MemoryManager::new().with_project_dir("/slug-collision-observer");
+        let proposals = observer.write_skill_proposals_now().unwrap();
+        assert_eq!(
+            proposals.len(),
+            2,
+            "both anchors must be proposed: {proposals:#?}"
+        );
+        let names: Vec<String> = std::fs::read_dir(home.join("skills").join(".proposals"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names.len(),
+            proposals.len(),
+            "every proposal must get its own file (no silent overwrite): {names:?}"
+        );
+    });
+}
+
+#[test]
 fn explicit_distill_bypasses_the_daily_rate_limit() {
     with_temp_home(|home| {
         // One item per store: three statements about the same task landing in

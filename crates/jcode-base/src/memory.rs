@@ -522,9 +522,21 @@ fn write_skill_proposals(base: &Path, proposals: &[SkillEvidenceProposal]) -> Re
     }
     let dir = base.join("skills").join(".proposals");
     std::fs::create_dir_all(&dir)?;
+    // The slug is human-readable, not injective: `api:/api/task/:id` and
+    // `api:/api/task/<id>` both reduce to `api--api-task--id`. Without a
+    // per-batch guard the second draft silently overwrote the first (observed:
+    // 26 proposals produced 25 files), so duplicates get a numeric suffix.
+    let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for proposal in proposals {
         let slug = proposal.slug();
-        std::fs::write(dir.join(format!("{slug}.md")), proposal.draft(&slug))?;
+        let seen = used.entry(slug.clone()).or_insert(0);
+        *seen += 1;
+        let file_slug = if *seen == 1 {
+            slug
+        } else {
+            format!("{slug}-{seen}")
+        };
+        std::fs::write(dir.join(format!("{file_slug}.md")), proposal.draft(&file_slug))?;
     }
     Ok(())
 }
