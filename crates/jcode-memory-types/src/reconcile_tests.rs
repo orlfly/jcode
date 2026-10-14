@@ -366,7 +366,42 @@ fn noise_gate_agrees_with_the_ontology_condition() {
 fn subject_key_prefers_api_route() {
     assert_eq!(
         derive_subject_key("Kaneo claim: POST /api/task/claim/{taskId} requires teamId"),
-        Some("api:/api/task/claim/{taskid}".to_string())
+        Some("api:/api/task/claim/{param}".to_string())
+    );
+}
+
+#[test]
+fn route_param_spellings_and_trailing_punctuation_normalize() {
+    // The same endpoint must not fragment into four clusters.
+    let forms = [
+        "api:/api/task/:id",
+        "api:/api/task/{id}",
+        "api:/api/task/<id>",
+        "api:/api/task/{taskId};",
+    ];
+    for form in forms {
+        assert_eq!(
+            normalize_subject_key(form),
+            "api:/api/task/{param}",
+            "form {form}"
+        );
+    }
+    assert_eq!(
+        normalize_subject_key("api:/api/task/claim-next;"),
+        "api:/api/task/claim-next"
+    );
+    // Other families only lose trailing punctuation.
+    assert_eq!(
+        normalize_subject_key("file:.gitlab-ci.yml."),
+        "file:.gitlab-ci.yml"
+    );
+}
+
+#[test]
+fn derived_route_key_is_canonical() {
+    assert_eq!(
+        derive_subject_key("Claim-next: POST /api/task/claim-next leaves nothing else;"),
+        Some("api:/api/task/claim-next".to_string())
     );
 }
 
@@ -436,7 +471,7 @@ fn prepare_for_write_stamps_subject_and_cleans_tags() {
         )
         .with_tags(vec!["assistant".to_string(), "Kaneo".to_string()]),
     );
-    assert_eq!(prepared.subject_key.as_deref(), Some("api:/api/task/claim/{id}"));
+    assert_eq!(prepared.subject_key.as_deref(), Some("api:/api/task/claim/{param}"));
     assert_eq!(prepared.tags, vec!["kaneo".to_string()]);
     assert!(prepared.search_text.contains("kaneo"));
 }

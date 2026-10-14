@@ -148,7 +148,10 @@ pub fn lexical_similarity(a: &MemoryEntry, b: &MemoryEntry) -> f32 {
 /// Whether two entries claim the same subject.
 pub fn same_subject(a: &MemoryEntry, b: &MemoryEntry) -> bool {
     match (a.subject_key.as_deref(), b.subject_key.as_deref()) {
-        (Some(x), Some(y)) => !x.is_empty() && x.eq_ignore_ascii_case(y),
+        (Some(x), Some(y)) => {
+            !x.is_empty()
+                && normalize_subject_key(x).eq_ignore_ascii_case(&normalize_subject_key(y))
+        }
         _ => false,
     }
 }
@@ -426,13 +429,61 @@ fn extract_api_route(lower: &str) -> Option<String> {
     let start = lower.find("/api/")?;
     let rest = &lower[start..];
     let end = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ')' | ',' | '?'))
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ')' | ',' | '?' | ';' | '#')
+        })
         .unwrap_or(rest.len());
-    let route = rest[..end].trim_end_matches('/');
+    let route = canonical_route(&rest[..end]);
     if route.len() > 4 && route.len() < 120 {
-        Some(route.to_string())
+        Some(route)
     } else {
         None
+    }
+}
+
+/// Canonical form of an API route: trailing punctuation removed and every path
+/// parameter normalized to `{param}`.
+///
+/// Without this the same endpoint fragments into several subjects -
+/// `/api/task/:id`, `/api/task/{id}` and `/api/task/<id>` are one route, and a
+/// sentence ending `.../claim-next;` must not create a `;`-suffixed key (both
+/// were observed in the live store, splitting 24 evidence items into four
+/// near-duplicate clusters).
+fn canonical_route(route: &str) -> String {
+    // Only punctuation that cannot close a placeholder is trimmed: a trailing
+    // '}' or '>' belongs to `{id}` / `<id>`.
+    let trimmed = route
+        .trim_end_matches(|c: char| matches!(c, '/' | ';' | ',' | '.' | ':' | ')' | ']' | '\'' | '"' | '`'));
+    let mut out = String::with_capacity(trimmed.len());
+    for (index, segment) in trimmed.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        let is_param = (segment.starts_with(':') && segment.len() > 1)
+            || (segment.starts_with('{') && segment.ends_with('}'))
+            || (segment.starts_with('<') && segment.ends_with('>'));
+        if is_param {
+            out.push_str("{param}");
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+/// Canonicalize a stored `subject_key` for grouping.
+///
+/// Applied when aggregating evidence and when comparing subjects, so keys
+/// written by older versions of the extractor still group with today's. The
+/// stored value is left untouched (other consumers address instances by it).
+pub fn normalize_subject_key(key: &str) -> String {
+    match key.split_once(':') {
+        Some((family, rest)) if family == "api" => format!("api:{}", canonical_route(rest)),
+        Some((family, rest)) => {
+            let trimmed = rest.trim_end_matches(|c: char| matches!(c, ';' | ',' | '.'));
+            format!("{family}:{trimmed}")
+        }
+        None => key.trim_end_matches(|c: char| matches!(c, ';' | ',' | '.')).to_string(),
     }
 }
 

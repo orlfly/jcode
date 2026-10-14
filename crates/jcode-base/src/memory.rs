@@ -2013,6 +2013,10 @@ impl MemoryManager {
                 let Some(subject) = entry.subject_key.clone() else {
                     continue;
                 };
+                // Group on the canonical key so anchors written by older
+                // extractors (param spelling, trailing punctuation) still land
+                // in the same cluster as today's rows.
+                let subject = jcode_memory_types::reconcile::normalize_subject_key(&subject);
                 let proposal = groups
                     .entry(subject.clone())
                     .or_insert_with(|| SkillEvidenceProposal {
