@@ -1505,6 +1505,10 @@ impl MemoryManager {
             crate::logging::warn(&format!("skill acceptance mirror save failed: {e}"));
             return linked;
         }
+        // Evidence typically lives in project stores while the mirror lives in
+        // the global store. Same-store edges cover the global-share; the rest
+        // are recorded on the project mirrors by scanning every store once.
+        let _ = self.link_evidence_in_project_stores(name, evidence_ids);
         // One invocation row: the acceptance itself is evidence the skill is in
         // use (the reviewer just acted on this workspace's own evidence). It
         // goes into the same store as the mirror: invocation without a working
@@ -1531,6 +1535,51 @@ impl MemoryManager {
             let _ = self.save_global_graph(&graph);
         }
         linked
+    }
+
+    /// Record `skill:<name> -derived_from-> mem_*` edges on each project
+    /// store's mirror node for evidence that lives in that store.
+    ///
+    /// The global share is handled by [`Self::record_accepted_skill`]; this
+    /// covers the rest: evidence ids written by project sessions live in
+    /// project stores, and the edge must connect nodes within one graph.
+    fn link_evidence_in_project_stores(&self, skill_name: &str, evidence_ids: &[String]) {
+        let name = skill_name.trim();
+        if name.is_empty() || evidence_ids.is_empty() {
+            return;
+        }
+        let wanted: std::collections::HashSet<&str> =
+            evidence_ids.iter().map(|id| id.as_str()).collect();
+        let _ = self.for_each_store(|_key, graph| {
+            if !graph.memories.keys().any(|id| wanted.contains(id.as_str())) {
+                return false;
+            }
+            // The mirror in a project store is created by finalize's
+            // sync pass; if it is not there yet, create it so the
+            // edges have a local endpoint.
+            if graph.get_memory(&format!("skill:{name}")).is_none() {
+                let mut mirror = MemoryEntry::new(
+                    MemoryCategory::Custom("observation".to_string()),
+                    format!("Skill `/{name}` distilled from memory evidence; invoke with `/{name}`."),
+                )
+                .with_id(format!("skill:{name}"))
+                .with_tags(vec![format!("skill:{name}"), "skill-accepted".to_string()])
+                .with_source("skill_registry")
+                .with_trust(crate::memory::TrustLevel::High);
+                mirror.subject_key = Some(format!("skill:{name}"));
+                graph.add_memory(mirror);
+            }
+            let mut changed = false;
+            for id in evidence_ids {
+                if !graph.memories.contains_key(id) {
+                    continue;
+                }
+                graph
+                    .add_edge(&format!("skill:{name}"), id, jcode_memory_types::EdgeKind::DerivedFrom);
+                changed = true;
+            }
+            changed
+        });
     }
 
     /// Count one retrieval for each ID (project and global stores).
