@@ -414,8 +414,19 @@ impl GraphBackend for SqliteGvecBackend {
             .list_edges(None, None)
             .map_err(|e| anyhow::anyhow!("load edges: {e}"))?;
         for edge in edges {
-            let from_id = read_node_id_from_props(&node_props(&graph, edge.source)?);
-            let to_id = read_node_id_from_props(&node_props(&graph, edge.target)?);
+            // A single unreadable endpoint skips one edge; failing the whole
+            // load sent callers into the stale-JSON rollback path.
+            let (from_id, to_id) = match (node_props(&graph, edge.source), node_props(&graph, edge.target)) {
+                (Ok(src), Ok(tgt)) => {
+                    (read_node_id_from_props(&src), read_node_id_from_props(&tgt))
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    crate::logging::info(&format!(
+                        "load edge skipped (endpoint vanished mid-read): {e}"
+                    ));
+                    continue;
+                }
+            };
             let (Some(from), Some(to)) = (from_id, to_id) else {
                 continue;
             };
@@ -890,11 +901,30 @@ fn drop_all_edges(graph: &Graph) -> Result<()> {
 }
 
 fn node_props(graph: &Graph, rowid: gvec_core::ids::NodeId) -> Result<Value> {
-    graph
-        .storage
-        .get_node(rowid)
-        .map(|n| n.properties)
-        .map_err(|e| anyhow::anyhow!("get_node({}): {e}", rowid.0))
+    match graph.storage.get_node(rowid) {
+        Ok(n) => Ok(n.properties),
+        // A concurrent replace-all save can retire the rowid between the
+        // node listing above and this per-row read (`get_node(116): node
+        // not found` raced three real loads). One refresh usually heals it;
+        // if not, the caller skips the node instead of failing the whole
+        // load (a whole-load failure is what used to route the caller into
+        // the stale-JSON fallback and roll the store back).
+        Err(_) => list_nodes_by_label(graph, "Memory")
+            .and_then(|nodes| {
+                nodes
+                    .into_iter()
+                    .find(|(id, _)| {
+                        id.parse::<i64>()
+                            .map(|candidate| candidate == rowid.0)
+                            .unwrap_or(false)
+                    })
+                    .map(|(_, props)| props)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("get_node({}): gone after refresh", rowid.0)
+                    })
+            })
+            .map_err(|e| anyhow::anyhow!("get_node({}): {e}", rowid.0)),
+    }
 }
 
 // Placeholder for reverse_edges serialization; see comment below.
