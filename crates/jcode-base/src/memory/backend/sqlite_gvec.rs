@@ -419,6 +419,21 @@ impl GraphBackend for SqliteGvecBackend {
             let (Some(from), Some(to)) = (from_id, to_id) else {
                 continue;
             };
+            // Drop edges whose memory endpoints have no MemoryEntry in this
+            // graph. A node row that only carries `__jcode_id` is a
+            // placeholder `ensure_node` created for an edge whose target was
+            // missing (e.g. a supersede row purged in the same session); the
+            // loader cannot reconstruct the entry, so the edge would become
+            // a permanent phantom endpoint: 17/51 edges in one live store
+            // touched such nodes, none of them traversable, and each save
+            // re-materialised the placeholders. Tag/cluster endpoints are
+            // never placeholders-with-content and stay.
+            if from.starts_with("mem_") && !out.memories.contains_key(&from) {
+                continue;
+            }
+            if to.starts_with("mem_") && !out.memories.contains_key(&to) {
+                continue;
+            }
             let kind_payload = edge
                 .properties
                 .get("kind_payload")
