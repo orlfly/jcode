@@ -663,7 +663,6 @@ pub fn project_memory_file(project_dir: &std::path::Path) -> Result<PathBuf> {
     Ok(memory_dir.join(format!("{}.json", project_hash)))
 }
 
-#[derive(Debug, Clone)]
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -673,6 +672,36 @@ pub struct MemoryManager {
     /// Held by `Arc` so cloning the manager is cheap and tests can substitute
     /// a custom registry without touching global state.
     ontology_registry: OntologyRegistry,
+    /// Set when a sqlite load failed and the graph was served from the legacy
+    /// JSON snapshot; the next legacy save on this instance must be a no-op so
+    /// the snapshot cannot overwrite the newer sqlite store
+    /// (`self-suppress`, the fallback is read-only by construction).
+    suppress_next_legacy_save: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for MemoryManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryManager")
+            .field("project_dir", &self.project_dir)
+            .field("test_mode", &self.test_mode)
+            .field("include_skills", &self.include_skills)
+            .finish()
+    }
+}
+
+impl Clone for MemoryManager {
+    fn clone(&self) -> Self {
+        Self {
+            project_dir: self.project_dir.clone(),
+            test_mode: self.test_mode,
+            include_skills: self.include_skills,
+            ontology_registry: self.ontology_registry.clone(),
+            suppress_next_legacy_save: std::sync::atomic::AtomicBool::new(
+                self.suppress_next_legacy_save
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl Default for MemoryManager {
@@ -697,6 +726,7 @@ impl MemoryManager {
             test_mode: false,
             include_skills: true,
             ontology_registry: OntologyRegistry::with_default(),
+            suppress_next_legacy_save: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -744,6 +774,7 @@ impl MemoryManager {
             test_mode: true,
             include_skills: true,
             ontology_registry: OntologyRegistry::with_default(),
+            suppress_next_legacy_save: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2830,9 +2861,16 @@ impl MemoryManager {
                 }
                 Err(e) => {
                     crate::logging::warn(&format!(
-                        "load_project_graph via {e}; falling back to JSON path"
+                        "load_project_graph via {e}; returning the legacy JSON snapshot read-only"
                     ));
-                    // fall through to legacy JSON handling
+                    // Fall through to legacy JSON, but never save this snapshot
+                    // back: it is staler than whatever the sqlite store holds
+                    // (the sqlite row read failed, not the store), and
+                    // persisting that stale graph would roll the whole store
+                    // back — measured: it erased generalized rules and
+                    // skill-invocation records written after the last JSON
+                    // export.
+                    self.suppress_next_legacy_save.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -2933,8 +2971,9 @@ impl MemoryManager {
                 }
                 Err(e) => {
                     crate::logging::warn(&format!(
-                        "load_global_graph via {e}; falling back to JSON path"
+                        "load_global_graph via {e}; returning the legacy JSON snapshot read-only"
                     ));
+                    self.suppress_next_legacy_save.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -3008,6 +3047,14 @@ impl MemoryManager {
                 crate::logging::warn(&format!(
                     "save_project_graph via {e}; falling back to JSON path"
                 ));
+                // Same suppression as the load fallback: a manager that served
+                // its graph from the staler JSON snapshot must not persist it.
+                if self.suppress_next_legacy_save.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    crate::logging::warn(
+                        "save_project_graph suppressed: legacy JSON snapshot may be staler than the sqlite store",
+                    );
+                    return Ok(());
+                }
                 return self.save_project_graph_json(graph);
             }
             if !self.test_mode {
@@ -3054,6 +3101,14 @@ impl MemoryManager {
                 crate::logging::warn(&format!(
                     "save_global_graph via {e}; falling back to JSON path"
                 ));
+                // Same suppression as the load fallback (see
+                // `save_project_graph`).
+                if self.suppress_next_legacy_save.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    crate::logging::warn(
+                        "save_global_graph suppressed: legacy JSON snapshot may be staler than the sqlite store",
+                    );
+                    return Ok(());
+                }
                 return self.save_global_graph_json(graph);
             }
             if !self.test_mode {
