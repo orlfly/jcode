@@ -609,25 +609,53 @@ fn bridge_update_is_skipped_until_the_bridge_is_installed() {
     }
 }
 
+/// Compile a minimal sleeper and return its path.
+///
+/// The test needs a binary whose behaviour does not depend on argv[0] (the
+/// file must be named `firefox-agent-bridge-host` while it runs). Copying
+/// `/bin/sleep` breaks on uutils coreutils: that `sleep` is a multicall
+/// binary that dispatches on argv[0] and exits with "unknown program host"
+/// for any other name, killing both children instantly (observed: the test
+/// failed deterministically on this machine with 1860 other tests green).
+/// A one-shot rustc build side-steps the dispatcher entirely; skipped with a
+/// clear message when no compiler is available.
+fn build_sleeper(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let src = dir.join("sleeper.rs");
+    std::fs::write(&src, "fn main() { std::thread::sleep(std::time::Duration::from_secs(120)); }\n").ok()?;
+    let out = dir.join("firefox-agent-bridge-host");
+    // RUSTC is not defined for every cargo invocation (plain `cargo test`);
+    // resolve through the toolchain locator as the build system does.
+    let rustc = std::env::var("RUSTC")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "rustc".to_string());
+    let status = std::process::Command::new(rustc)
+        .arg("-O")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .ok()?;
+    status.success().then_some(out)
+}
+
 /// After an update only hosts still running the replaced binary are stopped;
 /// a host the reloaded extension already started from the new file survives.
 #[cfg(target_os = "linux")]
 #[test]
 fn update_stops_only_hosts_running_the_replaced_binary() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let host = temp.path().join("firefox-agent-bridge-host");
-    let sleep = std::path::Path::new("/bin/sleep");
-    std::fs::copy(sleep, &host).expect("copy sleep");
+    let Some(host) = build_sleeper(temp.path()) else {
+        eprintln!("rustc unavailable; skipping process-replacement test");
+        return;
+    };
     let mut old = std::process::Command::new(&host)
-        .arg("30")
         .spawn()
         .expect("old host");
     // Replace the binary the way the updater does (rename over it).
-    let staged = temp.path().join(".staged");
-    std::fs::copy(sleep, &staged).expect("stage");
+    let staged = build_sleeper(temp.path()).expect("staged sleeper");
     std::fs::rename(&staged, &host).expect("replace");
     let mut new = std::process::Command::new(&host)
-        .arg("30")
         .spawn()
         .expect("new host");
     std::thread::sleep(std::time::Duration::from_millis(100));

@@ -1033,7 +1033,12 @@ mod tests {
         );
 
         dispatch_observer(HookEvent::new("session_start").session_id("ses_multi"));
-        for _ in 0..100 {
+        // Deadline-based, not a fixed 2s budget: full-suite runs schedule 1800+
+        // tests on all cores, and a machine under that load has taken longer
+        // than 2s to schedule two detached observers (observed: passed 3/3
+        // isolated, failed in the full run). 10s deadline + early exit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if first_record.exists() && second_record.exists() {
                 break;
             }
