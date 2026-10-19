@@ -5,7 +5,10 @@ pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
 pub mod bedrock;
+mod catalog_memo;
 mod catalog_routes;
+pub use catalog_memo::bump_catalog_generation;
+use catalog_memo::{RoutesMemoEntry, catalog_generation, next_catalog_scope};
 pub mod catalog_scheduler;
 pub mod copilot;
 pub mod cursor;
@@ -166,6 +169,14 @@ pub use stream_timeout::{
     MAX_STREAM_IDLE_TIMEOUT_MULTIPLIER, max_stream_idle_timeout, stream_idle_timeout,
     stream_idle_timeout_for_effort, stream_idle_timeout_multiplier_for_effort,
 };
+
+/// Effective `[provider] request_compression` policy. Unknown values fall back
+/// to `Auto` (the shipped default) rather than silently disabling.
+pub fn request_compression_mode() -> jcode_provider_core::request_compression::CompressionMode {
+    use jcode_provider_core::request_compression::CompressionMode;
+    CompressionMode::parse(&crate::config::config().provider.request_compression)
+        .unwrap_or(CompressionMode::Auto)
+}
 
 /// Whether reasoning deltas should be persisted in session history for later
 /// provider context reconstruction.
@@ -330,148 +341,9 @@ pub(crate) fn jcode_subscription_model_prefix(model: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// The outcome of re-applying a persisted session's model on resume.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionModelRestore {
-    /// The model-switch request that was actually applied.
-    pub request: String,
-    /// Set when the persisted credential route could not be honored and the
-    /// session was moved onto the credential the process can actually use.
-    /// Callers must write these back to the session so every later reader
-    /// (swarm spawn inheritance, headed clients, the next resume) sees the
-    /// route the session really runs on instead of the stale one.
-    pub healed_route: Option<HealedSessionRoute>,
-}
-
-/// Route metadata to persist after a stale credential pin was recovered.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealedSessionRoute {
-    pub stale_request: String,
-    pub provider_key: Option<String>,
-    pub route_api_method: Option<String>,
-}
-
-/// When a persisted request pins a dual-auth credential (`claude-api:`,
-/// `claude-oauth:`, `openai-api:`, `openai-oauth:`) that the process cannot
-/// use, compute the request that keeps the same provider and model on the
-/// credential the process *can* use:
-///
-/// - `JCODE_RUNTIME_PROVIDER` pins the same provider with the other credential
-///   (the operator moved the deployment from an API key to OAuth or back):
-///   follow the runtime pin.
-/// - No runtime pin for that provider: drop to the bare provider prefix
-///   (`claude:` / `openai:`) so the runtime's automatic mode picks whichever
-///   credential exists.
-///
-/// Returns `None` when the request pins nothing, or when the runtime pins the
-/// very credential that failed (a genuine auth failure, not a stale session).
-pub fn stale_credential_route_fallback(request: &str) -> Option<(String, HealedSessionRoute)> {
-    let (_, prefix, bare) = explicit_model_provider_prefix(request.trim())?;
-    let bare = bare.trim();
-    if bare.is_empty() {
-        return None;
-    }
-    let stale = jcode_provider_core::AuthRoute::parse_explicit_credential_prefix(prefix)?;
-    match jcode_provider_core::runtime_env_auth_route()
-        .filter(|runtime| runtime.provider == stale.provider)
-    {
-        Some(runtime) if runtime.mode == stale.mode => None,
-        Some(runtime) => Some((
-            format!("{}:{bare}", runtime.model_prefix()),
-            HealedSessionRoute {
-                stale_request: request.to_string(),
-                provider_key: Some(runtime.session_provider_key().to_string()),
-                route_api_method: Some(runtime.route_api_method().to_string()),
-            },
-        )),
-        None => {
-            let bare_prefix = stale.provider.bare_model_prefix();
-            Some((
-                format!("{bare_prefix}:{bare}"),
-                HealedSessionRoute {
-                    stale_request: request.to_string(),
-                    provider_key: Some(bare_prefix.to_string()),
-                    route_api_method: None,
-                },
-            ))
-        }
-    }
-}
-
-/// Re-apply a persisted session's model on resume, recovering from a stale
-/// credential pin.
-///
-/// A session records the credential route it was created on. When the
-/// deployment's credential later changes type (an Anthropic API key replaced
-/// by a Claude subscription, or the reverse), the persisted pin names a
-/// credential that no longer exists. Restoring through it fails, and before
-/// this the failure was only logged: the session kept running on the provider
-/// default while its metadata still claimed the dead route, so every swarm
-/// worker that inherited it failed with "No Anthropic API key found".
-pub fn restore_session_model(
-    provider: &dyn Provider,
-    model: &str,
-    provider_key: Option<&str>,
-    route_api_method: Option<&str>,
-) -> Result<SessionModelRestore> {
-    let request = MultiProvider::model_switch_request_for_session_route(
-        model,
-        provider_key,
-        route_api_method,
-    );
-    let first_err = match set_model_with_auth_refresh(provider, &request) {
-        Ok(()) => {
-            return Ok(SessionModelRestore {
-                request,
-                healed_route: None,
-            });
-        }
-        Err(err) => err,
-    };
-    let Some((fallback, healed)) = stale_credential_route_fallback(&request) else {
-        return Err(first_err);
-    };
-    set_model_with_auth_refresh(provider, &fallback).map_err(|fallback_err| {
-        anyhow!("{first_err} (fallback to '{fallback}' also failed: {fallback_err})")
-    })?;
-    crate::logging::warn(&format!(
-        "Session credential route '{request}' is no longer usable ({first_err}); \
-         restored on '{fallback}' and updated the session route"
-    ));
-    Ok(SessionModelRestore {
-        request: fallback,
-        healed_route: Some(healed),
-    })
-}
-
-pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Result<()> {
-    match provider.set_model(model) {
-        Ok(()) => Ok(()),
-        Err(first_err) => {
-            let first_message = first_err.to_string();
-            crate::logging::auth_event(
-                "auth_changed_retry_after_set_model_failure",
-                provider.name(),
-                &[("reason", first_message.as_str())],
-            );
-            // Use the preserve-current-provider variant: this is a retry for an
-            // already-open session, so refreshing auth from disk must NOT swap a
-            // user-defined named OpenAI-compatible profile slot for a generic
-            // OpenRouter runtime (which would lose `profile_id` and re-introduce
-            // the `<profile>:<model>` prefix on the wire). See #408.
-            provider.on_auth_changed_preserve_current_provider();
-            provider.set_model(model).map_err(|second_err| {
-                anyhow::anyhow!(
-                    "{} (retried after reloading auth from disk: {})",
-                    first_message,
-                    second_err
-                )
-            })
-        }
-    }
-}
-
 use self::dispatch::CompletionMode;
+
+mod session_restore;
 pub use self::models::{
     AccountModelAvailability, AccountModelAvailabilityState, AnthropicModelCatalog,
     ModelCatalogHttpStatus, OpenAIModelCatalog, anthropic_catalog_scope_for_route,
@@ -503,18 +375,19 @@ pub use self::models::{
 };
 pub use self::models::{
     begin_openai_model_catalog_refresh_for_scope, cached_openai_model_ids_for_scope,
-    cached_openai_reasoning_efforts_for_scope, clear_model_unavailable_for_scope,
-    finish_openai_model_catalog_refresh_for_scope, get_best_available_openai_model_for_scope,
-    known_openai_model_ids_for_scope, model_availability_for_scope,
-    openai_catalog_scope_for_credential, persist_openai_model_catalog_for_scope,
-    populate_account_models_for_scope, record_model_unavailable_for_scope,
-    refresh_openai_model_catalog_in_background_for_scope,
+    cached_openai_reasoning_efforts_for_scope, cached_openai_service_tiers_for_scope,
+    clear_model_unavailable_for_scope, finish_openai_model_catalog_refresh_for_scope,
+    get_best_available_openai_model_for_scope, known_openai_model_ids_for_scope,
+    model_availability_for_scope, openai_catalog_scope_for_credential,
+    persist_openai_model_catalog_for_scope, populate_account_models_for_scope,
+    record_model_unavailable_for_scope, refresh_openai_model_catalog_in_background_for_scope,
     should_refresh_openai_model_catalog_for_scope,
 };
 pub use self::selection::DefaultModelSelection;
 use self::selection::{ActiveProvider, ProviderAvailability};
 use self::state::ProviderState;
 pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent};
+pub use session_restore::*;
 
 pub(crate) const GROK_BUILD_PROFILE_ID: &str = "grok-build";
 
@@ -554,6 +427,8 @@ pub struct MultiProvider {
     /// switches, catalog display, or auth refresh handling.
     openai_compatible_profiles: RwLock<HashMap<String, Arc<dyn Provider>>>,
     active_openai_compatible_profile: RwLock<Option<String>>,
+    /// Stable application session identity, retained across runtime replacement.
+    session_id: RwLock<Option<String>>,
     active: RwLock<ActiveProvider>,
     /// Notifications generated during provider/account auto-selection.
     /// The TUI should drain and display these on session start.
@@ -570,6 +445,8 @@ pub struct MultiProvider {
     /// a couple of seconds, saturating every core. The memo collapses those
     /// into one build per TTL window; auth/model changes invalidate it
     /// explicitly so pickers never see stale routes after a switch.
+    /// Unique configuration lineage, preserved only by equivalent forks.
+    catalog_scope: u64,
     routes_memo: Mutex<Option<RoutesMemoEntry>>,
     /// Number of model-catalog prefetches launched by the latest auth refresh.
     /// Shared by forks so the server can wait for real work rather than sleeping
@@ -577,213 +454,18 @@ pub struct MultiProvider {
     post_auth_refreshes_pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Memoized route catalog with the inputs that decide its freshness: build
-/// time (short TTL), the auth generation at build time (bumped by
-/// `AuthStatus::invalidate_cache()` on login/logout/credential edits), and the
-/// catalog generation (bumped by prefetch/refresh completions).
-#[derive(Clone)]
-struct RoutesMemoEntry {
-    built_at: std::time::Instant,
-    auth_generation: u64,
-    catalog_generation: u64,
-    routes: Vec<ModelRoute>,
-    /// `listable_model_names_from_routes(&routes)`, cached because the
-    /// non-chat-model heuristic string-scans every route name and callers
-    /// (catalog snapshots) ask for names and routes together.
-    listable_models: Vec<String>,
-}
-
-/// Process-wide route-catalog memo shared across `MultiProvider` instances.
-///
-/// The shared server forks one `MultiProvider` per client connection, so a
-/// per-instance memo cannot deduplicate the builds triggered by a burst of
-/// simultaneous client spawns: every fresh fork still built its own catalog.
-/// Catalog content is derived almost entirely from process-global state
-/// (credential files, disk caches, config), so identical forks can share one
-/// build. Instance-specific inputs (active provider/model/profile) are folded
-/// into the memo key; anything not captured is bounded by the short TTL and
-/// the auth/catalog generations.
-static GLOBAL_ROUTES_MEMO: LazyLock<Mutex<HashMap<String, RoutesMemoEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Single-flight guard for catalog builds. During a client connect burst every
-/// connection calls `model_routes()` at nearly the same instant; without this
-/// they all miss the still-empty memo and build the same catalog in parallel
-/// (a thundering herd that pegs every core). Holding this lock across the
-/// build makes followers block (sleep, not spin) until the leader publishes
-/// its result, which they then serve from the shared memo.
-static GLOBAL_ROUTES_BUILD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Bumped whenever provider catalogs change out-of-band (prefetch completion,
-/// forced catalog refresh, auth changes). Invalidates every shared memo entry.
-static CATALOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn catalog_generation() -> u64 {
-    CATALOG_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Invalidate every memoized route catalog in the process.
-///
-/// Called when provider catalogs change out-of-band (background catalog
-/// refresh completion, auth changes). This is what keeps the route memo TTL a
-/// backstop rather than the mechanism: a completed refresh is reflected on the
-/// next render instead of waiting for the memo to expire.
-pub fn bump_catalog_generation() {
-    CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 impl MultiProvider {
-    /// Drop this instance's route-catalog memo. Use for changes that are
-    /// captured by [`Self::routes_memo_key`] (model/provider/profile switches):
-    /// the shared memo stays valid because those instances key differently.
-    fn invalidate_routes_memo(&self) {
-        if let Ok(mut memo) = self.routes_memo.lock() {
-            *memo = None;
-        }
-    }
-
-    /// Drop every memoized catalog in the process. Use for changes that alter
-    /// catalog *content* beyond the memo key: credential changes and catalog
-    /// prefetch/refresh completions. Deliberately not called from set_model /
-    /// set_active_provider, which run once per shared-server fork during
-    /// connect bursts and would otherwise defeat the shared memo.
-    fn invalidate_routes_memo_globally(&self) {
-        self.invalidate_routes_memo();
-        CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Key identifying the instance-specific state that feeds the route
-    /// catalog. Two `MultiProvider` instances with equal keys (given equal
-    /// auth/catalog generations) produce equivalent catalogs, so shared-server
-    /// forks can reuse one build. The current model matters because the active
-    /// OpenRouter model gets priority endpoint-refresh scheduling and detail
-    /// annotations in the catalog; the configured-provider bitmap matters
-    /// because each configured runtime contributes its own route family.
-    fn routes_memo_key(&self) -> String {
-        let active = self.active_provider();
-        let credential_mode = self.credential_mode();
-        let profile = self
-            .active_openai_compatible_profile
+    fn bound_session_id(&self) -> Option<String> {
+        self.session_id
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-            .unwrap_or_default();
-        let mut compat_profiles: Vec<String> = self
-            .openai_compatible_profiles
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        compat_profiles.sort();
-        let configured = [
-            ("an", self.anthropic_provider().is_some()),
-            ("oa", self.openai_provider().is_some()),
-            ("co", self.copilot_provider().is_some()),
-            ("ag", self.antigravity_provider().is_some()),
-            ("ge", self.gemini_provider().is_some()),
-            ("cu", self.cursor_provider().is_some()),
-            ("be", self.bedrock_provider().is_some()),
-            ("or", self.openrouter_provider().is_some()),
-        ]
-        .iter()
-        .filter(|(_, present)| *present)
-        .map(|(tag, _)| *tag)
-        .collect::<Vec<_>>()
-        .join(",");
-        format!(
-            "{}|{}|{}|{:?}|{}|{}|{}",
-            // Scope by home so sandboxes (tests, JCODE_HOME switches) never
-            // share catalogs that were built from different credential files.
-            std::env::var("JCODE_HOME").unwrap_or_default(),
-            Self::provider_key(active),
-            self.model(),
-            credential_mode,
-            profile,
-            configured,
-            compat_profiles.join(","),
-        )
     }
 
-    /// Return a fresh memoized catalog entry (routes + listable model names),
-    /// building it at most once per TTL window per catalog-relevant state.
-    ///
-    /// Freshness is keyed on a short TTL plus the auth and catalog
-    /// generations. Lookup order: this instance's memo, the process-wide
-    /// shared memo (so shared-server forks reuse one build), then a
-    /// single-flight build that followers wait on instead of duplicating.
-    fn fresh_routes_memo_entry(&self) -> RoutesMemoEntry {
-        // Backstop only: invalidation is event-driven via auth/catalog
-        // generations, so a completed refresh shows up on the next render.
-        const ROUTES_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-        // Rendering no longer schedules catalog I/O; the sweeper does.
-        catalog_scheduler::ensure_started();
-
-        let auth_generation = pricing::auth_pricing_generation();
-        let catalog_gen = catalog_generation();
-        let fresh = |entry: &RoutesMemoEntry| {
-            entry.auth_generation == auth_generation
-                && entry.catalog_generation == catalog_gen
-                && entry.built_at.elapsed() < ROUTES_MEMO_TTL
-        };
-
-        // Fast path: this instance already built (or copied) a fresh catalog.
-        if let Ok(memo) = self.routes_memo.lock()
-            && let Some(entry) = memo.as_ref()
-            && fresh(entry)
-        {
-            return entry.clone();
+    fn bind_provider_session(&self, provider: &dyn Provider) {
+        if let Some(session_id) = self.bound_session_id() {
+            provider.set_session_id(&session_id);
         }
-
-        // Shared path: another instance with the same catalog-relevant state
-        // (typically a fresh fork on the shared server) built one already.
-        let shared_key = self.routes_memo_key();
-        let try_shared = || -> Option<RoutesMemoEntry> {
-            let shared = GLOBAL_ROUTES_MEMO.lock().ok()?;
-            let entry = shared.get(&shared_key)?;
-            if !fresh(entry) {
-                return None;
-            }
-            let entry = entry.clone();
-            if let Ok(mut memo) = self.routes_memo.lock() {
-                *memo = Some(entry.clone());
-            }
-            Some(entry)
-        };
-        if let Some(entry) = try_shared() {
-            return entry;
-        }
-
-        // Single-flight: serialize builds so a connect burst produces one
-        // build and N-1 memo hits instead of N parallel builds.
-        let _build_guard = GLOBAL_ROUTES_BUILD_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Re-check after acquiring the lock: the leader that held it may have
-        // just published exactly the entry this instance needs.
-        if let Some(entry) = try_shared() {
-            return entry;
-        }
-
-        let routes = catalog_routes::multiprovider_model_routes(self);
-        let entry = RoutesMemoEntry {
-            built_at: std::time::Instant::now(),
-            auth_generation,
-            catalog_generation: catalog_gen,
-            listable_models: listable_model_names_from_routes(&routes),
-            routes,
-        };
-        if let Ok(mut memo) = self.routes_memo.lock() {
-            *memo = Some(entry.clone());
-        }
-        if let Ok(mut shared) = GLOBAL_ROUTES_MEMO.lock() {
-            // Tiny keyspace (active provider + model + profile); prune stale
-            // entries opportunistically so it cannot grow unbounded.
-            shared.retain(|_, existing| fresh(existing));
-            shared.insert(shared_key, entry.clone());
-        }
-        entry
     }
 
     #[cfg(test)]
@@ -2031,6 +1713,25 @@ impl Default for MultiProvider {
 
 #[async_trait]
 impl Provider for MultiProvider {
+    fn set_session_id(&self, session_id: &str) {
+        *self
+            .session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session_id.to_owned());
+    }
+
+    fn catalog_sharing_identity(&self) -> Option<String> {
+        Some(format!(
+            "{:?}",
+            (
+                "multiprovider-v1",
+                self.routes_memo_key(),
+                pricing::auth_pricing_generation(),
+                catalog_generation(),
+                self.display_name(),
+            )
+        ))
+    }
     async fn prewarm(&self, tools: &[ToolDefinition], system_static: &str) {
         let provider = match self.active_provider() {
             ActiveProvider::Claude => self.anthropic_provider(),
@@ -2045,6 +1746,7 @@ impl Provider for MultiProvider {
             ActiveProvider::OpenRouter => self.active_openrouter_execution_provider(),
         };
         if let Some(provider) = provider {
+            self.bind_provider_session(provider.as_ref());
             provider.prewarm(tools, system_static).await;
         }
     }
@@ -2641,6 +2343,13 @@ impl Provider for MultiProvider {
         self.fresh_routes_memo_entry().routes
     }
 
+    fn model_capabilities_need_refresh(&self) -> bool {
+        matches!(self.active_provider(), ActiveProvider::OpenAI)
+            && self
+                .openai_provider()
+                .is_some_and(|provider| provider.model_capabilities_need_refresh())
+    }
+
     async fn prefetch_models(&self) -> Result<()> {
         let anthropic = self.anthropic_provider();
         let openai = self.openai_provider();
@@ -3201,19 +2910,29 @@ impl Provider for MultiProvider {
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
+        let fork_start = std::time::Instant::now();
         let current_model = self.model();
         let active = self.active_provider();
 
+        let mut lap = std::time::Instant::now();
+        let mut laps: Vec<(&str, u128)> = Vec::new();
+        let mut mark = |name: &'static str, laps: &mut Vec<(&str, u128)>| {
+            laps.push((name, lap.elapsed().as_millis()));
+            lap = std::time::Instant::now();
+        };
+        mark("model_active", &mut laps);
         let anthropic = if self.anthropic_provider().is_some() {
             external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME)
         } else {
             None
         };
+        mark("anthropic", &mut laps);
         let openai = if self.openai_provider().is_some() {
             external::instantiate_expected_external_provider(external::OPENAI_RUNTIME)
         } else {
             None
         };
+        mark("openai", &mut laps);
         let copilot_api = self
             .copilot_api
             .read()
@@ -3229,6 +2948,7 @@ impl Provider for MultiProvider {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        mark("copy", &mut laps);
         let cursor_provider = if self
             .cursor
             .read()
@@ -3239,11 +2959,13 @@ impl Provider for MultiProvider {
         } else {
             None
         };
+        mark("cursor", &mut laps);
         let bedrock_provider = if self.bedrock_provider().is_some() {
             Some(Arc::new(new_bedrock_provider()))
         } else {
             None
         };
+        mark("bedrock", &mut laps);
         let openrouter = if self
             .openrouter
             .read()
@@ -3255,6 +2977,7 @@ impl Provider for MultiProvider {
             None
         };
 
+        mark("openrouter", &mut laps);
         // Clone the parent's compatible-profile registry so the forked
         // provider retains the active execution runtime identity. Without
         // this, `display_name()` on the fork would fall back to the
@@ -3288,17 +3011,34 @@ impl Provider for MultiProvider {
             openrouter: RwLock::new(openrouter),
             openai_compatible_profiles: RwLock::new(compatible_profiles),
             active_openai_compatible_profile: RwLock::new(active_compatible_profile),
+            session_id: RwLock::new(self.bound_session_id()),
             active: RwLock::new(active),
             startup_notices: RwLock::new(Vec::new()),
             initial_provider: self.initial_provider,
+            catalog_scope: self.catalog_scope,
             routes_memo: Mutex::new(None),
             post_auth_refreshes_pending: Arc::clone(&self.post_auth_refreshes_pending),
         };
 
+        let runtimes_ms = fork_start.elapsed().as_millis();
+        let catalog_start = std::time::Instant::now();
         provider.spawn_anthropic_catalog_refresh_if_needed();
         provider.spawn_openai_catalog_refresh_if_needed();
+        let catalog_ms = catalog_start.elapsed().as_millis();
+        let set_model_start = std::time::Instant::now();
         let switch_request = self.fork_model_switch_request(active, &current_model);
         let _ = provider.set_model(&switch_request);
+        crate::logging::info(&format!(
+            "[TIMING] provider fork: runtimes={}ms ({}), catalog_spawn={}ms, set_model={}ms, total={}ms",
+            runtimes_ms,
+            laps.iter()
+                .map(|(name, ms)| format!("{name}={ms}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            catalog_ms,
+            set_model_start.elapsed().as_millis(),
+            fork_start.elapsed().as_millis()
+        ));
         Arc::new(provider)
     }
 
@@ -3309,7 +3049,10 @@ impl Provider for MultiProvider {
         // in-flight helper work but stale for a brand-new session. Reconstruct the
         // orchestrator so the reloadable config cache and current auth state choose
         // the provider/model again.
-        let provider = Self::new_fast();
+        let mut provider = Self::new_fast();
+        // Reconstruction uses the same composition root. Selection, home,
+        // reloadable config and auth/catalog revisions remain part of the key.
+        provider.catalog_scope = self.catalog_scope;
 
         // An explicit CLI initial provider/model remains the starting selection
         // for new sessions, while each session can switch freely afterward.

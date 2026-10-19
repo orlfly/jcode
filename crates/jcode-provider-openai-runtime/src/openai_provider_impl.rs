@@ -13,6 +13,22 @@ fn catalog_error_is_auth_rejection(err: &anyhow::Error) -> bool {
 
 #[async_trait]
 impl Provider for OpenAIProvider {
+    fn set_session_id(&self, session_id: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        let mut current = self
+            .cache_session_id
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if *current != session_id {
+            *current = session_id.to_owned();
+            drop(current);
+            self.prewarm.clear();
+            self.clear_persistent_ws_try("OpenAI session changed");
+        }
+    }
+
     fn set_oauth_account(&self, label: Option<&str>) -> Result<()> {
         let selected = label
             .map(jcode_base::auth::codex::load_credentials_for_account)
@@ -42,12 +58,28 @@ impl Provider for OpenAIProvider {
     }
 
     fn active_oauth_account_email(&self) -> Option<String> {
-        let credentials = self.credentials.try_read().ok()?;
+        let credentials = match self.credentials.try_read() {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                jcode_base::logging::debug(&format!(
+                    "OpenAI account identity deferred while credentials are in use: {error}"
+                ));
+                return None;
+            }
+        };
         if !Self::is_chatgpt_mode(&credentials) || self.is_browser_only() {
             return None;
         }
-        jcode_base::auth::codex::list_accounts()
-            .ok()
+        let accounts = match jcode_base::auth::codex::list_accounts() {
+            Ok(accounts) => Some(accounts),
+            Err(error) => {
+                jcode_base::logging::warn(&format!(
+                    "Cannot read OpenAI OAuth account identities: {error:#}"
+                ));
+                None
+            }
+        };
+        accounts
             .and_then(|accounts| {
                 accounts.into_iter().find_map(|account| {
                     let matches = (!credentials.access_token.is_empty()
@@ -827,77 +859,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn set_model(&self, model: &str) -> Result<()> {
-        let model = model.trim();
-        if self.is_browser_only() && !is_chatgpt_web_model(model) {
-            anyhow::bail!(
-                "OpenAI API credentials are not available for '{}'. The browser-only runtime can use '{}'; run `jcode login --provider openai` before selecting API models.",
-                model,
-                CHATGPT_WEB_MODEL,
-            );
-        }
-        let scope = self.catalog_scope();
-        if !is_chatgpt_web_model(model)
-            && !jcode_base::provider::known_openai_model_ids_for_scope(&scope)
-                .iter()
-                .any(|known| known == model)
-        {
-            anyhow::bail!(
-                "Unsupported OpenAI model '{}'. Use /model to choose from the models available to your account.",
-                model,
-            );
-        }
-        let availability = jcode_base::provider::model_availability_for_scope(&scope, model);
-        if !is_chatgpt_web_model(model)
-            && availability.state
-                == jcode_base::provider::AccountModelAvailabilityState::Unavailable
-        {
-            let detail =
-                jcode_base::provider::format_account_model_availability_detail(&availability)
-                    .unwrap_or_else(|| "not available for your account".to_string());
-            anyhow::bail!(
-                "The '{}' model is not available for your account right now ({}). \
-                 Use /model to see available models.",
-                model,
-                detail
-            );
-        }
-        // Platform-API-only GPT Pro models cannot run on ChatGPT/Codex OAuth
-        // tokens. If the loaded credential is OAuth-shaped, switch to the
-        // platform API key now so selecting the model from the picker just
-        // works instead of failing at request time with a backend rejection.
-        if jcode_provider_core::is_openai_api_only_pro_model(model) {
-            let is_chatgpt_shaped = self
-                .credentials
-                .try_read()
-                .map(|creds| Self::is_chatgpt_mode(&creds))
-                .unwrap_or(false);
-            if is_chatgpt_shaped {
-                self.set_credential_mode(OpenAICredentialMode::ApiKey)
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "'{}' is only available on the OpenAI platform API and needs an \
-                             OPENAI_API_KEY (ChatGPT/Codex OAuth cannot run it): {}",
-                            model,
-                            err
-                        )
-                    })?;
-            }
-        }
-        if let Ok(mut current) = self.model.try_write() {
-            let changed = current.as_str() != model;
-            *current = model.to_string();
-            jcode_base::provider::clear_model_unavailable_for_scope(&self.catalog_scope(), model);
-            drop(current);
-            if changed {
-                self.clear_persistent_ws_try("manual OpenAI model change reset the response chain");
-                self.revalidate_reasoning_effort();
-            }
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Cannot change model while a request is in progress"
-            ))
-        }
+        self.select_model(model)
     }
 
     fn available_models(&self) -> Vec<&'static str> {
@@ -931,6 +893,27 @@ impl Provider for OpenAIProvider {
 
     fn available_models_display(&self) -> Vec<String> {
         self.available_models_for_switching()
+    }
+
+    fn model_capabilities_need_refresh(&self) -> bool {
+        if self.is_browser_only()
+            || !self
+                .credentials
+                .try_read()
+                .is_ok_and(|creds| Self::is_chatgpt_mode(&creds))
+        {
+            return false;
+        }
+        let model = jcode_provider_core::model_id::canonical(&self.model());
+        if is_chatgpt_web_model(&model) {
+            return false;
+        }
+        let tiers = self
+            .model_service_tiers
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        !tiers.contains_key(&model)
+            && !tiers.contains_key(jcode_provider_core::model_id::slash_base(&model))
     }
 
     async fn prefetch_models(&self) -> Result<()> {
@@ -1008,6 +991,11 @@ impl Provider for OpenAIProvider {
             Ok(mut efforts) => *efforts = catalog.reasoning_efforts.clone(),
             Err(poisoned) => *poisoned.into_inner() = catalog.reasoning_efforts.clone(),
         }
+        *self
+            .model_service_tiers
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = catalog.service_tiers.clone();
+        self.warn_unsupported_service_tier();
         self.revalidate_reasoning_effort();
         jcode_base::provider::persist_openai_model_catalog_for_scope(&scope, &catalog);
         if !catalog.context_limits.is_empty() {
@@ -1040,7 +1028,7 @@ impl Provider for OpenAIProvider {
             && !jcode_base::prompt::is_swarm_effort(&requested)
         {
             anyhow::bail!(
-                "Unsupported OpenAI reasoning effort '{}'; expected none|minimal|low|medium|high|xhigh|max|swarm|swarm-deep",
+                "Unsupported OpenAI reasoning effort '{}'; expected none|minimal|low|medium|high|xhigh|max|swarm",
                 effort
             );
         }
@@ -1082,9 +1070,9 @@ impl Provider for OpenAIProvider {
         // medium/high/xhigh.
         if jcode_provider_core::is_openai_api_only_pro_model(&model) {
             return if model.starts_with("gpt-5-pro") {
-                vec!["high", "swarm", "swarm-deep"]
+                vec!["high", "swarm"]
             } else {
-                vec!["medium", "high", "xhigh", "swarm", "swarm-deep"]
+                vec!["medium", "high", "xhigh", "swarm"]
             };
         }
         let advertised = self
@@ -1097,17 +1085,14 @@ impl Provider for OpenAIProvider {
                 .iter()
                 .filter_map(|effort| jcode_provider_core::canonical_reasoning_effort(effort))
                 .collect();
-            efforts.extend(["swarm", "swarm-deep"]);
+            efforts.push("swarm");
             return efforts;
         }
         jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
     }
 
     fn service_tier(&self) -> Option<String> {
-        self.service_tier
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+        self.effective_service_tier(&self.model())
     }
 
     fn native_compaction_mode(&self) -> Option<String> {
@@ -1121,6 +1106,17 @@ impl Provider for OpenAIProvider {
 
     fn set_service_tier(&self, service_tier: &str) -> Result<()> {
         let normalized = Self::normalize_service_tier(service_tier)?;
+        if normalized
+            .as_deref()
+            .is_some_and(|tier| !self.supports_service_tier(&self.model(), tier))
+        {
+            anyhow::bail!(
+                "Service tier '{}' is not supported for OpenAI model '{}'. Available tiers: {} (or off)",
+                service_tier,
+                self.model(),
+                self.available_service_tiers().join(", ")
+            );
+        }
         let mut guard = self
             .service_tier
             .write()
@@ -1130,21 +1126,26 @@ impl Provider for OpenAIProvider {
     }
 
     fn available_service_tiers(&self) -> Vec<&'static str> {
-        if jcode_provider_core::service_tier::openai_model_supports_ultrafast(&self.model()) {
-            vec!["priority", "ultrafast", "flex"]
-        } else {
-            vec!["priority", "flex"]
-        }
+        let model = self.model();
+        ["priority", "ultrafast", "flex"]
+            .into_iter()
+            .filter(|tier| self.supports_service_tier(&model, tier))
+            .collect()
     }
 
     fn transport(&self) -> Option<String> {
         if is_chatgpt_web_model(&self.model()) {
             return Some("browser".to_string());
         }
-        self.transport_mode
-            .try_read()
-            .ok()
-            .map(|g| g.as_str().to_string())
+        match self.transport_mode.try_read() {
+            Ok(mode) => Some(mode.as_str().to_string()),
+            Err(error) => {
+                jcode_base::logging::debug(&format!(
+                    "OpenAI transport query deferred while settings are in use: {error}"
+                ));
+                None
+            }
+        }
     }
 
     fn set_transport(&self, transport: &str) -> Result<()> {
@@ -1206,114 +1207,12 @@ impl Provider for OpenAIProvider {
         existing_summary_text: Option<&str>,
         existing_openai_encrypted_content: Option<&str>,
     ) -> Result<jcode_provider_core::NativeCompactionResult> {
-        if self.native_compaction_mode != OpenAINativeCompactionMode::Explicit {
-            anyhow::bail!(
-                "OpenAI native explicit compaction is disabled (mode={})",
-                self.native_compaction_mode.as_str()
-            );
-        }
-
-        let access_token =
-            openai_access_token(self.refresh_account_label(), &self.credentials).await?;
-        let creds = self.credentials.read().await;
-        let is_chatgpt_mode = Self::is_chatgpt_mode(&creds);
-        let account_id = creds.account_id.clone();
-        let url = Self::responses_compact_url(&creds);
-        drop(creds);
-
-        let mut input = Vec::new();
-        if let Some(encrypted_content) = existing_openai_encrypted_content {
-            if !jcode_base::provider::openai_request::openai_encrypted_content_is_sendable(
-                encrypted_content,
-            ) {
-                anyhow::bail!(
-                    "OpenAI native compaction payload is too large to replay ({} chars > safe limit {} chars)",
-                    encrypted_content.len(),
-                    jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
-                );
-            }
-            input.push(serde_json::json!({
-                "type": "compaction",
-                "encrypted_content": encrypted_content,
-            }));
-        } else if let Some(summary_text) = existing_summary_text {
-            input.push(serde_json::json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": format!("## Previous Conversation Summary\n\n{}\n", summary_text),
-                }]
-            }));
-        }
-        input.extend(build_responses_input(messages));
-        // The compact request declares no tools, so hosted-search history
-        // goes as its text summary.
-        native_web_search::downgrade_web_search_calls(&mut input);
-
-        let mut builder = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json");
-
-        if is_chatgpt_mode {
-            builder = builder.header("originator", ORIGINATOR);
-            if let Some(account_id) = account_id.as_ref() {
-                builder = builder.header("chatgpt-account-id", account_id);
-            }
-        }
-
-        let response = builder
-            .json(&serde_json::json!({
-                "model": self.model_id().await,
-                "input": input,
-                "store": false,
-            }))
-            .send()
-            .await
-            .context("Failed to send OpenAI compact request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-            anyhow::bail!("OpenAI compact error {}: {}", status, body);
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .context("Failed to parse OpenAI compact response")?;
-        let encrypted_content = body
-            .get("output")
-            .and_then(|v| v.as_array())
-            .and_then(|items| {
-                items.iter().find_map(|item| {
-                    if item.get("type").and_then(|v| v.as_str()) == Some("compaction") {
-                        item.get("encrypted_content")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("OpenAI compact response missing compaction item"))?;
-
-        if !jcode_base::provider::openai_request::openai_encrypted_content_is_sendable(
-            &encrypted_content,
-        ) {
-            anyhow::bail!(
-                "OpenAI compact response returned oversized encrypted_content ({} chars > safe limit {} chars)",
-                encrypted_content.len(),
-                jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS,
-            );
-        }
-
-        Ok(jcode_provider_core::NativeCompactionResult {
-            summary_text: None,
-            openai_encrypted_content: Some(encrypted_content),
-        })
+        self.native_compact_request(
+            messages,
+            existing_summary_text,
+            existing_openai_encrypted_content,
+        )
+        .await
     }
 
     fn context_window(&self) -> usize {
@@ -1325,12 +1224,19 @@ impl Provider for OpenAIProvider {
     fn fork(&self) -> Arc<dyn Provider> {
         let model = self.model();
         let mode = self.credential_mode_snapshot();
-        let credentials = self
-            .credentials
-            .try_read()
-            .ok()
-            .map(|c| c.clone())
-            .or_else(|| self.load_selected_credentials(mode).ok())
+        let credentials = match self.credentials.try_read() {
+            Ok(credentials) => Some(credentials.clone()),
+            Err(error) => {
+                jcode_base::logging::debug(&format!("OpenAI fork loading credentials from account storage: {error}"));
+                match self.load_selected_credentials(mode) {
+                    Ok(credentials) => Some(credentials),
+                    Err(error) => {
+                        jcode_base::logging::warn(&format!("OpenAI fork cannot load credentials, authentication will be required: {error:#}"));
+                        None
+                    }
+                }
+            }
+        }
             .unwrap_or_else(|| CodexCredentials {
                 access_token: String::new(),
                 refresh_token: String::new(),
@@ -1345,6 +1251,12 @@ impl Provider for OpenAIProvider {
             oauth_account: StdRwLock::new(self.oauth_account_label()),
             model: Arc::new(RwLock::new(model)),
             prompt_cache_key: self.prompt_cache_key.clone(),
+            cache_session_id: StdRwLock::new(
+                self.cache_session_id
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            ),
             prompt_cache_retention: self.prompt_cache_retention.clone(),
             max_output_tokens: self.max_output_tokens,
             // Copy the raw stored effort (not the surfaced effective value) so
@@ -1362,7 +1274,18 @@ impl Provider for OpenAIProvider {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone(),
             )),
-            service_tier: Arc::new(StdRwLock::new(self.service_tier())),
+            model_service_tiers: Arc::new(StdRwLock::new(
+                self.model_service_tiers
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )),
+            service_tier: Arc::new(StdRwLock::new(
+                self.service_tier
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )),
             native_compaction_mode: self.native_compaction_mode,
             native_compaction_threshold_tokens: self.native_compaction_threshold_tokens,
             transport_mode: Arc::clone(&self.transport_mode),

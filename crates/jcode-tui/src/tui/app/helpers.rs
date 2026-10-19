@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 mod clipboard_helper;
+mod git_line_cache;
 pub(crate) mod model_names;
 
 use crate::todo::TodoItem;
@@ -20,6 +21,8 @@ static AMBIENT_INFO_CACHE: Mutex<Option<AmbientInfoCacheEntry>> = Mutex::new(Non
 /// edits) instead of waiting out the TTL with a stale branch/dirty count.
 type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
 static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
+static GIT_LINE_CACHE: std::sync::LazyLock<Mutex<git_line_cache::GitLineCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(git_line_cache::GitLineCache::default()));
 
 /// Stale-while-revalidate cache for per-session todos plus their goal-level
 /// assessments (closed feedback loop etc.). Module-level so the app can force a
@@ -529,7 +532,7 @@ pub(crate) fn effort_display_label(effort: &str) -> &str {
 fn effort_display_label_with_root<'a>(effort: &'a str, root: Option<&str>) -> &'a str {
     macro_rules! swarm_label {
         ($mode:literal, $detail:literal) => {
-            match root.unwrap_or("max") {
+            match root.unwrap_or("low") {
                 "none" => concat!($mode, " (None + ", $detail, ") [Beta]"),
                 "minimal" => concat!($mode, " (Minimal + ", $detail, ") [Beta]"),
                 "low" => concat!($mode, " (Low + ", $detail, ") [Beta]"),
@@ -541,8 +544,7 @@ fn effort_display_label_with_root<'a>(effort: &'a str, root: Option<&str>) -> &'
         };
     }
     match effort {
-        "swarm" => swarm_label!("Swarm", "light fan-out"),
-        "swarm-deep" => swarm_label!("Swarm Deep", "task graph"),
+        "swarm" => swarm_label!("Swarm", "parallel agents"),
         "max" => "Max",
         "xhigh" => "xHigh",
         "high" => "High",
@@ -618,11 +620,14 @@ pub(super) fn fast_mode_success_message(
     let status = if enabled { "on" } else { "off" };
     if applies_next_request {
         format!(
-            "✓ Fast mode {} ({})\nApplies to the next request/turn. The current in-flight request keeps its existing tier.",
+            "✓ Fast mode configured {} ({})\nRequested for the next provider request, including later in this turn. The current in-flight request is unchanged. Provider acceptance is not yet confirmed.",
             status, label
         )
     } else {
-        format!("✓ Fast mode {} ({})", status, label)
+        format!(
+            "✓ Fast mode configured {} ({})\nRequested for the next provider request. Provider acceptance is not yet confirmed.",
+            status, label
+        )
     }
 }
 
@@ -663,6 +668,25 @@ pub(super) fn fast_mode_default_message(default_enabled: bool, default_label: &s
         if default_enabled { "on" } else { "off" },
         default_label
     )
+}
+
+/// Suffix for "Switched to model" notices: auth method plus the masked
+/// account email (e.g. `j***y@gmail.com`) when the route uses OAuth, so the
+/// account is recognizable without exposing the full address on screen.
+pub(crate) fn switched_model_account_suffix(
+    auth_label: Option<&str>,
+    oauth_email: Option<&str>,
+) -> String {
+    let email = oauth_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(mask_email);
+    match (auth_label, email) {
+        (Some(label), Some(email)) => format!(" (via {label} · {email})"),
+        (Some(label), None) => format!(" (via {label})"),
+        (None, Some(email)) => format!(" ({email})"),
+        (None, None) => String::new(),
+    }
 }
 
 pub(super) fn mask_email(email: &str) -> String {
@@ -1783,6 +1807,8 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
         .unwrap_or_default();
     let mut added_total = 0usize;
     let mut removed_total = 0usize;
+    let mut line_cache = GIT_LINE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    line_cache.begin_scan();
     for file in &mut all_files {
         let key = file
             .path
@@ -1791,8 +1817,14 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
             .unwrap_or(&file.path)
             .trim_matches('"');
         let abs = repo_root.as_ref().map(|root| root.join(key));
+        let metadata = abs
+            .as_deref()
+            .and_then(|p| std::fs::symlink_metadata(p).ok());
         if file.status == '?' {
-            file.added = abs.as_deref().and_then(count_text_lines);
+            file.added = abs
+                .as_deref()
+                .zip(metadata.as_ref())
+                .and_then(|(path, meta)| line_cache.count(path, meta));
             file.removed = file.added.map(|_| 0);
         } else if let Some(&(a, r)) = numstat.get(key) {
             file.added = a;
@@ -1800,11 +1832,10 @@ pub(crate) fn gather_git_info_in(dir: Option<&std::path::Path>) -> Option<GitInf
         }
         added_total += file.added.unwrap_or(0);
         removed_total += file.removed.unwrap_or(0);
-        file.modified_at = abs
-            .as_deref()
-            .and_then(|p| std::fs::symlink_metadata(p).ok())
-            .and_then(|m| m.modified().ok());
+        file.modified_at = metadata.and_then(|m| m.modified().ok());
     }
+    line_cache.finish_scan();
+    drop(line_cache);
     // Newest first, so the file being worked on stays visible under the cap.
     // Deleted files have no mtime and sort last.
     all_files.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
@@ -1909,26 +1940,6 @@ pub(crate) fn parse_numstat(
     out
 }
 
-/// Line count of a small text file, for untracked files. Large or binary
-/// files return `None` so the widget shows no count rather than a bogus one.
-fn count_text_lines(path: &std::path::Path) -> Option<usize> {
-    const MAX_BYTES: u64 = 2 * 1024 * 1024;
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.contains(&0) {
-        return None;
-    }
-    let lines = bytes.iter().filter(|&&b| b == b'\n').count();
-    Some(if bytes.last().is_some_and(|&b| b != b'\n') {
-        lines + 1
-    } else {
-        lines
-    })
-}
-
 /// Collapse a porcelain `XY` pair into the single letter the Changes widget
 /// shows. Conflicts win, then the worktree side (what the user is editing),
 /// then the index side.
@@ -1946,5 +1957,31 @@ pub(crate) fn porcelain_status_letter(index: u8, worktree: u8) -> char {
         b'D' => 'D',
         b'R' | b'C' => 'R',
         _ => 'M',
+    }
+}
+
+#[cfg(test)]
+mod switched_model_account_suffix_tests {
+    use super::switched_model_account_suffix;
+
+    #[test]
+    fn email_is_masked() {
+        assert_eq!(
+            switched_model_account_suffix(Some("OAuth"), Some("jeremy@gmail.com")),
+            " (via OAuth · j***y@gmail.com)"
+        );
+        assert_eq!(
+            switched_model_account_suffix(Some("OAuth"), Some("me@example.com")),
+            " (via OAuth · m*@example.com)"
+        );
+    }
+
+    #[test]
+    fn no_email_keeps_existing_suffix() {
+        assert_eq!(
+            switched_model_account_suffix(Some("API key"), None),
+            " (via API key)"
+        );
+        assert_eq!(switched_model_account_suffix(None, Some("  ")), "");
     }
 }

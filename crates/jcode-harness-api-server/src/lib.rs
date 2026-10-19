@@ -52,13 +52,13 @@ fn release_large_frame(buffer: &mut Vec<u8>) {
     }
 }
 
-/// Capabilities the native daemon advertises in its ping reply. Empty when
-/// the daemon is too old to advertise any or did not answer in time.
+/// Capabilities the native daemon advertises in its ping reply. `None` means
+/// the probe failed, not that the daemon advertised no capabilities.
 ///
 /// Probe only an old, universally supported control request on a disposable
 /// connection. Older daemons close that connection after ping, and may close
 /// connections receiving unknown requests. Never probe on the session stream.
-async fn daemon_capabilities(socket: &std::path::Path) -> Vec<String> {
+async fn daemon_capabilities(socket: &std::path::Path) -> Option<Vec<String>> {
     let probe = async {
         let mut stream = Stream::connect(socket).await.ok()?;
         write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0}))
@@ -86,33 +86,42 @@ async fn daemon_capabilities(socket: &std::path::Path) -> Vec<String> {
         .await
         .ok()
         .flatten()
-        .unwrap_or_default()
 }
 
 /// Fresh source-daemon connections. A disposable Ping never subscribes,
 /// resumes, or creates a session. Failed snapshots clear connection presence.
 async fn daemon_user_connections(socket: &std::path::Path) -> std::collections::HashSet<String> {
     let probe = async {
-        let mut stream = Stream::connect(socket).await.ok()?;
-        write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0}))
+        let mut stream = Stream::connect(socket)
             .await
-            .ok()?;
+            .context("connect presence probe")?;
+        write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0})).await?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        read_frame(&mut reader, &mut line).await.ok()?;
-        let reply: Value = serde_json::from_str(&line).ok()?;
+        read_frame(&mut reader, &mut line).await?;
+        let reply: Value = serde_json::from_str(&line).context("parse presence pong")?;
         if reply["type"] != "pong" || reply["id"] != 0 {
-            return None;
+            anyhow::bail!("presence probe received an uncorrelated reply");
         }
-        let ids: Vec<String> =
-            serde_json::from_value(reply["user_connected_session_ids"].clone()).ok()?;
-        Some(ids.into_iter().filter(|id| !id.is_empty()).collect())
+        // Older daemons do not advertise connection presence.
+        if reply["user_connected_session_ids"].is_null() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<String> = serde_json::from_value(reply["user_connected_session_ids"].clone())
+            .context("parse connected session IDs")?;
+        Ok::<_, anyhow::Error>(ids.into_iter().filter(|id| !id.is_empty()).collect())
     };
-    tokio::time::timeout(std::time::Duration::from_millis(500), probe)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    match tokio::time::timeout(std::time::Duration::from_millis(500), probe).await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(error)) => {
+            eprintln!("Harness presence snapshot unavailable: {error:#}");
+            std::collections::HashSet::new()
+        }
+        Err(_) => {
+            eprintln!("Harness presence probe timed out, clearing connection presence");
+            std::collections::HashSet::new()
+        }
+    }
 }
 
 /// Largest single request frame accepted from an API client, in bytes.
@@ -355,7 +364,9 @@ where
     let legacy = Stream::connect(&legacy_socket)
         .await
         .with_context(|| format!("connect legacy socket {}", legacy_socket.display()))?;
-    let daemon_caps = daemon_capabilities(&legacy_socket).await;
+    let daemon_caps = daemon_capabilities(&legacy_socket)
+        .await
+        .unwrap_or_default();
     let user_connections_supported = daemon_caps.iter().any(|cap| cap == "session_connections");
     let runtime_commands_supported = daemon_caps.iter().any(|cap| cap == "runtime_commands");
     let session_tools_supported = daemon_caps.iter().any(|cap| cap == "session_tools");
@@ -454,6 +465,28 @@ where
                         continue;
                     }
                 };
+                // The initial bounded probe may have timed out while the daemon
+                // was busy. A missing advertised capability is only a snapshot,
+                // not a permanent rejection. Recheck on a disposable connection
+                // before dispatch, without reattaching or replaying anything on
+                // the live session stream.
+                if request["req"] == "runtime_command" && !state.runtime_commands_supported {
+                    match daemon_capabilities(&legacy_socket).await {
+                        Some(capabilities) => {
+                            state.runtime_commands_supported = capabilities.iter().any(|cap| cap == "runtime_commands");
+                        }
+                        None => {
+                            write_json_line(&mut write_half, &ServerFrame::reply(
+                                request["id"].as_u64().unwrap_or(0),
+                                ApiEvent::Error {
+                                    code: ErrorCode::Internal,
+                                    message: "Could not verify runtime command support because the daemon capability probe failed. Retry the command once the runtime is responsive. The command was not executed.".into(),
+                                },
+                            )).await?;
+                            continue;
+                        }
+                    }
+                }
                 if request["req"] == "list_sessions" {
                     state.user_connected_sessions = if user_connections_supported {
                         daemon_user_connections(&legacy_socket).await
@@ -537,6 +570,9 @@ where
     writer.flush().await?;
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod runtime_command_compat_tests;
 
 #[cfg(all(test, unix))]
 mod public_acceptance_tests {

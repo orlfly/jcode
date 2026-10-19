@@ -1,4 +1,3 @@
-use super::available_models_dedup::available_models_dedup_key;
 use super::client_actions::{
     AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
@@ -44,7 +43,7 @@ use super::provider_control::{
     handle_notify_auth_changed, handle_refresh_models, handle_set_compaction_mode,
     handle_set_model, handle_set_premium_mode, handle_set_reasoning_effort, handle_set_route,
     handle_set_service_tier, handle_set_transport, handle_switch_anthropic_account,
-    handle_switch_openai_account, try_available_models_updated_event,
+    handle_switch_openai_account, try_available_models_catalog,
 };
 use super::{
     AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
@@ -78,110 +77,9 @@ type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<S
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
 const REQUEST_HANDLER_STALL_THRESHOLDS_MS: [u64; 3] = [2_000, 10_000, 60_000];
 
-fn required_subscribe_working_dir(working_dir: Option<&str>) -> std::result::Result<&str, String> {
-    let working_dir = working_dir
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-        .ok_or_else(|| "Subscribe requires the client's working directory".to_string())?;
-    if !Path::new(working_dir).is_absolute() {
-        return Err("Subscribe working_dir must be an absolute path".to_string());
-    }
-    Ok(working_dir)
-}
-
-fn initial_subscribe_working_dir(request: &Request) -> std::result::Result<String, String> {
-    match request {
-        Request::Subscribe {
-            working_dir,
-            continue_on_disconnect,
-            ..
-        } => validated_subscribe_working_dir(working_dir.as_deref(), *continue_on_disconnect)
-            .map(str::to_string),
-        _ => Err(
-            "Client must Subscribe with a working_dir before sending stateful requests".to_string(),
-        ),
-    }
-}
-
-/// A reattachment names an existing session, not a new client working directory.
-/// Resolve an omitted cwd before provisional initialization, never from the
-/// daemon/bridge process cwd. Idle empty sessions may exist only in memory.
-async fn resolve_target_subscribe_working_dir(
-    request: &mut Request,
-    sessions: &SessionAgents,
-    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-) -> std::result::Result<(), String> {
-    let Request::Subscribe {
-        working_dir,
-        target_session_id: Some(target),
-        ..
-    } = request
-    else {
-        return Ok(());
-    };
-    if working_dir.is_some() {
-        return Ok(());
-    }
-    let live = sessions.read().await.get(target).cloned();
-    let resolved = if let Some(live) = live {
-        let idle_cwd = live
-            .try_lock()
-            .ok()
-            .and_then(|agent| agent.working_dir().map(str::to_string));
-        if idle_cwd.is_some() {
-            idle_cwd
-        } else {
-            // A generating Agent owns its mutex. The member records the same
-            // session root, so attaching must not wait for the model turn.
-            members
-                .read()
-                .await
-                .get(target)
-                .and_then(|member| member.working_dir.as_ref())
-                .map(|path| path.to_string_lossy().into_owned())
-        }
-    } else {
-        crate::session::Session::load_startup_stub(target)
-            .ok()
-            .and_then(|session| session.working_dir)
-    };
-    *working_dir = Some(resolved.ok_or_else(|| {
-        format!("Unknown session '{target}' or session has no working directory")
-    })?);
-    Ok(())
-}
-
-fn validated_subscribe_working_dir(
-    working_dir: Option<&str>,
-    remote_continuation: bool,
-) -> std::result::Result<&str, String> {
-    let working_dir = required_subscribe_working_dir(working_dir)?;
-    if remote_continuation && !Path::new(working_dir).is_dir() {
-        return Err(format!(
-            "Remote working directory must exist and be a directory on the server: {working_dir}"
-        ));
-    }
-    Ok(working_dir)
-}
-
-fn new_session_system_prompt<'a>(
-    provisional_session: bool,
-    target_session_id: Option<&str>,
-    system_prompt: Option<&'a str>,
-) -> Option<&'a str> {
-    if provisional_session && target_session_id.is_none() {
-        system_prompt
-    } else {
-        None
-    }
-}
-
-fn initial_subscribe_terminal_env(request: &Request) -> Vec<(String, String)> {
-    match request {
-        Request::Subscribe { terminal_env, .. } => terminal_env.clone(),
-        _ => Vec::new(),
-    }
-}
+#[path = "client_subscribe_context.rs"]
+mod subscribe_context;
+use subscribe_context::*;
 
 fn initial_subscribe_session_env(request: &Request) -> Vec<(String, String)> {
     match request {
@@ -196,6 +94,8 @@ struct ProcessingMessage {
     images: Vec<(String, String)>,
     system_reminder: Option<String>,
     active_skill: Option<String>,
+    /// Retry on the next pool account after a usage limit (API clients).
+    server_failover: bool,
 }
 
 struct ProcessingState<'a> {
@@ -446,6 +346,7 @@ async fn refresh_session_control_handle(
         agent_guard.background_tool_signal(),
         agent_guard.graceful_shutdown_signal(),
     )
+    .with_provider(agent_guard.provider_handle())
 }
 
 #[expect(
@@ -482,6 +383,7 @@ pub(super) async fn handle_client(
     await_members_runtime: AwaitMembersRuntime,
     swarm_mutation_runtime: SwarmMutationRuntime,
 ) -> Result<()> {
+    let handler_start = Instant::now();
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
@@ -508,6 +410,13 @@ pub(super) async fn handle_client(
 
         match decode_request(&line) {
             Ok(request) => {
+                if !request.is_lightweight_control_request() {
+                    crate::logging::info(&format!(
+                        "[TIMING] handle_client initial request read: bytes={}, handler_to_read={}ms",
+                        line.len(),
+                        handler_start.elapsed().as_millis()
+                    ));
+                }
                 if request.is_lightweight_control_request() {
                     let keep_connection_open = matches!(request, Request::Ping { .. });
                     handle_lightweight_control_request(
@@ -560,6 +469,7 @@ pub(super) async fn handle_client(
         }
     };
 
+    let mut initialization_activity = Some(crate::runtime_activity::global().try_enter()?);
     let initial_working_dir =
         match resolve_target_subscribe_working_dir(&mut initial_request, &sessions, &swarm_members)
             .await
@@ -594,37 +504,66 @@ pub(super) async fn handle_client(
     let mut model_usage_updates_enabled = false;
     let mut supports_pdf_panels = false;
     let mut supports_user_response = false;
+    let mut supports_server_failover = false;
     // Client selfdev status is determined by Subscribe request, not server's env
     let mut client_selfdev = false;
 
     let client_start = std::time::Instant::now();
 
-    let provider = provider_template.fork_for_new_session();
+    // A target-aware Subscribe for an existing session restores that
+    // session's own model onto this placeholder. Choosing a fresh pool route
+    // for it is wasted work, and in a reload storm the forks serialize on that
+    // choice (seconds when an account's quota state changes mid-storm).
+    let resumes_persisted_session = match &initial_request {
+        Request::Subscribe {
+            target_session_id: Some(target),
+            ..
+        } => crate::session::session_exists(target),
+        _ => false,
+    };
+    let provider = if resumes_persisted_session {
+        provider_template.fork()
+    } else {
+        provider_template.fork_for_new_session()
+    };
     let provider_fork_ms = client_start.elapsed().as_millis();
     let t0 = std::time::Instant::now();
     let registry = Registry::new(provider.clone()).await;
     let registry_ms = t0.elapsed().as_millis();
 
     let mut swarm_enabled = crate::config::config().features.swarm;
-    let mut last_available_models_snapshot: Option<String> = None;
-    const MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES: usize = 64 * 1024;
+    let mut last_available_models_snapshot: Option<Arc<str>> = None;
 
     // Create a new session for this client
     let t0 = std::time::Instant::now();
     let mut new_agent =
         crate::hooks::with_client_terminal_env(active_terminal_env.clone(), async {
-            Agent::new_provisional_with_initial_working_dir(
-                Arc::clone(&provider),
-                registry.clone(),
-                Some(&initial_working_dir),
-            )
+            super::run_blocking_io(|| {
+                Agent::new_provisional_with_initial_working_dir(
+                    Arc::clone(&provider),
+                    registry.clone(),
+                    Some(&initial_working_dir),
+                )
+            })
         })
         .await;
     let agent_new_ms = t0.elapsed().as_millis();
 
     new_agent.set_memory_enabled(crate::config::config().features.memory);
     let prewarm_start = std::time::Instant::now();
-    new_agent.prewarm_provider_idle().await;
+    // A target-aware Subscribe replaces this placeholder with the restored
+    // session right away, so warming its provider is wasted work on the
+    // resume critical path (p50 ~200ms per reconnect in a reload storm).
+    let resuming_existing_session = matches!(
+        &initial_request,
+        Request::Subscribe {
+            target_session_id: Some(_),
+            ..
+        }
+    );
+    if !resuming_existing_session {
+        new_agent.prewarm_provider_idle().await;
+    }
     let prewarm_ms = prewarm_start.elapsed().as_millis();
 
     crate::logging::info(&format!(
@@ -671,7 +610,8 @@ pub(super) async fn handle_client(
         new_agent.soft_interrupt_queue(),
         new_agent.background_tool_signal(),
         new_agent.graceful_shutdown_signal(),
-    );
+    )
+    .with_provider(new_agent.provider_handle());
 
     // Register the shutdown signal in the server-level map so
     // graceful_shutdown_sessions can signal it without locking the agent mutex
@@ -898,56 +838,27 @@ pub(super) async fn handle_client(
                         }
                     }
                     Ok(BusEvent::ModelsUpdated) => {
-                        let Some(event) = try_available_models_updated_event(&agent) else {
-                            crate::logging::info(&format!(
-                                "Skipping ModelsUpdated push for busy connection {}",
-                                client_connection_id
-                            ));
+                        let Some(catalog) = try_available_models_catalog(&agent) else {
                             continue;
                         };
-                        // Compare on an age-insensitive key: route details carry
-                        // cosmetic "12m ago" cache ages that tick on their own,
-                        // and a raw byte compare treated that drift as a real
-                        // catalog change, fanning a full repaint out to every
-                        // connected client.
-                        let dedup_key = available_models_dedup_key(&event);
-                        if last_available_models_snapshot.as_ref() == Some(&dedup_key) {
+                        // Equivalent clients share the snapshot, normalized key,
+                        // and size/downgrade decision. Pointer equality makes an
+                        // unchanged shared catalog a constant-time fast path.
+                        if last_available_models_snapshot.as_ref().is_some_and(|previous| {
+                            Arc::ptr_eq(previous, &catalog.dedup_key)
+                                || previous.as_ref() == catalog.dedup_key.as_ref()
+                        }) {
                             continue;
                         }
-                        let encoded_len = crate::protocol::encode_event(&event).len();
-                        if encoded_len > MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES {
-                            // Don't drop the catalog update entirely: clients still
-                            // need fresh model names for the picker. Strip the heavy
-                            // route expansion and ship a names-only snapshot; the TUI
-                            // rebuilds fallback routes for missing models locally.
-                            let slim_event = names_only_available_models_event(&event);
-                            let slim_encoded =
-                                slim_event.as_ref().map(crate::protocol::encode_event);
-                            match (slim_event, slim_encoded) {
-                                (Some(slim_event), Some(slim_encoded))
-                                    if slim_encoded.len()
-                                        <= MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES =>
-                                {
-                                    crate::logging::info(&format!(
-                                        "Downgrading oversized bus AvailableModelsUpdated frame to names-only for connection {} ({} -> {} bytes)",
-                                        client_connection_id,
-                                        encoded_len,
-                                        slim_encoded.len()
-                                    ));
-                                    let _ = client_event_tx.send(slim_event);
-                                }
-                                _ => {
-                                    crate::logging::warn(&format!(
-                                        "Skipping oversized bus AvailableModelsUpdated frame for connection {} ({} bytes)",
-                                        client_connection_id, encoded_len
-                                    ));
-                                }
-                            }
-                            last_available_models_snapshot = Some(dedup_key);
-                            continue;
+                        if let Some(event) = catalog.live_event() {
+                            let _ = client_event_tx.send(event.clone());
+                        } else {
+                            crate::logging::warn(&format!(
+                                "Skipping oversized catalog for connection {} ({} bytes)",
+                                client_connection_id, catalog.encoded_len
+                            ));
                         }
-                        let _ = client_event_tx.send(event);
-                        last_available_models_snapshot = Some(dedup_key);
+                        last_available_models_snapshot = Some(Arc::clone(&catalog.dedup_key));
                     }
                     Ok(BusEvent::BatchProgress(progress)) => {
                         if progress.session_id == client_session_id {
@@ -1021,6 +932,24 @@ pub(super) async fn handle_client(
             }
         };
         let request_decoded_at = Instant::now();
+        // Reserve before Ack or any session mutation, not just when the turn
+        // eventually polls. Upgrade requests themselves must not reserve work.
+        let _request_activity = if matches!(&request, Request::UpgradeRuntime { .. }) {
+            None
+        } else {
+            match crate::runtime_activity::global().try_enter() {
+                Ok(activity) => Some(activity),
+                Err(error) => {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id: request.id(), message: error.to_string(), retry_after_secs: None,
+                    });
+                    continue;
+                }
+            }
+        };
+        // The first request now owns its admission reservation. Setup can stop
+        // holding its own without leaving a registration-to-dispatch gap.
+        drop(initialization_activity.take());
         let request_id = request.id();
         // Keep the session's host-provided tool env current. Registering on every
         // request (not only the first subscribe) means an attach, a re-subscribe
@@ -1297,6 +1226,7 @@ pub(super) async fn handle_client(
                         images,
                         system_reminder,
                         active_skill,
+                        server_failover: supports_server_failover,
                     },
                     &client_session_id,
                     &mut ProcessingState {
@@ -1416,6 +1346,7 @@ pub(super) async fn handle_client(
                             images,
                             system_reminder: None,
                             active_skill: None,
+                            server_failover: supports_server_failover,
                         },
                         &client_session_id,
                         &mut ProcessingState {
@@ -1555,7 +1486,8 @@ pub(super) async fn handle_client(
                             &server_icon,
                             None,
                             supports_pdf_panels,
-                        )
+                            None,
+                    )
                         .await
                         .is_err()
                         {
@@ -1616,7 +1548,8 @@ pub(super) async fn handle_client(
                             &server_icon,
                             None,
                             supports_pdf_panels,
-                        )
+                            None,
+                    )
                         .await
                         .is_err()
                         {
@@ -1680,11 +1613,13 @@ pub(super) async fn handle_client(
                 system_prompt,
                 supports_pdf_panels: requested_pdf_panels,
                 supports_user_response: requested_user_response,
+                supports_server_failover: requested_server_failover,
                 working_dir: subscribe_working_dir,
                 selfdev,
                 target_session_id,
                 client_instance_id,
                 client_has_local_history,
+                history_base,
                 allow_session_takeover,
                 crash_on_disconnect: _,
                 continue_on_disconnect: requested_continuation,
@@ -1718,6 +1653,7 @@ pub(super) async fn handle_client(
                 continue_on_disconnect = requested_continuation;
                 supports_pdf_panels = requested_pdf_panels;
                 supports_user_response = requested_user_response;
+                supports_server_failover = requested_server_failover;
                 active_terminal_env = terminal_env;
                 current_client_instance_id = client_instance_id.clone();
                 {
@@ -1747,6 +1683,7 @@ pub(super) async fn handle_client(
                                 subscribe_working_dir.as_deref(),
                                 client_instance_id.as_deref(),
                                 client_has_local_history,
+                                history_base,
                                 allow_session_takeover,
                                 &mut client_selfdev,
                                 &mut client_session_id,
@@ -1912,7 +1849,8 @@ pub(super) async fn handle_client(
                     &server_icon,
                     None,
                     supports_pdf_panels,
-                )
+                    None,
+            )
                 .await
                 .is_err()
                 {
@@ -1968,6 +1906,10 @@ pub(super) async fn handle_client(
                 });
             }
 
+            Request::UpgradeRuntime { id, candidate } => {
+                super::runtime_upgrade::handle(id, &candidate, &writer, &sessions).await?;
+            }
+
             Request::Reload { id, force } => {
                 handle_reload(
                     id,
@@ -2007,6 +1949,7 @@ pub(super) async fn handle_client(
                         resume_working_dir.as_deref(),
                         client_instance_id.as_deref(),
                         client_has_local_history,
+                        None,
                         allow_session_takeover,
                         &mut client_selfdev,
                         &mut client_session_id,
@@ -2165,7 +2108,7 @@ pub(super) async fn handle_client(
             }
 
             Request::SetServiceTier { id, service_tier } => {
-                handle_set_service_tier(id, service_tier, &agent, &client_event_tx).await;
+                handle_set_service_tier(id, service_tier, &agent, session_control.provider_handle(), &client_event_tx).await;
             }
 
             Request::SetTransport { id, transport } => {
@@ -2248,6 +2191,10 @@ pub(super) async fn handle_client(
 
             Request::SwitchOpenAiAccount { id, label } => {
                 handle_switch_openai_account(id, label, &agent, &client_event_tx).await;
+            }
+
+            Request::AccountUsage { id } => {
+                super::account_usage::request(id, client_event_tx.clone());
             }
 
             Request::InvalidateOpenAiUsage { id, account_label } => {
@@ -2768,98 +2715,6 @@ pub(super) async fn handle_client(
                 .await;
             }
 
-            Request::CommSeedGraph {
-                id,
-                session_id: req_session_id,
-                mode,
-                nodes,
-            } => {
-                super::comm_graph::handle_comm_seed_graph(
-                    id,
-                    req_session_id,
-                    mode,
-                    nodes,
-                    &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                )
-                .await;
-            }
-
-            Request::CommExpandNode {
-                id,
-                session_id: req_session_id,
-                node_id,
-                children,
-            } => {
-                super::comm_graph::handle_comm_expand_node(
-                    id,
-                    req_session_id,
-                    node_id,
-                    children,
-                    &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                )
-                .await;
-            }
-
-            Request::CommCompleteNode {
-                id,
-                session_id: req_session_id,
-                node_id,
-                artifact_json,
-            } => {
-                super::comm_graph::handle_comm_complete_node(
-                    id,
-                    req_session_id,
-                    node_id,
-                    artifact_json,
-                    &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                )
-                .await;
-            }
-
-            Request::CommInjectGap {
-                id,
-                session_id: req_session_id,
-                gate_id,
-                nodes,
-            } => {
-                super::comm_graph::handle_comm_inject_gap(
-                    id,
-                    req_session_id,
-                    gate_id,
-                    nodes,
-                    &client_event_tx,
-                    &swarm_members,
-                    &swarms_by_id,
-                    &swarm_plans,
-                    &swarm_coordinators,
-                    &event_history,
-                    &event_counter,
-                    &swarm_event_tx,
-                )
-                .await;
-            }
-
             Request::CommSpawn {
                 id,
                 session_id: req_session_id,
@@ -3038,6 +2893,15 @@ pub(super) async fn handle_client(
                     Some(&event_history),
                     Some(&event_counter),
                     Some(&swarm_event_tx),
+                )
+                .await;
+                super::comm_control::close_reporter_task_on_terminal_report(
+                    &req_session_id,
+                    &status,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_plans,
+                    &swarm_coordinators,
                 )
                 .await;
                 let _ = client_event_tx.send(ServerEvent::CommReportResponse {
@@ -3551,6 +3415,7 @@ async fn start_processing_message(
         images,
         system_reminder,
         active_skill,
+        server_failover,
     } = message;
     if server_reload_starting() {
         crate::logging::info(&format!(
@@ -3629,12 +3494,19 @@ async fn start_processing_message(
     );
     let done_tx = processing_done_tx.clone();
     crate::logging::info(&format!("Processing message id={} spawning task", id));
-    *state.task = Some(tokio::spawn(async move {
+    *state.task = crate::runtime_activity::spawn(async move {
         let event_tx = tx.clone();
         let mut stop_reason = crate::protocol::TurnStopReason::Failure;
         let result = match std::panic::AssertUnwindSafe(crate::hooks::with_client_terminal_env(
             client_terminal_env,
-            process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
+            super::turn_failover::process_message_with_server_failover(
+                agent,
+                &content,
+                images,
+                system_reminder,
+                event_tx,
+                server_failover,
+            ),
         ))
         .catch_unwind()
         .await
@@ -3702,7 +3574,7 @@ async fn start_processing_message(
         }
         let _ = tx.send(terminal_event);
         let _ = done_tx.send((id, result, completion_report));
-    }));
+    });
 }
 
 async fn cancel_processing_message(
@@ -3924,30 +3796,8 @@ async fn cancel_processing_message(
     }
 }
 
-fn try_available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> Option<String> {
-    let event = try_available_models_updated_event(agent)?;
-    Some(available_models_dedup_key(&event))
-}
-
-/// Build a names-only copy of an `AvailableModelsUpdated` event by dropping the
-/// per-model route expansion. Used when the fully-routed frame exceeds the live
-/// update size cap so clients still receive fresh model names.
-fn names_only_available_models_event(event: &ServerEvent) -> Option<ServerEvent> {
-    let ServerEvent::AvailableModelsUpdated {
-        provider_name,
-        provider_model,
-        available_models,
-        ..
-    } = event
-    else {
-        return None;
-    };
-    Some(ServerEvent::AvailableModelsUpdated {
-        provider_name: provider_name.clone(),
-        provider_model: provider_model.clone(),
-        available_models: available_models.clone(),
-        available_model_routes: Vec::new(),
-    })
+fn try_available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> Option<Arc<str>> {
+    Some(Arc::clone(&try_available_models_catalog(agent)?.dedup_key))
 }
 
 fn queue_soft_interrupt(

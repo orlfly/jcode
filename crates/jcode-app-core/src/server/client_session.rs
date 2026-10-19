@@ -22,7 +22,7 @@ use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -451,63 +451,9 @@ async fn ensure_client_swarm_member(
     inserted
 }
 
-/// Resolve the working directory a subscribe should actually bind to.
-///
-/// Returns the reported dir when it is acceptable, or the session's existing
-/// dir when the report is rejected by [`subscribe_working_dir_replacement`].
-/// Every consumer of a subscribe cwd (agent state, swarm id, project-local MCP
-/// resolution) must agree on this one answer, otherwise the session's tools,
-/// swarm grouping, and MCP config can each resolve against a different
-/// directory (issue #481).
-pub(super) fn effective_subscribe_working_dir(
-    current: Option<&str>,
-    reported: &str,
-    home: Option<&Path>,
-) -> String {
-    match subscribe_working_dir_replacement(current, reported, home) {
-        Some(accepted) => accepted,
-        None => current
-            .map(str::to_string)
-            .unwrap_or_else(|| reported.trim().to_string()),
-    }
-}
-
-/// Decide whether a client-reported subscribe cwd may replace the session's
-/// current working directory.
-///
-/// Requiring a subscribe cwd to be non-empty and absolute (the earlier
-/// require-cwd change) is necessary but not sufficient: a client that launches
-/// with an inherited environment can report the user's *home* directory even
-/// though the real project lives elsewhere. Accepting that silently re-pins the
-/// session to home, so bash/file tools run against home while the header still
-/// shows the project path (issue #481).
-///
-/// The rule is deliberately narrow so it cannot break legitimate directory
-/// changes: a reported cwd that is exactly the home directory is ignored *only*
-/// when the session already has a different working directory. Working in home
-/// on purpose (no prior cwd, or a session already pinned to home) still works,
-/// and every other path is accepted as before.
-pub(super) fn subscribe_working_dir_replacement(
-    current: Option<&str>,
-    reported: &str,
-    home: Option<&Path>,
-) -> Option<String> {
-    let reported_trimmed = reported.trim();
-    if reported_trimmed.is_empty() {
-        return None;
-    }
-    let current = current.map(str::trim).filter(|dir| !dir.is_empty());
-    if current == Some(reported_trimmed) {
-        return None;
-    }
-    if let (Some(current), Some(home)) = (current, home)
-        && Path::new(reported_trimmed) == home
-        && Path::new(current) != home
-    {
-        return None;
-    }
-    Some(reported_trimmed.to_string())
-}
+pub(super) use super::subscribe_working_dir::{
+    effective_subscribe_working_dir, subscribe_working_dir_replacement,
+};
 
 fn log_ignored_subscribe_working_dir(session_id: &str, current: &str, reported: &str) {
     crate::logging::warn(&format!(
@@ -543,7 +489,7 @@ fn apply_or_defer_subscribe_working_dir(
     let agent = Arc::clone(agent);
     let working_dir = working_dir.to_string();
     let session_id = session_id.to_string();
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         match subscribe_working_dir_replacement(
             agent_guard.working_dir(),
@@ -578,7 +524,7 @@ fn apply_or_defer_subscribe_selfdev(agent: &Arc<Mutex<Agent>>, session_id: &str)
 
     let agent = Arc::clone(agent);
     let session_id = session_id.to_string();
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         if !agent_guard.is_canary() {
             agent_guard.set_canary("self-dev");
@@ -603,7 +549,7 @@ pub(super) async fn apply_or_defer_desktop_response_capability(
         return;
     }
     let agent = Arc::clone(agent);
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         agent
             .lock()
             .await
@@ -1028,7 +974,14 @@ async fn rename_swarm_member_session(
     // opposite order, so retaining the member write guard while waiting for the
     // swarm map can permanently deadlock reconnects and every later subscribe.
     let rename = {
+        let wait = Instant::now();
         let mut members = swarm_members.write().await;
+        let members_wait_ms = wait.elapsed().as_millis();
+        if members_wait_ms >= 50 {
+            crate::logging::info(&format!(
+                "[TIMING] swarm_rename members write wait={members_wait_ms}ms session={new_session_id}"
+            ));
+        }
         let mut rename = SwarmMemberRename::default();
         if let Some(mut temporary) = members.remove(old_session_id) {
             rename.old_swarm_id = temporary.swarm_id.clone();
@@ -1091,7 +1044,14 @@ async fn rename_swarm_member_session(
         rename
     };
 
+    let wait = Instant::now();
     let mut swarms = swarms_by_id.write().await;
+    let swarms_wait_ms = wait.elapsed().as_millis();
+    if swarms_wait_ms >= 50 {
+        crate::logging::info(&format!(
+            "[TIMING] swarm_rename swarms_by_id write wait={swarms_wait_ms}ms session={new_session_id}"
+        ));
+    }
     if let Some(old_swarm_id) = rename.old_swarm_id.as_ref()
         && let Some(swarm) = swarms.get_mut(old_swarm_id)
     {
@@ -1355,6 +1315,7 @@ pub(super) async fn handle_resume_session(
     working_dir_override: Option<&str>,
     client_instance_id: Option<&str>,
     client_has_local_history: bool,
+    history_base: Option<crate::protocol::HistoryBase>,
     allow_session_takeover: bool,
     client_selfdev: &mut bool,
     client_session_id: &mut String,
@@ -1568,6 +1529,7 @@ pub(super) async fn handle_resume_session(
             server_icon,
             None,
             supports_pdf_panels,
+            history_base,
         )
         .await?;
         let _ = client_event_tx.send(ServerEvent::Done { id });
@@ -1735,10 +1697,18 @@ pub(super) async fn handle_resume_session(
         }
     }
 
+    let pre_lock_ms = resume_start.elapsed().as_millis();
     let (result, is_canary) = {
         let mut agent_guard = agent.lock().await;
-        let result =
-            agent_guard.restore_session_with_working_dir(&session_id, working_dir_override);
+        crate::logging::info(&format!(
+            "[TIMING] resume pre-restore: session={}, pre_lock={}ms, locked_at={}ms",
+            session_id,
+            pre_lock_ms,
+            resume_start.elapsed().as_millis()
+        ));
+        let result = super::run_blocking_io(|| {
+            agent_guard.restore_session_deferring_save(&session_id, working_dir_override)
+        });
         if *client_selfdev {
             agent_guard.set_canary("self-dev");
         }
@@ -1759,16 +1729,34 @@ pub(super) async fn handle_resume_session(
         registry.register_selfdev_tools().await;
     }
 
+    let restored_ms = resume_start.elapsed().as_millis();
+    // Persist the restore (status, env snapshot) off the History critical
+    // path, but never skip it: it runs once History is sent or on any error.
+    let persist_restored = || async {
+        let mut agent_guard = agent.lock().await;
+        super::run_blocking_io(|| agent_guard.persist_restored_session());
+    };
+    if result.is_err() {
+        persist_restored().await;
+    }
     match result {
         Ok(_prev_status) => {
             let old_session_id = client_session_id.clone();
             *client_session_id = session_id.clone();
+            let attach_start = Instant::now();
+            let mut attach_laps: Vec<(&'static str, u128)> = Vec::new();
+            let mut attach_lap = Instant::now();
+            let mut lap = |name: &'static str| {
+                attach_laps.push((name, attach_lap.elapsed().as_millis()));
+                attach_lap = Instant::now();
+            };
 
             {
                 let mut sessions_guard = sessions.write().await;
                 sessions_guard.remove(&old_session_id);
                 sessions_guard.insert(session_id.clone(), Arc::clone(agent));
             }
+            lap("sessions");
             crate::runtime_memory_log::emit_event(
                 crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
                     "session_resumed",
@@ -1780,6 +1768,7 @@ pub(super) async fn handle_resume_session(
             rename_shutdown_signal(shutdown_signals, &old_session_id, &session_id).await;
             rename_session_interrupt_queue(soft_interrupt_queues, &old_session_id, &session_id)
                 .await;
+            lap("signals");
             {
                 let mut connections = client_connections.write().await;
                 if let Some(info) = connections.get_mut(client_connection_id) {
@@ -1796,6 +1785,7 @@ pub(super) async fn handle_resume_session(
                 swarms_by_id,
             )
             .await;
+            lap("swarm_rename");
             remove_session_channel_subscriptions(
                 &old_session_id,
                 channel_subscriptions,
@@ -1847,6 +1837,7 @@ pub(super) async fn handle_resume_session(
                 persist_swarm_state_for(stale_swarm_id, &swarm_state).await;
                 broadcast_swarm_status(stale_swarm_id, swarm_members, swarms_by_id).await;
             }
+            lap("swarm_cleanup");
             update_member_status(
                 &session_id,
                 "ready",
@@ -1858,6 +1849,7 @@ pub(super) async fn handle_resume_session(
                 Some(swarm_event_tx),
             )
             .await;
+            lap("member_status");
             if let Some(swarm_id) = {
                 let members = swarm_members.read().await;
                 members
@@ -1873,6 +1865,7 @@ pub(super) async fn handle_resume_session(
                 };
                 persist_swarm_state_for(&swarm_id, &swarm_state).await;
             }
+            lap("swarm_persist");
 
             register_session_event_sender(
                 swarm_members,
@@ -1881,6 +1874,7 @@ pub(super) async fn handle_resume_session(
                 client_event_tx.clone(),
             )
             .await;
+            lap("event_sender");
 
             // Captured before the history call, which takes the agent, so the restored
             // route can still be reported to a client that has never been told.
@@ -1890,6 +1884,7 @@ pub(super) async fn handle_resume_session(
                 resumed_context_window,
                 resumed_credential,
                 resumed_reasoning_effort,
+                resumed_oauth_account_label,
             ) = {
                 let guard = agent.lock().await;
                 (
@@ -1898,10 +1893,24 @@ pub(super) async fn handle_resume_session(
                     guard.provider_context_window(),
                     guard.active_resolved_credential(),
                     guard.provider_reasoning_effort(),
+                    guard.provider_handle().oauth_account_label(),
                 )
             };
 
-            handle_get_history(
+            lap("agent_route");
+            let attach_ms = attach_start.elapsed().as_millis();
+            if attach_ms >= 100 {
+                crate::logging::info(&format!(
+                    "[TIMING] resume attach laps: session={session_id}, total={attach_ms}ms, {}",
+                    attach_laps
+                        .iter()
+                        .map(|(name, ms)| format!("{name}={ms}ms"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            let pre_history_ms = resume_start.elapsed().as_millis();
+            let history_result = handle_get_history(
                 id,
                 &session_id,
                 false,
@@ -1915,8 +1924,12 @@ pub(super) async fn handle_resume_session(
                 server_icon,
                 Some(was_interrupted),
                 supports_pdf_panels,
+                history_base,
             )
-            .await?;
+            .await;
+            persist_restored().await;
+            history_result?;
+            let history_sent_ms = resume_start.elapsed().as_millis();
             let _ = client_event_tx.send(ServerEvent::Done { id });
             // Re-send the swarm plan AFTER the History payload: the client
             // clears its plan snapshot on session change, so without this the
@@ -1950,6 +1963,7 @@ pub(super) async fn handle_resume_session(
                     agent.lock().await.provider_handle().as_ref(),
                 ),
                 reasoning_effort: resumed_reasoning_effort,
+                provider_oauth_account_label: resumed_oauth_account_label,
             });
             // Resolve project-local MCP config against the restored session's
             // working dir, not the server process cwd (issue #420).
@@ -1975,6 +1989,9 @@ pub(super) async fn handle_resume_session(
                     ("target_session_id", session_id.clone()),
                     ("client_connection_id", client_connection_id.to_string()),
                     ("was_interrupted", was_interrupted.to_string()),
+                    ("restored_ms", restored_ms.to_string()),
+                    ("pre_history_ms", pre_history_ms.to_string()),
+                    ("history_sent_ms", history_sent_ms.to_string()),
                     ("elapsed_ms", resume_start.elapsed().as_millis().to_string()),
                 ],
             );

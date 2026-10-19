@@ -1,7 +1,12 @@
+#[path = "auth_subscription_status.rs"]
+mod subscription_status;
+
 #[path = "auth_account_commands.rs"]
 mod auth_account_commands;
 #[path = "auth_account_picker.rs"]
 mod auth_account_picker;
+#[path = "auth_progress.rs"]
+mod auth_progress;
 #[path = "auth_types.rs"]
 mod auth_types;
 pub(crate) use self::auth_account_commands::{
@@ -21,7 +26,10 @@ fn saved_account_route_selection(
     current_provider: &str,
     current_model: &str,
     configured_default: Option<&str>,
-) -> crate::provider::RouteSelection {
+) -> anyhow::Result<crate::provider::RouteSelection> {
+    if !matches!(provider_id, "claude" | "openai") {
+        anyhow::bail!("Saved OAuth accounts are not supported for provider {provider_id}");
+    }
     let (runtime_key, provider_label, method) = if provider_id == "claude" {
         (
             crate::provider::RuntimeKey::ClaudeOAuth,
@@ -53,94 +61,22 @@ fn saved_account_route_selection(
     let model = if same_provider && !current_model.trim().is_empty() {
         current_model
     } else {
-        configured_model.unwrap_or_else(|| {
-            crate::auth::lifecycle::default_model_for_provider(provider_id)
-                .expect("saved account provider has a default model")
-        })
+        configured_model
+            .or_else(|| crate::auth::lifecycle::default_model_for_provider(provider_id))
+            .ok_or_else(|| anyhow::anyhow!("No default model is configured for {provider_label}"))?
     };
-    crate::provider::RouteSelection {
+    Ok(crate::provider::RouteSelection {
         model: model.to_string(),
         runtime_key,
         api_method: format!("{method}@{label}"),
         provider_label: provider_label.to_string(),
         detail: format!("Saved account {label}"),
-    }
+    })
 }
 
 #[cfg(test)]
-mod saved_account_route_tests {
-    use super::*;
-
-    #[test]
-    fn account_switch_preserves_same_provider_model_and_replaces_account_pin() {
-        for (id, name, model, method) in [
-            ("claude", "Claude", "claude-custom-model", "claude-oauth"),
-            ("openai", "OpenAI", "gpt-custom-model", "openai-oauth"),
-        ] {
-            let selection = saved_account_route_selection(
-                id,
-                "work",
-                name,
-                model,
-                Some("openai-oauth:configured-other-model"),
-            );
-            assert_eq!(selection.model, model);
-            assert_eq!(selection.account_label(), Some("work"));
-            assert_eq!(
-                selection.routed_model_spec(),
-                format!("{method}@work:{model}")
-            );
-        }
-    }
-
-    #[test]
-    fn account_switch_uses_target_provider_default_for_cross_provider_selection() {
-        for (id, other) in [("claude", "OpenAI"), ("openai", "Claude")] {
-            let selection =
-                saved_account_route_selection(id, "personal", other, "foreign-model", None);
-            assert_eq!(
-                selection.model,
-                crate::auth::lifecycle::default_model_for_provider(id).unwrap()
-            );
-            assert_eq!(selection.account_label(), Some("personal"));
-            assert_ne!(selection.model, "foreign-model");
-        }
-    }
-
-    #[test]
-    fn cross_provider_account_switch_honors_matching_configured_default() {
-        let mut config = crate::config::Config::default();
-        config.provider.default_model = Some("openai-oauth:gpt-6.1-sol".to_string());
-        let configured = config.provider.default_model.as_deref();
-        let selection =
-            saved_account_route_selection("openai", "work", "Claude", "claude-current", configured);
-        assert_eq!(selection.model, "gpt-6.1-sol");
-        assert_eq!(
-            selection.routed_model_spec(),
-            "openai-oauth@work:gpt-6.1-sol"
-        );
-        let selection =
-            saved_account_route_selection("openai", "work", "OpenAI", "gpt-current", configured);
-        assert_eq!(selection.model, "gpt-current");
-        let selection =
-            saved_account_route_selection("claude", "work", "OpenAI", "gpt-current", configured);
-        assert_eq!(
-            selection.model,
-            crate::auth::lifecycle::default_model_for_provider("claude").unwrap()
-        );
-        let selection = saved_account_route_selection(
-            "claude",
-            "work",
-            "OpenAI",
-            "gpt-current",
-            Some("claude-api:claude-configured"),
-        );
-        assert_eq!(
-            selection.routed_model_spec(),
-            "claude-oauth@work:claude-configured"
-        );
-    }
-}
+#[path = "saved_account_route_tests.rs"]
+mod saved_account_route_tests;
 
 impl App {
     pub(super) fn open_auth_browser(url: &str) -> bool {
@@ -191,139 +127,6 @@ impl App {
             ));
         }
         notices.join("\n")
-    }
-
-    pub(super) fn show_jcode_subscription_status(&mut self) {
-        let configured_key = crate::subscription_catalog::configured_api_key().is_some();
-        let configured_base = crate::subscription_catalog::configured_api_base()
-            .unwrap_or_else(|| crate::subscription_catalog::DEFAULT_JCODE_API_BASE.to_string());
-        let runtime_mode = crate::subscription_catalog::is_runtime_mode_enabled();
-
-        let mut message = String::from("Jcode Hosted Model Status\n\n");
-        message.push_str(&format!(
-            "  - Credentials: {}\n",
-            if configured_key {
-                "configured"
-            } else {
-                "not configured (/login jcode)"
-            }
-        ));
-        message.push_str(&format!(
-            "  - Router base: {}{}\n",
-            configured_base,
-            if crate::subscription_catalog::has_router_base() {
-                ""
-            } else {
-                " (default)"
-            }
-        ));
-        message.push_str("  - Billing: pay as you go, no subscription fee\n");
-        message.push_str(&format!(
-            "  - Runtime mode: {}\n\n",
-            if runtime_mode {
-                "active for this session"
-            } else {
-                "inactive for this session"
-            }
-        ));
-
-        message.push_str("Catalog\n\n");
-        for model in crate::subscription_catalog::curated_models() {
-            let default_suffix = if model.default_enabled {
-                " (default)"
-            } else {
-                ""
-            };
-            let tier_suffix = String::new();
-            message.push_str(&format!(
-                "  - {} - {}{}{}\n      - {}\n      - {}\n",
-                model.display_name,
-                model.id,
-                default_suffix,
-                tier_suffix,
-                crate::subscription_catalog::routing_policy_detail(model),
-                model.note
-            ));
-        }
-
-        message.push_str("\nBilling\n\n");
-        message.push_str("  - Set the monthly spending limit you control in your Jcode account\n");
-        message.push_str("  - Email and account warnings are sent at usage milestones\n");
-        message.push_str("  - Warning milestones do not rate limit hosted requests\n");
-        message.push_str("  - Charges begin at $20, then use progressively larger tranches\n");
-        message.push_str("  - Any unbilled remainder is collected at your limit or month end\n");
-
-        if configured_key {
-            message.push_str("\nFetching hosted usage and spending limit...");
-        } else {
-            message.push_str(
-                "\nLog in with /login jcode to set a spending limit and connect hosted models.",
-            );
-        }
-
-        self.push_display_message(DisplayMessage::system(message));
-
-        // With credentials present, fetch live account status (/v1/me) in the
-        // background and surface it via a UiActivity card. Short timeout keeps
-        // this responsive; offline failures degrade to a quiet log line.
-        if configured_key {
-            let session_id = self.session.id.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    match crate::subscription_api::fetch_subscription_me().await {
-                        Ok(me) => {
-                            let resets = me
-                                .usage
-                                .resets_at
-                                .as_deref()
-                                .map(|at| format!(", resets {}", at))
-                                .unwrap_or_default();
-                            crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
-                                crate::bus::UiActivity::background(
-                                    Some(session_id),
-                                    format!(
-                                        "Jcode Hosted Model Account\n\n  - Email: {}\n  - Billing: {}\n  - Spend: ${:.2} of ${:.2} monthly limit\n  - Billed in tranches: ${:.2}{}{}",
-                                        me.email,
-                                        me.status,
-                                        me.usage.used_usd,
-                                        me.usage.budget_usd,
-                                        me.usage.billed_usd,
-                                        me.usage
-                                            .next_charge_at_usd
-                                            .map(|amount| format!("\n  - Next tranche at: ${amount:.2}"))
-                                            .unwrap_or_default(),
-                                        resets
-                                    ),
-                                    Some("Hosted usage: account status loaded"),
-                                ),
-                            ));
-                        }
-                        Err(error) => {
-                            let message = if error
-                                .downcast_ref::<crate::subscription_api::AccountApiError>()
-                                == Some(&crate::subscription_api::AccountApiError::Unauthorized)
-                            {
-                                let _ = crate::subscription_catalog::clear_account_credentials();
-                                "Jcode Account Status\n\nThe saved account key was revoked or expired. Local credentials were cleared. Use /account jcode login to sign in again."
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "Jcode Account Status\n\nCould not load /v1/me: {}\n\nThe local credential was retained. Retry /account jcode status, open /account jcode manage, or use /account jcode logout.",
-                                    error
-                                )
-                            };
-                            crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
-                                crate::bus::UiActivity::background(
-                                    Some(session_id),
-                                    message,
-                                    Some("Jcode account status unavailable"),
-                                ),
-                            ));
-                        }
-                    }
-                });
-            }
-        }
     }
 
     pub(super) fn show_auth_status(&mut self) {
@@ -1138,13 +941,21 @@ impl App {
     }
 
     fn switch_saved_oauth_account(&mut self, provider_id: &str, label: &str) {
-        let selection = saved_account_route_selection(
+        let selection = match saved_account_route_selection(
             provider_id,
             label,
             self.provider.name(),
             &self.provider.model(),
             crate::config::config().provider.default_model.as_deref(),
-        );
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Failed to select saved account {label}: {error}"
+                )));
+                return;
+            }
+        };
         let model_request = selection.routed_model_spec();
         if let Err(error) = self.provider.set_route_selection(&selection) {
             self.push_display_message(DisplayMessage::error(format!(
@@ -1346,29 +1157,13 @@ impl App {
             Some(callback_available),
         );
 
-        self.push_display_message(DisplayMessage::system(format!(
-            "OpenAI OAuth Login (account: {})\n\n\
-             Opening browser for authentication...\n\n\
-             If the browser didn't open, visit:\n{}\n\n\
-             Note: Wait a few seconds for the page to fully load before clicking Continue. \
-             OpenAI's verification system may briefly disable the button.\n\n\
-             {}{}{}\
-             Or paste the full callback URL or query string here to finish from another device. Type /cancel to abort.{}",
+        self.show_openai_login_progress(
             label,
-            auth_url,
-            if preflight.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", preflight)
-            },
-            callback_line,
-            if preflight.is_empty() {
-                String::new()
-            } else {
-                "Manual-safe fallback is already active here.\n".to_string()
-            },
-            qr_section
-        )));
+            &auth_url,
+            browser_opened,
+            callback_available,
+            &format!("{preflight}\n{callback_line}\nIf Continue is disabled, wait for the page to finish loading.\nPaste the full callback URL or query string to finish from another device.{qr_section}"),
+        );
         self.set_status_notice(format!("Login [{}]: waiting...", label));
         self.begin_pending_login(PendingLogin::OpenAiAccount {
             verifier,
@@ -2128,10 +1923,20 @@ impl App {
     pub(super) fn handle_login_input(&mut self, pending: PendingLogin, input: String) {
         let trimmed = input.trim();
         if trimmed == "/cancel" {
+            if matches!(&pending, PendingLogin::Exchanging { .. }) {
+                self.set_status_notice("Login exchange is running. Wait for completion.");
+                self.pending_login = Some(pending);
+                return;
+            }
             if let Some((provider, method)) = pending.telemetry_context() {
                 crate::telemetry::record_auth_cancelled(&provider, &method);
             }
-            self.push_display_message(DisplayMessage::system("Login cancelled.".to_string()));
+            let replaced = matches!(&pending, PendingLogin::OpenAiAccount { .. })
+                && self.finish_openai_login_progress("OpenAI login cancelled.".to_string());
+            if !replaced {
+                self.push_display_message(DisplayMessage::system("Login cancelled.".to_string()));
+            }
+            self.set_status_notice("Login cancelled");
             return;
         }
 
@@ -2166,6 +1971,10 @@ impl App {
         }
 
         match pending {
+            PendingLogin::Exchanging { provider } => {
+                self.set_status_notice("Login only: exchanging credentials, input not sent to AI");
+                self.pending_login = Some(PendingLogin::Exchanging { provider });
+            }
             PendingLogin::Remote => {
                 // SSH input must never fall through to laptop credential handlers.
                 self.append_ssh_login_input(&input);
@@ -2175,6 +1984,9 @@ impl App {
                 label,
                 redirect_uri,
             } => {
+                self.pending_login = Some(PendingLogin::Exchanging {
+                    provider: "claude".to_string(),
+                });
                 self.set_status_notice(format!("Login [{}]: exchanging...", label));
                 let input_owned = input.clone();
                 let label_clone = label.clone();
@@ -2214,6 +2026,9 @@ impl App {
                 expected_state,
                 redirect_uri,
             } => {
+                self.pending_login = Some(PendingLogin::Exchanging {
+                    provider: "openai".to_string(),
+                });
                 self.set_status_notice(format!("Login [{}]: exchanging...", label));
                 let input_owned = input.clone();
                 let label_clone = label.clone();
@@ -2243,16 +2058,16 @@ impl App {
                         }
                     }
                 });
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Exchanging OpenAI callback for account {}...",
-                    label
-                )));
+                self.update_openai_login_exchange(&label);
             }
             PendingLogin::Gemini {
                 verifier,
                 expected_state,
                 redirect_uri,
             } => {
+                self.pending_login = Some(PendingLogin::Exchanging {
+                    provider: "gemini".to_string(),
+                });
                 self.set_status_notice("Login: exchanging...");
                 let input_owned = input.clone();
                 tokio::spawn(async move {
@@ -2294,6 +2109,9 @@ impl App {
                 expected_state,
                 redirect_uri,
             } => {
+                self.pending_login = Some(PendingLogin::Exchanging {
+                    provider: "antigravity".to_string(),
+                });
                 self.set_status_notice("Login: exchanging...");
                 let input_owned = input.clone();
                 tokio::spawn(async move {
@@ -3363,6 +3181,19 @@ impl App {
             }
             return;
         }
+        // A callback may complete while the user is still typing a URL/code.
+        // Never leave that authentication input armed as the next AI prompt.
+        if self
+            .pending_login
+            .as_ref()
+            .and_then(PendingLogin::telemetry_context)
+            .is_some_and(|(provider, _)| provider == login.provider)
+        {
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.pasted_contents.clear();
+            self.clear_input_undo_history();
+        }
         crate::auth::AuthStatus::invalidate_cache();
         crate::logging::event_info(
             "login_completed",
@@ -3385,6 +3216,8 @@ impl App {
             }
         }
         if login.success {
+            let replaced_login_card = login.provider == "openai"
+                && self.finish_openai_login_progress("✓ OpenAI login complete.".to_string());
             self.recent_authenticated_provider = Some((login.provider.clone(), Instant::now()));
             // A fresh login is exactly what the credential-failure breaker is
             // waiting for: give automatic retries a fresh budget.
@@ -3393,7 +3226,7 @@ impl App {
             self.invalidate_model_picker_cache();
             let suppress_first_run_login_noise =
                 self.onboarding_flow_active() && !matches!(login.provider.as_str(), "copilot_code");
-            if !suppress_first_run_login_noise {
+            if !suppress_first_run_login_noise && !replaced_login_card {
                 self.push_display_message(DisplayMessage::system(login.message));
             }
             self.set_status_notice(format!("Login: {} ready", login.provider));
@@ -3437,15 +3270,26 @@ impl App {
             // During onboarding we route the failure to the recovery screen
             // (which explains next steps) instead of dumping a raw error message
             // and a status notice the user can miss.
+            let replaced_login_card = login.provider == "openai"
+                && self.finish_openai_login_progress(format!(
+                    "OpenAI login failed: {message}\nRetry /login openai."
+                ));
             if self.onboarding_flow_active() {
                 self.onboarding_handle_login_failed(Some(message));
             } else {
-                self.push_display_message(DisplayMessage::error(message));
+                if !replaced_login_card {
+                    self.push_display_message(DisplayMessage::error(message));
+                }
                 self.set_status_notice(format!("Login: {} failed", login.provider));
                 self.onboarding_handle_login_failed(None);
             }
         }
-        if self.pending_login.is_some() {
+        if self
+            .pending_login
+            .as_ref()
+            .and_then(PendingLogin::telemetry_context)
+            .is_some_and(|(provider, _)| provider == login.provider)
+        {
             self.pending_login = None;
         }
     }

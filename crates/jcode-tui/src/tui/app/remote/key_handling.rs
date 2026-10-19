@@ -1,3 +1,7 @@
+#[path = "key_handling/rewind.rs"]
+mod rewind;
+use rewind::*;
+
 use super::*;
 use crate::tui::app as app_mod;
 use crate::tui::app::PendingRemoteRewindNotice;
@@ -68,9 +72,13 @@ async fn apply_remote_speed_direction(
     remote: &mut RemoteConnection,
     direction: i8,
 ) -> Result<()> {
-    use jcode_provider_core::service_tier::{speed_tier_ladder, step_speed_tier};
+    use jcode_provider_core::service_tier::{speed_tier_ladder_with_capabilities, step_speed_tier};
     let (provider_name, provider_model) = app.remote_effort_identity();
-    let ladder = speed_tier_ladder(provider_name.as_deref(), provider_model.as_deref());
+    let ladder = speed_tier_ladder_with_capabilities(
+        provider_name.as_deref(),
+        provider_model.as_deref(),
+        app.remote_available_service_tiers.as_deref(),
+    );
     let Some((index, next, at_end)) =
         step_speed_tier(&ladder, app.remote_service_tier.as_deref(), direction)
     else {
@@ -86,9 +94,23 @@ async fn apply_remote_speed_direction(
         ));
         return Ok(());
     }
-    app.set_status_notice(app_mod::speed_tier_notice(next, index, ladder.len(), None));
-    remote.set_service_tier(next).await?;
+    request_remote_service_tier(app, remote, next).await?;
     Ok(())
+}
+
+async fn request_remote_service_tier(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    tier: &str,
+) -> Result<()> {
+    // A transient notice acknowledges input without claiming configuration or
+    // provider acceptance. The server acknowledgement replaces it, so fast
+    // round trips do not add a second transcript message.
+    app.set_status_notice(format!(
+        "Speed: {} requested (waiting for server)",
+        app_mod::service_tier_display_label(tier)
+    ));
+    remote.set_service_tier(tier).await
 }
 
 async fn apply_remote_effort_direction(
@@ -142,97 +164,6 @@ async fn apply_remote_effort_direction(
         remote.set_reasoning_effort(next_effort).await?;
     }
     Ok(())
-}
-
-fn remote_rewindable_messages(app: &App) -> Vec<&DisplayMessage> {
-    app.display_messages()
-        .iter()
-        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-        .collect()
-}
-
-fn show_remote_rewind_history(app: &mut App) {
-    let rewindable = remote_rewindable_messages(app);
-    if rewindable.is_empty() {
-        app.push_display_message(DisplayMessage::system(
-            "No messages in conversation.".to_string(),
-        ));
-        return;
-    }
-
-    let mut history = String::from("Conversation history:\n\n");
-    for (i, msg) in rewindable.iter().enumerate() {
-        let role_str = match msg.role.as_str() {
-            "user" => "👤 User",
-            "assistant" => "🤖 Assistant",
-            _ => "💬 Message",
-        };
-        let preview = crate::util::truncate_str(&msg.content, 80);
-        history.push_str(&format!("  {} {} - {}\n", i + 1, role_str, preview));
-    }
-    history.push_str("\nUse /rewind N to rewind to message N (removes all messages after).");
-    history.push_str(" After rewinding, use /rewind undo to restore the removed messages.");
-    app.push_display_message(DisplayMessage::system(history));
-}
-
-async fn handle_remote_rewind_command(
-    app: &mut App,
-    remote: &mut RemoteConnection,
-    trimmed: &str,
-) -> Result<bool> {
-    if trimmed == "/rewind" {
-        show_remote_rewind_history(app);
-        return Ok(true);
-    }
-
-    if trimmed == "/rewind undo" {
-        remote.rewind_undo().await?;
-        app.pending_remote_rewind_notice = Some(PendingRemoteRewindNotice {
-            undo: true,
-            message_index: None,
-            changed_messages: 0,
-        });
-        app.set_status_notice("Undoing rewind...");
-        return Ok(true);
-    }
-
-    let Some(num_str) = trimmed.strip_prefix("/rewind ") else {
-        return Ok(false);
-    };
-
-    let message_count = remote_rewindable_messages(app).len();
-    if message_count == 0 {
-        app.push_display_message(DisplayMessage::system(
-            "No messages in conversation.".to_string(),
-        ));
-        return Ok(true);
-    }
-
-    match num_str.trim().parse::<usize>() {
-        Ok(n) if n > 0 && n <= message_count => {
-            remote.rewind(n).await?;
-            app.pending_remote_rewind_notice = Some(PendingRemoteRewindNotice {
-                undo: false,
-                message_index: Some(n),
-                changed_messages: message_count - n,
-            });
-            app.set_status_notice(format!("Rewinding to message {}...", n));
-        }
-        Ok(n) => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Invalid message number: {}. Valid range: 1-{}",
-                n, message_count
-            )));
-        }
-        Err(_) => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Usage: /rewind N where N is a message number (1-{})",
-                message_count
-            )));
-        }
-    }
-
-    Ok(true)
 }
 
 impl App {
@@ -302,6 +233,7 @@ async fn handle_remote_key_internal(
     remote: &mut RemoteConnection,
     text_input: Option<String>,
 ) -> Result<()> {
+    app.wake_idle_hibernation();
     let mut code = code;
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
@@ -934,10 +866,16 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Up => {
+                let had_server_interrupts = !app.pending_soft_interrupts.is_empty();
                 let had_pending = app.retrieve_pending_message_for_edit();
-                if had_pending {
-                    let _ = remote.cancel_soft_interrupts().await;
-                } else {
+                if had_pending && had_server_interrupts {
+                    if let Err(error) = remote.cancel_soft_interrupts().await {
+                        app.push_display_message(DisplayMessage::error(format!(
+                            "Recalled draft retained, but server interrupt cancellation failed: {error}"
+                        )));
+                        app.set_status_notice("Draft recalled locally; server cancellation failed");
+                    }
+                } else if !had_pending {
                     input::handle_prompt_history_navigation(app, code, modifiers);
                 }
                 return Ok(());
@@ -1484,11 +1422,11 @@ pub(in crate::tui::app) async fn submit_remote_enter_input(
             match mode.as_str() {
                 "on" => {
                     app_mod::auth::save_openai_fast_setting_local(app, true);
-                    remote.set_service_tier("priority").await?;
+                    request_remote_service_tier(app, remote, "priority").await?;
                 }
                 "off" => {
                     app_mod::auth::save_openai_fast_setting_local(app, false);
-                    remote.set_service_tier("off").await?;
+                    request_remote_service_tier(app, remote, "off").await?;
                 }
                 "status" => {
                     let default_tier = crate::config::Config::load().provider.openai_service_tier;
@@ -1566,7 +1504,7 @@ pub(in crate::tui::app) async fn submit_remote_enter_input(
                     return Ok(());
                 }
             };
-            remote.set_service_tier(service_tier).await?;
+            request_remote_service_tier(app, remote, service_tier).await?;
             return Ok(());
         }
 

@@ -58,13 +58,9 @@ fn available_models_snapshot_into_event(snapshot: ModelCatalogSnapshot) -> Serve
     }
 }
 
-fn available_models_updated_event_from_agent(agent: &Agent) -> ServerEvent {
-    available_models_snapshot_into_event(agent.model_catalog_snapshot())
-}
-
 async fn available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> ModelCatalogSnapshot {
     let agent_guard = agent.lock().await;
-    agent_guard.model_catalog_snapshot()
+    super::available_models_cache::for_agent(&agent_guard).snapshot()
 }
 
 fn available_models_snapshot_from_provider(provider: &Arc<dyn Provider>) -> ModelCatalogSnapshot {
@@ -75,12 +71,16 @@ fn available_models_snapshot_from_provider(provider: &Arc<dyn Provider>) -> Mode
 
 pub(super) async fn available_models_updated_event(agent: &Arc<Mutex<Agent>>) -> ServerEvent {
     let agent_guard = agent.lock().await;
-    available_models_updated_event_from_agent(&agent_guard)
+    super::available_models_cache::for_agent(&agent_guard)
+        .event
+        .clone()
 }
 
-pub(super) fn try_available_models_updated_event(agent: &Arc<Mutex<Agent>>) -> Option<ServerEvent> {
+pub(super) fn try_available_models_catalog(
+    agent: &Arc<Mutex<Agent>>,
+) -> Option<Arc<super::available_models_cache::Catalog>> {
     let agent_guard = agent.try_lock().ok()?;
-    Some(available_models_updated_event_from_agent(&agent_guard))
+    Some(super::available_models_cache::for_agent(&agent_guard))
 }
 
 fn format_auth_catalog_refresh_complete(
@@ -170,7 +170,7 @@ fn spawn_deferred_agent_mutation<F>(
     F: FnOnce(&mut Agent, &mpsc::UnboundedSender<ServerEvent>) + Send + 'static,
 {
     let queued_at = log_provider_control_deferred(operation, id);
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         log_provider_control_lock_acquired(operation, id, queued_at);
         apply(&mut agent_guard, &client_event_tx);
@@ -188,7 +188,7 @@ fn spawn_deferred_provider_operation<F>(
     F: FnOnce(Arc<dyn Provider>, &mpsc::UnboundedSender<ServerEvent>) + Send + 'static,
 {
     let queued_at = log_provider_control_deferred(operation, id);
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let provider = {
             let agent_guard = agent.lock().await;
             log_provider_control_lock_acquired(operation, id, queued_at);
@@ -257,7 +257,7 @@ async fn auth_refresh_targets(
 
 fn spawn_deferred_auth_refreshes(agents: Vec<Arc<Mutex<Agent>>>) {
     for agent in agents {
-        tokio::spawn(async move {
+        crate::runtime_activity::spawn(async move {
             let provider = {
                 let agent_guard = agent.lock().await;
                 agent_guard.provider_handle()
@@ -415,6 +415,7 @@ fn send_model_changed_result(
                 error: None,
                 resolved_credential,
                 provider_oauth_email: super::provider_oauth_email(agent.provider_handle().as_ref()),
+                provider_oauth_account_label: agent.provider_handle().oauth_account_label(),
                 reasoning_effort,
             });
         }
@@ -435,6 +436,7 @@ fn send_model_changed_result(
                 error: Some(error.to_string()),
                 resolved_credential: None,
                 provider_oauth_email: None,
+                provider_oauth_account_label: None,
                 reasoning_effort: None,
             });
         }
@@ -457,6 +459,7 @@ fn apply_cycle_model(
             error: Some("Model switching is not available for this provider.".to_string()),
             resolved_credential: None,
             provider_oauth_email: None,
+            provider_oauth_account_label: None,
             reasoning_effort: None,
         });
         return;
@@ -614,7 +617,7 @@ fn apply_set_model(
     send_model_changed_result(id, result, current, agent, client_event_tx);
 }
 
-fn automatic_failover_source_is_pool_member(agent: &Agent) -> bool {
+pub(super) fn automatic_failover_source_is_pool_member(agent: &Agent) -> bool {
     let provider = agent.provider_handle();
     let name = provider.name().to_ascii_lowercase();
     let name = match name.as_str() {
@@ -625,7 +628,15 @@ fn automatic_failover_source_is_pool_member(agent: &Agent) -> bool {
     };
     let key = match (name, provider.active_resolved_credential()) {
         ("claude" | "openai", Some(jcode_provider_core::ResolvedCredential::Oauth)) => {
-            let Some(label) = provider.oauth_account_label() else {
+            // Unpinned sessions run on the global active login, which is
+            // exactly the account the router just proposed leaving.
+            let Some(label) = provider.oauth_account_label().or_else(|| {
+                if name == "openai" {
+                    crate::auth::codex::active_account_label()
+                } else {
+                    crate::auth::claude::active_account_label()
+                }
+            }) else {
                 return false;
             };
             let exists = if name == "openai" {
@@ -691,18 +702,25 @@ fn apply_set_route(
 
     let current = agent.provider_model();
     let result = {
-        let result = if automatic_failover
-            && (crate::config::Config::load()
-                .provider
-                .cross_provider_failover
-                != crate::config::CrossProviderFailoverMode::Countdown
-                || !automatic_failover_source_is_pool_member(agent)
-                || !crate::provider::MultiProvider::is_failover_route_pool_approved(
-                    &selection.routed_model_spec(),
-                )) {
-            Err(anyhow::anyhow!(
-                "Auto-switch canceled: target account is no longer eligible in your auto-switch group."
-            ))
+        let ineligible = if !automatic_failover {
+            None
+        } else if crate::config::Config::load()
+            .provider
+            .cross_provider_failover
+            != crate::config::CrossProviderFailoverMode::Countdown
+        {
+            Some("countdown auto-switch is disabled")
+        } else if !automatic_failover_source_is_pool_member(agent) {
+            Some("source account is not in the auto-switch group")
+        } else if !crate::provider::MultiProvider::is_failover_route_pool_approved(
+            &selection.routed_model_spec(),
+        ) {
+            Some("target account is not eligible in the auto-switch group")
+        } else {
+            None
+        };
+        let result = if let Some(why) = ineligible {
+            Err(anyhow::anyhow!("Auto-switch canceled: {why}."))
         } else {
             agent.set_route_selection(&selection)
         };
@@ -790,7 +808,7 @@ pub(super) async fn handle_refresh_models(
     let provider_clone = provider.clone();
     let agent_clone = agent.clone();
     let client_event_tx_clone = client_event_tx.clone();
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         send_catalog_activity(
             &client_event_tx_clone,
             &crate::message::format_model_refresh_progress_markdown(
@@ -925,7 +943,7 @@ fn spawn_deferred_reasoning_effort_change(
     client_event_tx: mpsc::UnboundedSender<ServerEvent>,
 ) {
     let queued_at = log_provider_control_deferred("set_reasoning_effort", id);
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         log_provider_control_lock_acquired("set_reasoning_effort", id, queued_at);
         let result = agent_guard.set_reasoning_effort(&effort);
@@ -944,6 +962,7 @@ pub(super) async fn handle_set_service_tier(
     id: u64,
     service_tier: String,
     agent: &Arc<Mutex<Agent>>,
+    provider: Option<Arc<dyn Provider>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let apply = move |provider: Arc<dyn Provider>,
@@ -952,6 +971,7 @@ pub(super) async fn handle_set_service_tier(
             Ok(()) => {
                 let _ = client_event_tx.send(ServerEvent::ServiceTierChanged {
                     id,
+                    pending: false,
                     service_tier: provider.service_tier(),
                     error: None,
                 });
@@ -959,6 +979,7 @@ pub(super) async fn handle_set_service_tier(
             Err(e) => {
                 let _ = client_event_tx.send(ServerEvent::ServiceTierChanged {
                     id,
+                    pending: false,
                     service_tier: None,
                     error: Some(e.to_string()),
                 });
@@ -966,9 +987,19 @@ pub(super) async fn handle_set_service_tier(
         }
     };
 
-    if let Ok(agent_guard) = agent.try_lock() {
+    if let Some(provider) = provider {
+        // Configures the next provider request, even while the turn owns Agent.
+        // The provider cannot rewrite a request already accepted upstream.
+        apply(provider, client_event_tx);
+    } else if let Ok(agent_guard) = agent.try_lock() {
         apply(agent_guard.provider_handle(), client_event_tx);
     } else {
+        let _ = client_event_tx.send(ServerEvent::ServiceTierChanged {
+            id,
+            pending: true,
+            service_tier: None,
+            error: None,
+        });
         spawn_deferred_provider_operation(
             "set_service_tier",
             id,
@@ -1073,7 +1104,7 @@ fn spawn_deferred_set_compaction_mode(
     client_event_tx: mpsc::UnboundedSender<ServerEvent>,
 ) {
     let queued_at = log_provider_control_deferred("set_compaction_mode", id);
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let registry = {
             let agent_guard = agent.lock().await;
             log_provider_control_lock_acquired("set_compaction_mode", id, queued_at);
@@ -1102,7 +1133,7 @@ pub(super) async fn handle_notify_auth_changed(
     let (session_id, before_snapshot) = if let Ok(agent_guard) = agent.try_lock() {
         (
             agent_guard.session_id().to_string(),
-            agent_guard.model_catalog_snapshot(),
+            super::available_models_cache::for_agent(&agent_guard).snapshot(),
         )
     } else {
         crate::logging::event_warn(
@@ -1132,7 +1163,7 @@ pub(super) async fn handle_notify_auth_changed(
     let targets = auth_refresh_targets(provider_template, provider, agent, sessions).await;
     let client_event_tx_clone = client_event_tx.clone();
     let agent_clone = agent.clone();
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         if !auth_refresh_is_current(&session_id, auth_refresh_generation) {
             return;
         }
@@ -1454,7 +1485,7 @@ fn spawn_account_switch_refresh(
         }
         _ => {}
     }
-    tokio::spawn(async move {
+    crate::runtime_activity::spawn(async move {
         let started = Instant::now();
         crate::logging::event_info(
             "SERVER_PROVIDER_CONTROL_ACCOUNT_SWITCH",
@@ -1495,8 +1526,17 @@ fn spawn_account_switch_refresh(
 
         crate::bus::Bus::global().publish_models_updated();
         let event = available_models_updated_event(&agent).await;
-        let _ = client_event_tx.send(event);
-        let _ = client_event_tx.send(ServerEvent::Done { id });
+        // Account activation remains valid if its requesting client disconnected.
+        if let Err(error) = client_event_tx.send(event) {
+            crate::logging::debug(&format!(
+                "Account switch catalog notification was not delivered: {error}"
+            ));
+        }
+        if let Err(error) = client_event_tx.send(ServerEvent::Done { id }) {
+            crate::logging::debug(&format!(
+                "Account switch completion was not delivered: {error}"
+            ));
+        }
         crate::logging::event_info(
             "SERVER_PROVIDER_CONTROL_ACCOUNT_SWITCH",
             vec![
@@ -1510,386 +1550,5 @@ fn spawn_account_switch_refresh(
 }
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)]
-mod tests {
-    use super::*;
-    use crate::message::{Message, ToolDefinition};
-    use crate::provider::EventStream;
-    use async_trait::async_trait;
-    use std::sync::Mutex as StdMutex;
-    use tokio::time::{Duration, timeout};
-
-    struct IsolatedRuntimeDir {
-        _prev_runtime: Option<std::ffi::OsString>,
-        _temp: tempfile::TempDir,
-    }
-
-    impl IsolatedRuntimeDir {
-        fn new() -> Self {
-            let temp = tempfile::TempDir::new().expect("runtime dir");
-            let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
-            crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
-            Self {
-                _prev_runtime: prev_runtime,
-                _temp: temp,
-            }
-        }
-    }
-
-    impl Drop for IsolatedRuntimeDir {
-        fn drop(&mut self) {
-            if let Some(prev_runtime) = self._prev_runtime.take() {
-                crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
-            } else {
-                crate::env::remove_var("JCODE_RUNTIME_DIR");
-            }
-        }
-    }
-
-    #[derive(Default)]
-    struct TestEffortProvider {
-        model: StdMutex<Option<String>>,
-        effort: StdMutex<Option<String>>,
-        service_tier: StdMutex<Option<String>>,
-        transport: StdMutex<Option<String>>,
-    }
-
-    #[async_trait]
-    impl Provider for TestEffortProvider {
-        async fn complete(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolDefinition],
-            _system: &str,
-            _resume_session_id: Option<&str>,
-        ) -> anyhow::Result<EventStream> {
-            panic!("complete should not run in provider control test")
-        }
-
-        fn name(&self) -> &str {
-            "test-effort"
-        }
-
-        fn model(&self) -> String {
-            self.model
-                .lock()
-                .expect("model lock")
-                .clone()
-                .unwrap_or_else(|| "test-model-a".to_string())
-        }
-
-        fn set_model(&self, model: &str) -> anyhow::Result<()> {
-            *self.model.lock().expect("model lock") = Some(model.to_string());
-            Ok(())
-        }
-
-        fn available_models_for_switching(&self) -> Vec<String> {
-            vec!["test-model-a".to_string(), "test-model-b".to_string()]
-        }
-
-        fn context_window(&self) -> usize {
-            if self.model() == "test-model-b" {
-                32_000
-            } else {
-                16_000
-            }
-        }
-
-        fn reasoning_effort(&self) -> Option<String> {
-            self.effort.lock().expect("effort lock").clone()
-        }
-
-        fn set_reasoning_effort(&self, effort: &str) -> anyhow::Result<()> {
-            *self.effort.lock().expect("effort lock") = Some(effort.to_string());
-            Ok(())
-        }
-
-        fn service_tier(&self) -> Option<String> {
-            self.service_tier.lock().expect("service lock").clone()
-        }
-
-        fn set_service_tier(&self, service_tier: &str) -> anyhow::Result<()> {
-            *self.service_tier.lock().expect("service lock") = Some(service_tier.to_string());
-            Ok(())
-        }
-
-        fn transport(&self) -> Option<String> {
-            self.transport.lock().expect("transport lock").clone()
-        }
-
-        fn set_transport(&self, transport: &str) -> anyhow::Result<()> {
-            *self.transport.lock().expect("transport lock") = Some(transport.to_string());
-            Ok(())
-        }
-
-        fn fork(&self) -> Arc<dyn Provider> {
-            Arc::new(Self {
-                model: StdMutex::new(Some(self.model())),
-                effort: StdMutex::new(self.reasoning_effort()),
-                service_tier: StdMutex::new(self.service_tier()),
-                transport: StdMutex::new(self.transport()),
-            })
-        }
-    }
-
-    /// Clears the runtime provider env vars for the duration of a test session
-    /// build, restoring them on drop.
-    struct AmbientProviderEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl AmbientProviderEnvGuard {
-        fn clear() -> Self {
-            const KEYS: [&str; 3] = [
-                "JCODE_ACTIVE_PROVIDER",
-                "JCODE_OPENROUTER_CACHE_NAMESPACE",
-                "JCODE_RUNTIME_PROVIDER",
-            ];
-            let previous = KEYS
-                .into_iter()
-                .map(|key| (key, std::env::var_os(key)))
-                .collect();
-            for key in KEYS {
-                crate::env::remove_var(key);
-            }
-            Self(previous)
-        }
-    }
-
-    impl Drop for AmbientProviderEnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in &self.0 {
-                match previous {
-                    Some(value) => crate::env::set_var(key, value),
-                    None => crate::env::remove_var(key),
-                }
-            }
-        }
-    }
-
-    async fn test_agent(
-        session_id: &str,
-    ) -> (
-        Arc<TestEffortProvider>,
-        Arc<Mutex<Agent>>,
-        mpsc::UnboundedSender<ServerEvent>,
-        mpsc::UnboundedReceiver<ServerEvent>,
-    ) {
-        // `derive_session_provider_key` consults the runtime provider env, so a
-        // developer shell configured for a real provider leaks into these
-        // tests: the mock session would inherit e.g. `opencode-go` as its route
-        // and a later bare `set_model` would be qualified to
-        // `opencode-go:<model>` instead of the mock provider's own model string.
-        // Clear it while the session is built so the tests keep exercising the
-        // mock provider's route identity.
-        let _ambient_provider_env = AmbientProviderEnvGuard::clear();
-        let provider = Arc::new(TestEffortProvider::default());
-        let provider_dyn: Arc<dyn Provider> = provider.clone();
-        let registry = crate::tool::Registry::new(Arc::clone(&provider_dyn)).await;
-        let mut session =
-            crate::session::Session::create_with_id(session_id.to_string(), None, None);
-        session.model = Some(provider.model());
-        let agent = Arc::new(Mutex::new(Agent::new_with_session(
-            Arc::clone(&provider_dyn),
-            registry,
-            session,
-            None,
-        )));
-        let (client_event_tx, client_event_rx) = mpsc::unbounded_channel();
-        (provider, agent, client_event_tx, client_event_rx)
-    }
-
-    #[tokio::test]
-    async fn set_reasoning_effort_does_not_wait_for_busy_agent_lock() {
-        let _guard = crate::storage::lock_test_env();
-        let _runtime = IsolatedRuntimeDir::new();
-
-        let (provider, agent, client_event_tx, mut client_event_rx) =
-            test_agent("session_busy_reasoning_effort").await;
-        let busy_agent_lock = agent.lock().await;
-
-        timeout(
-            Duration::from_millis(100),
-            handle_set_reasoning_effort(7, "low".to_string(), &agent, &client_event_tx),
-        )
-        .await
-        .expect("reasoning effort changes must not wait for a busy agent mutex");
-
-        assert!(client_event_rx.try_recv().is_err());
-
-        drop(busy_agent_lock);
-
-        let event = timeout(Duration::from_secs(1), client_event_rx.recv())
-            .await
-            .expect("deferred reasoning effort change should finish after agent is idle");
-        assert_eq!(provider.reasoning_effort().as_deref(), Some("low"));
-        assert!(matches!(
-            event,
-            Some(ServerEvent::ReasoningEffortChanged {
-                id: 7,
-                effort: Some(effort),
-                error: None,
-            }) if effort == "low"
-        ));
-    }
-
-    #[tokio::test]
-    async fn automatic_failover_revalidates_after_waiting_for_agent_lock() {
-        let _guard = crate::storage::lock_test_env();
-        let _runtime = IsolatedRuntimeDir::new();
-        let (provider, agent, tx, mut rx) = test_agent("session_rejected_auto_route").await;
-        let selection = crate::provider::RouteSelection {
-            model: "gpt-6.1-sol".to_string(),
-            runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
-            api_method: "openai-oauth@nonexistent-failover-test-account".to_string(),
-            provider_label: "OpenAI".to_string(),
-            detail: String::new(),
-        };
-        let lock = agent.lock().await;
-        timeout(
-            Duration::from_millis(100),
-            handle_set_route(29, selection, true, &agent, &tx),
-        )
-        .await
-        .expect("route request must not block on the agent lock");
-        assert!(rx.try_recv().is_err());
-        drop(lock);
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(event, ServerEvent::ModelChanged { id: 29, error: Some(error), .. }
-            if error.contains("Auto-switch canceled"))
-        );
-        assert_eq!(provider.model(), "test-model-a");
-    }
-
-    #[tokio::test]
-    async fn automatic_failover_source_respects_current_api_pool_membership() {
-        let _guard = crate::storage::lock_test_env();
-        let _runtime = IsolatedRuntimeDir::new();
-        let home = tempfile::tempdir().unwrap();
-        struct RestoreHome(Option<std::ffi::OsString>);
-        impl Drop for RestoreHome {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(home) => crate::env::set_var("JCODE_HOME", home),
-                    None => crate::env::remove_var("JCODE_HOME"),
-                }
-                crate::config::Config::invalidate_cache();
-            }
-        }
-        let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
-        crate::env::set_var("JCODE_HOME", home.path());
-        struct ApiSource;
-        #[async_trait]
-        impl Provider for ApiSource {
-            async fn complete(
-                &self,
-                _: &[Message],
-                _: &[ToolDefinition],
-                _: &str,
-                _: Option<&str>,
-            ) -> anyhow::Result<EventStream> {
-                panic!("must not send")
-            }
-            fn name(&self) -> &str {
-                "OpenAI"
-            }
-            fn active_resolved_credential(
-                &self,
-            ) -> Option<jcode_provider_core::ResolvedCredential> {
-                Some(jcode_provider_core::ResolvedCredential::ApiKey)
-            }
-            fn fork(&self) -> Arc<dyn Provider> {
-                Arc::new(Self)
-            }
-        }
-        let agent = Agent::new(Arc::new(ApiSource), crate::tool::Registry::empty());
-        assert!(
-            !automatic_failover_source_is_pool_member(&agent),
-            "metered keys stay manual by default"
-        );
-        let mut pool = crate::auth::account_pool::AccountPool::default();
-        pool.members.push("openai-api".to_string());
-        pool.save().unwrap();
-        assert!(automatic_failover_source_is_pool_member(&agent));
-        pool.members.clear();
-        pool.excluded.push("openai-api".to_string());
-        pool.save().unwrap();
-        assert!(
-            !automatic_failover_source_is_pool_member(&agent),
-            "a source moved below the boundary must stay manual"
-        );
-    }
-
-    #[tokio::test]
-    async fn set_model_does_not_wait_for_busy_agent_lock() {
-        let _guard = crate::storage::lock_test_env();
-        let _runtime = IsolatedRuntimeDir::new();
-
-        let (provider, agent, client_event_tx, mut client_event_rx) =
-            test_agent("session_busy_set_model").await;
-        let busy_agent_lock = agent.lock().await;
-
-        timeout(
-            Duration::from_millis(100),
-            handle_set_model(8, "test-model-b".to_string(), &agent, &client_event_tx),
-        )
-        .await
-        .expect("model changes must not wait for a busy agent mutex");
-
-        assert!(client_event_rx.try_recv().is_err());
-
-        drop(busy_agent_lock);
-
-        let event = timeout(Duration::from_secs(1), client_event_rx.recv())
-            .await
-            .expect("deferred model change should finish after agent is idle");
-        assert_eq!(provider.model(), "test-model-b");
-        assert_eq!(agent.lock().await.compaction_token_budget().await, 32_000);
-        assert!(matches!(
-            event,
-            Some(ServerEvent::ModelChanged {
-                id: 8,
-                model,
-                provider_name: Some(provider_name),
-                error: None,
-                ..
-            }) if model == "test-model-b" && provider_name == "test-effort"
-        ));
-    }
-
-    #[tokio::test]
-    async fn set_service_tier_does_not_wait_for_busy_agent_lock() {
-        let _guard = crate::storage::lock_test_env();
-        let _runtime = IsolatedRuntimeDir::new();
-
-        let (provider, agent, client_event_tx, mut client_event_rx) =
-            test_agent("session_busy_set_service_tier").await;
-        let busy_agent_lock = agent.lock().await;
-
-        timeout(
-            Duration::from_millis(100),
-            handle_set_service_tier(9, "priority".to_string(), &agent, &client_event_tx),
-        )
-        .await
-        .expect("service tier changes must not wait for a busy agent mutex");
-
-        assert!(client_event_rx.try_recv().is_err());
-
-        drop(busy_agent_lock);
-
-        let event = timeout(Duration::from_secs(1), client_event_rx.recv())
-            .await
-            .expect("deferred service tier change should finish after agent is idle");
-        assert_eq!(provider.service_tier().as_deref(), Some("priority"));
-        assert!(matches!(
-            event,
-            Some(ServerEvent::ServiceTierChanged {
-                id: 9,
-                service_tier: Some(service_tier),
-                error: None,
-            }) if service_tier == "priority"
-        ));
-    }
-}
+#[path = "provider_control_busy_tests.rs"]
+mod tests;

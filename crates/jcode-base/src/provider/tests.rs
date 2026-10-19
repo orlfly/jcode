@@ -1,5 +1,8 @@
 use super::*;
+mod catalog_memo;
 mod saved_account_selection;
+mod session_binding;
+mod startup_pool;
 use crate::provider::models::{ensure_model_allowed_for_subscription, filtered_display_models};
 
 pub(crate) fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
@@ -222,12 +225,75 @@ fn test_multi_provider_with_openai() -> MultiProvider {
         openrouter: RwLock::new(None),
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
+        session_id: RwLock::new(None),
         active: RwLock::new(ActiveProvider::OpenAI),
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
+        catalog_scope: next_catalog_scope(),
         routes_memo: std::sync::Mutex::new(None),
         post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
+}
+
+#[test]
+fn model_capabilities_refresh_forwards_only_active_present_openai() {
+    struct RefreshMock(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl Provider for RefreshMock {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _system: &str,
+            _resume_session_id: Option<&str>,
+        ) -> Result<EventStream> {
+            unreachable!("refresh checks must not start a completion")
+        }
+
+        fn name(&self) -> &str {
+            "openai-refresh-mock"
+        }
+
+        fn model(&self) -> String {
+            "gpt-5.4".to_string()
+        }
+
+        fn fork(&self) -> Arc<dyn Provider> {
+            Arc::new(Self(std::sync::atomic::AtomicBool::new(
+                self.model_capabilities_need_refresh(),
+            )))
+        }
+
+        fn model_capabilities_need_refresh(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _enter = runtime.enter();
+        let provider = test_multi_provider_with_openai();
+        let underlying = Arc::new(RefreshMock(std::sync::atomic::AtomicBool::new(true)));
+        *provider.openai.write().unwrap() = Some(underlying.clone());
+
+        assert!(Provider::model_capabilities_need_refresh(&provider));
+
+        underlying
+            .0
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!Provider::model_capabilities_need_refresh(&provider));
+        underlying
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        *provider.active.write().unwrap() = ActiveProvider::Claude;
+        assert!(!Provider::model_capabilities_need_refresh(&provider));
+
+        *provider.active.write().unwrap() = ActiveProvider::OpenAI;
+        *provider.openai.write().unwrap() = None;
+        assert!(!Provider::model_capabilities_need_refresh(&provider));
+    });
 }
 
 #[test]
@@ -494,104 +560,6 @@ fn openai_model_routes_cover_oauth_api_and_no_auth_state_space() {
             .map(|route| route.api_method.as_str())
             .collect::<Vec<_>>();
         assert_eq!(api_only_methods, vec!["openai-api-key"]);
-    });
-}
-
-/// The route-catalog memo must serve repeated `model_routes()` calls without
-/// rebuilding (a shared server fans one ModelsUpdated event out to every
-/// connection, each of which snapshots the catalog), while auth invalidation
-/// and model switches must bypass it immediately.
-#[test]
-fn model_routes_memo_serves_repeats_and_invalidates_on_auth_and_model_changes() {
-    with_clean_provider_test_env(|| {
-        let rt = enter_test_runtime();
-        let _runtime_guard = rt.enter();
-        let provider = test_multi_provider_with_openai();
-
-        let first = provider.model_routes();
-        let second = provider.model_routes();
-        assert_eq!(
-            first, second,
-            "memoized catalog must be identical across back-to-back reads"
-        );
-        assert!(
-            provider
-                .routes_memo
-                .lock()
-                .expect("routes memo lock")
-                .is_some(),
-            "memo should be populated after a build"
-        );
-
-        // Auth invalidation bumps the pricing generation, which must make the
-        // memo stale even within the TTL window (verified behaviorally by the
-        // oauth/api state-space test above; here we check the memo mechanism).
-        let generation_before = crate::provider::pricing::auth_pricing_generation();
-        crate::auth::AuthStatus::invalidate_cache();
-        assert!(
-            crate::provider::pricing::auth_pricing_generation() > generation_before,
-            "auth invalidation must advance the pricing generation"
-        );
-
-        // A model switch drops the memo outright.
-        let model = known_openai_model_ids()
-            .first()
-            .expect("at least one OpenAI model")
-            .clone();
-        provider.model_routes();
-        let _ = provider.set_model(&format!("openai-api:{model}"));
-        assert!(
-            provider
-                .routes_memo
-                .lock()
-                .expect("routes memo lock")
-                .is_none(),
-            "set_model must invalidate the routes memo"
-        );
-
-        // A second instance with identical catalog-relevant state must reuse
-        // the shared process-wide memo (this is what collapses shared-server
-        // connect bursts down to one build), and instances with different
-        // state must not share a key.
-        let first_instance = test_multi_provider_with_openai();
-        let second_instance = test_multi_provider_with_openai();
-        assert_eq!(
-            first_instance.routes_memo_key(),
-            second_instance.routes_memo_key(),
-            "identical forks must share a memo key"
-        );
-        let baseline = first_instance.model_routes();
-        assert!(
-            second_instance
-                .routes_memo
-                .lock()
-                .expect("routes memo lock")
-                .is_none(),
-            "second instance has not built anything yet"
-        );
-        let shared = second_instance.model_routes();
-        assert_eq!(baseline, shared, "shared memo must serve identical routes");
-        assert!(
-            second_instance
-                .routes_memo
-                .lock()
-                .expect("routes memo lock")
-                .is_some(),
-            "shared hit should hydrate the instance memo"
-        );
-        let _ = second_instance.set_model(&format!("openai-oauth:{model}"));
-        // Credential-mode switches don't change catalog content (routes come
-        // from global auth status), so the key may legitimately stay equal.
-        // A different *model* must change it: the active model gets special
-        // treatment (endpoint refresh priority) during the build.
-        if let Some(alternate) = known_openai_model_ids().get(1) {
-            let _ = second_instance.set_model(&format!("openai-oauth:{alternate}"));
-            assert_ne!(
-                first_instance.routes_memo_key(),
-                second_instance.routes_memo_key(),
-                "a different active model must change the memo key"
-            );
-        }
     });
 }
 
@@ -1049,9 +1017,11 @@ fn test_multi_provider_with_cursor() -> MultiProvider {
         openrouter: RwLock::new(None),
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
+        session_id: RwLock::new(None),
         active: RwLock::new(ActiveProvider::Cursor),
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
+        catalog_scope: next_catalog_scope(),
         routes_memo: std::sync::Mutex::new(None),
         post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
