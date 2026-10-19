@@ -109,9 +109,18 @@ async fn generalize_candidates(
 }
 
 fn parse_category(raw: &str) -> MemoryCategory {
+    // v2 type names stay first-class: the generalize prompt emits the same
+    // vocabulary as the extraction prompt (process_rule / env_fact / contract
+    // / observation), and routing them through the legacy `fact` fallthrough
+    // would erase their TTL/decay/scoring treatment the moment the model says
+    // what they are. Unknown names still fail safe to Fact.
     match raw {
         "preference" => MemoryCategory::Preference,
         "correction" => MemoryCategory::Correction,
+        "env_fact" | "envfact" | "environment" | "environment_fact" => MemoryCategory::EnvFact,
+        "contract" | "contracts" | "api_contract" => MemoryCategory::Contract,
+        "process_rule" | "processrule" | "rule" | "procedure" => MemoryCategory::ProcessRule,
+        "observation" | "lesson" | "learning" => MemoryCategory::Observation,
         _ => MemoryCategory::Fact,
     }
 }
@@ -261,6 +270,19 @@ mod tests {
             MemoryCategory::Correction
         ));
         assert!(matches!(parse_category("fact"), MemoryCategory::Fact));
+        // v2 type names keep their type through the generalizer too.
+        assert!(matches!(
+            parse_category("process_rule"),
+            MemoryCategory::ProcessRule
+        ));
+        assert!(matches!(
+            parse_category("env_fact"),
+            MemoryCategory::EnvFact
+        ));
+        assert!(matches!(parse_category("contract"), MemoryCategory::Contract));
+        assert!(
+            matches!(parse_category("observation"), MemoryCategory::Observation)
+        );
         // Unknown names fail safe to Fact, the least harmful category.
         assert!(matches!(parse_category("entity"), MemoryCategory::Fact));
     }

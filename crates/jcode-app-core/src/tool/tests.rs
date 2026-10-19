@@ -437,6 +437,12 @@ fn test_resolve_tool_name_oauth_aliases() {
 
 #[tokio::test]
 async fn test_batch_resolves_function_namespaced_tools() {
+    // Tool execution reads JCODE_HOOK_PRE_TOOL via the config cache, and a
+    // parallel test sets that env var while holding the env lock. Running
+    // without the lock raced that setter and blocked batch calls with a
+    // pre_tool refusal pointing at the other test's temp-dir script (observed:
+    // 'cannot open .../policy.sh' in full-suite runs only).
+    let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
     let ctx = ToolContext {
@@ -1565,6 +1571,9 @@ async fn test_large_output_flag_costs_little_across_the_whole_tool_set() {
 
 #[tokio::test]
 async fn test_batch_guards_both_its_subcalls_and_its_own_aggregate() {
+    // Same env-lock reasoning as test_batch_resolves: execution reads the
+    // pre_tool hook env, which a parallel test may be setting.
+    let _guard = crate::storage::lock_test_env();
     // Batch is how oversized results actually arrive in practice: several
     // searches fan out at once. Two separate guard applications matter here, and
     // the aggregate one is the load-bearing case: batch concatenates every

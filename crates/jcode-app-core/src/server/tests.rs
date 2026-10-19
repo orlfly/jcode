@@ -327,6 +327,17 @@ fn persisted_headless_member(
 
 #[tokio::test]
 async fn background_task_wake_runs_live_session_immediately_when_idle() {
+    // Hold the env lock for the whole body: execution branches on the config
+    // singleton's wake_mode, and a parallel test holds the env lock while
+    // setting JCODE_WAKE_MODE=external — without this lock that flip lands
+    // mid-test, emit_external_wake succeeds, and the live-idle turn never
+    // starts (observed: consistent timeout in full-suite runs, stable in
+    // isolation). The ScopedEnvVar pin alone cannot protect a test that does
+    // not own the lock, because the setter invalidates the cache mid-flight.
+    let _env_lock = crate::storage::lock_test_env();
+    // Pin the mode off as well: the config singleton parses JCODE_WAKE_MODE
+    // once per process, and internal is what this test needs.
+    let _wake_mode = ScopedEnvVar::set("JCODE_WAKE_MODE", "");
     let provider = Arc::new(StreamingMockProvider::default());
     provider.queue_response(vec![
         StreamEvent::TextDelta("Build result processed.".to_string()),
@@ -397,7 +408,10 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     }
     assert!(notification.1.contains("**Background task** `bgwake`"));
 
-    let streamed = timeout(Duration::from_secs(2), async {
+    // 20s, not 2s: under a full-suite run (1600+ tests on every core) the
+    // wake has to schedule behind the other runtimes; 2s failed two runs in a
+    // row there while passing consistently in isolation.
+    let streamed = timeout(Duration::from_secs(20), async {
         loop {
             match member_event_rx.recv().await {
                 Some(ServerEvent::TextDelta { text })

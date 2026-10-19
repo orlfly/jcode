@@ -133,6 +133,8 @@ pdf = ["dep:jcode-pdf"]
 test-support = ["jcode-base/test-support"]
 
 [dev-dependencies]
+# browser_fast timing tests pause the Tokio clock (`start_paused = true`).
+tokio = { version = "1", features = ["test-util"] }
 # Used by async streaming tests (ambient/runner_tests, server/client_actions_tests).
 async-stream = "0.3"
 # Enables jcode-base's test-support helpers (storage::lock_test_env,
