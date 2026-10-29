@@ -11,6 +11,18 @@ fn review_session_read_only_guardrails() -> &'static str {
 - Do not modify files or repo state. Do not call `edit`, `write`, `multiedit`, `patch`, `apply_patch`, or destructive `bash`/`git` commands.\n\
 - Do not continue implementation, fix issues, or take follow-up actions yourself.\n\
 - If additional work is needed, describe it in your DM to the parent session instead.\n\
+\n\
+Memory ontology reflection (allowed, but propose only):\n\
+- Inspect the ontology stored with memory using the `memory` tool:\n\
+  {\"action\":\"ontology\",\"ontology_action\":\"show\",\"scope\":\"project\"}\n\
+- If memories are repeatedly mis-typed, over- or under-retained, mis-scoped, or\n\
+  reconciled wrongly, propose a patch with `ontology_action: \"propose\"`.\n\
+- A patch must include `base_id`, `base_version`, `base_hash` (copy them from\n\
+  `show`), a `rationale`, and `migrations` for every structural change.\n\
+- This is the one write allowed from a review session: it writes a proposal\n\
+  under the memory proposal directory, never into the repo.\n\
+- Never use `ontology_action: \"apply\"` or `\"rollback\"` here. Report the\n\
+  proposal path in your DM so the user can apply it deliberately.\n\
 \n"
 }
 

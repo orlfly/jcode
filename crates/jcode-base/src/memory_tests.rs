@@ -2314,3 +2314,130 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
         assert!(explicit.iter().any(|p| p.subject_key == "api:/api/merge/gate"));
     });
 }
+
+#[test]
+fn ontology_patch_persists_migrates_and_rolls_back() {
+    use jcode_memory_types::migration::{
+        MigrationStep, OntologyOp, OntologyPatch, TypePatch,
+    };
+
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-runtime");
+        let id = manager
+            .remember_project(
+                MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    "You must call POST /api/task/claim with the team id",
+                )
+                .with_tags(vec!["assistant".to_string(), "api".to_string()]),
+            )
+            .unwrap();
+
+        let base = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(base.types["env_fact"].ttl_days, Some(30.0));
+
+        let patch = OntologyPatch {
+            base_id: base.id.clone(),
+            base_version: base.version,
+            base_hash: base.content_hash(),
+            rationale: "env facts are re-created too often".to_string(),
+            evidence: vec![id.clone()],
+            ops: vec![OntologyOp::UpdateType {
+                id: "env_fact".to_string(),
+                patch: TypePatch {
+                    ttl_days: Some(45.0),
+                    ..Default::default()
+                },
+            }],
+            migrations: vec![
+                MigrationStep::ResanitizeTags,
+                MigrationStep::RecomputeSubjectKey { overwrite: true },
+                MigrationStep::ReclassifyResidual,
+            ],
+        };
+
+        let report = manager
+            .apply_ontology_patch(OntologyScope::Project, &patch, false)
+            .expect("patch applies");
+        assert_eq!(report.new_version, base.version + 1);
+        assert!(!report.dry_run);
+
+        let graph = manager.load_project_graph().unwrap();
+        assert_eq!(
+            graph
+                .metadata
+                .ontology
+                .as_ref()
+                .unwrap()
+                .types["env_fact"]
+                .ttl_days,
+            Some(45.0)
+        );
+        let entry = graph.get_memory(&id).unwrap();
+        assert_eq!(entry.category, MemoryCategory::ProcessRule);
+        assert!(!entry.tags.contains(&"assistant".to_string()));
+        assert_eq!(entry.subject_key.as_deref(), Some("api:/api/task/claim"));
+
+        // A fresh manager reads the stored ontology, not the compiled default.
+        let other = MemoryManager::new().with_project_dir("/ontology-runtime");
+        let stored = other.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(stored.types["env_fact"].ttl_days, Some(45.0));
+        assert_eq!(stored.version, base.version + 1);
+
+        // Rollback restores the previous definition and keeps the data.
+        let snapshot = other
+            .rollback_ontology(OntologyScope::Project, base.version)
+            .expect("rollback");
+        assert_eq!(snapshot.version, base.version);
+        let restored = other.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(restored.types["env_fact"].ttl_days, Some(30.0));
+        assert_eq!(
+            other
+                .load_project_graph()
+                .unwrap()
+                .get_memory(&id)
+                .unwrap()
+                .category,
+            MemoryCategory::ProcessRule
+        );
+    });
+}
+
+#[test]
+fn json_store_persists_default_ontology_on_first_load() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-json-bind");
+        let graph = manager.load_project_graph().unwrap();
+        let ontology = graph
+            .metadata
+            .ontology
+            .as_ref()
+            .expect("JSON store must persist the ontology");
+        assert_eq!(
+            graph.metadata.ontology_hash,
+            ontology.content_hash()
+        );
+        assert_eq!(
+            graph.metadata.ontology_version,
+            jcode_memory_types::ontology::DEFAULT_ONTOLOGY_VERSION
+        );
+
+        // A fresh manager reads it back from disk instead of recompiling.
+        let other = MemoryManager::new().with_project_dir("/ontology-json-bind");
+        let reloaded = other.load_project_graph().unwrap();
+        assert_eq!(
+            reloaded.metadata.ontology_hash,
+            graph.metadata.ontology_hash
+        );
+        assert_eq!(
+            reloaded
+                .metadata
+                .ontology
+                .as_ref()
+                .unwrap()
+                .types
+                .len(),
+            ontology.types.len()
+        );
+    });
+}

@@ -87,6 +87,24 @@ struct MemoryInput {
     /// For recall action: retrieval mode
     #[serde(default)]
     mode: Option<String>,
+    /// For ontology action: show | propose | apply | history | rollback
+    #[serde(default)]
+    ontology_action: Option<String>,
+    /// For ontology action: inline patch object
+    #[serde(default)]
+    patch: Option<Value>,
+    /// For ontology action: path to a patch JSON file
+    #[serde(default)]
+    patch_file: Option<String>,
+    /// For ontology apply/rollback: explicitly confirm the change
+    #[serde(default)]
+    confirm: Option<bool>,
+    /// For ontology apply: report what would change without writing
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// For ontology rollback: target version
+    #[serde(default)]
+    version: Option<u32>,
 }
 
 #[async_trait]
@@ -109,13 +127,13 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "ontology"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
                 "category": {
                     "type": "string",
-                    "enum": ["fact", "preference", "entity", "correction"]
+                    "enum": ["fact", "preference", "entity", "correction", "env_fact", "contract", "process_rule", "observation"]
                 },
                 "query": { "type": "string" },
                 "id": {
@@ -130,7 +148,32 @@ impl Tool for MemoryTool {
                 },
                 "from_id": { "type": "string" },
                 "to_id": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, or list. Zero returns no results. Recall defaults to 10." }
+                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, or list. Zero returns no results. Recall defaults to 10." },
+                "ontology_action": {
+                    "type": "string",
+                    "enum": ["show", "propose", "validate", "apply", "history", "rollback"],
+                    "description": "For action=ontology. Review sessions may show/validate/propose only."
+                },
+                "patch": {
+                    "type": "object",
+                    "description": "OntologyPatch JSON object (base_id, base_version, base_hash, rationale, ops, migrations)."
+                },
+                "patch_file": {
+                    "type": "string",
+                    "description": "Path to an OntologyPatch JSON file instead of `patch`."
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Required true to apply or roll back an ontology change from a normal session."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "For ontology apply: report migration counts without writing."
+                },
+                "version": {
+                    "type": "integer",
+                    "description": "For ontology rollback: target version."
+                }
             },
             "required": ["action"]
         })
@@ -485,6 +528,168 @@ impl Tool for MemoryTool {
                     Ok(ToolOutput::new(out))
                 }
             }
+            "ontology" => {
+                use crate::memory::OntologyScope;
+                use crate::memory_types::migration::{OntologyPatch, apply_patch};
+
+                let scope = OntologyScope::parse(input.scope.as_deref().unwrap_or("project"))?;
+                let ontology_action = input.ontology_action.as_deref().unwrap_or("show");
+
+                let patch = if let Some(value) = input.patch.clone() {
+                    Some(serde_json::from_value::<OntologyPatch>(value)?)
+                } else if let Some(path) = input.patch_file.as_deref() {
+                    let raw = std::fs::read_to_string(path)?;
+                    Some(serde_json::from_str::<OntologyPatch>(&raw)?)
+                } else {
+                    None
+                };
+
+                match ontology_action {
+                    "show" => {
+                        let ontology = manager.stored_ontology(scope)?;
+                        let history = manager.ontology_history(scope)?;
+                        Ok(ToolOutput::new(format!(
+                            "{} scope\nbase_id: {}\nbase_version: {}\nbase_hash: {}\n{}\nhistory: {}",
+                            scope.label(),
+                            ontology.id,
+                            ontology.version,
+                            ontology.content_hash(),
+                            crate::memory_types::migration::describe_ontology(&ontology),
+                            history
+                                .iter()
+                                .map(|snapshot| format!("v{}", snapshot.version))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )))
+                    }
+                    "propose" | "validate" => {
+                        let patch = patch.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "ontology {ontology_action} requires `patch` or `patch_file`"
+                            )
+                        })?;
+                        let base = manager.stored_ontology(scope)?;
+                        match apply_patch(&base, &patch) {
+                            Ok(next) => {
+                                if ontology_action == "validate" {
+                                    return Ok(ToolOutput::new(format!(
+                                        "Patch valid: {} v{} -> v{} ({})",
+                                        next.id,
+                                        base.version,
+                                        next.version,
+                                        next.content_hash()
+                                    )));
+                                }
+                                let dir = crate::storage::jcode_dir()?
+                                    .join("memory")
+                                    .join("ontology")
+                                    .join(".proposals");
+                                std::fs::create_dir_all(&dir)?;
+                                let slug: String = patch
+                                    .base_id
+                                    .chars()
+                                    .map(|c| {
+                                        if c.is_ascii_alphanumeric() {
+                                            c
+                                        } else {
+                                            '-'
+                                        }
+                                    })
+                                    .collect();
+                                let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+                                let path = dir.join(format!("{stamp}-{slug}.json"));
+                                std::fs::write(&path, serde_json::to_string_pretty(&patch)?)?;
+                                Ok(ToolOutput::new(format!(
+                                    "Ontology proposal written to {}\n{} v{} -> v{}\nApply with: jcode memory ontology apply {} --scope {} --apply",
+                                    path.display(),
+                                    next.id,
+                                    base.version,
+                                    next.version,
+                                    path.display(),
+                                    scope.label()
+                                )))
+                            }
+                            Err(errors) => Ok(ToolOutput::new(format!(
+                                "Patch rejected:\n- {}",
+                                errors.join("\n- ")
+                            ))),
+                        }
+                    }
+                    "apply" => {
+                        if input.confirm != Some(true) {
+                            return Err(anyhow::anyhow!(
+                                "ontology apply requires `confirm: true`"
+                            ));
+                        }
+                        if is_read_only_review_session(&session_id) {
+                            return Err(anyhow::anyhow!(
+                                "review sessions may propose ontology patches but not apply them; \
+                                 use `jcode memory ontology apply <proposal> --apply`"
+                            ));
+                        }
+                        let patch = patch.ok_or_else(|| {
+                            anyhow::anyhow!("ontology apply requires `patch` or `patch_file`")
+                        })?;
+                        let report = manager.apply_ontology_patch(
+                            scope,
+                            &patch,
+                            input.dry_run.unwrap_or(false),
+                        )?;
+                        Ok(ToolOutput::new(format!(
+                            "{} ontology: v{} -> v{} ({})\nmigrations: {}",
+                            if report.dry_run { "Dry run" } else { "Applied" },
+                            report.old_version,
+                            report.new_version,
+                            report.new_hash,
+                            serde_json::to_string(&report.migrations)?
+                        )))
+                    }
+                    "history" => {
+                        let history = manager.ontology_history(scope)?;
+                        if history.is_empty() {
+                            Ok(ToolOutput::new(format!(
+                                "No ontology history for {} scope.",
+                                scope.label()
+                            )))
+                        } else {
+                            let mut out = format!("Ontology history ({} scope):\n", scope.label());
+                            for snapshot in history {
+                                out.push_str(&format!(
+                                    "- v{} {} {}\n",
+                                    snapshot.version, snapshot.hash, snapshot.rationale
+                                ));
+                            }
+                            Ok(ToolOutput::new(out))
+                        }
+                    }
+                    "rollback" => {
+                        if input.confirm != Some(true) {
+                            return Err(anyhow::anyhow!(
+                                "ontology rollback requires `confirm: true`"
+                            ));
+                        }
+                        if is_read_only_review_session(&session_id) {
+                            return Err(anyhow::anyhow!(
+                                "review sessions cannot roll back the ontology"
+                            ));
+                        }
+                        let version = input.version.ok_or_else(|| {
+                            anyhow::anyhow!("ontology rollback requires `version`")
+                        })?;
+                        let snapshot = manager.rollback_ontology(scope, version)?;
+                        Ok(ToolOutput::new(format!(
+                            "Restored {} ontology v{} ({})",
+                            scope.label(),
+                            snapshot.version,
+                            snapshot.hash
+                        )))
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "Unknown ontology action: {}. Use show, propose, validate, apply, history or rollback",
+                        other
+                    )),
+                }
+            }
             other => Err(anyhow::anyhow!("Unknown action: {}", other)),
         }
         .map_err(|err| {
@@ -495,6 +700,19 @@ impl Tool for MemoryTool {
             err
         })
     }
+}
+
+/// Review/autoreview/judge sessions are analysis-only. They may propose an
+/// ontology patch (which writes to the memory proposal directory, not the
+/// repo) but must never apply or roll one back.
+fn is_read_only_review_session(session_id: &str) -> bool {
+    let Ok(session) = crate::session::Session::load(session_id) else {
+        return false;
+    };
+    matches!(
+        session.title.as_deref(),
+        Some("review" | "autoreview" | "judge" | "autojudge")
+    )
 }
 
 fn truncate_for_widget(s: &str, max: usize) -> String {
@@ -1100,5 +1318,80 @@ mod tests {
         } else {
             crate::env::remove_var("JCODE_HOME");
         }
+    }
+    #[tokio::test]
+    async fn ontology_tool_show_propose_and_confirmed_apply() {
+        use serde_json::json;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let tool = MemoryTool::new();
+        let ctx = test_ctx(Some(project));
+
+        let show = tool
+            .execute(
+                json!({"action":"ontology","ontology_action":"show","scope":"project"}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(show.output.contains("jcode/default/v1"), "{}", show.output);
+
+        let patch = json!({
+            "base_id": "jcode/default/v1",
+            "base_version": 2,
+            "base_hash": "",
+            "rationale": "tool test: extend env_fact retention",
+            "ops": [{
+                "op": "update_type",
+                "id": "env_fact",
+                "patch": { "ttl_days": 45.0 }
+            }]
+        });
+
+        let propose = tool
+            .execute(
+                json!({"action":"ontology","ontology_action":"propose","scope":"project","patch":patch}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            propose.output.contains("Ontology proposal written"),
+            "{}",
+            propose.output
+        );
+        let proposals = home.path().join("memory/ontology/.proposals");
+        assert!(
+            std::fs::read_dir(&proposals).unwrap().next().is_some(),
+            "proposal file must exist"
+        );
+
+        let apply = json!({
+            "action":"ontology",
+            "ontology_action":"apply",
+            "scope":"project",
+            "confirm": true,
+            "patch": patch
+        });
+        let applied = tool.execute(apply, ctx.clone()).await.unwrap();
+        assert!(
+            applied.output.contains("Applied ontology"),
+            "{}",
+            applied.output
+        );
+
+        let updated = tool
+            .execute(
+                json!({"action":"ontology","ontology_action":"show","scope":"project"}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(updated.output.contains("ttl=45d"), "{}", updated.output);
     }
 }

@@ -142,6 +142,15 @@ the selected scope to the selected provider; disabling memory or setting
 `memory_l1_recall` without a Jev route keeps recall fully local. Do not store
 secrets in memory.
 
+## Runtime ontology (added 2026-10-29)
+
+The ontology is now stored beside each memory graph (`GraphMetadata.ontology`),
+not only compiled into the binary. A reflection pass can propose an
+`OntologyPatch` (`memory` tool action `ontology`, or
+`jcode memory ontology ...`), and applying it runs deterministic data
+migrations before installing the new definition. See
+[MEMORY_ONTOLOGY_RUNTIME.md](./MEMORY_ONTOLOGY_RUNTIME.md).
+
 ## Implementation map
 
 - `crates/jcode-memory-types/src/{lib,graph,ontology,instance,reconcile}.rs`:

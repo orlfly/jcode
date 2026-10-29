@@ -213,6 +213,21 @@ fn identifiers(text: &str) -> HashSet<String> {
 /// Link nodes (`goal:` / `skill:`) are owned by their subsystem and upserted by
 /// id, so they are inserted without reconciliation.
 pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
+    reconcile_with_thresholds(entry, graph, REINFORCE_AT, SUPERSEDE_AT, RELATE_AT)
+}
+
+/// Same decision tree as [`reconcile`] with caller-supplied thresholds.
+///
+/// The runtime passes the thresholds declared by the active ontology
+/// (`ActivityStep::ReconcileOnWrite`), so a reflection-driven ontology patch can
+/// change write-time dedup/conflict behaviour without recompiling.
+pub fn reconcile_with_thresholds(
+    entry: &MemoryEntry,
+    graph: &MemoryGraph,
+    reinforce_at: f32,
+    supersede_at: f32,
+    relate_at: f32,
+) -> ReconcileOutcome {
     if crate::is_link_node(entry) {
         return ReconcileOutcome::insert();
     }
@@ -223,7 +238,7 @@ pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
         // Link nodes are indexes of external artifacts, not knowledge peers.
         .filter(|existing| !crate::is_link_node(existing))
         .map(|existing| (existing, lexical_similarity(entry, existing)))
-        .filter(|(_, sim)| *sim >= RELATE_AT)
+        .filter(|(_, sim)| *sim >= relate_at)
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -272,7 +287,7 @@ pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
     // just `similarity >= REINFORCE_AT`, because normalized tokenization drops
     // separators and would otherwise merge `foo/bar` with `foo-bar`.
     let is_restatement = |other: &MemoryEntry, sim: f32| {
-        sim >= REINFORCE_AT && !spelling_variant_only(&entry.content, &other.content)
+        sim >= reinforce_at && !spelling_variant_only(&entry.content, &other.content)
     };
     // The top match may be a spelling variant while an exact duplicate sits
     // further down the ranking; pick the duplicate as the dedup target.
@@ -302,7 +317,7 @@ pub fn reconcile(entry: &MemoryEntry, graph: &MemoryGraph) -> ReconcileOutcome {
         ReconcileAction::Reinforce {
             existing_id: target.id.clone(),
         }
-    } else if (same || correction) && similarity >= SUPERSEDE_AT && authority_ok {
+    } else if (same || correction) && similarity >= supersede_at && authority_ok {
         // Retiring what is stored needs a *deliberate* relationship: a
         // correction, or an update to the same anchor that also overlaps
         // materially. Sharing only a container anchor (a task id, a workspace)

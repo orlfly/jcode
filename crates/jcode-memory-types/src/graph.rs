@@ -6,6 +6,8 @@
 //! - Various edge types (HasTag, RelatesTo, Supersedes, etc.)
 //! - BFS cascade retrieval through the graph
 
+use crate::migration::{MigrationState, OntologySnapshot};
+use crate::ontology::Ontology;
 use crate::{MemoryEntry, MemoryStore, ValidationReport, validate_graph};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -234,6 +236,29 @@ pub struct GraphMetadata {
     /// bound ontology has been upgraded and re-validate stored entries.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub ontology_version: u32,
+    /// Full serialized ontology this store is authored against.
+    ///
+    /// When present the runtime uses it instead of the compiled-in default.
+    /// When absent the store predates runtime ontology storage and falls back
+    /// to `default_ontology()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology: Option<Ontology>,
+    /// Deterministic content hash of `ontology` (see
+    /// `migration::ontology_content_hash`). Used for drift detection and for
+    /// optimistic-concurrency checks when applying a patch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ontology_hash: String,
+    /// Bounded history of previously installed ontologies, newest last.
+    /// Enables `memory ontology rollback` without external snapshot files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ontology_history: Vec<OntologySnapshot>,
+    /// Data migrations already applied to this store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_migrations: Vec<String>,
+    /// Set while a migration is running. A store loaded with this set was
+    /// interrupted and must be validated or rolled back before writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_state: Option<MigrationState>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {

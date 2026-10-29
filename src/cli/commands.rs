@@ -1619,6 +1619,14 @@ pub enum MemorySubcommand {
         apply: bool,
         subject_keys: bool,
     },
+    Ontology {
+        action: String,
+        scope: String,
+        file: Option<String>,
+        version: Option<u32>,
+        apply: bool,
+        json: bool,
+    },
 }
 
 pub async fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
@@ -1953,6 +1961,151 @@ async fn run_memory_command_for_dir(
             );
             if report.dry_run && report.total_changes() > 0 {
                 println!("Re-run with --apply to write these changes.");
+            }
+        }
+
+        MemorySubcommand::Ontology {
+            action,
+            scope,
+            file,
+            version,
+            apply,
+            json,
+        } => {
+            use memory::OntologyScope;
+            let scope = OntologyScope::parse(&scope)?;
+            match action.as_str() {
+                "show" => {
+                    let ontology = manager.stored_ontology(scope)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "base_id": ontology.id,
+                                "base_version": ontology.version,
+                                "base_hash": ontology.content_hash(),
+                                "ontology": &*ontology,
+                            }))?
+                        );
+                    } else {
+                        println!("base_id: {}", ontology.id);
+                        println!("base_version: {}", ontology.version);
+                        println!("base_hash: {}", ontology.content_hash());
+                        print!(
+                            "{}",
+                            crate::memory_types::migration::describe_ontology(&ontology)
+                        );
+                    }
+                }
+                "validate" => {
+                    let path = file.ok_or_else(|| {
+                        anyhow::anyhow!("memory ontology validate requires a patch file")
+                    })?;
+                    let raw = std::fs::read_to_string(&path)?;
+                    let patch: crate::memory_types::OntologyPatch = serde_json::from_str(&raw)?;
+                    let base = manager.stored_ontology(scope)?;
+                    match crate::memory_types::migration::apply_patch(&base, &patch) {
+                        Ok(next) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "ok": true,
+                                        "old_version": base.version,
+                                        "new_version": next.version,
+                                        "old_hash": base.content_hash(),
+                                        "new_hash": next.content_hash(),
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "Patch valid: {} v{} -> v{} ({})",
+                                    next.id,
+                                    base.version,
+                                    next.version,
+                                    next.content_hash()
+                                );
+                            }
+                        }
+                        Err(errors) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "ok": false,
+                                        "errors": errors,
+                                    }))?
+                                );
+                            } else {
+                                eprintln!("Ontology patch rejected:");
+                                for error in &errors {
+                                    eprintln!("  - {error}");
+                                }
+                            }
+                            anyhow::bail!("ontology patch rejected");
+                        }
+                    }
+                }
+                "apply" => {
+                    let path = file.ok_or_else(|| {
+                        anyhow::anyhow!("memory ontology apply requires a patch file")
+                    })?;
+                    let raw = std::fs::read_to_string(&path)?;
+                    let patch: crate::memory_types::OntologyPatch = serde_json::from_str(&raw)?;
+                    let report = manager.apply_ontology_patch(scope, &patch, !apply)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "{} ontology: v{} -> v{} ({})",
+                            if report.dry_run { "Dry run" } else { "Applied" },
+                            report.old_version,
+                            report.new_version,
+                            report.new_hash
+                        );
+                        println!(
+                            "migrations: {} change(s) {}",
+                            report.migrations.changed(),
+                            serde_json::to_string(&report.migrations)?
+                        );
+                        if report.dry_run {
+                            println!("Re-run with --apply to write these changes.");
+                        }
+                    }
+                }
+                "history" => {
+                    let history = manager.ontology_history(scope)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&history)?);
+                    } else if history.is_empty() {
+                        println!("No ontology history for {} scope.", scope.label());
+                    } else {
+                        println!("Ontology history ({} scope):", scope.label());
+                        for snapshot in &history {
+                            println!(
+                                "  v{:<4} {} {}",
+                                snapshot.version,
+                                snapshot.hash,
+                                snapshot.rationale
+                            );
+                        }
+                    }
+                }
+                "rollback" => {
+                    let version = version.ok_or_else(|| {
+                        anyhow::anyhow!("memory ontology rollback requires a version")
+                    })?;
+                    let snapshot = manager.rollback_ontology(scope, version)?;
+                    println!(
+                        "Restored {} ontology v{} ({})",
+                        scope.label(),
+                        snapshot.version,
+                        snapshot.hash
+                    );
+                }
+                other => anyhow::bail!(
+                    "unknown ontology action '{other}'; use show, validate, apply, history or rollback"
+                ),
             }
         }
 

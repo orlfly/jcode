@@ -1,6 +1,7 @@
 //! Conversion from clap commands into runtime command requests.
 
 use super::*;
+use crate::cli::args::OntologyCommand;
 
 pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySubcommand {
     match subcmd {
@@ -31,6 +32,53 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
         } => commands::MemorySubcommand::Reclassify {
             apply,
             subject_keys,
+        },
+        MemoryCommand::Ontology { action } => match action {
+            OntologyCommand::Show { scope, json } => commands::MemorySubcommand::Ontology {
+                action: "show".to_string(),
+                scope,
+                file: None,
+                version: None,
+                apply: false,
+                json,
+            },
+            OntologyCommand::Validate { file, json } => commands::MemorySubcommand::Ontology {
+                action: "validate".to_string(),
+                scope: "project".to_string(),
+                file: Some(file),
+                version: None,
+                apply: false,
+                json,
+            },
+            OntologyCommand::Apply {
+                file,
+                scope,
+                apply,
+                json,
+            } => commands::MemorySubcommand::Ontology {
+                action: "apply".to_string(),
+                scope,
+                file: Some(file),
+                version: None,
+                apply,
+                json,
+            },
+            OntologyCommand::History { scope, json } => commands::MemorySubcommand::Ontology {
+                action: "history".to_string(),
+                scope,
+                file: None,
+                version: None,
+                apply: false,
+                json,
+            },
+            OntologyCommand::Rollback { version, scope } => commands::MemorySubcommand::Ontology {
+                action: "rollback".to_string(),
+                scope,
+                file: None,
+                version: Some(version),
+                apply: true,
+                json: false,
+            },
         },
     }
 }

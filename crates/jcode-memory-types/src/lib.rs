@@ -28,7 +28,8 @@ pub mod reconcile;
 pub use reconcile::{
     MAX_RELATED, MIN_MEANINGFUL_MEMORY_LEN, RELATE_AT, REINFORCE_AT, ReconcileAction,
     ReconcileOutcome, SUPERSEDE_AT, derive_subject_key, detect_conflict, is_admitted_tag,
-    lexical_similarity, noise_reason, prepare_for_write, reconcile, same_subject, sanitize_tags,
+    lexical_similarity, noise_reason, prepare_for_write, reconcile, reconcile_with_thresholds,
+    same_subject, sanitize_tags,
 };
 
 pub mod rule_engine;
@@ -48,6 +49,14 @@ pub use actions::{
 
 pub mod backend;
 pub use backend::{GraphBackend, GraphMutation, StoreKey, apply_mutations_in_place};
+
+pub mod migration;
+pub use migration::{
+    MigrationReport, MigrationState, MigrationStep, OntologyApplyReport, OntologyOp,
+    OntologyPatch, OntologySnapshot, SplitRule, TypePatch, apply_migrations, apply_patch,
+    classify_residual_type, describe_ontology, ontology_content_hash, reconcile_thresholds,
+    validate_ontology,
+};
 
 pub mod validation;
 pub use validation::{

@@ -1019,6 +1019,34 @@ mod tests {
     }
 
     #[test]
+    fn ontology_metadata_round_trips_through_the_meta_table() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("ontology-roundtrip");
+
+        let ontology = jcode_memory_types::default_ontology();
+        let hash = ontology.content_hash();
+        let mut graph = MemoryGraph::new();
+        graph.metadata.ontology_id = ontology.id.clone();
+        graph.metadata.ontology_version = ontology.version;
+        graph.metadata.ontology_hash = hash.clone();
+        graph.metadata.ontology = Some(ontology.clone());
+        graph.metadata.applied_migrations = vec!["v2->v3".to_string()];
+
+        backend.save(&key, &graph).unwrap();
+        let loaded = backend.load(&key).unwrap();
+
+        let stored = loaded
+            .metadata
+            .ontology
+            .expect("ontology must survive the meta table");
+        assert_eq!(stored.id, ontology.id);
+        assert_eq!(stored.version, ontology.version);
+        assert_eq!(loaded.metadata.ontology_hash, hash);
+        assert_eq!(loaded.metadata.applied_migrations, vec!["v2->v3".to_string()]);
+        assert_eq!(stored.types.len(), ontology.types.len());
+    }
+
+    #[test]
     fn ensure_known_label_default() {
         assert_eq!(ensure_known_label("Memory"), "Memory");
         assert_eq!(ensure_known_label(""), "Node");

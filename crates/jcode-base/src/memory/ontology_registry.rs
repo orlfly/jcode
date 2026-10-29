@@ -17,7 +17,7 @@
 //! introducing `Mutex` contention on the hot paths.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use jcode_memory_types::activity::{
     ScheduleEvent, ScheduledActivity, schedule as activity_schedule,
@@ -34,9 +34,17 @@ use jcode_memory_types::{MemoryEntry, MemoryEvent, MemoryEventKind, MemoryGraph}
 use crate::memory_types::MemoryCategory;
 
 /// Bundle of ontologies the runtime knows about.
+///
+/// The map is behind a `RwLock` so a reflection pass can install a new
+/// ontology while the process keeps running. Cloning the registry shares the
+/// same map (like the previous `Arc<HashMap>` did), so every `MemoryManager`
+/// sees an installed replacement immediately.
 #[derive(Debug, Clone)]
 pub struct OntologyRegistry {
-    inner: Arc<HashMap<String, Arc<Ontology>>>,
+    inner: Arc<RwLock<HashMap<String, Arc<Ontology>>>>,
+    /// Id of the ontology treated as the store default. Normally
+    /// `jcode/default/v1`; tests can seed a custom one.
+    default_id: Arc<RwLock<String>>,
 }
 
 impl Default for OntologyRegistry {
@@ -48,47 +56,112 @@ impl Default for OntologyRegistry {
 impl OntologyRegistry {
     /// Construct a registry seeded with the bundled default ontology.
     pub fn with_default() -> Self {
-        let mut map = HashMap::new();
         let ontology = default_ontology();
+        let mut map = HashMap::new();
         map.insert(ontology.id.clone(), Arc::new(ontology));
         Self {
-            inner: Arc::new(map),
+            inner: Arc::new(RwLock::new(map)),
+            default_id: Arc::new(RwLock::new(DEFAULT_ONTOLOGY_ID.to_string())),
         }
     }
 
     /// Construct a registry containing exactly the supplied ontologies.  When
-    /// two ontologies share an id, the last one wins.
+    /// two ontologies share an id, the last one wins. The last ontology also
+    /// becomes the default.
     pub fn from_ontologies<I: IntoIterator<Item = Ontology>>(iter: I) -> Self {
-        let map = iter
-            .into_iter()
-            .map(|o| (o.id.clone(), Arc::new(o)))
-            .collect();
-        Self {
-            inner: Arc::new(map),
+        let mut map: HashMap<String, Arc<Ontology>> = HashMap::new();
+        let mut default_id = DEFAULT_ONTOLOGY_ID.to_string();
+        for ontology in iter {
+            default_id = ontology.id.clone();
+            map.insert(ontology.id.clone(), Arc::new(ontology));
         }
+        Self {
+            inner: Arc::new(RwLock::new(map)),
+            default_id: Arc::new(RwLock::new(default_id)),
+        }
+    }
+
+    /// Install or replace an ontology under its id and make it the default.
+    ///
+    /// This is the runtime hook a reflection pass uses after a patch has been
+    /// validated and persisted. The returned `Arc` is the value new turns
+    /// will pin.
+    pub fn install(&self, ontology: Ontology) -> Arc<Ontology> {
+        let id = ontology.id.clone();
+        let ontology = Arc::new(ontology);
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(id.clone(), Arc::clone(&ontology));
+        drop(guard);
+        *self
+            .default_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = id;
+        ontology
+    }
+
+    /// Remove an ontology by id. Removing the current default leaves the
+    /// registry without a default, which makes `get` fall back to the compiled
+    /// ontology rather than returning a stale value.
+    pub fn remove(&self, id: &str) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(id);
+    }
+
+    /// Replace the default id without removing the old entry.
+    pub fn set_default(&self, id: &str) {
+        *self
+            .default_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = id.to_string();
     }
 
     /// Look up an ontology by id.  Returns an `Arc<Ontology>` so callers can
     /// keep it alive for as long as they need (e.g. embed it inside
     /// `RuleContext`).
     pub fn get(&self, id: &str) -> Arc<Ontology> {
-        if let Some(arc) = self.inner.get(id) {
-            return arc.clone();
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(arc) = guard.get(id) {
+            return Arc::clone(arc);
         }
-        if let Some(arc) = self.inner.get(DEFAULT_ONTOLOGY_ID) {
-            return arc.clone();
+        let default_id = self
+            .default_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(arc) = guard.get(&default_id) {
+            return Arc::clone(arc);
         }
+        drop(guard);
         Arc::new(default_ontology())
     }
 
-    /// Return the default ontology (`jcode/default/v1`).
+    /// Return the active default ontology.
     pub fn default_ontology(&self) -> Arc<Ontology> {
-        self.get(DEFAULT_ONTOLOGY_ID)
+        let id = self
+            .default_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.get(&id)
     }
 
     /// Ids of all loaded ontologies.  Mostly useful for tests and diagnostics.
-    pub fn ids(&self) -> impl Iterator<Item = &str> {
-        self.inner.keys().map(|s| s.as_str())
+    pub fn ids(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Dispatch an event through the rule engine using the supplied context.

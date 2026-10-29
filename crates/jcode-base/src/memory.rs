@@ -346,6 +346,34 @@ fn classify_graph(
     touched
 }
 
+/// Scope of a stored ontology. Project and global stores each carry their own
+/// definition so a reflection pass can tune one workspace without changing the
+/// machine-wide knowledge base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OntologyScope {
+    Project,
+    Global,
+}
+
+impl OntologyScope {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "project" | "local" => Ok(Self::Project),
+            "global" | "machine" => Ok(Self::Global),
+            other => Err(anyhow::anyhow!(
+                "unknown ontology scope '{other}'; use project or global"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
 /// Outcome of a reclassification pass ([`MemoryManager::reclassify_observations`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReclassifyReport {
@@ -382,61 +410,9 @@ fn type_name_of(category: &MemoryCategory) -> &str {
 
 /// Deterministic classifier for residual (`fact` / `observation`) instances.
 ///
-/// Order matters and mirrors what the corpus actually contains: procedures
-/// first (a rule that mentions an endpoint is still a rule), then interface
-/// contracts, then perishable environment facts. Returns `None` when the
-/// instance should stay in the residual bucket.
-pub fn classify_residual_type(content: &str) -> Option<&'static str> {
-    use jcode_memory_types::ontology::{TYPE_CONTRACT, TYPE_ENV_FACT, TYPE_PROCESS_RULE};
-    let lower = content.to_ascii_lowercase();
-    const RULE_MARKERS: [&str; 24] = [
-        "必须", "不得", "禁止", "应该", "正确做法", "约定", "流程", "规范", "always", "never",
-        "must ", "must\n", "do not", "instead of", "prefer ", "workflow", "rule ", "convention",
-        "should ", "required", "不允许", "只能", "务必", "禁止",
-    ];
-    if RULE_MARKERS.iter().any(|m| lower.contains(m)) {
-        return Some(TYPE_PROCESS_RULE);
-    }
-    const CONTRACT_MARKERS: [&str; 16] = [
-        "/api/", "get ", "post ", "put ", "patch ", "delete ", "endpoint", "schema", "字段", "枚举",
-        "enum", "payload", "接口", "路由", "status code", "http ",
-    ];
-    if CONTRACT_MARKERS.iter().any(|m| lower.contains(m)) {
-        return Some(TYPE_CONTRACT);
-    }
-    const ENV_MARKERS: [&str; 8] = [
-        "localhost:",
-        "127.0.0.1",
-        "/home/",
-        "/opt/workspace/",
-        "/tmp/",
-        "task #",
-        "session_",
-        "mem_",
-    ];
-    if ENV_MARKERS.iter().any(|m| lower.contains(m)) || looks_like_host_port(&lower) {
-        return Some(TYPE_ENV_FACT);
-    }
-    None
-}
-
-/// `host:port` or `ip:port` anywhere in the text.
-fn looks_like_host_port(lower: &str) -> bool {
-    lower
-        .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')'))
-        .any(|token| {
-            let token = token.trim_matches(|c: char| c == ',' || c == ';');
-            let Some((host, port)) = token.rsplit_once(':') else {
-                return false;
-            };
-            !host.is_empty()
-                && !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit())
-                && (host == "localhost"
-                    || host.chars().all(|c| c.is_ascii_digit() || c == '.')
-                    || host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'))
-        })
-}
+/// The implementation lives in `jcode_memory_types::migration` so ontology
+/// migrations and the runtime classification pass share one definition.
+pub use jcode_memory_types::migration::classify_residual_type;
 
 /// Whether an anchor can name a reusable procedure, i.e. whether it is worth
 /// turning accumulated evidence about it into a skill.
@@ -936,6 +912,21 @@ impl MemoryManager {
         storage::write_json(&path, store)
     }
 
+    /// Resolve the ontology a specific store is authored against.
+    ///
+    /// A store that has an installed ontology uses it. Older stores fall back
+    /// to the process registry default, which keeps pre-v2-install data
+    /// working unchanged.
+    pub fn ontology_for_graph(
+        &self,
+        graph: &MemoryGraph,
+    ) -> std::sync::Arc<jcode_memory_types::Ontology> {
+        match &graph.metadata.ontology {
+            Some(stored) => std::sync::Arc::new(stored.clone()),
+            None => self.ontology_registry().default_ontology(),
+        }
+    }
+
     /// Store without embedding inference. Exact duplicates reinforce an
     /// existing entry only within the requested scope, never mutate a
     /// different project. Inadmissible provenance (below the extraction
@@ -948,7 +939,8 @@ impl MemoryManager {
         crate::memory_types::validate_new_entry(&entry)
             .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
         let mut graph = self.load_project_graph()?;
-        let id = Self::remember_in_graph(&mut graph, entry);
+        let ontology = self.ontology_for_graph(&graph);
+        let id = Self::remember_in_graph(&mut graph, entry, &ontology);
         self.save_project_graph(&graph)?;
         Ok(id)
     }
@@ -956,20 +948,21 @@ impl MemoryManager {
     pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
         crate::memory_types::validate_new_entry(&entry)
             .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+        let mut graph = self.load_global_graph()?;
+        let ontology = self.ontology_for_graph(&graph);
         // Ontology gate: global memory must stay conceptual / generalized /
         // cross-project. Dispatch the scope-gate rule and abort environment-
         // specific content before it ever reaches the graph. The tool layer
         // additionally steers in-conversation writes toward project scope;
         // generalized entries from background extraction pass the gate via
         // their extraction provenance and content shape.
-        if let Some(verdict) = self.evaluate_global_gate(&entry) {
+        if let Some(verdict) = self.evaluate_global_gate(&entry, &ontology) {
             return Err(anyhow::anyhow!(
                 "global memory rejected by scope gate: {verdict}; \
                  write environment-specific facts to project scope instead"
             ));
         }
-        let mut graph = self.load_global_graph()?;
-        let id = Self::remember_in_graph(&mut graph, entry);
+        let id = Self::remember_in_graph(&mut graph, entry, &ontology);
         self.save_global_graph(&graph)?;
         Ok(id)
     }
@@ -977,14 +970,19 @@ impl MemoryManager {
     /// Run the ontology global-scope gate for `entry`. `Some(reason)` means
     /// the write must be aborted; `None` admits it. Uses the same rule
     /// engine as the rest of the ontology so the policy stays declarative.
-    fn evaluate_global_gate(&self, entry: &MemoryEntry) -> Option<String> {
+    fn evaluate_global_gate(
+        &self,
+        entry: &MemoryEntry,
+        ontology: &jcode_memory_types::Ontology,
+    ) -> Option<String> {
         let registry = self.ontology_registry();
         let type_id = entry.category.to_string();
         let mut ctx = registry.make_context(
-            jcode_memory_types::ontology::DEFAULT_ONTOLOGY_ID,
+            &ontology.id,
             entry.clone(),
             jcode_memory_types::ontology::EVENT_REMEMBER_GLOBAL,
         );
+        ctx.ontology = std::sync::Arc::new(ontology.clone());
         ctx.type_id = type_id.clone();
         ctx.scope = "global".to_string();
         let plan = registry.dispatch(&ctx);
@@ -1004,13 +1002,25 @@ impl MemoryManager {
         None
     }
 
-    fn remember_in_graph(graph: &mut MemoryGraph, entry: MemoryEntry) -> String {
+    fn remember_in_graph(
+        graph: &mut MemoryGraph,
+        entry: MemoryEntry,
+        ontology: &jcode_memory_types::Ontology,
+    ) -> String {
         // v2 write path: sanitize (derived `subject_key`, tag vocabulary,
         // identity-less entity demotion) and then reconcile against the store
         // so `dedup` / `supersedes` / `contradicts` / `relates_to` are decided
         // by one deterministic local pass instead of never running at all.
         let entry = jcode_memory_types::reconcile::prepare_for_write(entry);
-        let outcome = jcode_memory_types::reconcile::reconcile(&entry, graph);
+        let (reinforce_at, supersede_at, relate_at) =
+            jcode_memory_types::migration::reconcile_thresholds(ontology);
+        let outcome = jcode_memory_types::reconcile::reconcile_with_thresholds(
+            &entry,
+            graph,
+            reinforce_at,
+            supersede_at,
+            relate_at,
+        );
         let source_label = entry.source.clone().unwrap_or_else(|| "reconcile".to_string());
 
         match outcome.action {
@@ -2082,7 +2092,7 @@ impl MemoryManager {
             },
             GcScope::Global => self.load_global_graph()?,
         };
-        let ontology = self.ontology_registry().default_ontology();
+        let ontology = self.ontology_for_graph(&graph);
         let now = chrono::Utc::now();
         let mut changed = false;
         let candidates: Vec<(String, f32, String)> = graph
@@ -2236,8 +2246,8 @@ impl MemoryManager {
             dry_run: !apply,
             ..Default::default()
         };
-        let ontology = self.ontology_registry().default_ontology();
         report.stores = self.for_each_store(|_key, graph| {
+            let ontology = self.ontology_for_graph(graph);
             classify_graph(graph, &ontology, stamp_subject_keys, apply, &mut report)
         })?;
         Ok(report)
@@ -2259,7 +2269,7 @@ impl MemoryManager {
             Err(_) => return Ok(report),
         };
         report.stores = 1;
-        let ontology = self.ontology_registry().default_ontology();
+        let ontology = self.ontology_for_graph(&graph);
         if classify_graph(&mut graph, &ontology, true, apply, &mut report) {
             self.save_project_graph(&graph)?;
         }
@@ -2331,7 +2341,6 @@ impl MemoryManager {
 
     /// Evidence scan behind [`Self::distill_skill_evidence`].
     pub fn collect_skill_evidence(&self) -> Result<Vec<SkillEvidenceProposal>> {
-        let ontology = self.ontology_registry().default_ontology();
         let evidence_types = [
             jcode_memory_types::ontology::TYPE_PROCESS_RULE,
             jcode_memory_types::ontology::TYPE_CORRECTION,
@@ -2339,6 +2348,7 @@ impl MemoryManager {
         let mut groups: std::collections::BTreeMap<String, SkillEvidenceProposal> =
             std::collections::BTreeMap::new();
         let mut consider = |store: &str, graph: &MemoryGraph| {
+            let ontology = self.ontology_for_graph(graph);
             for entry in graph.active_memories() {
                 if jcode_memory_types::is_link_node(entry) {
                     continue;
@@ -2426,6 +2436,190 @@ impl MemoryManager {
                 .then_with(|| b.weight.total_cmp(&a.weight))
         });
         Ok(out)
+    }
+
+    // === Runtime ontology evolution ===
+
+    fn load_scope_graph(&self, scope: OntologyScope) -> Result<MemoryGraph> {
+        match scope {
+            OntologyScope::Project => {
+                anyhow::ensure!(
+                    self.project_memory_path()?.is_some(),
+                    "project ontology requires a working directory; use global scope explicitly"
+                );
+                self.load_project_graph()
+            }
+            OntologyScope::Global => self.load_global_graph(),
+        }
+    }
+
+    fn save_scope_graph(&self, scope: OntologyScope, graph: &MemoryGraph) -> Result<()> {
+        match scope {
+            OntologyScope::Project => self.save_project_graph(graph),
+            OntologyScope::Global => self.save_global_graph(graph),
+        }
+    }
+
+    /// The ontology a store currently uses, whether stored or compiled-in.
+    pub fn stored_ontology(
+        &self,
+        scope: OntologyScope,
+    ) -> Result<std::sync::Arc<jcode_memory_types::Ontology>> {
+        let graph = self.load_scope_graph(scope)?;
+        Ok(self.ontology_for_graph(&graph))
+    }
+
+    /// Installed ontology snapshots for a store, newest last.
+    pub fn ontology_history(
+        &self,
+        scope: OntologyScope,
+    ) -> Result<Vec<jcode_memory_types::OntologySnapshot>> {
+        let graph = self.load_scope_graph(scope)?;
+        Ok(graph.metadata.ontology_history.clone())
+    }
+
+    /// Validate and (unless `dry_run`) apply an ontology patch to one store.
+    ///
+    /// This is the runtime entry point a reflection pass uses. It:
+    /// 1. resolves the store's current ontology,
+    /// 2. checks base id/version/hash and validates the result,
+    /// 3. runs the patch's data migrations over the graph,
+    /// 4. persists the new ontology, hash, version and history,
+    /// 5. installs it into the process registry so subsequent turns use it.
+    pub fn apply_ontology_patch(
+        &self,
+        scope: OntologyScope,
+        patch: &jcode_memory_types::OntologyPatch,
+        dry_run: bool,
+    ) -> Result<jcode_memory_types::OntologyApplyReport> {
+        use jcode_memory_types::migration::{
+            MigrationState, OntologyApplyReport, OntologySnapshot, apply_migrations, apply_patch,
+        };
+
+        let mut graph = self.load_scope_graph(scope)?;
+        let base = self.ontology_for_graph(&graph);
+        let next = match apply_patch(&base, patch) {
+            Ok(next) => next,
+            Err(errors) => {
+                anyhow::bail!(
+                    "ontology patch rejected:\n- {}",
+                    errors.join("\n- ")
+                );
+            }
+        };
+        let old_hash = base.content_hash();
+        let new_hash = next.content_hash();
+        let validation_ok = jcode_memory_types::migration::validate_ontology(&next).is_empty();
+
+        let migrations = if dry_run {
+            let mut probe = graph.clone();
+            apply_migrations(&mut probe, &patch.migrations, &next)
+        } else {
+            // Keep a bounded history so rollback does not need external files.
+            graph
+                .metadata
+                .ontology_history
+                .push(OntologySnapshot::new(
+                    (*base).clone(),
+                    patch.rationale.clone(),
+                ));
+            const MAX_HISTORY: usize = 10;
+            if graph.metadata.ontology_history.len() > MAX_HISTORY {
+                let drain = graph.metadata.ontology_history.len() - MAX_HISTORY;
+                graph.metadata.ontology_history.drain(..drain);
+            }
+            graph.metadata.migration_state = Some(MigrationState {
+                from_version: base.version,
+                to_version: next.version,
+                started_at: chrono::Utc::now(),
+                completed_steps: 0,
+                total_steps: patch.migrations.len(),
+            });
+            let report = apply_migrations(&mut graph, &patch.migrations, &next);
+            graph.metadata.migration_state = None;
+            graph.metadata.applied_migrations.push(format!(
+                "{}:{}->{}",
+                patch.base_id, base.version, next.version
+            ));
+            graph.metadata.ontology_id = next.id.clone();
+            graph.metadata.ontology_version = next.version;
+            graph.metadata.ontology_hash = new_hash.clone();
+            graph.metadata.ontology = Some(next.clone());
+            self.save_scope_graph(scope, &graph)?;
+            // Only the global ontology becomes the process-wide fallback for
+            // stores that carry none. A project-specific patch must not leak
+            // into other projects.
+            if scope == OntologyScope::Global {
+                self.ontology_registry().install(next.clone());
+            }
+            report
+        };
+
+        Ok(OntologyApplyReport {
+            store: format!("{}:{}", scope.label(), patch.base_id),
+            old_version: base.version,
+            new_version: next.version,
+            old_hash,
+            new_hash,
+            dry_run,
+            validation_ok,
+            migrations,
+            patch: patch.clone(),
+        })
+    }
+
+    /// Restore an ontology snapshot from a store's history.
+    ///
+    /// Only the ontology definition is restored. Data migrations are not
+    /// reversed; use a store backup when a migration itself must be undone.
+    pub fn rollback_ontology(
+        &self,
+        scope: OntologyScope,
+        version: u32,
+    ) -> Result<jcode_memory_types::OntologySnapshot> {
+        use jcode_memory_types::OntologySnapshot;
+
+        let mut graph = self.load_scope_graph(scope)?;
+        let snapshot = graph
+            .metadata
+            .ontology_history
+            .iter()
+            .rev()
+            .find(|snapshot| snapshot.version == version)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no ontology version {version} in {} history; available: {:?}",
+                    scope.label(),
+                    graph
+                        .metadata
+                        .ontology_history
+                        .iter()
+                        .map(|snapshot| snapshot.version)
+                        .collect::<Vec<_>>()
+                )
+            })?;
+
+        if let Some(current) = graph.metadata.ontology.clone() {
+            graph.metadata.ontology_history.push(OntologySnapshot::new(
+                current,
+                format!("before rollback to v{version}"),
+            ));
+        }
+        graph
+            .metadata
+            .ontology_history
+            .retain(|entry| entry.version != version);
+        let restored = snapshot.ontology.clone();
+        graph.metadata.ontology_id = restored.id.clone();
+        graph.metadata.ontology_version = restored.version;
+        graph.metadata.ontology_hash = restored.content_hash();
+        graph.metadata.ontology = Some(restored.clone());
+        self.save_scope_graph(scope, &graph)?;
+        if scope == OntologyScope::Global {
+            self.ontology_registry().install(restored);
+        }
+        Ok(snapshot)
     }
 
     pub fn forget(&self, id: &str) -> Result<bool> {
@@ -2800,25 +2994,67 @@ impl MemoryManager {
         if self.test_mode {
             return;
         }
-        graph.metadata.retrieval_count = graph.metadata.retrieval_count.saturating_add(1);
-        let stored_id = graph.metadata.ontology_id.clone();
-        let stored_version = graph.metadata.ontology_version;
-        self.ontology_registry().bind_to_graph(graph);
-        let bound_id = graph.metadata.ontology_id.clone();
-        let bound_version = graph.metadata.ontology_version;
-        if (stored_id.is_empty() || stored_id == bound_id) && stored_version != bound_version {
-            crate::logging::info(&format!(
-                "Memory ontology drift for {}: stored v{} -> active v{}",
-                key.as_str(),
-                stored_version,
-                bound_version
-            ));
+        if self.bind_ontology_metadata(key.as_str(), graph)
+            && let Err(e) = backend.save(key, graph)
+        {
+            crate::logging::warn(&format!("ontology binding persist failed: {e}"));
         }
-        if stored_id != bound_id || stored_version != bound_version {
-            if let Err(e) = backend.save(key, graph) {
-                crate::logging::warn(&format!("ontology binding persist failed: {e}"));
+    }
+
+    /// Bind the stored or compiled ontology into `graph.metadata`.
+    ///
+    /// Returns true when the metadata changed and needs to be persisted. The
+    /// caller decides how (backend save, JSON write, cache update).
+    fn bind_ontology_metadata(&self, key: &str, graph: &mut MemoryGraph) -> bool {
+        graph.metadata.retrieval_count = graph.metadata.retrieval_count.saturating_add(1);
+        let mut changed = false;
+
+        if graph.metadata.ontology.is_none() {
+            // First load of a store that predates runtime ontology storage:
+            // persist the compiled default so the store carries its own
+            // definition and can later be patched/rolled back.
+            let ontology = self.ontology_registry().default_ontology();
+            graph.metadata.ontology_id = ontology.id.clone();
+            graph.metadata.ontology_version = ontology.version;
+            graph.metadata.ontology_hash = ontology.content_hash();
+            graph.metadata.ontology = Some((*ontology).clone());
+            changed = true;
+        } else {
+            let stored = graph
+                .metadata
+                .ontology
+                .as_ref()
+                .expect("checked above")
+                .clone();
+            let stored_hash = jcode_memory_types::migration::ontology_content_hash(&stored);
+            if graph.metadata.ontology_hash != stored_hash {
+                crate::logging::warn(&format!(
+                    "Memory ontology hash mismatch for {key}: metadata {} -> {stored_hash}",
+                    graph.metadata.ontology_hash
+                ));
+                graph.metadata.ontology_hash = stored_hash;
+                changed = true;
+            }
+            if graph.metadata.ontology_id != stored.id {
+                graph.metadata.ontology_id = stored.id.clone();
+                changed = true;
+            }
+            if graph.metadata.ontology_version != stored.version {
+                graph.metadata.ontology_version = stored.version;
+                changed = true;
             }
         }
+
+        changed
+    }
+
+    /// Bind the ontology into a JSON-backed graph and report whether the
+    /// caller must write it back.
+    fn bind_json_ontology(&self, path: &std::path::Path, graph: &mut MemoryGraph) -> bool {
+        if self.test_mode {
+            return false;
+        }
+        self.bind_ontology_metadata(&path.display().to_string(), graph)
     }
 
     /// Load project memories as a MemoryGraph without generating embeddings.
@@ -2895,7 +3131,12 @@ impl MemoryManager {
         if !self.test_mode
             && let Some(mut graph) = cached_graph(&path)
         {
-            if Self::normalize_graph_search_text(&mut graph) {
+            let normalized = Self::normalize_graph_search_text(&mut graph);
+            let bound = self.bind_json_ontology(&path, &mut graph);
+            if normalized || bound {
+                if bound {
+                    storage::write_json(&path, &graph)?;
+                }
                 cache_graph(path.clone(), &graph);
             }
             return Ok(graph);
@@ -2908,9 +3149,11 @@ impl MemoryManager {
             {
                 let mut graph = graph;
                 let normalized = Self::normalize_graph_search_text(&mut graph);
-                if self.import_legacy_notes_into_graph(&mut graph)? {
+                let imported = self.import_legacy_notes_into_graph(&mut graph)?;
+                let bound = self.bind_json_ontology(&path, &mut graph);
+                if imported {
                     self.save_project_graph(&graph)?;
-                } else if normalized {
+                } else if normalized || bound {
                     storage::write_json(&path, &graph)?;
                 }
                 if !self.test_mode {
@@ -2923,6 +3166,7 @@ impl MemoryManager {
             let store: MemoryStore = storage::read_json(&path)?;
             let mut graph = MemoryGraph::from_legacy_store(store);
             let _ = self.import_legacy_notes_into_graph(&mut graph)?;
+            let _ = self.bind_json_ontology(&path, &mut graph);
 
             // Save migrated format (create backup first)
             let backup_path = path.with_extension("json.bak");
@@ -2941,7 +3185,9 @@ impl MemoryManager {
             Ok(graph)
         } else {
             let mut graph = MemoryGraph::new();
-            if self.import_legacy_notes_into_graph(&mut graph)? {
+            let imported = self.import_legacy_notes_into_graph(&mut graph)?;
+            let bound = self.bind_json_ontology(&path, &mut graph);
+            if imported || bound {
                 self.save_project_graph(&graph)?;
             }
             if !self.test_mode {
@@ -2995,7 +3241,12 @@ impl MemoryManager {
         if !self.test_mode
             && let Some(mut graph) = cached_graph(&path)
         {
-            if Self::normalize_graph_search_text(&mut graph) {
+            let normalized = Self::normalize_graph_search_text(&mut graph);
+            let bound = self.bind_json_ontology(&path, &mut graph);
+            if normalized || bound {
+                if bound {
+                    storage::write_json(&path, &graph)?;
+                }
                 cache_graph(path.clone(), &graph);
             }
             return Ok(graph);
@@ -3007,7 +3258,9 @@ impl MemoryManager {
                 && graph.graph_version == GRAPH_VERSION
             {
                 let mut graph = graph;
-                if Self::normalize_graph_search_text(&mut graph) {
+                let normalized = Self::normalize_graph_search_text(&mut graph);
+                let bound = self.bind_json_ontology(&path, &mut graph);
+                if normalized || bound {
                     storage::write_json(&path, &graph)?;
                 }
                 if !self.test_mode {
@@ -3018,7 +3271,8 @@ impl MemoryManager {
 
             // Fall back to legacy MemoryStore and migrate
             let store: MemoryStore = storage::read_json(&path)?;
-            let graph = MemoryGraph::from_legacy_store(store);
+            let mut graph = MemoryGraph::from_legacy_store(store);
+            let _ = self.bind_json_ontology(&path, &mut graph);
 
             // Save migrated format (create backup first)
             let backup_path = path.with_extension("json.bak");
@@ -3036,7 +3290,10 @@ impl MemoryManager {
             }
             Ok(graph)
         } else {
-            let graph = MemoryGraph::new();
+            let mut graph = MemoryGraph::new();
+            if self.bind_json_ontology(&path, &mut graph) {
+                storage::write_json(&path, &graph)?;
+            }
             if !self.test_mode {
                 cache_graph(path, &graph);
             }

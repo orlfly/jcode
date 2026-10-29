@@ -1153,6 +1153,63 @@ pub(crate) enum MemoryCommand {
         #[arg(long)]
         subject_keys: bool,
     },
+
+    /// Inspect, validate, apply or roll back the ontology stored with memory
+    Ontology {
+        #[command(subcommand)]
+        action: OntologyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum OntologyCommand {
+    /// Show the ontology stored with the project/global memory store
+    Show {
+        #[arg(long, default_value = "project")]
+        scope: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate an ontology patch file against the current store
+    Validate {
+        file: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Apply an ontology patch. Dry-run unless `--apply` is passed.
+    Apply {
+        file: String,
+
+        #[arg(long, default_value = "project")]
+        scope: String,
+
+        /// Write the patch instead of reporting what it would change
+        #[arg(long)]
+        apply: bool,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show installed ontology snapshots (newest last)
+    History {
+        #[arg(long, default_value = "project")]
+        scope: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Restore an ontology version from the store's history
+    Rollback {
+        version: u32,
+
+        #[arg(long, default_value = "project")]
+        scope: String,
+    },
 }
 
 #[cfg(test)]
