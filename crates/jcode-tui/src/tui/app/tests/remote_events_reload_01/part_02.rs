@@ -95,6 +95,9 @@ fn test_remote_auto_poke_followup_preserves_visible_timer_and_stays_hidden() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                external_blocker: None,
+                completely_blocked: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -149,6 +152,9 @@ fn test_remote_auto_poke_challenges_abrupt_confidence_increase() {
                 assigned_to: None,
                 confidence: Some(crate::todo::ConfidenceState::from_legacy_score(0)),
                 completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(100)),
+                external_blocker: None,
+                completely_blocked: None,
+                waiting_on: Vec::new(),
                 confidence_history: vec![
                     crate::todo::ConfidenceState::from_legacy_score(0),
                     crate::todo::ConfidenceState::from_legacy_score(100),
@@ -216,6 +222,9 @@ fn test_remote_auto_poke_completion_below_threshold_tells_model_to_keep_working(
                 confidence: Some(crate::todo::ConfidenceState::from_legacy_score(80)),
                 completion_confidence: Some(crate::todo::ConfidenceState::from_legacy_score(80)),
                 confidence_history: Vec::new(),
+                external_blocker: None,
+                completely_blocked: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -277,6 +286,9 @@ fn test_remote_poke_status_and_off_update_state() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                external_blocker: None,
+                completely_blocked: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -466,6 +478,9 @@ fn test_remote_done_does_not_challenge_moderate_or_unrecorded_confidence_jumps()
                     status: "completed".into(),
                     confidence: Some(planning),
                     completion_confidence: Some(completion),
+                    external_blocker: None,
+                    completely_blocked: None,
+                    waiting_on: Vec::new(),
                     confidence_history: history,
                     ..Default::default()
                 }],

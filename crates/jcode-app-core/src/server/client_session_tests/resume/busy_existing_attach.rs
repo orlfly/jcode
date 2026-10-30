@@ -171,6 +171,8 @@ async fn handle_resume_session_allows_live_attach_when_existing_agent_is_busy() 
             &event_history,
             &event_counter,
             &swarm_event_tx,
+            &sessions,
+            &soft_interrupt_queues,
         ),
     )
     .await

@@ -297,6 +297,14 @@ impl SessionPicker {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if session.server_icon.as_deref() == Some("☁")
+            && let Some(host) = session.server_name.as_deref()
+        {
+            line1_spans.push(Span::styled(
+                format!("  ☁ {host}"),
+                Style::default().fg(rgb(120, 210, 255)),
+            ));
+        }
         if in_batch_restore {
             line1_spans.push(Span::styled(
                 "  [BATCH]",
@@ -426,6 +434,7 @@ impl SessionPicker {
     }
 
     pub(super) fn render_session_list(&mut self, frame: &mut Frame, area: Rect) {
+        self.poll_transcript_search();
         let server_color: Color = rgb(255, 200, 100);
         let dim: Color = rgb(100, 100, 100);
         let spinner_frame = Self::running_spinner_frame();
@@ -489,7 +498,11 @@ impl SessionPicker {
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
-                                    format!("  {} · {} sessions", version, session_count),
+                                    if version.is_empty() {
+                                        format!("  {} sessions", session_count)
+                                    } else {
+                                        format!("  {} · {} sessions", version, session_count)
+                                    },
                                     Style::default().fg(dim),
                                 ),
                             ]);
@@ -546,7 +559,11 @@ impl SessionPicker {
         let mut title_parts: Vec<Span> = Vec::new();
         if self.loading_message.is_some() {
             title_parts.push(Span::styled(
-                " loading sessions ",
+                if self.search_active {
+                    " loading "
+                } else {
+                    " loading sessions "
+                },
                 Style::default()
                     .fg(rgb(255, 200, 100))
                     .add_modifier(Modifier::BOLD),
@@ -597,12 +614,16 @@ impl SessionPicker {
             format!("  {}", filter_label),
             Style::default().fg(rgb(255, 180, 100)),
         ));
-        title_parts.push(Span::styled(
-            " (s/S filter)",
-            Style::default().fg(rgb(80, 80, 80)),
-        ));
+        // These shortcuts insert search text while editing, so do not advertise
+        // them there or let their hint push the query out of a narrow header.
+        if !self.search_active {
+            title_parts.push(Span::styled(
+                " (s/S filter)",
+                Style::default().fg(rgb(80, 80, 80)),
+            ));
+        }
 
-        if self.hidden_test_count > 0 {
+        if self.hidden_test_count > 0 && !self.search_active {
             title_parts.push(Span::styled(
                 format!(" (+{} hidden)", self.hidden_test_count),
                 Style::default().fg(rgb(80, 80, 80)),
@@ -625,8 +646,12 @@ impl SessionPicker {
 
         title_parts.push(Span::styled(" ", Style::default()));
 
-        let mut help = if self.loading_message.is_some() {
-            " Esc cancel ".to_string()
+        let mut help = if self.search_active && self.loading_message.is_some() {
+            " type to filter · loading… · Esc clear · Ctrl+C cancel ".to_string()
+        } else if self.loading_message.is_some() {
+            " / search · s/S filter · Esc cancel ".to_string()
+        } else if self.transcript_search.pending() {
+            " searching full transcripts… · type to refine · Ctrl+C cancel ".to_string()
         } else if self.search_active {
             " type to filter · Ctrl+J/K or ↑↓ nav · Ctrl+W word-del · Esc cancel ".to_string()
         } else {

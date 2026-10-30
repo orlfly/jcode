@@ -180,6 +180,32 @@ pub fn lane_todos_for_worker(coordinator_todos: &[TodoItem], lane: &str) -> Vec<
         .map(|todo| TodoItem {
             assigned_to: None,
             blocked_by: Vec::new(),
+            external_blocker: None,
+            waiting_on: Vec::new(),
+            ..todo.clone()
+        })
+        .collect()
+}
+
+/// Pin worker-authored todos to their assigned coordinator lane before local
+/// persistence. Only lane identity changes: task edits and session-local
+/// bookkeeping stay with the worker. A missing lane leaves the list alone.
+pub fn canonicalize_worker_lane(
+    coordinator_todos: &[TodoItem],
+    link: &LaneLink,
+    worker_todos: &[TodoItem],
+) -> Vec<TodoItem> {
+    let Some(template) = coordinator_todos
+        .iter()
+        .find(|todo| lane_id(todo) == link.lane)
+    else {
+        return worker_todos.to_vec();
+    };
+    worker_todos
+        .iter()
+        .map(|todo| TodoItem {
+            stage: template.stage,
+            group: template.group.clone(),
             ..todo.clone()
         })
         .collect()
@@ -215,6 +241,16 @@ pub fn merge_worker_lane(
             if other_ids.contains(item.id.as_str()) {
                 item.id = format!("{}:{}", link.worker, item.id);
             }
+            // Background task IDs belong to the destination session, not the
+            // worker. New items get no references from the source session.
+            item.waiting_on = match coordinator_todos
+                .iter()
+                .find(|old| lane_id(old) == link.lane && old.id == item.id)
+            {
+                Some(old) => old.waiting_on.clone(),
+                // A newly introduced worker item cannot inherit another session's waits.
+                None => Vec::new(),
+            };
             item
         })
         .collect();
@@ -303,6 +339,47 @@ mod lane_sync_tests {
         let ids: Vec<&str> = seeded.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["p1", "p2"]);
         assert!(seeded.iter().all(|t| t.assigned_to.is_none()));
+    }
+
+    #[test]
+    fn canonical_worker_lane_preserves_unstaged_and_ungrouped_assignments() {
+        for group in [Some("parser"), None] {
+            let boss = vec![item("p1", "pending", None, group)];
+            let link = LaneLink {
+                lane: lane_id(&boss[0]),
+                ..link()
+            };
+            let worker = vec![item("p1", "completed", Some(9), Some("renamed"))];
+            let canonical = canonicalize_worker_lane(&boss, &link, &worker);
+            assert_eq!(canonical[0].stage, None);
+            assert_eq!(canonical[0].group.as_deref(), group);
+            assert_eq!(canonical[0].status, "completed");
+            assert_eq!(canonicalize_worker_lane(&[], &link, &worker), worker);
+        }
+    }
+
+    #[test]
+    fn session_local_dependencies_never_cross_lane_mirrors() {
+        let mut boss = coordinator();
+        boss[0].waiting_on = vec!["boss-task".into()];
+        let mut worker = lane_todos_for_worker(&boss, "lane:1:parser");
+        assert!(worker.iter().all(|todo| todo.waiting_on.is_empty()));
+        worker[0].waiting_on = vec!["worker-task".into()];
+        worker[0].status = "in_progress".into();
+        let mut added = item("new", "pending", Some(1), Some("parser"));
+        added.waiting_on = vec!["worker-new-task".into()];
+        worker.push(added);
+        let merged = merge_worker_lane(&boss, &link(), &worker).unwrap();
+        assert_eq!(merged[0].waiting_on, vec!["boss-task"]);
+        assert!(
+            merged
+                .iter()
+                .find(|todo| todo.id == "new")
+                .unwrap()
+                .waiting_on
+                .is_empty()
+        );
+        assert_eq!(worker[0].waiting_on, vec!["worker-task"]);
     }
 
     #[test]

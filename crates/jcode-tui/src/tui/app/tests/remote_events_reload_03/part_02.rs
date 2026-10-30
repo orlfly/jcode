@@ -434,7 +434,7 @@ fn test_service_tier_reported_deduplicates_and_does_not_confirm_old_request() {
     let badge = app.info_widget_data().service_tier.unwrap();
     assert_eq!(
         badge,
-        "Ultrafast requested, provider reports default (unconfirmed)"
+        "default ← Ultrafast"
     );
     assert!(!badge.contains("applied"));
     assert!(!badge.split_whitespace().any(|word| word == "confirmed"));
@@ -511,7 +511,7 @@ fn test_service_tier_reported_fast_alias_matches_and_badge_tracks_reports() {
     app.is_remote = true;
     app.remote_service_tier = Some("fast".into());
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
-    assert!(app.info_widget_data().service_tier.unwrap().contains("unconfirmed"));
+    assert_eq!(app.info_widget_data().service_tier.as_deref(), Some("Fast ?"));
     app.handle_server_event(
         crate::protocol::ServerEvent::ServiceTierReported {
             requested: Some("priority".into()), tier: "default".into(),
@@ -520,7 +520,7 @@ fn test_service_tier_reported_fast_alias_matches_and_badge_tracks_reports() {
     let badge = app.info_widget_data().service_tier.unwrap();
     assert_eq!(
         badge,
-        "Fast requested, provider reports default (unconfirmed)"
+        "default ← Fast"
     );
     assert!(!badge.contains("applied"));
     assert!(!badge.split_whitespace().any(|word| word == "confirmed"));
@@ -533,13 +533,94 @@ fn test_service_tier_reported_fast_alias_matches_and_badge_tracks_reports() {
     app.remote_service_tier = None;
     app.remote_reported_service_tier = None;
     app.remote_service_tier_confirmation_pending = true;
-    assert_eq!(app.info_widget_data().service_tier.as_deref(), Some("Standard requested (unconfirmed)"));
+    assert_eq!(app.info_widget_data().service_tier.as_deref(), Some("Standard ?"));
     app.handle_server_event(
         crate::protocol::ServerEvent::ServiceTierReported {
             requested: None, tier: "default".into(),
         }, &mut remote,
     );
     assert_eq!(app.info_widget_data().service_tier, None);
+}
+
+fn check_history_panel_snapshot(authoritative: bool, session_changed: bool) {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.remote_session_id = Some("ses_panel_catalog".to_string());
+    app.set_side_panel_snapshot(crate::side_panel::SidePanelSnapshot {
+        focus_revision: 7,
+        focused_page_id: Some("second".to_string()),
+        pages: ["first", "second"]
+            .into_iter()
+            .map(|id| crate::side_panel::SidePanelPage {
+                id: id.to_string(),
+                title: id.to_string(),
+                file_path: String::new(),
+                format: crate::side_panel::SidePanelPageFormat::Markdown,
+                pdf_data: None,
+                source: crate::side_panel::SidePanelPageSource::Managed,
+                content: format!("# {id}"),
+                updated_at_ms: 1,
+            })
+            .collect(),
+    });
+    app.remote_side_pane_images = vec![crate::session::RenderedImage {
+        media_type: "image/png".to_string(),
+        data: "restored-image-payload".to_string(),
+        label: Some("restored image".to_string()),
+        source: crate::session::RenderedImageSource::UserInput,
+        anchor: None,
+        history_message_index: None,
+    }];
+    let panels_before = app.side_panel.clone();
+    let images_before = app.remote_side_pane_images.clone();
+    // Exercise the same-session refresh after the initial restore has completed.
+    remote.mark_history_loaded();
+    let session_id = if session_changed {
+        "ses_other"
+    } else {
+        "ses_panel_catalog"
+    };
+    let mut event = delta_history_event(session_id, vec![], None);
+    if let crate::protocol::ServerEvent::History {
+        is_canary,
+        provider_name,
+        provider_model,
+        available_models,
+        ..
+    } = &mut event {
+        // False still counts as a present identity field on full History.
+        *is_canary = authoritative.then_some(false);
+        *provider_name = Some("openai".to_string());
+        *provider_model = Some("gpt-5.4".to_string());
+        *available_models = vec!["gpt-5.4".to_string()];
+    }
+    app.handle_server_event(event, &mut remote);
+    assert_eq!(app.remote_provider_model.as_deref(), Some("gpt-5.4"));
+    if authoritative || session_changed {
+        assert!(app.side_panel.pages.is_empty());
+        assert!(app.side_panel.focused_page_id.is_none());
+        assert!(app.remote_side_pane_images.is_empty());
+    } else {
+        assert_eq!(app.side_panel, panels_before);
+        assert_eq!(app.remote_side_pane_images, images_before);
+    }
+}
+
+#[test]
+fn test_catalog_history_preserves_restored_panels_and_images() {
+    check_history_panel_snapshot(false, false);
+}
+
+#[test]
+fn test_authoritative_same_session_history_clears_panels_and_images() {
+    check_history_panel_snapshot(true, false);
+}
+
+#[test]
+fn test_session_switch_history_clears_panels_and_images() {
+    check_history_panel_snapshot(false, true);
 }
 
 fn delta_history_event(

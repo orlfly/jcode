@@ -1,5 +1,6 @@
 #[path = "app/cache_fingerprints.rs"]
 mod cache_fingerprints;
+mod cache_request;
 use cache_fingerprints::*;
 
 use super::DisplayMessageRoleExt;
@@ -62,6 +63,7 @@ mod catchup;
 mod commands;
 mod commit_log;
 pub(crate) use commit_log::CommitLogOverlay;
+mod cloud_environment;
 mod commands_cloud;
 mod commands_colors;
 mod commands_desktop;
@@ -102,6 +104,7 @@ mod remote;
 mod remote_header_hint;
 mod remote_notifications;
 mod replay;
+mod response_output;
 pub(crate) mod run_shell;
 mod runtime_memory;
 mod shortcut_hints;
@@ -114,6 +117,7 @@ mod update_sim;
 mod usage_reset;
 mod voice_input;
 pub(crate) use state_ui_input_helpers::{registered_command_entries, registered_command_names};
+mod justrust_status;
 mod state_ui_maintenance;
 mod state_ui_messages;
 mod state_ui_runtime;
@@ -124,6 +128,7 @@ mod swarm_hint;
 mod terminal_liveness;
 mod terminal_setup_command;
 mod terminal_title;
+mod todo_completion;
 mod todos_view;
 pub(crate) use todos_view::pinned_todos_payload_for_session;
 mod tui_lifecycle;
@@ -644,6 +649,12 @@ pub enum CloudHandoff {
         host: String,
         working_dir: Option<String>,
     },
+    /// Attach to an already cloud-owned session without submitting a continuation.
+    RemoteResume {
+        session_id: String,
+        host: String,
+        working_dir: Option<String>,
+    },
     /// Resume the (returned) session locally.
     Local { session_id: String },
 }
@@ -884,6 +895,7 @@ enum ColdCacheWarningTrigger {
 #[derive(Clone, Debug, Default)]
 struct StreamingProgress {
     streaming_text: String,
+    response_output: response_output::ResponseOutput,
     // Live token usage (per turn)
     streaming_input_tokens: u64,
     streaming_output_tokens: u64,
@@ -1057,6 +1069,9 @@ pub struct App {
     remote_interrupt_ack_deadline: Option<Instant>,
     // Reload reconnect is waiting for server history before deciding whether to continue.
     pending_reload_reconnect_status: Option<PendingReloadReconnectStatus>,
+    // Keep recovery identities after dispatch so delayed History cannot requeue
+    // the same continuation. Reset only when a new server reload begins.
+    scheduled_reload_recoveries: HashSet<(String, String)>,
     // Current status
     status: ProcessingStatus,
     // Subagent status (shown during Task tool execution)
@@ -1106,10 +1121,9 @@ pub struct App {
     /// Todo state at the final-response handoff. Unchanged finished work must
     /// not re-enter quality gates on later turn-end or timer callbacks.
     final_response_todo_fingerprint: Option<String>,
-    /// Exact continuation sent for the last incomplete todo state. An unchanged
-    /// list must not trigger another automatic turn: the agent may be parked on
-    /// a worker, wake, or human decision, and repeated pokes cannot help.
+    /// Last incomplete state and its bounded automatic continuation budget.
     last_auto_poke_fingerprint: Option<String>,
+    auto_poke_attempts: u8,
     /// Set when the current turn ended with a provider guardrail/refusal stop
     /// (ServerEvent::ProviderGuardrail). Consumed by the Done handler to
     /// update `consecutive_guardrail_stops`.
@@ -1215,6 +1229,7 @@ pub struct App {
     // Running `/cloud` or `/local` job (wakes the machine, moves the session).
     cloud_job: Option<commands_cloud::CloudJob>,
     pending_cloud_handoff: Option<commands_cloud::PendingCloudHandoff>,
+    cloud_recovery_context: Option<(String, String)>,
     // Pasted content storage (displayed as placeholders, expanded on submit)
     pasted_contents: Vec<String>,
     // Pending pasted images (media_type, base64_data) attached to next message
@@ -1424,6 +1439,7 @@ pub struct App {
     tool_output_scan_index: usize,
     // Current session ID (from server in remote mode)
     remote_session_id: Option<String>,
+    cloud_environment: cloud_environment::CloudEnvironment,
     // All sessions on the server (remote mode only)
     remote_sessions: Vec<String>,
     remote_side_pane_images: Vec<crate::session::RenderedImage>,
@@ -1432,6 +1448,9 @@ pub struct App {
     side_pane_images_signature_cache: std::cell::Cell<Option<(usize, u64)>>,
     // Swarm member status snapshots (remote mode only)
     remote_swarm_members: Vec<crate::protocol::SwarmMemberStatus>,
+    /// When `remote_swarm_members` last arrived, so worker stopwatches can
+    /// tick locally between server snapshots.
+    remote_swarm_members_received_at: Option<std::time::Instant>,
     // Latest swarm plan snapshot (local or remote server event stream)
     swarm_plan_items: Vec<crate::plan::PlanItem>,
     swarm_plan_version: Option<u64>,
@@ -1526,6 +1545,8 @@ pub struct App {
     /// Hash of the todo payload rendered into the inline chat todo card, used
     /// to keep the card live-updating while it stays in the transcript.
     todo_card_rendered_hash: u64,
+    /// Tracks the display-only full report for the current completed todo cycle.
+    todo_completion_report: todo_completion::TodoCompletionReportState,
     /// JSON payload for the pinned todo band (display.pin_todos). `None` when
     /// the feature is off or the session has no todos. Refreshed on tick.
     /// The renderer wiring for these three fields is landing separately, so
@@ -1543,6 +1564,8 @@ pub struct App {
     pinned_todos_expanded: bool,
     /// Running and terminal background tasks shown beneath the pinned todo band.
     background_task_rows: Vec<crate::tui::BackgroundTaskRow>,
+    /// Asynchronous, bounded queries of justrust's public live-status API.
+    justrust_status: crate::tui::justrust_status::Poller,
     last_side_panel_refresh: Option<Instant>,
     // Most recently persisted focus target for dictation routing.
     last_client_focus_recorded_at: Option<Instant>,
@@ -1935,71 +1958,11 @@ impl App {
     }
     const KV_CACHE_MAX_MISS_SAMPLES: usize = 12;
 
-    pub(super) fn begin_kv_cache_request(
-        &mut self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        system_static: &str,
-        system_dynamic: &str,
-    ) {
-        let turn_number = self
-            .display_messages
-            .iter()
-            .filter(|message| message.role == "user")
-            .count()
-            .max(1);
-        if self.kv_cache.kv_cache_turn_number == Some(turn_number) {
-            self.kv_cache.kv_cache_turn_call_index = self
-                .kv_cache
-                .kv_cache_turn_call_index
-                .saturating_add(1)
-                .max(1);
-        } else {
-            self.kv_cache.kv_cache_turn_number = Some(turn_number);
-            self.kv_cache.kv_cache_turn_call_index = 1;
-        }
-
-        let baseline = self.kv_cache_baseline_for_current_session();
-        let signature =
-            Self::kv_cache_request_signature(messages, tools, system_static, system_dynamic);
-        let baseline_messages_prefix_matches = baseline
-            .as_ref()
-            .and_then(|baseline| baseline.signature.as_ref())
-            .map(|previous| Self::kv_cache_signatures_prefix_match(&signature, previous));
-
-        self.maybe_push_cold_cache_warning(
-            turn_number,
-            self.kv_cache.kv_cache_turn_call_index,
-            baseline.as_ref(),
-        );
-        self.pause_streaming_tps(false);
-        self.kv_cache.current_api_usage_recorded = false;
-        self.mark_stream_usage_call_boundary();
-
-        self.kv_cache.pending_kv_cache_request = Some(PendingKvCacheRequest {
-            started_at: Some(Instant::now()),
-            utc_day: crate::kv_cache_monitor::utc_day_now(),
-            turn_number,
-            call_index: self.kv_cache.kv_cache_turn_call_index,
-            cache_ttl_secs: crate::tui::cache_ttl_for_provider_model(
-                &self.kv_cache_provider_name(),
-                Some(&self.kv_cache_provider_model()),
-            ),
-            provider: self.kv_cache_provider_name(),
-            model: self.kv_cache_provider_model(),
-            upstream_provider: self.upstream_provider.clone(),
-            account: self.kv_cache_account(),
-            signature: Some(signature),
-            baseline_messages_prefix_matches,
-            baseline,
-            cache_generation: self.kv_cache.cache_generation,
-        });
-    }
-
     pub(in crate::tui::app) fn begin_remote_kv_cache_request(
         &mut self,
         signature: KvCacheRequestSignature,
     ) {
+        self.streaming.response_output.reset();
         let turn_number = self
             .display_messages
             .iter()
@@ -2633,14 +2596,44 @@ impl App {
             return;
         }
 
+        let prefix_tag = if matches!(
+            reason,
+            KvCacheMissReason::LowRead | KvCacheMissReason::ZeroRead
+        ) && Self::kv_cache_checked_prefix_unchanged(request)
+        {
+            " [prefix unchanged]"
+        } else {
+            ""
+        };
         self.push_kv_cache_notice(format!(
-            "{} KV cache miss [{}] {}: ~{} tokens resent ({}). See KV_CACHE_USAGE in logs.",
+            "{} KV cache miss [{}]{} {}: ~{} tokens resent ({}). See KV_CACHE_USAGE in logs.",
             if harness_change { "⚠️" } else { "ℹ️" },
             reason.label(),
+            prefix_tag,
             usage,
             token_label,
             detail,
         ));
+    }
+
+    fn kv_cache_checked_prefix_unchanged(request: &PendingKvCacheRequest) -> bool {
+        let Some((previous, current)) = request
+            .baseline
+            .as_ref()
+            .and_then(|baseline| baseline.signature.as_ref())
+            .zip(request.signature.as_ref())
+        else {
+            return false;
+        };
+        previous.message_count > 0
+            && previous.system_static_hash != 0
+            && previous.tools_hash != 0
+            && previous.message_hashes.len() == previous.message_count
+            && current.message_hashes.len() == current.message_count
+            && current.system_static_hash == previous.system_static_hash
+            && current.tools_hash == previous.tools_hash
+            && current.tool_count == previous.tool_count
+            && Self::kv_cache_signatures_prefix_match(current, previous)
     }
 
     /// Specific, human-readable cause: what changed (from -> to) and the

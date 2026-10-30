@@ -10,6 +10,7 @@ mod persistence;
 mod prompt;
 pub mod runner;
 pub mod scheduler;
+mod todo_reviews;
 
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
@@ -23,6 +24,9 @@ pub use prompt::{
     build_ambient_system_prompt, format_minutes_human, format_scheduled_session_message,
     gather_feedback_memories, gather_global_promotion_candidates, gather_memory_graph_health,
     gather_recent_sessions,
+};
+pub use todo_reviews::{
+    reconcile_stored_todo_reviews, reconcile_todo_reviews, scheduled_todo_review_is_current,
 };
 
 use crate::storage;
@@ -100,18 +104,27 @@ pub enum ScheduleTarget {
     Ambient,
     /// Deliver the reminder back into a specific interactive session.
     Session { session_id: String },
+    /// Internal todo review. Validate the exact blocker again before delivery.
+    TodoReview {
+        session_id: String,
+        todo_id: String,
+        blocker: crate::todo::TodoExternalBlocker,
+    },
     /// Spawn a single new session derived from the originating session.
     Spawn { parent_session_id: String },
 }
 
 impl ScheduleTarget {
     pub fn is_direct_delivery(&self) -> bool {
-        matches!(self, Self::Session { .. } | Self::Spawn { .. })
+        matches!(
+            self,
+            Self::Session { .. } | Self::Spawn { .. } | Self::TodoReview { .. }
+        )
     }
 }
 
 /// A scheduled ambient task
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledItem {
     pub id: String,
     pub scheduled_for: DateTime<Utc>,

@@ -128,6 +128,7 @@ struct TestState {
     queue_mode: bool,
     active_skill: Option<String>,
     centered_mode: bool,
+    diff_mode_override: Option<crate::config::DiffDisplayMode>,
     anim_elapsed: f32,
     now_ms: u64,
     time_since_activity: Option<Duration>,
@@ -143,6 +144,7 @@ struct TestState {
     side_pane_images: Vec<crate::session::RenderedImage>,
     pin_images: bool,
     inline_images_visible: bool,
+    image_expand_level: Option<crate::tui::ImageExpandLevel>,
     cache_ttl_status: Option<crate::tui::CacheTtlInfo>,
     openai_reset_hint: Option<&'static str>,
     status_notice: Option<String>,
@@ -152,10 +154,14 @@ struct TestState {
     swarm_panel_selected: usize,
     swarm_panel_focused: bool,
     pinned_todos_payload: Option<String>,
+    justrust_status: Option<crate::tui::justrust_status::StatusRow>,
     swarm_panel_full_page: bool,
 }
 
 impl crate::tui::TuiState for TestState {
+    fn justrust_status(&self) -> Option<&crate::tui::justrust_status::StatusRow> {
+        self.justrust_status.as_ref()
+    }
     fn pinned_todos_payload(&self) -> Option<&str> {
         self.pinned_todos_payload.as_deref()
     }
@@ -182,6 +188,9 @@ impl crate::tui::TuiState for TestState {
     }
     fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> {
         self.side_pane_images.clone()
+    }
+    fn image_expand_level(&self, _id: u64) -> crate::tui::ImageExpandLevel {
+        self.image_expand_level.unwrap_or_default()
     }
     fn display_messages_version(&self) -> u64 {
         self.messages_version
@@ -284,7 +293,8 @@ impl crate::tui::TuiState for TestState {
         false
     }
     fn diff_mode(&self) -> crate::config::DiffDisplayMode {
-        crate::config::DiffDisplayMode::Inline
+        self.diff_mode_override
+            .unwrap_or(crate::config::DiffDisplayMode::Inline)
     }
     fn current_session_id(&self) -> Option<String> {
         None
@@ -512,11 +522,14 @@ fn reset_prompt_viewport_state_for_test() {
 
 #[path = "pinned_todo_regressions.rs"]
 mod pinned_todo_regressions;
+mod todo_blocker_notes;
 
 #[path = "basic.rs"]
 mod basic;
 #[path = "diagrams.rs"]
 mod diagrams;
+#[path = "expanded_diff.rs"]
+mod expanded_diff;
 #[path = "inline_picker.rs"]
 mod inline_picker;
 #[path = "onboarding.rs"]

@@ -48,6 +48,7 @@ fn chat_swarm_member(session_id: &str) -> crate::protocol::SwarmMemberStatus {
             effort: Some("high".to_string()),
             elapsed_secs: Some(18),
             activity_age_secs: None,
+            ..Default::default()
         },
     }
 }
@@ -1342,32 +1343,5 @@ fn test_prepare_messages_restored_history_matches_live_tool_rows() {
     assert_eq!(live, restored);
 }
 
-#[test]
-fn test_prepare_messages_keeps_multiline_error_rows() {
-    let state = TestState {
-        display_messages: vec![DisplayMessage::error(
-            "/cloud failed. Nothing moved.\n\nError: remote failed\nCaused by:\n    host down",
-        )],
-        ..Default::default()
-    };
-    let rendered = prepare::prepare_messages(&state, 110, 30)
-        .materialize_all_lines()
-        .iter()
-        .map(extract_line_text)
-        .collect::<Vec<_>>();
-    let all = rendered.join("\n");
-    let first = rendered
-        .iter()
-        .position(|line| line.contains("✗ /cloud failed. Nothing moved."))
-        .unwrap_or_else(|| panic!("missing headline: {all}"));
-    let error = rendered
-        .iter()
-        .position(|line| line.contains("Error: remote failed"))
-        .unwrap_or_else(|| panic!("missing error row: {all}"));
-    let cause = rendered
-        .iter()
-        .position(|line| line.contains("    host down"))
-        .unwrap_or_else(|| panic!("missing cause row: {all}"));
-    assert!(first < error && error < cause, "rows collapsed: {all}");
-    assert!(!rendered[first].contains("Error:"), "rows collapsed: {all}");
-}
+#[path = "prepare_error_tests.rs"]
+mod error_rows;

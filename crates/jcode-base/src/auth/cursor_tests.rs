@@ -277,21 +277,17 @@ fn load_key_from_file(path: &PathBuf) -> Result<String> {
 /// Helper: create a mock state.vscdb with the given key/value pairs.
 fn create_mock_vscdb(dir: &std::path::Path, entries: &[(&str, &str)]) -> PathBuf {
     let db_path = dir.join("state.vscdb");
-    // Built via rusqlite (bundled) instead of shelling out to the `sqlite3`
-    // CLI: the suite then runs on machines without the CLI binary instead of
-    // failing six tests there.
-    let conn = rusqlite::Connection::open(&db_path).expect("open mock vscdb");
-    conn.execute(
-        "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-        [],
-    )
-    .expect("create mock vscdb table");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);")
+        .unwrap();
     for (key, value) in entries {
-        conn.execute(
-            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2);",
-            rusqlite::params![key, value],
-        )
-        .expect("insert into mock vscdb");
+        connection
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+                (key, value),
+            )
+            .unwrap();
     }
     db_path
 }
@@ -381,10 +377,11 @@ fn vscdb_multiple_keys() {
 fn vscdb_wrong_table_name() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.vscdb");
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute("CREATE TABLE WrongTable (key TEXT, value BLOB);", [])
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE WrongTable (key TEXT, value BLOB);")
         .unwrap();
-    drop(conn);
+    drop(connection);
     let result = read_vscdb_key(&db_path, "cursorAuth/accessToken");
     assert!(result.is_err());
 }

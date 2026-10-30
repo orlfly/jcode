@@ -73,12 +73,14 @@ fn parse(
     if fields.len() != 7 || fields[0] != b"jcode-machine-v1" || !fields[6].is_empty() {
         return None;
     }
-    let mut stats = CloudMachineStats::default();
-    stats.hostname = std::str::from_utf8(fields[1])
-        .ok()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-        .map(str::to_owned);
+    let mut stats = CloudMachineStats {
+        hostname: std::str::from_utf8(fields[1])
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(str::to_owned),
+        ..Default::default()
+    };
     let mut ticks = None;
     if let Ok(text) = std::str::from_utf8(fields[2]) {
         let mut count = 0u32;
@@ -255,7 +257,7 @@ mod tests {
             total: 100,
             idle: 50,
         };
-        let (stats, _) = parse(b"jcode-machine-v1\0machine\n\0cpu 50 0 30 100 20 0 0 0\ncpu0 1\n\0MemTotal: 200 kB\nMemAvailable: 80 kB\n\01000 600\0123.75 2\0", Some(previous)).unwrap();
+        let (stats, _) = parse(b"jcode-machine-v1\0machine\n\0cpu 50 0 30 100 20 0 0 0\ncpu0 1\n\0MemTotal: 200 kB\nMemAvailable: 80 kB\n\x001000 600\x00123.75 2\0", Some(previous)).unwrap();
         assert_eq!(stats.hostname.as_deref(), Some("machine"));
         assert_eq!(stats.cpu_percent, Some(30.0));
         assert_eq!(stats.memory_available_bytes, Some(80 * 1024));
@@ -282,7 +284,7 @@ mod tests {
 
     #[test]
     fn partial_invalid_and_cpu_deltas() {
-        let (stats, ticks) = parse(b"jcode-machine-v1\0host\ncpu?\0cpu 10 0 20 70 0 0 0 0 100 100\ncpu0 1\ncpu1 1\n\0MemTotal: 10 kB\nMemAvailable: invalid kB\n\0100 20\0123.5 2\0", None).unwrap();
+        let (stats, ticks) = parse(b"jcode-machine-v1\0host\ncpu?\0cpu 10 0 20 70 0 0 0 0 100 100\ncpu0 1\ncpu1 1\n\0MemTotal: 10 kB\nMemAvailable: invalid kB\n\x00100 20\x00123.5 2\0", None).unwrap();
         assert_eq!(stats.hostname, None);
         assert_eq!(stats.cpu_count, Some(2));
         assert_eq!(stats.cpu_percent, None);
