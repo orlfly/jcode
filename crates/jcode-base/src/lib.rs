@@ -88,7 +88,6 @@ pub mod runtime_memory_log;
 pub mod safety;
 pub mod scratch_maintenance;
 pub mod session;
-pub mod session_env;
 pub mod session_list_cache;
 pub mod session_metrics;
 pub mod side_panel;

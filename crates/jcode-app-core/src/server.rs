@@ -190,8 +190,23 @@ pub(super) async fn remove_session_entry<T>(
     let removed = sessions.write().await.remove(session_id);
     if removed.is_some() {
         crate::storage::unregister_active_pid(session_id);
+        crate::session_env::remove_session_env(session_id);
     }
     removed
+}
+
+/// Keep session presence locked until the synchronous registry update finishes.
+/// Otherwise a stale attached client could recreate credentials after teardown.
+pub(super) async fn set_live_session_env<T>(
+    sessions: &Arc<RwLock<HashMap<String, T>>>,
+    session_id: &str,
+    env: HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let sessions = sessions.read().await;
+    if !sessions.contains_key(session_id) {
+        anyhow::bail!("Session is no longer active");
+    }
+    crate::session_env::set_session_env(session_id, env)
 }
 
 const SERVER_NAME_ENV: &str = "JCODE_SERVER_NAME";
@@ -2070,7 +2085,13 @@ impl Server {
                 break;
             };
             // Keep the envelope alive through asynchronous queue delivery, not
-            // just receipt. An idle upgrade must include every accepted wake.
+            // just receipt. A queued selected-session callback must exclude
+            // transfer even after its original turn/background task exits.
+            let Some(_activity) =
+                self::background_tasks::admit_runtime_delivery(&delivery.event).await
+            else {
+                continue;
+            };
             match delivery.event.clone() {
                 BusEvent::FileTouch(touch) => {
                     let path = touch.path.clone();

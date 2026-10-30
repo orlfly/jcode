@@ -689,26 +689,6 @@ fn configure_background_command_stdio(command: &mut TokioCommand) {
         .stderr(Stdio::piped());
 }
 
-/// Project the session's host-provided env (e.g. `KANEO_API_URL` injected by
-/// AionUi into the connecting CLI) onto a shell child process.
-///
-/// Tools run in the daemon, not in the host's frontend process, so these values
-/// have to be re-applied here. Looked up by session id at spawn time because an
-/// attaching client's environment must take effect even when the turn executes
-/// in the session's original context.
-fn apply_session_env(command: &mut TokioCommand, session_id: &str) {
-    for (key, value) in jcode_base::session_env::session_env_for(session_id) {
-        command.env(key, value);
-    }
-}
-
-#[cfg(unix)]
-fn apply_session_env_std(command: &mut StdCommand, session_id: &str) {
-    for (key, value) in jcode_base::session_env::session_env_for(session_id) {
-        command.env(key, value);
-    }
-}
-
 /// Keep cloud environment values out of tool arguments and transcript output.
 /// Read on each spawn so a just-completed opaque transfer is available to the
 /// next command without changing the long-lived daemon's global environment.
@@ -937,7 +917,7 @@ impl BashTool {
 
         let mut command = build_shell_command(&params.command);
         command.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
-        apply_session_env(&mut command, &ctx.session_id);
+        command.envs(crate::session_env::session_env(&ctx.session_id));
         command
             .env("JCODE_SESSION_ID", &ctx.session_id)
             .kill_on_drop(true)
@@ -1169,7 +1149,7 @@ impl BashTool {
 
         let mut cmd = build_detached_shell_wrapper(&params.command);
         cmd.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
-        apply_session_env_std(&mut cmd, &ctx.session_id);
+        cmd.envs(crate::session_env::session_env(&ctx.session_id));
         cmd.env("JCODE_SESSION_ID", &ctx.session_id);
         let stdout = OpenOptions::new()
             .create(true)
@@ -1310,7 +1290,9 @@ impl BashTool {
         let working_dir = ctx.working_dir.clone();
         let cloud_environment = cloud_command_environment(working_dir.as_deref())?;
         let session_id_env = ctx.session_id.clone();
-        let session_env = jcode_base::session_env::session_env_for(&ctx.session_id);
+        // Capture before handing work to the manager. Its closure can start
+        // after a caller has already replaced or cleared these overrides.
+        let session_environment = crate::session_env::session_env(&ctx.session_id);
         let timeout_ms = params.timeout.map(|timeout| timeout.min(600000));
         let timeout_duration = timeout_ms.map(Duration::from_millis);
 
@@ -1324,11 +1306,11 @@ impl BashTool {
                 notify,
                 wake,
 				move |output_path| async move {
+                    #[cfg(test)]
+                    tests::wait_for_session_env_launch_gate(&session_id_env).await;
 					let mut cmd = build_shell_command(&command);
 					cmd.envs(cloud_environment);
-					for (key, value) in &session_env {
-						cmd.env(key, value);
-					}
+					cmd.envs(session_environment);
 					cmd.env("JCODE_SESSION_ID", &session_id_env);
 					#[cfg(unix)]
 					unsafe {

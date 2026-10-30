@@ -15,7 +15,8 @@ impl Agent {
         &mut self,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.ensure_session_lease()?;
         self.set_log_context();
         let usage_turn_id = self.model_usage_turn_id();
@@ -829,6 +830,7 @@ impl Agent {
                                 output,
                                 cache_read_input: usage_cache_read,
                                 cache_creation_input: usage_cache_creation,
+                                effective_budget: Some(self.effective_context_budget().await),
                             });
                         }
                         usage_recorder.observe(
@@ -1167,6 +1169,7 @@ impl Agent {
                     output: usage_output.unwrap_or(0),
                     cache_read_input: usage_cache_read,
                     cache_creation_input: usage_cache_creation,
+                    effective_budget: Some(self.effective_context_budget().await),
                 });
                 // Native compaction is applied and announced below, after
                 // usage. Attribute this response's cache refresh now using
@@ -1635,11 +1638,15 @@ impl Agent {
                 let registry_clone = self.registry.clone();
                 let tool_name_for_spawn = tc.name.clone();
                 let tool_input_for_spawn = tc.input.clone();
-                let tool_handle = tokio::spawn(async move {
-                    registry_clone
-                        .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
-                        .await
-                });
+                let tool_handle =
+                    crate::runtime_activity::spawn_session(&self.session.id, async move {
+                        registry_clone
+                            .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
+                            .await
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session transfer in progress; tool not accepted")
+                    })?;
 
                 // Reset background signal before waiting
                 self.background_tool_signal.reset();

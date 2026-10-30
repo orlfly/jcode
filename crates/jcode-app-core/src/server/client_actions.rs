@@ -202,7 +202,7 @@ pub(super) fn handle_input_shell(
     let tx = client_event_tx.clone();
     // Snapshot the session's host-provided env before spawning: the task cannot
     // borrow `client_session_id`.
-    let session_env = jcode_base::session_env::session_env_for(client_session_id);
+    let session_env = crate::session_env::session_env(client_session_id);
 
     crate::runtime_activity::spawn(async move {
         let cwd = {
@@ -818,6 +818,7 @@ fn clone_split_session(
     child.append_fork_notice(parent_session_id, parent.display_name());
     child.save()?;
 
+    crate::session_env::inherit_session_env(parent_session_id, &child.id);
     let name = child.display_name().to_string();
     Ok((child.id.clone(), name))
 }
@@ -863,6 +864,7 @@ fn create_transfer_child_session(
     child.status = crate::session::SessionStatus::Closed;
     child.save()?;
     crate::todo::save_todos(&child.id, &todos)?;
+    crate::session_env::inherit_session_env(parent_session_id, &child.id);
     Ok((child.id.clone(), child.display_name().to_string()))
 }
 

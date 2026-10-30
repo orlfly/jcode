@@ -361,7 +361,9 @@ pub(super) fn is_kv_cache_footer(msg: &DisplayMessage) -> bool {
 
 /// Keep the same separator policy in full/incremental layout and overflow estimates.
 pub(super) fn needs_message_separator(msg: &DisplayMessage) -> bool {
-    !matches!(msg.effective_role(), "tool" | "meta" | "swarm") && !is_kv_cache_footer(msg)
+    // Thinking and tool calls form one compact activity stream.
+    !matches!(msg.effective_role(), "tool" | "meta" | "swarm" | "reasoning")
+        && !is_kv_cache_footer(msg)
 }
 
 pub(crate) fn render_system_message(
@@ -1365,6 +1367,14 @@ fn push_todo_status_pips<'a>(
     max_pips: usize,
 ) {
     let todos: Vec<_> = todos.into_iter().collect();
+    let self_active = todos
+        .iter()
+        .filter(|todo| {
+            todo.status == "in_progress"
+                && todo.assigned_to.as_deref() == Some("@self")
+                && !crate::todo::todo_completely_blocked(todo)
+        })
+        .count();
     let mut max_pips = max_pips;
     // The two-cell hand takes priority over ordinary progress at narrow widths.
     for _ in todos
@@ -1419,7 +1429,17 @@ fn push_todo_status_pips<'a>(
     for _ in 0..done_pips {
         spans.push(Span::styled("●", Style::default().fg(rgb(100, 180, 100))));
     }
-    for _ in 0..active_pips {
+    let self_pips = if self_active == 0 || in_progress == 0 {
+        0
+    } else {
+        (self_active * active_pips)
+            .div_ceil(in_progress)
+            .min(active_pips)
+    };
+    for _ in 0..self_pips {
+        spans.push(Span::styled("●", Style::default().fg(rgb(255, 200, 100))));
+    }
+    for _ in self_pips..active_pips {
         spans.push(Span::styled("●", Style::default().fg(asap_color())));
     }
     for _ in 0..open_pips {
@@ -2114,6 +2134,9 @@ fn todo_card_item_spans(todo: &crate::todo::TodoItem, with_confidence: bool) -> 
     } else {
         match todo.status.as_str() {
             "completed" => ("✓", rgb(105, 190, 125)),
+            "in_progress" if todo.assigned_to.as_deref() == Some("@self") => {
+                ("●", rgb(255, 200, 100))
+            }
             "in_progress" => ("●", asap_color()),
             "cancelled" => ("✗", rgb(190, 105, 115)),
             _ => ("○", rgb(135, 145, 160)),
