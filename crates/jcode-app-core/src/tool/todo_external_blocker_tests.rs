@@ -149,16 +149,21 @@ fn completely_blocked_schema_is_shared_and_strict() {
                 ["properties"][field]
         );
         let description = canonical["description"].as_str().unwrap();
-        assert!(description.contains("only by someone else"));
-        assert!(description.contains("no safe workaround exists after investigation"));
-        assert!(description.contains("who must do exactly what"));
+        // The schema descriptions stay under the shared 25-token parameter
+        // cap (tool/tests.rs); the longer rationale lives in the tool
+        // description and the `reason` field below.
+        assert!(description.contains("only someone else"), "{description}");
+        if field == "completely_blocked" {
+            assert!(description.contains("Name who and why"), "{description}");
+            assert!(description.contains("Null clears"), "{description}");
+        } else {
+            assert!(description.contains("review_at"), "{description}");
+            assert!(description.contains("null cancels"), "{description}");
+        }
         assert_eq!(
             canonical["properties"]["reason"]["description"],
             "Who must do exactly what, and why the agent cannot do it or work around it."
         );
-        assert!(description.contains(
-            "Not for implementation decisions, uncertainty, task size, or agent coordination."
-        ));
     }
     let tool = TodoTool::new();
     let guidance = tool.description();

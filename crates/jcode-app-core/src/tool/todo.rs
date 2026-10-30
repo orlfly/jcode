@@ -1259,7 +1259,7 @@ impl Tool for TodoTool {
                                 "properties": {
                                     "reason": {"type": "string", "minLength": 1, "description": "Who must do exactly what, and why the agent cannot do it or work around it."}
                                 },
-                                "description": "Only when an indispensable action can be performed only by someone else and no safe workaround exists after investigation. Name who must do exactly what, and why the agent cannot do it or work around it. Not for implementation decisions, uncertainty, task size, or agent coordination."
+                                "description": "Only when only someone else can do the indispensable action. Name who and why. Null clears."
                             },
                             "external_blocker": {
                                 "type": ["object", "null"],
@@ -1269,7 +1269,7 @@ impl Tool for TodoTool {
                                     "reason": {"type": "string", "minLength": 1, "description": "Who must do exactly what, and why the agent cannot do it or work around it."},
                                     "review_at": {"type": "string", "format": "date-time", "description": "Future finite RFC3339 reassessment deadline. Does not mean the blocker resolves then."}
                                 },
-                                "description": "Only when an indispensable action can be performed only by someone else and no safe workaround exists after investigation. Name who must do exactly what, and why the agent cannot do it or work around it. Not for implementation decisions, uncertainty, task size, or agent coordination. No dependency ID: pause until durable review_at to reassess. null cancels."
+                                "description": "Only when only someone else can do it. review_at reassesses later; null cancels."
                             },
                             "status": {
                                 "type": "string",
