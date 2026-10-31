@@ -232,6 +232,8 @@ struct SessionState {
     last_check: Option<Instant>,
     failed_at: Option<Instant>,
     turns: usize,
+    /// One-shot startup repair of skill mirrors for this session's workspace.
+    skill_reconciled: bool,
 }
 
 pub struct MemoryAgent {
@@ -308,6 +310,24 @@ impl MemoryAgent {
             return Ok(());
         }
         let ss = self.sessions.entry(session_id.to_string()).or_default();
+        if !ss.skill_reconciled {
+            ss.skill_reconciled = true;
+            // Eventual repair for a crash between writing a SKILL.md and the
+            // finalize reconcile. Loading the registry here is bounded and
+            // runs off the UI thread.
+            if let Ok(registry) = crate::skill::SkillRegistry::load_global() {
+                let report = crate::skill::reconcile_skill_memory_links(
+                    &registry,
+                    ss.working_dir.as_deref().map(std::path::Path::new),
+                );
+                if report.pruned > 0 || report.edges_removed > 0 || report.edges_added > 0 {
+                    crate::logging::info(&format!(
+                        "Skill-memory startup repair: {} pruned, +{} edges, -{} edges",
+                        report.pruned, report.edges_added, report.edges_removed
+                    ));
+                }
+            }
+        }
         // Optional writing is fire-and-forget and never delays a recall request.
         if ss.turns > 0
             && ss.turns.is_multiple_of(PERIODIC_EXTRACTION_INTERVAL)
