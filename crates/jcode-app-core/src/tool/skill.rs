@@ -505,6 +505,42 @@ mod tests {
         assert_eq!(result.title.as_deref(), Some("skill: optimization"));
     }
 
+    struct RestoreHome(Option<String>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("JCODE_HOME", value),
+                    None => std::env::remove_var("JCODE_HOME"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_records_a_skill_invocation() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _restore = RestoreHome(std::env::var("JCODE_HOME").ok());
+        unsafe { std::env::set_var("JCODE_HOME", home.path()) };
+
+        let (tool, project) = create_test_tool_with_skill("optimization");
+        let mut ctx = create_test_context();
+        ctx.working_dir = Some(project.path().to_path_buf());
+        let result = tool
+            .execute(json!({"action": "load", "name": "optimization"}), ctx)
+            .await
+            .unwrap();
+        assert!(result.output.contains("## Skill: optimization"));
+
+        let manager = crate::memory::MemoryManager::new().with_project_dir(project.path());
+        let graph = manager.load_project_graph().unwrap();
+        let invocation = graph
+            .get_memory("skill-invocation:optimization")
+            .expect("load must record an invocation row");
+        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:started"));
+    }
+
     #[tokio::test]
     async fn test_load_strips_leading_slash_from_name() {
         let (tool, _temp_dir) = create_test_tool_with_skill("optimization");

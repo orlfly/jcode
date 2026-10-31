@@ -596,3 +596,51 @@ fn host_session_env_forwards_only_host_namespaces() {
         "only host namespaces may travel over the wire: {keys:?}"
     );
 }
+
+struct RestoreHome(Option<String>);
+impl Drop for RestoreHome {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("JCODE_HOME", value),
+                None => std::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn acp_skill_outcome_records_invocation_memory() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var("JCODE_HOME").ok());
+    unsafe { std::env::set_var("JCODE_HOME", home.path()) };
+
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (sock_a, _sock_b) = tokio::net::UnixStream::pair().unwrap();
+    let (sock_c, _sock_d) = tokio::net::UnixStream::pair().unwrap();
+    let session = DaemonSession::new(
+        String::new(),
+        sock_a.into_split().0,
+        sock_c.into_split().1,
+        1,
+    )
+    .with_working_dir(project.clone());
+
+    record_acp_skill_outcome(
+        &session,
+        Some("probe"),
+        crate::memory_types::ActionOutcome::Succeeded,
+    );
+
+    let manager = crate::memory::MemoryManager::new().with_project_dir(&project);
+    let graph = manager.load_project_graph().unwrap();
+    let invocation = graph
+        .get_memory("skill-invocation:probe")
+        .expect("ACP outcome must persist an invocation row");
+    assert!(invocation
+        .tags
+        .iter()
+        .any(|tag| tag == "skill-outcome:succeeded"));
+}
