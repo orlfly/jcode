@@ -1009,6 +1009,10 @@ pub struct App {
     /// Pauses auto-scroll when user scrolls up during streaming
     auto_scroll_paused: bool,
     active_skill: Option<String>,
+    /// Skill invoked during the current turn whose result has not been
+    /// recorded into memory yet. `active_skill` persists across turns; this
+    /// one-shot marker closes the action -> knowledge feedback loop once.
+    pending_skill_outcome: Option<String>,
     is_processing: bool,
     // Live streaming/turn progress (text, per-turn tokens, TPS tracking).
     streaming: StreamingProgress,
@@ -1957,6 +1961,27 @@ impl App {
     const INPUT_UNDO_LIMIT: usize = 128;
     const CLIENT_FOCUS_RECORD_DEBOUNCE: Duration = Duration::from_secs(2);
     const KV_CACHE_OPTIMAL_OK_PCT: u8 = 85;
+
+    /// Feed the result of the turn that executed an invoked skill back into
+    /// memory. One-shot: `pending_skill_outcome` is cleared so the persistent
+    /// `active_skill` does not record every later turn as a skill run.
+    pub(super) fn record_pending_skill_outcome(
+        &mut self,
+        outcome: crate::memory_types::ActionOutcome,
+    ) {
+        let Some(skill) = self.pending_skill_outcome.take() else {
+            return;
+        };
+        let Some(dir) = self.session.working_dir.clone() else {
+            return;
+        };
+        crate::skill::record_skill_outcome(
+            &skill,
+            outcome,
+            Some(std::path::Path::new(&dir)),
+        );
+    }
+
     fn kv_cache_min_missed_tokens(provider: &str) -> u64 {
         crate::kv_cache_monitor::min_missed_tokens_for_provider(provider)
     }

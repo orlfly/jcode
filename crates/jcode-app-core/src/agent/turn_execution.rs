@@ -1427,10 +1427,24 @@ impl Agent {
                     println!("Activating skill: {}", skill.name);
                     println!("{}\n", skill.description);
                     self.active_skill = Some(invocation.name.to_string());
-                    jcode_base::skill::record_skill_invocation(invocation.name, None);
+                    let working_dir = self.working_dir().map(str::to_string);
+                    jcode_base::skill::record_skill_invocation(
+                        invocation.name,
+                        working_dir.as_deref().map(std::path::Path::new),
+                    );
                     self.announce_active_skill();
                     if let Some(prompt) = invocation.prompt {
-                        if let Err(e) = self.run_once(prompt).await {
+                        let result = self.run_once(prompt).await;
+                        jcode_base::skill::record_skill_outcome(
+                            invocation.name,
+                            if result.is_ok() {
+                                crate::memory_types::ActionOutcome::Succeeded
+                            } else {
+                                crate::memory_types::ActionOutcome::Failed
+                            },
+                            working_dir.as_deref().map(std::path::Path::new),
+                        );
+                        if let Err(e) = result {
                             eprintln!("\nError: {}\n", e);
                         }
                         println!();

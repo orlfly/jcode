@@ -1228,6 +1228,9 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.is_processing = false;
                 app.status = ProcessingStatus::Idle;
                 app.stream_message_ended = false;
+                app.record_pending_skill_outcome(
+                    crate::memory_types::ActionOutcome::Succeeded,
+                );
                 // Turn completed successfully; drop the saved prompt so a later
                 // unrelated failure cannot restore stale text into the input box.
                 app.last_submitted_input = None;
@@ -1392,6 +1395,14 @@ pub(in crate::tui::app) fn handle_server_event(
             app.is_processing = false;
             app.status = ProcessingStatus::Idle;
             app.stream_message_ended = false;
+            // A terminal provider error without a failover prompt ends the
+            // turn that ran the skill. Rate-limit holds returned earlier and
+            // keep the pending marker so the eventual result is recorded.
+            if !is_failover_prompt {
+                app.record_pending_skill_outcome(
+                    crate::memory_types::ActionOutcome::Failed,
+                );
+            }
             let recovered_local = recover_local_interleave_to_queue(app, "request error");
             crate::tui::mermaid::clear_streaming_preview_diagram();
             app.thought_line_inserted = false;

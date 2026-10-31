@@ -1170,6 +1170,18 @@ fn skill_invocation_with_prompt_activates_and_submits_in_one_turn() {
 }
 
 #[test]
+fn pending_skill_outcome_is_recorded_once() {
+    let mut app = create_test_app();
+    // No working dir: the recorder must clear the one-shot marker without
+    // touching a store.
+    app.session.working_dir = None;
+    app.pending_skill_outcome = Some("prompt-skill".to_string());
+    app.record_pending_skill_outcome(crate::memory_types::ActionOutcome::Succeeded);
+    assert!(app.pending_skill_outcome.is_none());
+    assert_eq!(app.active_skill, None, "active skill is not implicated");
+}
+
+#[test]
 fn skill_invocation_with_prompt_attaches_pending_image_to_user_message() {
     let mut app = create_test_app();
     let temp = tempfile::tempdir().expect("tempdir");

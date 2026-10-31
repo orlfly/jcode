@@ -3928,6 +3928,11 @@ impl App {
 
             if let Some(skill) = skill {
                 self.active_skill = Some(skill_name.clone());
+                // Only record an outcome when the session has a workspace:
+                // without one there is no project store to feed back into.
+                if self.session.working_dir.is_some() {
+                    self.pending_skill_outcome = Some(skill_name.clone());
+                }
                 crate::skill::record_skill_invocation(
                     &skill_name,
                     self.session
