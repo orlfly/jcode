@@ -645,6 +645,41 @@ pub fn project_memory_file(project_dir: &std::path::Path) -> Result<PathBuf> {
     Ok(memory_dir.join(format!("{}.json", project_hash)))
 }
 
+/// Optional `<jcode_dir>/memory/artifact-kinds.json` override.
+///
+/// The file adds or overrides artifact kinds without a rebuild:
+/// `{"kinds":[{"id":"workflow","prefix":"workflow:"}]}`.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct ArtifactKindConfig {
+    #[serde(default)]
+    pub kinds: Vec<jcode_memory_types::ArtifactKind>,
+}
+
+/// Reload artifact kinds from disk. Public so embedding apps and tests can
+/// force a refresh; normal startup uses [`ensure_artifact_kind_config`].
+pub fn load_artifact_kind_config() {
+    let Ok(dir) = crate::storage::jcode_dir() else {
+        return;
+    };
+    let path = dir.join("memory").join("artifact-kinds.json");
+    if !path.exists() {
+        return;
+    }
+    match crate::storage::read_json::<ArtifactKindConfig>(&path) {
+        Ok(config) => jcode_memory_types::configure_artifact_kinds(config.kinds),
+        Err(error) => crate::logging::warn(&format!(
+            "artifact kind config {} is unreadable: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Load the artifact-kind config once per process.
+pub fn ensure_artifact_kind_config() {
+    static LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOADED.get_or_init(load_artifact_kind_config);
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -703,6 +738,7 @@ pub struct MemoryRelevanceResult {
 
 impl MemoryManager {
     pub fn new() -> Self {
+        ensure_artifact_kind_config();
         Self {
             project_dir: None,
             test_mode: false,

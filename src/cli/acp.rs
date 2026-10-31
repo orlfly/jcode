@@ -1246,6 +1246,9 @@ impl AcpRuntime {
             }
         }
         let active_skill = session.active_skill.lock().await.clone();
+        if let Some(name) = active_skill.as_deref() {
+            crate::skill::record_skill_invocation(name, session.working_dir.as_deref());
+        }
 
         let prompt_id = session.next_id();
         {
@@ -1259,11 +1262,16 @@ impl AcpRuntime {
                 content: text,
                 images,
                 system_reminder: None,
-                active_skill,
+                active_skill: active_skill.clone(),
                 no_reply: false,
             })
             .await;
         if let Err(err) = send_result {
+            record_acp_skill_outcome(
+                &session,
+                active_skill.as_deref(),
+                crate::memory_types::ActionOutcome::Failed,
+            );
             cleanup_prompt_state(&session).await;
             return Err(err);
         }
@@ -1275,6 +1283,11 @@ impl AcpRuntime {
             let event = match session.read_event().await {
                 Ok(event) => event,
                 Err(err) => {
+                    record_acp_skill_outcome(
+                        &session,
+                        active_skill.as_deref(),
+                        crate::memory_types::ActionOutcome::Failed,
+                    );
                     cleanup_prompt_state(&session).await;
                     return Err(err);
                 }
@@ -1298,6 +1311,11 @@ impl AcpRuntime {
                     // failures such as HTTP 429 rate limits.
                     // See: agent-client-protocol v1 error.rs maps -32000 to
                     // ErrorCode::AuthRequired.
+                    record_acp_skill_outcome(
+                        &session,
+                        active_skill.as_deref(),
+                        crate::memory_types::ActionOutcome::Failed,
+                    );
                     cleanup_prompt_state(&session).await;
                     self.write_notification(
                         "session/update",
@@ -1407,6 +1425,15 @@ impl AcpRuntime {
             }
         }
 
+        record_acp_skill_outcome(
+            &session,
+            active_skill.as_deref(),
+            if stop_reason == "cancelled" {
+                crate::memory_types::ActionOutcome::Cancelled
+            } else {
+                crate::memory_types::ActionOutcome::Succeeded
+            },
+        );
         cleanup_prompt_state(&session).await;
         self.write_result(rpc_id, prompt_response(&stop_reason, &turn_usage))
             .await?;
@@ -2022,6 +2049,25 @@ fn explicit_skill_from_params(params: &Value) -> Option<String> {
         .map(|name| name.trim().trim_start_matches(['/', '$']).trim())
         .find(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+/// Feed an ACP turn result back into the skill-memory loop.
+///
+/// ACP sessions keep a sticky `active_skill`, so every prompt that runs under
+/// it is a real execution and produces an outcome. The call is best-effort:
+/// memory bookkeeping must never fail an ACP turn.
+fn record_acp_skill_outcome(
+    session: &DaemonSession,
+    skill: Option<&str>,
+    outcome: crate::memory_types::ActionOutcome,
+) {
+    if let Some(skill) = skill {
+        crate::skill::record_skill_outcome(
+            skill,
+            outcome,
+            session.working_dir.as_deref(),
+        );
+    }
 }
 
 /// Resolve `/name [prompt]` or `$name [prompt]` to a registered skill. Returns

@@ -150,6 +150,11 @@ impl SkillTool {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".".to_string());
 
+        // Loading activates the procedure for this session. Record the
+        // invocation (started, not an outcome) so the skill-memory loop sees
+        // tool-driven activation even when no slash command was typed.
+        crate::skill::record_skill_invocation(&skill.name, working_dir);
+
         Ok(ToolOutput::new(format!(
             "## Skill: {}\n\n**Base directory**: {}\n\n{}",
             skill.name,
@@ -244,6 +249,8 @@ impl SkillTool {
         // session-scoped and re-read from disk on every access, so reloading
         // it here would leak this session's project skills to other sessions
         // (issue #457).
+        // Durable pre-marker: reload changes what the reconciler will see.
+        crate::skill::queue_skill_reconcile("reload_all", working_dir);
         let reloaded = {
             let mut registry = self.registry.write().await;
             registry.reload_global()

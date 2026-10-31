@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1061,6 +1061,9 @@ pub fn accept_skill_proposal(
         );
     }
     std::fs::create_dir_all(&target_dir)?;
+    // Durable marker: if we crash after the file write and before the
+    // reconcile below, the next session still repairs the mirror.
+    queue_skill_reconcile("accept", working_dir);
     std::fs::write(&target, &raw)?;
 
     // Close the loop in memory, best-effort: the file is the source of truth,
@@ -1108,6 +1111,128 @@ pub struct SkillMemoryReconcileReport {
     pub needs_review: usize,
 }
 
+impl SkillMemoryReconcileReport {
+    fn merge(&mut self, other: Self) {
+        self.mirrored += other.mirrored;
+        self.pruned += other.pruned;
+        self.edges_added += other.edges_added;
+        self.edges_removed += other.edges_removed;
+        self.needs_review += other.needs_review;
+    }
+}
+
+/// One pending skill-memory reconciliation request.
+///
+/// This is a durable outbox rather than an in-process queue: a crash between
+/// writing a SKILL.md (or an ontology change) and the reconciler running leaves
+/// a marker on disk that the next session drains before recall.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingSkillReconcile {
+    key: String,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_dir: Option<String>,
+    requested_at: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SkillReconcileOutbox {
+    #[serde(default)]
+    pending: Vec<PendingSkillReconcile>,
+}
+
+fn skill_reconcile_outbox_path() -> Option<std::path::PathBuf> {
+    crate::storage::jcode_dir()
+        .ok()
+        .map(|dir| dir.join("memory").join("skill-reconcile-outbox.json"))
+}
+
+fn read_skill_reconcile_outbox() -> SkillReconcileOutbox {
+    let Some(path) = skill_reconcile_outbox_path() else {
+        return SkillReconcileOutbox::default();
+    };
+    if !path.exists() {
+        return SkillReconcileOutbox::default();
+    }
+    crate::storage::read_json(&path).unwrap_or_default()
+}
+
+fn write_skill_reconcile_outbox(outbox: &SkillReconcileOutbox) {
+    let Some(path) = skill_reconcile_outbox_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = crate::storage::write_json(&path, outbox) {
+        crate::logging::warn(&format!("skill reconcile outbox write failed: {error}"));
+    }
+}
+
+fn skill_reconcile_key(working_dir: Option<&Path>) -> String {
+    match working_dir {
+        Some(dir) => format!("project:{}", dir.display()),
+        None => "global".to_string(),
+    }
+}
+
+/// Enqueue a durable reconcile request. Duplicate keys collapse to one entry.
+fn enqueue_skill_reconcile(
+    reason: &str,
+    working_dir: Option<&Path>,
+) -> Option<String> {
+    let key = skill_reconcile_key(working_dir);
+    let mut outbox = read_skill_reconcile_outbox();
+    if !outbox.pending.iter().any(|entry| entry.key == key) {
+        outbox.pending.push(PendingSkillReconcile {
+            key: key.clone(),
+            reason: reason.to_string(),
+            working_dir: working_dir.map(|dir| dir.display().to_string()),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+        });
+        write_skill_reconcile_outbox(&outbox);
+    }
+    Some(key)
+}
+
+fn complete_skill_reconcile(key: &str) {
+    let mut outbox = read_skill_reconcile_outbox();
+    let before = outbox.pending.len();
+    outbox.pending.retain(|entry| entry.key != key);
+    if outbox.pending.len() != before || before > 0 {
+        write_skill_reconcile_outbox(&outbox);
+    }
+}
+
+/// Queue a durable reconcile without running it immediately.
+///
+/// Used before multi-step mutations (install, reload, ontology apply) so a
+/// crash between the mutation and the reconcile is repaired on next startup.
+pub fn queue_skill_reconcile(reason: &str, working_dir: Option<&Path>) {
+    let _ = enqueue_skill_reconcile(reason, working_dir);
+}
+
+/// Drain every durable reconcile request left by an earlier process.
+///
+/// Called from the memory agent before its first recall for a session, so a
+/// crash cannot leave mirrors permanently stale.
+pub fn drain_skill_reconcile_outbox() -> SkillMemoryReconcileReport {
+    let mut report = SkillMemoryReconcileReport::default();
+    let outbox = read_skill_reconcile_outbox();
+    if outbox.pending.is_empty() {
+        return report;
+    }
+
+    let registry = SkillRegistry::load_global().unwrap_or_default();
+    for entry in &outbox.pending {
+        let working_dir = entry.working_dir.as_deref().map(Path::new);
+        let next = reconcile_skill_memory_links_inner(&registry, working_dir);
+        report.merge(next);
+    }
+    write_skill_reconcile_outbox(&SkillReconcileOutbox::default());
+    report
+}
+
 /// Reconcile skill mirrors and their evidence edges against the current skill
 /// registry. Unlike the old additive sync, this pass is authoritative:
 ///
@@ -1123,6 +1248,18 @@ pub struct SkillMemoryReconcileReport {
 /// skills into the workspace store. The pass is best-effort and idempotent, so
 /// callers can run it at finalize, after reloads, or during startup repair.
 pub fn reconcile_skill_memory_links(
+    registry: &SkillRegistry,
+    working_dir: Option<&Path>,
+) -> SkillMemoryReconcileReport {
+    let key = enqueue_skill_reconcile("reconcile", working_dir);
+    let report = reconcile_skill_memory_links_inner(registry, working_dir);
+    if let Some(key) = key {
+        complete_skill_reconcile(&key);
+    }
+    report
+}
+
+fn reconcile_skill_memory_links_inner(
     registry: &SkillRegistry,
     working_dir: Option<&Path>,
 ) -> SkillMemoryReconcileReport {

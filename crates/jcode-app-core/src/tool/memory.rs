@@ -630,6 +630,12 @@ impl Tool for MemoryTool {
                         let patch = patch.ok_or_else(|| {
                             anyhow::anyhow!("ontology apply requires `patch` or `patch_file`")
                         })?;
+                        if input.dry_run != Some(true) {
+                            crate::skill::queue_skill_reconcile(
+                                "ontology_apply",
+                                ctx.working_dir.as_deref(),
+                            );
+                        }
                         let report = manager.apply_ontology_patch(
                             scope,
                             &patch,
@@ -682,6 +688,10 @@ impl Tool for MemoryTool {
                         let version = input.version.ok_or_else(|| {
                             anyhow::anyhow!("ontology rollback requires `version`")
                         })?;
+                        crate::skill::queue_skill_reconcile(
+                            "ontology_rollback",
+                            ctx.working_dir.as_deref(),
+                        );
                         let snapshot = manager.rollback_ontology(scope, version)?;
                         let reconciled =
                             reconcile_skill_links_after_ontology(ctx.working_dir.as_deref());

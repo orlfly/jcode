@@ -315,6 +315,13 @@ impl MemoryAgent {
             // Eventual repair for a crash between writing a SKILL.md and the
             // finalize reconcile. Loading the registry here is bounded and
             // runs off the UI thread.
+            let drained = crate::skill::drain_skill_reconcile_outbox();
+            if drained.pruned > 0 || drained.edges_added > 0 || drained.edges_removed > 0 {
+                crate::logging::info(&format!(
+                    "Skill-memory outbox drain: {} pruned, +{} edges, -{} edges",
+                    drained.pruned, drained.edges_added, drained.edges_removed
+                ));
+            }
             if let Ok(registry) = crate::skill::SkillRegistry::load_global() {
                 let report = crate::skill::reconcile_skill_memory_links(
                     &registry,

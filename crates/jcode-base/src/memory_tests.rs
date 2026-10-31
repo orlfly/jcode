@@ -1708,6 +1708,67 @@ fn skill_mirror_reconcile_prunes_removed_skill() {
 }
 
 #[test]
+fn skill_reconcile_outbox_survives_and_drains() {
+    with_temp_home(|home| {
+        let skill_dir = home.join("skills").join("outbox-probe");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: outbox-probe\ndescription: Outbox probe\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+
+        crate::skill::queue_skill_reconcile("unit_test", None);
+        let path = home
+            .join("memory")
+            .join("skill-reconcile-outbox.json");
+        let outbox: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("outbox file"))
+                .expect("outbox json");
+        assert_eq!(outbox["pending"].as_array().unwrap().len(), 1);
+
+        let report = crate::skill::drain_skill_reconcile_outbox();
+        assert_eq!(report.mirrored, 1);
+        assert!(
+            MemoryManager::new()
+                .load_global_graph()
+                .unwrap()
+                .memories
+                .contains_key("skill:outbox-probe")
+        );
+        let outbox: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("outbox file"))
+                .expect("outbox json");
+        assert!(outbox["pending"].as_array().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn artifact_kinds_are_configurable_from_disk() {
+    with_temp_home(|home| {
+        let path = home.join("memory").join("artifact-kinds.json");
+        fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        fs::write(
+            &path,
+            r#"{"kinds":[{"id":"workflow","prefix":"workflow:","description":"Workflow artifact"}]}"#,
+        )
+        .expect("write config");
+
+        crate::memory::load_artifact_kind_config();
+        assert!(jcode_memory_types::is_link_id("workflow:deploy"));
+        let kind = jcode_memory_types::artifact_kind_for_id("workflow:deploy")
+            .expect("configured kind");
+        assert_eq!(kind.id, "workflow");
+        // Built-ins survive the override.
+        assert!(jcode_memory_types::is_link_id("skill:optimization"));
+
+        // Restore the process-wide registry for other tests.
+        jcode_memory_types::configure_artifact_kinds(Vec::new());
+        assert!(!jcode_memory_types::is_link_id("workflow:deploy"));
+    });
+}
+
+#[test]
 fn project_cross_store_mirror_for_global_skill_is_preserved() {
     with_temp_home(|home| {
         let project = home.join("workspace");

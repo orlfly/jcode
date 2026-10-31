@@ -21,7 +21,8 @@ pub use ontology::{
     RULE_TAG, RULE_UNTAG, RULE_UPSERT, RULE_WRITE_RECONCILE, RelationshipDef, Rule, ScoringPolicy,
     TYPE_CONTRACT, TYPE_CORRECTION, TYPE_ENTITY, TYPE_ENV_FACT, TYPE_OBSERVATION, TYPE_PREFERENCE,
     TYPE_PROCESS_RULE, TrustMultiplier, WeightRange, default_event_names, default_ontology,
-    is_link_id, validate_default_ontology,
+    is_link_id, validate_default_ontology, ArtifactKind, artifact_kind_for_id, artifact_kinds,
+    configure_artifact_kinds, default_artifact_kinds, register_artifact_kind,
 };
 
 pub mod reconcile;

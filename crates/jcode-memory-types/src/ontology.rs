@@ -75,13 +75,104 @@ pub const TYPE_CORRECTION: &str = "correction";
 pub const LINK_GOAL: &str = "goal";
 pub const LINK_SKILL: &str = "skill";
 
-/// Every reserved link prefix.
+/// Built-in reserved link prefixes. Custom artifact kinds are registered at
+/// runtime; these remain the compatibility defaults.
 pub const LINK_PREFIXES: [&str; 2] = ["goal:", "skill:"];
+
+/// A configurable external-artifact kind mirrored into the memory graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactKind {
+    /// Stable id, e.g. `skill` or `goal`.
+    pub id: String,
+    /// Reserved id prefix, e.g. `skill:`.
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// Built-in artifact kinds. Runtime configuration may add more.
+pub fn default_artifact_kinds() -> Vec<ArtifactKind> {
+    vec![
+        ArtifactKind {
+            id: LINK_SKILL.to_string(),
+            prefix: "skill:".to_string(),
+            description: "Executable procedure installed as SKILL.md".to_string(),
+        },
+        ArtifactKind {
+            id: LINK_GOAL.to_string(),
+            prefix: "goal:".to_string(),
+            description: "Long-lived goal mirrored from its owner subsystem".to_string(),
+        },
+    ]
+}
+
+fn artifact_kind_registry() -> &'static std::sync::RwLock<Vec<ArtifactKind>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::RwLock<Vec<ArtifactKind>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::RwLock::new(default_artifact_kinds()))
+}
+
+/// Current artifact kinds, including runtime-registered ones.
+pub fn artifact_kinds() -> Vec<ArtifactKind> {
+    artifact_kind_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Replace the registry with defaults plus `kinds`.
+///
+/// Ids and prefixes are deduplicated; empty prefixes are ignored. This is what
+/// a config file or an embedding application calls at startup.
+pub fn configure_artifact_kinds(kinds: Vec<ArtifactKind>) {
+    let mut merged = default_artifact_kinds();
+    for kind in kinds {
+        let prefix = kind.prefix.trim();
+        if prefix.is_empty() {
+            continue;
+        }
+        if let Some(existing) = merged.iter_mut().find(|existing| existing.id == kind.id) {
+            *existing = ArtifactKind {
+                prefix: prefix.to_string(),
+                ..kind
+            };
+        } else if !merged.iter().any(|existing| existing.prefix == prefix) {
+            merged.push(ArtifactKind {
+                prefix: prefix.to_string(),
+                ..kind
+            });
+        }
+    }
+    *artifact_kind_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = merged;
+}
+
+/// Register one additional artifact kind without replacing the registry.
+pub fn register_artifact_kind(kind: ArtifactKind) {
+    let mut kinds = artifact_kinds();
+    kinds.push(kind);
+    configure_artifact_kinds(kinds);
+}
+
+/// The artifact kind whose prefix matches `id`, if any.
+pub fn artifact_kind_for_id(id: &str) -> Option<ArtifactKind> {
+    artifact_kind_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|kind| id.starts_with(&kind.prefix))
+        .cloned()
+}
 
 /// Whether `id` is a link node (external artifact mirror) rather than a
 /// classic memory instance.
 pub fn is_link_id(id: &str) -> bool {
-    LINK_PREFIXES.iter().any(|prefix| id.starts_with(prefix))
+    artifact_kind_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|kind| id.starts_with(&kind.prefix))
 }
 
 pub const REL_HAS_TAG: &str = "has_tag";
