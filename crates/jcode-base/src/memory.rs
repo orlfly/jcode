@@ -2306,24 +2306,179 @@ impl MemoryManager {
     /// becomes a queryable fact instead of nothing (measured before this: 0
     /// memories carried a `skill_registry` source or a `skill:` tag).
     pub fn remember_skill_invocation(&self, skill_name: &str) -> Result<String> {
+        self.record_skill_outcome(
+            skill_name,
+            jcode_memory_types::actions::ActionOutcome::Started,
+            &[],
+        )
+    }
+
+    /// Record an action/skill execution outcome and let the ontology rules
+    /// validate or invalidate the knowledge behind it.
+    ///
+    /// The action contract (`MemoryActionSpec::skill`) and the outcome are
+    /// dispatched through `event.action_outcome`; matching rules set the
+    /// artifact health, tag the mirror and emit evidence effects. Evidence
+    /// memories are then reinforced or weakened in place, which is the
+    /// "execution result verifies cognition" half of the loop.
+    pub fn record_skill_outcome(
+        &self,
+        skill_name: &str,
+        outcome: jcode_memory_types::actions::ActionOutcome,
+        evidence_ids: &[String],
+    ) -> Result<String> {
         let name = skill_name.trim();
         anyhow::ensure!(!name.is_empty(), "skill invocation needs a skill name");
+        let invocation_id = format!("skill-invocation:{name}");
+        let outcome_tag = format!("skill-outcome:{}", outcome.as_str());
+        let confidence = if outcome.is_success() { 1.0 } else { 0.6 };
         let entry = MemoryEntry::new(
             MemoryCategory::Fact,
-            format!("Skill `/{name}` was invoked in this workspace."),
+            format!(
+                "Skill `/{name}` was invoked in this workspace ({}).",
+                outcome.as_str()
+            ),
         )
-        .with_id(format!("skill-invocation:{name}"))
-        .with_tags(vec![format!("skill:{name}"), "skill-invoked".to_string()])
+        .with_id(invocation_id.clone())
+        .with_tags(vec![
+            format!("skill:{name}"),
+            "skill-invoked".to_string(),
+            outcome_tag,
+        ])
         .with_source(format!("skill:{name}"))
         .with_provenance(
             ProvenanceRecord::new(format!("skill:{name}"), ExtractionMethod::SkillInvocation)
-                .with_confidence(1.0),
+                .with_confidence(confidence),
         );
         // Idempotent by id: invoking the same skill again refreshes the row
         // (and its timestamp) instead of piling up one memory per run.
         let mut entry = entry;
         entry.subject_key = Some(format!("skill:{name}"));
-        self.upsert_project_memory(entry)
+        let mut project = self.load_project_graph()?;
+        Self::upsert_invocation_entry(&mut project, entry);
+        self.apply_skill_outcome_to_graph(&mut project, name, outcome, evidence_ids);
+        self.save_project_graph(&project)?;
+
+        // A global skill's mirror lives in the global store even when the
+        // invocation ran in a project. Keep its health in sync too.
+        if let Ok(mut global) = self.load_global_graph()
+            && self.apply_skill_outcome_to_graph(&mut global, name, outcome, evidence_ids)
+        {
+            self.save_global_graph(&global)?;
+        }
+        Ok(invocation_id)
+    }
+
+    fn upsert_invocation_entry(graph: &mut MemoryGraph, entry: MemoryEntry) {
+        let id = entry.id.clone();
+        if let Some(existing) = graph.get_memory_mut(&id) {
+            existing.content = entry.content;
+            existing.tags = entry.tags;
+            existing.updated_at = entry.updated_at;
+            existing.confidence = entry.confidence;
+            existing.source = entry.source;
+            existing.provenance = entry.provenance;
+            existing.subject_key = entry.subject_key;
+            existing.refresh_search_text();
+        } else {
+            graph.add_memory(entry);
+        }
+    }
+
+    /// Apply the ontology outcome rules to one graph's skill mirror.
+    ///
+    /// Returns true when a mirror existed and the graph changed.
+    fn apply_skill_outcome_to_graph(
+        &self,
+        graph: &mut MemoryGraph,
+        name: &str,
+        outcome: jcode_memory_types::actions::ActionOutcome,
+        evidence_ids: &[String],
+    ) -> bool {
+        use jcode_memory_types::actions::MemoryActionSpec;
+        use jcode_memory_types::ontology::Effect;
+        use jcode_memory_types::rule_engine::{
+            RuleContext, apply_entry_effects, dispatch_event,
+        };
+
+        let mirror_id = format!("skill:{name}");
+        let Some(mut mirror) = graph.get_memory(&mirror_id).cloned() else {
+            return false;
+        };
+        let implementation = mirror.artifact.as_ref().map(|artifact| artifact.path.clone());
+        // Stores author their own ontology snapshot. Add the action-outcome
+        // rules when an older snapshot predates them, so execution feedback
+        // works without forcing an ontology version bump or migration.
+        let mut ontology = (*self.ontology_for_graph(graph)).clone();
+        for rule in jcode_memory_types::ontology::skill_outcome_rules() {
+            if !ontology.rules.iter().any(|existing| existing.id == rule.id) {
+                ontology.rules.push(rule);
+            }
+        }
+        let ontology = std::sync::Arc::new(ontology);
+        let context = RuleContext {
+            entry: mirror.clone(),
+            type_id: "custom".to_string(),
+            existing_id: Some(mirror_id.clone()),
+            similarity: None,
+            graph: std::sync::Arc::new(graph.clone()),
+            ontology,
+            source_label: "skill_outcome".to_string(),
+            event: jcode_memory_types::ontology::EVENT_ACTION_OUTCOME.to_string(),
+            scope: String::new(),
+            action: Some(MemoryActionSpec::skill(
+                name,
+                implementation.as_deref(),
+            )),
+            outcome: Some(outcome),
+        };
+        let plan = dispatch_event(&context);
+        let deferred = apply_entry_effects(&plan, &mut mirror);
+
+        let resolved: Vec<String> = mirror
+            .artifact
+            .as_ref()
+            .map(|artifact| {
+                if evidence_ids.is_empty() {
+                    artifact.resolved_evidence.clone()
+                } else {
+                    evidence_ids.to_vec()
+                }
+            })
+            .unwrap_or_else(|| evidence_ids.to_vec());
+
+        graph.memories.insert(mirror_id, mirror);
+        for tag in ["skill-validated", "skill-invalidated"] {
+            if graph
+                .get_memory(&format!("skill:{name}"))
+                .is_some_and(|entry| entry.tags.iter().any(|existing| existing == tag))
+            {
+                graph.tag_memory(&format!("skill:{name}"), tag);
+            }
+        }
+
+        for effect in deferred {
+            let (delta, tag) = match effect {
+                Effect::ReinforceEvidence { amount } => (amount, "skill-validated"),
+                Effect::InvalidateEvidence { amount } => (-amount, "skill-invalidated"),
+                _ => continue,
+            };
+            for id in &resolved {
+                if let Some(evidence) = graph.get_memory_mut(id) {
+                    evidence.confidence = (evidence.confidence + delta).clamp(0.0, 1.0);
+                    if delta > 0.0 {
+                        evidence.strength = evidence.strength.saturating_add(1);
+                    }
+                    evidence.updated_at = chrono::Utc::now();
+                    evidence.refresh_search_text();
+                }
+                if graph.memories.contains_key(id) {
+                    graph.tag_memory(id, tag);
+                }
+            }
+        }
+
+        true
     }
 
     /// Aggregate evidence memories into skill proposals (memory -> skill).

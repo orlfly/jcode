@@ -44,6 +44,10 @@ pub struct RuleContext {
     /// Target storage scope for the write ("project" or "global").  Lets
     /// scope-gating rules fire only on global writes; empty means unknown.
     pub scope: String,
+    /// Action contract being executed, when the event is an action outcome.
+    pub action: Option<crate::actions::MemoryActionSpec>,
+    /// Result of the action, when the event is an action outcome.
+    pub outcome: Option<crate::actions::ActionOutcome>,
 }
 
 impl RuleContext {
@@ -78,6 +82,8 @@ impl RuleContext {
             source_label: "minimal".to_string(),
             event: event.into(),
             scope: String::new(),
+            action: None,
+            outcome: None,
         }
     }
 }
@@ -199,6 +205,10 @@ pub fn evaluate_condition(cond: &Condition, ctx: &RuleContext) -> bool {
             // added incrementally without breaking stored ontologies.
             _ => true,
         },
+        Condition::ActionOutcomeIs { values } => ctx
+            .outcome
+            .map(|outcome| values.iter().any(|value| value == outcome.as_str()))
+            .unwrap_or(false),
     }
 }
 
@@ -357,13 +367,26 @@ pub fn apply_entry_effects(plan: &RulePlan, entry: &mut MemoryEntry) -> Vec<Effe
             Effect::Touch => {
                 entry.touch();
             }
+            Effect::SetArtifactHealth { health } => {
+                if let Some(artifact) = entry.artifact.as_mut() {
+                    artifact.health = health.clone();
+                    artifact.synced_at = Some(chrono::Utc::now());
+                }
+            }
+            Effect::ReinforceEvidence { .. } | Effect::InvalidateEvidence { .. } => {
+                // Evidence lives on other nodes; the runtime applies these to
+                // the artifact's resolved evidence set.
+                deferred.push(effect.clone());
+            }
             Effect::Abort { .. } => {
                 // Abort is purely declarative; the runtime short-circuits on
                 // it before calling `apply_entry_effects`.
             }
         }
     }
-    entry.refresh_search_text();
+    if !crate::is_link_node(entry) {
+        entry.refresh_search_text();
+    }
     deferred
 }
 
@@ -516,6 +539,9 @@ fn effect_kind_name(e: &Effect) -> &'static str {
         Effect::Touch => "touch",
         Effect::Link { .. } => "link",
         Effect::Abort { .. } => "abort",
+        Effect::SetArtifactHealth { .. } => "set_artifact_health",
+        Effect::ReinforceEvidence { .. } => "reinforce_evidence",
+        Effect::InvalidateEvidence { .. } => "invalidate_evidence",
     }
 }
 
@@ -568,6 +594,9 @@ mod tests {
     use super::*;
     use crate::ontology::{EVENT_REMEMBER, TYPE_OBSERVATION, TYPE_PROCESS_RULE, default_ontology};
     use crate::{MemoryCategory, MemoryEntry, MemoryGraph};
+    use crate::ontology::{
+        EVENT_ACTION_OUTCOME, RULE_SKILL_INVALIDATED, RULE_SKILL_VALIDATED,
+    };
     use std::sync::Arc;
 
     fn ctx(event: &'static str, type_id: &'static str) -> RuleContext {
@@ -582,6 +611,8 @@ mod tests {
             source_label: "test".to_string(),
             event: event.to_string(),
             scope: String::new(),
+            action: None,
+            outcome: None,
         }
     }
 
@@ -629,5 +660,44 @@ mod tests {
         let kinds = declared_effect_kinds(&onto, EVENT_REMEMBER);
         assert!(kinds.contains(&"set_provenance"));
         assert!(kinds.contains(&"touch"));
+    }
+
+    #[test]
+    fn action_outcome_rules_validate_and_invalidate() {
+        let mut ctx = ctx(EVENT_ACTION_OUTCOME, "custom");
+        ctx.entry.artifact = Some(crate::ArtifactMetadata {
+            kind: "skill".to_string(),
+            health: "ok".to_string(),
+            ..Default::default()
+        });
+        ctx.action = Some(crate::actions::MemoryActionSpec::skill("probe", None));
+
+        ctx.outcome = Some(crate::actions::ActionOutcome::Succeeded);
+        let plan = dispatch_event(&ctx);
+        assert!(plan.applied_rules.iter().any(|rule| rule == RULE_SKILL_VALIDATED));
+        let mut entry = ctx.entry.clone();
+        let deferred = apply_entry_effects(&plan, &mut entry);
+        assert_eq!(entry.artifact.as_ref().unwrap().health, "ok");
+        assert!(entry.tags.iter().any(|tag| tag == "skill-validated"));
+        assert!(deferred.iter().any(|effect| matches!(
+            effect,
+            Effect::ReinforceEvidence { .. }
+        )));
+
+        ctx.outcome = Some(crate::actions::ActionOutcome::Failed);
+        let plan = dispatch_event(&ctx);
+        assert!(
+            plan.applied_rules
+                .iter()
+                .any(|rule| rule == RULE_SKILL_INVALIDATED)
+        );
+        let mut entry = ctx.entry.clone();
+        let deferred = apply_entry_effects(&plan, &mut entry);
+        assert_eq!(entry.artifact.as_ref().unwrap().health, "needs_review");
+        assert!(entry.tags.iter().any(|tag| tag == "skill-invalidated"));
+        assert!(deferred.iter().any(|effect| matches!(
+            effect,
+            Effect::InvalidateEvidence { .. }
+        )));
     }
 }

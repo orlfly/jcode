@@ -1761,6 +1761,71 @@ fn project_cross_store_mirror_for_global_skill_is_preserved() {
 }
 
 #[test]
+fn skill_outcome_validates_or_invalidates_evidence() {
+    use jcode_memory_types::actions::ActionOutcome;
+
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let manager = MemoryManager::new().with_project_dir(&project);
+        let evidence_id = "evidence-outcome";
+        manager
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "outcome evidence")
+                    .with_id(evidence_id),
+            )
+            .unwrap();
+
+        let skill_dir = project.join(".jcode").join("skills").join("outcome-probe");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: outcome-probe\ndescription: Outcome probe\nevidence:\n  - {evidence_id}\n---\n\nSteps.\n"
+            ),
+        )
+        .expect("write skill");
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+
+        let strength_before = manager
+            .load_project_graph()
+            .unwrap()
+            .get_memory(evidence_id)
+            .unwrap()
+            .strength;
+        manager
+            .record_skill_outcome("outcome-probe", ActionOutcome::Succeeded, &[])
+            .unwrap();
+        let graph = manager.load_project_graph().unwrap();
+        let mirror = graph.get_memory("skill:outcome-probe").unwrap();
+        assert_eq!(mirror.artifact.as_ref().unwrap().health, "ok");
+        assert!(mirror.tags.iter().any(|tag| tag == "skill-validated"));
+        assert!(
+            graph.get_memory(evidence_id).unwrap().strength > strength_before,
+            "successful execution must reinforce the evidence"
+        );
+        let invocation = graph.get_memory("skill-invocation:outcome-probe").unwrap();
+        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:succeeded"));
+
+        let confidence_before = graph.get_memory(evidence_id).unwrap().confidence;
+        manager
+            .record_skill_outcome("outcome-probe", ActionOutcome::Failed, &[])
+            .unwrap();
+        let graph = manager.load_project_graph().unwrap();
+        let mirror = graph.get_memory("skill:outcome-probe").unwrap();
+        assert_eq!(mirror.artifact.as_ref().unwrap().health, "needs_review");
+        assert!(mirror.tags.iter().any(|tag| tag == "skill-invalidated"));
+        assert!(
+            graph.get_memory(evidence_id).unwrap().confidence < confidence_before,
+            "failed execution must weaken the evidence"
+        );
+        let invocation = graph.get_memory("skill-invocation:outcome-probe").unwrap();
+        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:failed"));
+    });
+}
+
+#[test]
 fn skill_mirror_reconcile_removes_stale_evidence_edges() {
     with_temp_home(|home| {
         let project = home.join("workspace");

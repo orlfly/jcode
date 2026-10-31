@@ -1005,6 +1005,24 @@ pub fn record_skill_invocation(skill_name: &str, working_dir: Option<&std::path:
     let _ = manager.remember_skill_invocation(skill_name);
 }
 
+/// Record the final result of a skill run, feeding it back into memory.
+///
+/// Success reinforces the evidence that justified the skill and keeps the
+/// mirror healthy; failure or cancellation weakens the evidence and marks the
+/// mirror `needs_review` through the ontology's `event.action_outcome` rules.
+/// Best-effort: never let bookkeeping break the caller.
+pub fn record_skill_outcome(
+    skill_name: &str,
+    outcome: jcode_memory_types::ActionOutcome,
+    working_dir: Option<&std::path::Path>,
+) {
+    let manager = match working_dir {
+        Some(dir) => crate::memory::MemoryManager::new().with_project_dir(dir),
+        None => crate::memory::MemoryManager::new(),
+    };
+    let _ = manager.record_skill_outcome(skill_name, outcome, &[]);
+}
+
 /// Accept a skill proposal draft: copy it into the installed skills directory
 /// with its `evidence:` list intact, delete the draft, and record the
 /// `skill:<name> -derived_from-> mem_*` edges plus one skill-invocation row so

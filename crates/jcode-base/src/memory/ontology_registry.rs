@@ -191,6 +191,8 @@ impl OntologyRegistry {
             source_label: String::new(),
             event: event.into(),
             scope: String::new(),
+            action: None,
+            outcome: None,
         }
     }
 
@@ -310,6 +312,7 @@ fn condition_kind_name(c: &Condition) -> &'static str {
         Condition::ConfidenceAtLeast { .. } => "confidence_at_least",
         Condition::SimilarityAtLeast { .. } => "similarity_at_least",
         Condition::Custom { .. } => "custom",
+        Condition::ActionOutcomeIs { .. } => "action_outcome_is",
     }
 }
 
@@ -328,6 +331,9 @@ fn effect_kind_name(e: &Effect) -> &'static str {
         Effect::Touch => "touch",
         Effect::Link { .. } => "link",
         Effect::Abort { .. } => "abort",
+        Effect::SetArtifactHealth { .. } => "set_artifact_health",
+        Effect::ReinforceEvidence { .. } => "reinforce_evidence",
+        Effect::InvalidateEvidence { .. } => "invalidate_evidence",
     }
 }
 

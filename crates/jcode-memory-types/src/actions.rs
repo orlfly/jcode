@@ -25,6 +25,13 @@ pub enum MemoryRole {
 pub struct MemoryActionSpec {
     pub id: String,
     pub target: MemoryActionTarget,
+    /// Optional external artifact this action executes (a skill or goal).
+    ///
+    /// When present, the action contract and the artifact implementation are
+    /// two halves of one thing: the ontology owns preconditions/effects, the
+    /// SKILL.md owns the executable instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ActionArtifactBinding>,
     /// Human-readable preconditions checked before execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preconditions: Vec<String>,
@@ -47,6 +54,61 @@ pub enum MemoryActionTarget {
     Tag,
     Cluster,
     Graph,
+    /// An external executable artifact mirrored as a link node.
+    Artifact,
+}
+
+/// Binding from an ontology action to its external implementation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ActionArtifactBinding {
+    /// Artifact kind, currently `skill` or `goal`.
+    pub kind: String,
+    /// Artifact name, for example `optimization`.
+    pub name: String,
+    /// On-disk implementation path, when the artifact has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub implementation: String,
+    /// `pinned` keeps accepted evidence; `tracking` follows supersede chains.
+    #[serde(default = "default_evidence_policy")]
+    pub evidence_policy: String,
+}
+
+fn default_evidence_policy() -> String {
+    "tracking".to_string()
+}
+
+/// Result of executing an action or skill.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOutcome {
+    /// Invocation accepted, result not known yet.
+    #[default]
+    Started,
+    /// Completed and the procedure worked.
+    Succeeded,
+    /// Completed with an error or rejected result.
+    Failed,
+    /// Abandoned before completion.
+    Cancelled,
+}
+
+impl ActionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionOutcome::Started => "started",
+            ActionOutcome::Succeeded => "succeeded",
+            ActionOutcome::Failed => "failed",
+            ActionOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_success(self) -> bool {
+        matches!(self, ActionOutcome::Succeeded)
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(self, ActionOutcome::Failed | ActionOutcome::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -57,6 +119,14 @@ pub enum MemoryEffect {
     EndRelation { relation: String },
     ArchiveInstance,
     SupersedeInstance,
+    /// Record an invocation of the action's artifact.
+    RecordInvocation,
+    /// Strengthen the evidence memories that justify the artifact.
+    ReinforceEvidence { amount_basis_points: u32 },
+    /// Weaken or invalidate the evidence memories that justify the artifact.
+    InvalidateEvidence { amount_basis_points: u32 },
+    /// Set the artifact mirror's health (`ok`, `partial`, `needs_review`).
+    SetArtifactHealth { health: String },
 }
 
 impl MemoryActionSpec {
@@ -65,6 +135,7 @@ impl MemoryActionSpec {
         Self {
             id: "remember".to_string(),
             target: MemoryActionTarget::Memory,
+            artifact: None,
             preconditions: vec![
                 "max_5_tags".to_string(),
                 "correction_has_target_tag".to_string(),
@@ -83,6 +154,7 @@ impl MemoryActionSpec {
         Self {
             id: "link".to_string(),
             target: MemoryActionTarget::Link,
+            artifact: None,
             preconditions: vec!["source_exists".to_string(), "target_exists".to_string()],
             effects: vec![MemoryEffect::CreateRelation {
                 relation: "relates_to".to_string(),
@@ -97,6 +169,7 @@ impl MemoryActionSpec {
         Self {
             id: "forget".to_string(),
             target: MemoryActionTarget::Memory,
+            artifact: None,
             preconditions: vec!["instance_exists".to_string()],
             effects: vec![MemoryEffect::ArchiveInstance],
             allowed_roles: vec![MemoryRole::Agent, MemoryRole::User],
@@ -109,6 +182,7 @@ impl MemoryActionSpec {
         Self {
             id: "supersede".to_string(),
             target: MemoryActionTarget::Memory,
+            artifact: None,
             preconditions: vec![
                 "newer_instance_exists".to_string(),
                 "older_instance_exists".to_string(),
@@ -124,6 +198,7 @@ impl MemoryActionSpec {
         Self {
             id: "tag".to_string(),
             target: MemoryActionTarget::Tag,
+            artifact: None,
             preconditions: vec!["instance_exists".to_string()],
             effects: vec![MemoryEffect::SetProperty {
                 property: "tags".to_string(),
@@ -138,11 +213,45 @@ impl MemoryActionSpec {
         Self {
             id: "validate".to_string(),
             target: MemoryActionTarget::Graph,
+            artifact: None,
             preconditions: vec!["graph_loadable".to_string()],
             effects: vec![MemoryEffect::SetProperty {
                 property: "validity".to_string(),
             }],
             allowed_roles: vec![MemoryRole::Agent, MemoryRole::User, MemoryRole::System],
+            requires_confirmation: false,
+        }
+    }
+
+    /// Action contract for an installed skill.
+    ///
+    /// The skill file supplies the execution body; this spec supplies the
+    /// ontology-visible contract used for admission, invocation bookkeeping and
+    /// outcome feedback.
+    pub fn skill(name: &str, implementation: Option<&str>) -> Self {
+        Self {
+            id: format!("action:skill:{name}"),
+            target: MemoryActionTarget::Artifact,
+            artifact: Some(ActionArtifactBinding {
+                kind: "skill".to_string(),
+                name: name.to_string(),
+                implementation: implementation.unwrap_or_default().to_string(),
+                evidence_policy: default_evidence_policy(),
+            }),
+            preconditions: vec![
+                "artifact_installed".to_string(),
+                "artifact_evidence_admissible".to_string(),
+            ],
+            effects: vec![
+                MemoryEffect::RecordInvocation,
+                MemoryEffect::ReinforceEvidence {
+                    amount_basis_points: 500,
+                },
+                MemoryEffect::SetArtifactHealth {
+                    health: "ok".to_string(),
+                },
+            ],
+            allowed_roles: vec![MemoryRole::Agent, MemoryRole::User],
             requires_confirmation: false,
         }
     }
@@ -336,6 +445,22 @@ pub fn check_preconditions(
             "provenance_admissible" => {
                 // Checked at write time on the entry, not on the graph.
             }
+            "artifact_installed" => {
+                let id = target_id.or(source_id);
+                if id.is_none_or(|id| !graph.memories.contains_key(id)) {
+                    issues.push(format!("precondition failed: {pre}"));
+                }
+            }
+            "artifact_evidence_admissible" => {
+                let id = target_id.or(source_id);
+                let healthy = id
+                    .and_then(|id| graph.memories.get(id))
+                    .and_then(|entry| entry.artifact.as_ref())
+                    .is_none_or(|artifact| artifact.health != "needs_review");
+                if !healthy {
+                    issues.push(format!("precondition failed: {pre}"));
+                }
+            }
             _ => {}
         }
     }
@@ -474,5 +599,36 @@ mod tests {
         let action = MemoryActionSpec::forget();
         let err = check_preconditions(&graph, &action, Some("missing"), None).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn skill_action_binds_the_artifact_contract() {
+        let action = MemoryActionSpec::skill("optimization", Some("/tmp/skill/SKILL.md"));
+        assert_eq!(action.id, "action:skill:optimization");
+        assert_eq!(action.target, MemoryActionTarget::Artifact);
+        let artifact = action.artifact.as_ref().expect("artifact binding");
+        assert_eq!(artifact.kind, "skill");
+        assert_eq!(artifact.name, "optimization");
+        assert_eq!(artifact.evidence_policy, "tracking");
+        assert!(action
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, MemoryEffect::RecordInvocation)));
+    }
+
+    #[test]
+    fn skill_action_rejects_an_unhealthy_artifact() {
+        let mut graph = MemoryGraph::new();
+        let mut mirror = make_entry("Skill `/optimization`").with_id("skill:optimization");
+        mirror.artifact = Some(crate::ArtifactMetadata {
+            kind: "skill".to_string(),
+            health: "needs_review".to_string(),
+            ..Default::default()
+        });
+        graph.add_memory(mirror);
+        let action = MemoryActionSpec::skill("optimization", None);
+        let err = check_preconditions(&graph, &action, Some("skill:optimization"), None)
+            .expect_err("needs_review must block execution");
+        assert!(err.iter().any(|issue| issue.contains("artifact_evidence_admissible")));
     }
 }

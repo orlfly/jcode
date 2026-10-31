@@ -108,6 +108,10 @@ pub const RULE_CONTRADICT: &str = "rule.contradict";
 pub const RULE_TAG: &str = "rule.tag";
 pub const RULE_UNTAG: &str = "rule.untag";
 pub const RULE_LINK: &str = "rule.link";
+/// A successful action execution validates the knowledge behind it.
+pub const RULE_SKILL_VALIDATED: &str = "rule.skill.validated";
+/// A failed or cancelled action marks the knowledge for review.
+pub const RULE_SKILL_INVALIDATED: &str = "rule.skill.invalidated";
 
 pub const ACTIVITY_FINAL_EXTRACT: &str = "activity.final_extract";
 /// Synchronous write-time reconciliation (no LLM, no embedder).
@@ -129,6 +133,8 @@ pub const EVENT_LINK: &str = "event.link";
 pub const EVENT_TOPIC_CHANGE: &str = "event.topic_change";
 pub const EVENT_TURN_TICK: &str = "event.turn_tick";
 pub const EVENT_FINALIZE: &str = "event.finalize";
+/// An action/skill was invoked. Carries the execution outcome.
+pub const EVENT_ACTION_OUTCOME: &str = "event.action_outcome";
 
 // ---------------------------------------------------------------------------
 // Schema structures
@@ -681,6 +687,9 @@ pub enum Condition {
     /// runtime treats unknown expressions as `true` so it can be added
     /// incrementally.
     Custom { expression: String },
+    /// The action outcome equals one of the listed values
+    /// (`started`, `succeeded`, `failed`, `cancelled`).
+    ActionOutcomeIs { values: Vec<String> },
 }
 
 /// A single, ordered effect applied to a memory mutation.
@@ -723,6 +732,12 @@ pub enum Effect {
     },
     /// Touch the instance (updated_at = now, access_count++).
     Touch,
+    /// Set the artifact mirror's health.
+    SetArtifactHealth { health: String },
+    /// Reinforce the evidence memories behind an artifact by `amount`.
+    ReinforceEvidence { amount: f32 },
+    /// Invalidate the evidence memories behind an artifact by `amount`.
+    InvalidateEvidence { amount: f32 },
     /// Link two instances with a relationship.
     Link {
         other_id: String,
@@ -929,6 +944,43 @@ fn default_min_stores() -> usize {
 // ---------------------------------------------------------------------------
 // Built-in ontology
 // ---------------------------------------------------------------------------
+
+/// Rules that turn an action/skill outcome into knowledge feedback.
+///
+/// Exposed separately from [`default_ontology`] so a store carrying an older
+/// ontology snapshot can still receive the rules at runtime.
+pub fn skill_outcome_rules() -> Vec<Rule> {
+    vec![
+        Rule::new(RULE_SKILL_VALIDATED, EVENT_ACTION_OUTCOME)
+            .with_description(
+                "A successful action strengthens its evidence and keeps the artifact healthy.",
+            )
+            .with_condition(Condition::ActionOutcomeIs {
+                values: vec!["succeeded".to_string()],
+            })
+            .with_effect(Effect::SetArtifactHealth {
+                health: "ok".to_string(),
+            })
+            .with_effect(Effect::ReinforceEvidence { amount: 0.05 })
+            .with_effect(Effect::AddTag {
+                tag: "skill-validated".to_string(),
+            }),
+        Rule::new(RULE_SKILL_INVALIDATED, EVENT_ACTION_OUTCOME)
+            .with_description(
+                "A failed or cancelled action weakens its evidence and marks the artifact for review.",
+            )
+            .with_condition(Condition::ActionOutcomeIs {
+                values: vec!["failed".to_string(), "cancelled".to_string()],
+            })
+            .with_effect(Effect::SetArtifactHealth {
+                health: "needs_review".to_string(),
+            })
+            .with_effect(Effect::InvalidateEvidence { amount: 0.10 })
+            .with_effect(Effect::AddTag {
+                tag: "skill-invalidated".to_string(),
+            }),
+    ]
+}
 
 /// The default ontology installed at startup.  This captures the behavior
 /// that the existing hardcoded `MemoryCategory`/`MemoryStatus`/`EdgeKind`
@@ -1269,6 +1321,14 @@ pub fn default_ontology() -> Ontology {
         .with_rule(untag_rule)
         .with_rule(link_rule);
 
+    // Action feedback rules: the outcome of executing a skill validates or
+    // invalidates the knowledge that justified it. This is the "action
+    // verifies cognition" half of the unified model. Kept in a reusable
+    // function so older stores can receive the rules without a version bump.
+    for rule in skill_outcome_rules() {
+        onto = onto.with_rule(rule);
+    }
+
     // ---- Activities ------------------------------------------------------
     //
     // v2 keeps only activities the runtime actually schedules. v1 declared
@@ -1340,6 +1400,7 @@ pub fn default_event_names() -> Vec<&'static str> {
         EVENT_TOPIC_CHANGE,
         EVENT_TURN_TICK,
         EVENT_FINALIZE,
+        EVENT_ACTION_OUTCOME,
     ]
 }
 

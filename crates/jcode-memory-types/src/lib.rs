@@ -43,8 +43,9 @@ pub use activity::{ScheduleEvent, ScheduledActivity, describe_step, schedule, st
 
 pub mod actions;
 pub use actions::{
-    ChangeProposal, ConfirmationGate, MemoryActionSpec, MemoryActionTarget, MemoryEffect,
-    MemoryRole, check_preconditions, evaluate_gates, requires_confirmation,
+    ActionArtifactBinding, ActionOutcome, ChangeProposal, ConfirmationGate, MemoryActionSpec,
+    MemoryActionTarget, MemoryEffect, MemoryRole, check_preconditions, evaluate_gates,
+    requires_confirmation,
 };
 
 pub mod backend;
