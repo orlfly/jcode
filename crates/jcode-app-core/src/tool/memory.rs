@@ -635,13 +635,19 @@ impl Tool for MemoryTool {
                             &patch,
                             input.dry_run.unwrap_or(false),
                         )?;
+                        let reconciled = if report.dry_run {
+                            String::new()
+                        } else {
+                            reconcile_skill_links_after_ontology(ctx.working_dir.as_deref())
+                        };
                         Ok(ToolOutput::new(format!(
-                            "{} ontology: v{} -> v{} ({})\nmigrations: {}",
+                            "{} ontology: v{} -> v{} ({})\nmigrations: {}{}",
                             if report.dry_run { "Dry run" } else { "Applied" },
                             report.old_version,
                             report.new_version,
                             report.new_hash,
-                            serde_json::to_string(&report.migrations)?
+                            serde_json::to_string(&report.migrations)?,
+                            reconciled
                         )))
                     }
                     "history" => {
@@ -677,11 +683,14 @@ impl Tool for MemoryTool {
                             anyhow::anyhow!("ontology rollback requires `version`")
                         })?;
                         let snapshot = manager.rollback_ontology(scope, version)?;
+                        let reconciled =
+                            reconcile_skill_links_after_ontology(ctx.working_dir.as_deref());
                         Ok(ToolOutput::new(format!(
-                            "Restored {} ontology v{} ({})",
+                            "Restored {} ontology v{} ({}){}",
                             scope.label(),
                             snapshot.version,
-                            snapshot.hash
+                            snapshot.hash,
+                            reconciled
                         )))
                     }
                     other => Err(anyhow::anyhow!(
@@ -751,6 +760,24 @@ fn validate_custom_memory_id(id: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Ontology migrations can retype or archive the memories a skill cites as
+/// evidence. Re-run the reconciler so mirrors record the new resolved set and
+/// the next recall does not advertise a stale justification.
+fn reconcile_skill_links_after_ontology(working_dir: Option<&std::path::Path>) -> String {
+    let Ok(registry) = crate::skill::SkillRegistry::load_global() else {
+        return String::new();
+    };
+    let report = crate::skill::reconcile_skill_memory_links(&registry, working_dir);
+    format!(
+        "\nskill-memory reconcile: {} mirror(s), {} pruned, +{} edges, -{} edges, {} need review",
+        report.mirrored,
+        report.pruned,
+        report.edges_added,
+        report.edges_removed,
+        report.needs_review
+    )
 }
 
 #[cfg(test)]

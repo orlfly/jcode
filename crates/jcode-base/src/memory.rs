@@ -306,6 +306,12 @@ fn classify_graph(
         if !entry.active {
             continue;
         }
+        // Link nodes are indexes of external artifacts; their category is
+        // owned by the artifact subsystem and must not be inferred from the
+        // pointer text (`skill:` pointers often mention APIs or "must").
+        if jcode_memory_types::is_link_node(entry) {
+            continue;
+        }
         report.scanned += 1;
         if stamp_subject_keys
             && entry.subject_key.is_none()
@@ -828,6 +834,12 @@ impl MemoryManager {
     fn normalize_graph_search_text(graph: &mut MemoryGraph) -> bool {
         let mut changed = false;
         for memory in graph.memories.values_mut() {
+            // Link nodes keep the match text their owning subsystem built
+            // (a skill's full body, a goal's bounded summary). Recomputing it
+            // from the pointer would silently drop that signal.
+            if jcode_memory_types::is_link_node(memory) {
+                continue;
+            }
             let expected = normalize_memory_search_text(&memory.content, &memory.tags);
             if memory.search_text != expected {
                 memory.search_text = expected;
@@ -1098,6 +1110,7 @@ impl MemoryManager {
         let old_tags: std::collections::HashSet<String> =
             existing_snapshot.tags.iter().cloned().collect();
         let new_tags: std::collections::HashSet<String> = entry.tags.iter().cloned().collect();
+        let is_link_node = jcode_memory_types::is_link_node(&entry);
 
         for tag in old_tags.difference(&new_tags) {
             graph.untag_memory(&id, tag);
@@ -1117,8 +1130,18 @@ impl MemoryManager {
             existing.active = entry.active;
             existing.superseded_by = entry.superseded_by;
             existing.confidence = entry.confidence;
+            if is_link_node {
+                // The subsystem that owns the artifact is authoritative for
+                // its match text and versioned metadata.
+                existing.subject_key = entry.subject_key;
+                existing.search_text = entry.search_text;
+                existing.artifact = entry.artifact;
+            }
             if content_changed {
                 existing.set_embedding(None, None);
+            }
+            if !is_link_node && (content_changed || old_tags != new_tags) {
+                existing.refresh_search_text();
             }
         }
 

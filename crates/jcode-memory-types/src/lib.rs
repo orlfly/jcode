@@ -308,6 +308,47 @@ pub struct Reinforcement {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Metadata for a link node that mirrors an external artifact (goal, skill).
+///
+/// Skill mirrors are not ordinary knowledge instances, so they carry the
+/// versioned facts the reconciler needs to keep the artifact and the graph in
+/// sync: content hash, declared/resolved evidence, sync state and health.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactMetadata {
+    /// Artifact kind, currently `skill` or `goal`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// On-disk location of the artifact source, when it has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// Hash of the full artifact source (name + description + body + evidence).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_hash: String,
+    /// Hash of the description only, for cheap pointer drift checks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description_hash: String,
+    /// `pending`, `synced`, `failed` or `stale`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_state: String,
+    /// `ok`, `partial` or `needs_review`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
+    /// Ontology id/version the evidence set was resolved against.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ontology_id: String,
+    #[serde(default)]
+    pub ontology_version: u32,
+    /// Evidence ids declared by the artifact source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_evidence: Vec<String>,
+    /// Evidence ids that resolved to a live node in this store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_evidence: Vec<String>,
+    /// Last successful reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<DateTime<Utc>>,
+}
+
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -373,6 +414,9 @@ pub struct MemoryEntry {
     /// subject are about the same thing even when their wording differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_key: Option<String>,
+    /// Versioned metadata for external artifact link nodes (`goal:`/`skill:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactMetadata>,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -435,7 +479,14 @@ impl MemoryEntry {
             critical: false,
             identity: IdentityMetadata::empty(),
             subject_key: None,
+            artifact: None,
         }
+    }
+
+    /// Attach or replace artifact metadata (link nodes only).
+    pub fn with_artifact(mut self, artifact: ArtifactMetadata) -> Self {
+        self.artifact = Some(artifact);
+        self
     }
 
     pub fn refresh_search_text(&mut self) {

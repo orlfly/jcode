@@ -253,6 +253,18 @@ impl SkillTool {
             Ok(global_count) => {
                 let effective = self.effective_registry(working_dir).await;
                 let skills = effective.list();
+                // Reloading is the moment a newly installed or edited SKILL.md
+                // becomes visible; reconcile now instead of waiting for the
+                // next session finalize.
+                {
+                    let global_snapshot = self.registry.read().await.clone();
+                    let report =
+                        crate::skill::reconcile_skill_memory_links(&global_snapshot, working_dir);
+                    crate::logging::info(&format!(
+                        "Skill reload reconcile: {} mirror(s), {} pruned, +{} edges, -{} edges",
+                        report.mirrored, report.pruned, report.edges_added, report.edges_removed
+                    ));
+                }
                 let mut output = format!(
                     "Reloaded {} global skills ({} effective for this session)\n\n",
                     global_count,

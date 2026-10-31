@@ -324,7 +324,11 @@ impl MemoryGraph {
     /// Add a memory entry to the graph
     /// Also creates tag nodes and HasTag edges for any tags on the entry
     pub fn add_memory(&mut self, mut entry: MemoryEntry) -> String {
-        entry.refresh_search_text();
+        // Link nodes own a richer match text than their bounded pointer (for
+        // example a skill's full body). Only derive it for ordinary memories.
+        if !crate::is_link_node(&entry) {
+            entry.refresh_search_text();
+        }
         let id = entry.id.clone();
 
         // Create tag nodes and edges for existing tags
@@ -551,7 +555,9 @@ impl MemoryGraph {
         // Update memory's tags list
         if let Some(memory) = self.memories.get_mut(memory_id) {
             memory.tags.retain(|t| t != tag_name);
-            memory.refresh_search_text();
+            if !crate::is_link_node(memory) {
+                memory.refresh_search_text();
+            }
         }
     }
 

@@ -1053,6 +1053,11 @@ pub fn accept_skill_proposal(
         crate::memory::MemoryManager::new().with_project_dir(working_dir.unwrap())
     };
     let mem_ids = manager.record_accepted_skill(&skill.name, &skill.evidence);
+    // Enrich the just-written mirror with hashes, health and a pruned edge set.
+    // The accepted skill is on disk now, so loading the registry sees it.
+    if let Ok(registry) = SkillRegistry::load_global() {
+        let _ = reconcile_skill_memory_links(&registry, working_dir);
+    }
     let _ = std::fs::remove_file(proposal_path);
     Ok(AcceptedSkill {
         name: skill.name,
@@ -1070,121 +1075,328 @@ pub struct AcceptedSkill {
     pub evidence_linked: usize,
 }
 
-/// Mirror skills into the memory graph as `skill:<name>` link nodes.
-///
-/// This is the skill -> memory half of the v2 linkage. It replaces the old
-/// `Custom("Skills")` synthetic entries, which were only ever wired up in tests:
-/// `register_synthetic_entry_provider` had no production caller and the skill
-/// type had zero instances in the live store.
-///
-/// Scope is respected, because it decides who can see the skill:
-///
-/// * global skills (plugins, `~/.jcode/skills/`, `~/.agents/skills/`) become
-///   link nodes in the **global** store - they apply everywhere;
-/// * a workspace's project-local skills (`.jcode/skills/`, `.agents/skills/`,
-///   `.claude/skills/`) become link nodes in **that project's** store. A
-///   project-local procedure is only true for its workspace, so indexing it
-///   globally would surface one repository's procedure in every other one.
-///
-/// Best-effort and deliberately *not* called from `load_global` (which runs
-/// before the TUI's first frame): it does memory I/O, so callers should pick a
-/// non-latency-critical point such as session finalize.
-pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&Path>) -> usize {
-    let mut written = 0;
-    if !registry.skills.is_empty() {
-        let manager = crate::memory::MemoryManager::new();
-        for skill in registry.skills.values() {
-            if manager
-                .upsert_global_memory(skill.as_memory_entry())
-                .is_ok()
-            {
-                written += 1;
-            }
-        }
-        written += link_skill_evidence(&manager, true, registry.skills.values());
-    }
-    if let Some(dir) = working_dir
-        && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
-        && !local.skills.is_empty()
-    {
-        let manager = crate::memory::MemoryManager::new().with_project_dir(dir);
-        for skill in local.skills.values() {
-            if manager
-                .upsert_project_memory(skill.as_memory_entry())
-                .is_ok()
-            {
-                written += 1;
-            }
-        }
-        written += link_skill_evidence(&manager, false, local.skills.values());
-    }
-    written
+/// Result of one idempotent skill-memory reconciliation pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SkillMemoryReconcileReport {
+    /// Skill mirrors that were written or refreshed.
+    pub mirrored: usize,
+    /// Stale `skill:*` mirrors removed because the skill no longer exists.
+    pub pruned: usize,
+    /// Missing `derived_from` edges added.
+    pub edges_added: usize,
+    /// Outdated `derived_from` edges removed.
+    pub edges_removed: usize,
+    /// Mirrors whose declared evidence resolves to nothing in this store.
+    pub needs_review: usize,
 }
 
-/// Record `skill:<name> -derived_from-> mem_*` for a skill's `evidence:`
-/// frontmatter.
+/// Reconcile skill mirrors and their evidence edges against the current skill
+/// registry. Unlike the old additive sync, this pass is authoritative:
 ///
-/// This is the last step of the memory -> skill loop: a proposal's draft that
-/// gets accepted (copied into `skills/<name>/SKILL.md` with its `evidence:`
-/// list intact) becomes a skill whose graph node points back at the memories it
-/// came from. Evidence ids that are not in this store are skipped - an edge may
-/// only connect two nodes that exist.
+/// * every registered skill gets exactly one mirror per scope;
+/// * mirrors for skills that no longer exist are pruned;
+/// * `derived_from` edges are diffed against the frontmatter evidence list,
+///   so removed evidence entries also lose their edge;
+/// * evidence ids are resolved through `superseded_by` chains to the current
+///   live node when one exists;
+/// * each mirror records a content hash, sync state and health.
 ///
-/// Returns the number of new edges.
-fn link_skill_evidence<'a, I>(manager: &crate::memory::MemoryManager, global: bool, skills: I) -> usize
-where
-    I: Iterator<Item = &'a Skill>,
-{
-    let mut graph = if global {
-        manager.load_global_graph()
-    } else {
-        manager.load_project_graph()
-    };
-    let Ok(graph) = graph.as_mut() else {
-        return 0;
-    };
-    let mut linked = 0;
-    for skill in skills {
-        if skill.evidence.is_empty() {
-            continue;
-        }
-        let node = format!("skill:{}", skill.name);
-        if !graph.memories.contains_key(&node) {
-            continue;
-        }
-        for id in &skill.evidence {
-            if !graph.memories.contains_key(id) {
-                continue;
-            }
-            let already = graph
-                .get_edges(&node)
-                .iter()
-                .any(|edge| edge.target == *id && matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom));
-            if already {
-                continue;
-            }
-            graph.add_edge(&node, id, jcode_memory_types::EdgeKind::DerivedFrom);
-            linked += 1;
-        }
-        if linked > 0
-            && let Some(entry) = graph.get_memory_mut(&node)
+/// Scope is respected: global skills mirror into the global store, project
+/// skills into the workspace store. The pass is best-effort and idempotent, so
+/// callers can run it at finalize, after reloads, or during startup repair.
+pub fn reconcile_skill_memory_links(
+    registry: &SkillRegistry,
+    working_dir: Option<&Path>,
+) -> SkillMemoryReconcileReport {
+    let mut report = SkillMemoryReconcileReport::default();
+
+    let manager = crate::memory::MemoryManager::new();
+    if let Ok(mut graph) = manager.load_global_graph()
+        && reconcile_skill_graph(&mut graph, registry, None, &mut report)
+        && let Err(error) = manager.save_global_graph(&graph)
+    {
+        crate::logging::warn(&format!(
+            "global skill-memory reconcile save failed: {error}"
+        ));
+    }
+
+    if let Some(dir) = working_dir
+        && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
+    {
+        let manager = crate::memory::MemoryManager::new().with_project_dir(dir);
+        if let Ok(mut graph) = manager.load_project_graph()
+            // Global skills may already have a project mirror created when
+            // `record_accepted_skill` linked cross-store evidence. Refresh
+            // those, but never create new global mirrors in a project store.
+            && reconcile_skill_graph(&mut graph, &local, Some(registry), &mut report)
+            && let Err(error) = manager.save_project_graph(&graph)
         {
-            entry.updated_at = chrono::Utc::now();
+            crate::logging::warn(&format!(
+                "project skill-memory reconcile save failed: {error}"
+            ));
         }
     }
-    if linked == 0 {
-        return 0;
+
+    report
+}
+
+/// Backwards-compatible wrapper returning the mirrored count.
+pub fn sync_skill_memory_mirrors(registry: &SkillRegistry, working_dir: Option<&Path>) -> usize {
+    reconcile_skill_memory_links(registry, working_dir).mirrored
+}
+
+fn reconcile_skill_graph(
+    graph: &mut crate::memory_graph::MemoryGraph,
+    registry: &SkillRegistry,
+    existing_global: Option<&SkillRegistry>,
+    report: &mut SkillMemoryReconcileReport,
+) -> bool {
+    let mut changed = false;
+    let mut names = std::collections::HashSet::new();
+
+    let mut skills: Vec<&Skill> = registry.skills.values().collect();
+    if let Some(global) = existing_global {
+        for skill in global.skills.values() {
+            if !registry.skills.contains_key(&skill.name)
+                && graph
+                    .memories
+                    .contains_key(&format!("skill:{}", skill.name))
+            {
+                skills.push(skill);
+            }
+        }
     }
-    let saved = if global {
-        manager.save_global_graph(graph)
+
+    for skill in skills {
+        names.insert(skill.name.clone());
+        let artifact = build_artifact_metadata(graph, skill);
+        // Edges are the union of pinned provenance (declared ids that still
+        // exist, even if superseded) and the resolved live successors. The
+        // former keeps "why does this skill exist" auditable; the latter keeps
+        // tracking mode pointing at current knowledge.
+        let mut desired_edges = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in &artifact.declared_evidence {
+            if graph.memories.contains_key(id) && seen.insert(id.clone()) {
+                desired_edges.push(id.clone());
+            }
+        }
+        for id in &artifact.resolved_evidence {
+            if seen.insert(id.clone()) {
+                desired_edges.push(id.clone());
+            }
+        }
+        if upsert_skill_mirror(graph, skill, artifact) {
+            changed = true;
+        }
+        report.mirrored += 1;
+        if graph
+            .get_memory(&format!("skill:{}", skill.name))
+            .and_then(|entry| entry.artifact.as_ref())
+            .is_some_and(|artifact| artifact.health == "needs_review")
+        {
+            report.needs_review += 1;
+        }
+        let (added, removed) =
+            reconcile_evidence_edges(graph, &format!("skill:{}", skill.name), &desired_edges);
+        report.edges_added += added;
+        report.edges_removed += removed;
+        changed |= added > 0 || removed > 0;
+    }
+
+    // Prune mirrors whose skill is gone. Link nodes are exempt from TTL, so
+    // without this pass a deleted SKILL.md would stay recallable forever.
+    let stale: Vec<String> = graph
+        .memories
+        .keys()
+        .filter(|id| id.starts_with("skill:"))
+        .filter(|id| !names.contains(&id["skill:".len()..]))
+        .filter(|id| {
+            // A global skill's cross-store mirror is legitimate; keep it even
+            // though it is not in the local overlay.
+            existing_global.is_none_or(|global| !global.skills.contains_key(&id["skill:".len()..]))
+        })
+        .cloned()
+        .collect();
+    for id in stale {
+        if graph.remove_memory(&id).is_some() {
+            report.pruned += 1;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn build_artifact_metadata(
+    graph: &crate::memory_graph::MemoryGraph,
+    skill: &Skill,
+) -> jcode_memory_types::ArtifactMetadata {
+    let mut declared = Vec::new();
+    let mut declared_seen = std::collections::HashSet::new();
+    for id in &skill.evidence {
+        if declared_seen.insert(id.clone()) {
+            declared.push(id.clone());
+        }
+    }
+
+    let mut resolved = Vec::new();
+    let mut resolved_seen = std::collections::HashSet::new();
+    for id in &declared {
+        if let Some(live) = resolve_evidence_id(graph, id)
+            && resolved_seen.insert(live.clone())
+        {
+            resolved.push(live);
+        }
+    }
+
+    let health = if declared.is_empty() {
+        "ok"
+    } else if resolved.is_empty() {
+        "needs_review"
+    } else if resolved.len() < declared.len() {
+        "partial"
     } else {
-        manager.save_project_graph(graph)
+        "ok"
     };
-    if let Err(e) = saved {
-        crate::logging::warn(&format!("recording skill evidence edges failed: {e}"));
-        return 0;
+
+    let content_hash = sha256_hex(format!(
+        "{}\n{}\n{}\n{}",
+        skill.name,
+        skill.description,
+        skill.content,
+        declared.join("\n")
+    ));
+    let description_hash = sha256_hex(&skill.description);
+
+    jcode_memory_types::ArtifactMetadata {
+        kind: jcode_memory_types::ontology::LINK_SKILL.to_string(),
+        path: skill.path.display().to_string(),
+        content_hash,
+        description_hash,
+        sync_state: "synced".to_string(),
+        health: health.to_string(),
+        ontology_id: graph.metadata.ontology_id.clone(),
+        ontology_version: graph.metadata.ontology_version,
+        declared_evidence: declared,
+        resolved_evidence: resolved,
+        synced_at: Some(chrono::Utc::now()),
     }
-    linked
+}
+
+/// Follow `superseded_by` links until an active node is found.
+fn resolve_evidence_id(graph: &crate::memory_graph::MemoryGraph, id: &str) -> Option<String> {
+    let mut current = id.to_string();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..16 {
+        if !seen.insert(current.clone()) {
+            return None;
+        }
+        let entry = graph.get_memory(&current)?;
+        if entry.active {
+            return Some(current);
+        }
+        match entry.superseded_by.clone() {
+            Some(next) if !next.is_empty() => current = next,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn upsert_skill_mirror(
+    graph: &mut crate::memory_graph::MemoryGraph,
+    skill: &Skill,
+    mut artifact: jcode_memory_types::ArtifactMetadata,
+) -> bool {
+    let mut entry = skill
+        .as_memory_entry()
+        .with_artifact(artifact.clone());
+    entry.updated_at = chrono::Utc::now();
+    let id = entry.id.clone();
+    let new_tags = entry.tags.clone();
+
+    if let Some(existing) = graph.get_memory(&id) {
+        // Keep the previous timestamp when only `synced_at` would differ, so a
+        // stable skill set does not rewrite the store on every finalize.
+        if let Some(previous) = &existing.artifact {
+            let mut probe = artifact.clone();
+            probe.synced_at = previous.synced_at;
+            if probe == *previous {
+                artifact.synced_at = previous.synced_at;
+                entry.artifact = Some(artifact);
+            }
+        }
+        let changed = existing.content != entry.content
+            || existing.tags != entry.tags
+            || existing.artifact != entry.artifact
+            || existing.category != entry.category
+            || existing.subject_key != entry.subject_key
+            || existing.search_text != entry.search_text;
+        let next_updated_at = entry.updated_at;
+        let old_tags = existing.tags.clone();
+        if let Some(existing) = graph.get_memory_mut(&id) {
+            existing.category = entry.category;
+            existing.content = entry.content;
+            existing.tags = entry.tags;
+            if changed {
+                existing.updated_at = next_updated_at;
+            }
+            existing.source = entry.source;
+            existing.trust = entry.trust;
+            existing.subject_key = entry.subject_key;
+            existing.search_text = entry.search_text;
+            existing.artifact = entry.artifact;
+        }
+        for tag in old_tags.iter().filter(|tag| !new_tags.contains(tag)) {
+            graph.untag_memory(&id, tag);
+        }
+        for tag in new_tags.iter().filter(|tag| !old_tags.contains(tag)) {
+            graph.tag_memory(&id, tag);
+        }
+        changed
+    } else {
+        graph.add_memory(entry);
+        true
+    }
+}
+
+fn reconcile_evidence_edges(
+    graph: &mut crate::memory_graph::MemoryGraph,
+    node: &str,
+    desired: &[String],
+) -> (usize, usize) {
+    use jcode_memory_types::EdgeKind;
+    let desired_set: std::collections::HashSet<&str> = desired.iter().map(String::as_str).collect();
+    let current: Vec<String> = graph
+        .get_edges(node)
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::DerivedFrom))
+        .map(|edge| edge.target.clone())
+        .collect();
+    let current_set: std::collections::HashSet<&str> = current.iter().map(String::as_str).collect();
+
+    let mut removed = 0;
+    for target in &current {
+        if !desired_set.contains(target.as_str()) {
+            graph.remove_edge(node, target, &EdgeKind::DerivedFrom);
+            removed += 1;
+        }
+    }
+    let mut added = 0;
+    for target in desired {
+        if !current_set.contains(target.as_str()) {
+            graph.add_edge(node, target, EdgeKind::DerivedFrom);
+            added += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn sha256_hex(value: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_ref());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn build_skill_search_text(name: &str, description: &str, content: &str) -> String {

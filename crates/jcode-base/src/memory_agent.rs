@@ -146,11 +146,28 @@ fn run_finalize_maintenance(working_dir: Option<&str>) {
     // Refresh the `skill:<name>` link nodes so the graph indexes the skills that
     // actually exist on disk (v2 replacement for the never-wired synthetic
     // `Custom("Skills")` entries).
-    let skills = crate::skill::SkillRegistry::shared_snapshot();
-    let mirrored =
-        crate::skill::sync_skill_memory_mirrors(&skills, working_dir.map(std::path::Path::new));
-    if mirrored > 0 {
-        crate::logging::info(&format!("Mirrored {mirrored} skill link node(s)"));
+    // Read the skills that actually exist on disk. A stale shared snapshot
+    // would make the authoritative reconciler prune a mirror for a skill the
+    // user installed or accepted since the registry was last reloaded.
+    let skills = match crate::skill::SkillRegistry::load_global() {
+        Ok(registry) => registry,
+        Err(_) => (*crate::skill::SkillRegistry::shared_snapshot()).clone(),
+    };
+    let report =
+        crate::skill::reconcile_skill_memory_links(&skills, working_dir.map(std::path::Path::new));
+    if report.mirrored > 0
+        || report.pruned > 0
+        || report.edges_added > 0
+        || report.edges_removed > 0
+    {
+        crate::logging::info(&format!(
+            "Skill-memory reconcile: {} mirror(s), {} pruned, +{} edges, -{} edges, {} need review",
+            report.mirrored,
+            report.pruned,
+            report.edges_added,
+            report.edges_removed,
+            report.needs_review
+        ));
     }
 }
 

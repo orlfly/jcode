@@ -1672,6 +1672,266 @@ fn project_local_skill_mirrors_land_in_the_project_store() {
 }
 
 #[test]
+fn skill_mirror_reconcile_prunes_removed_skill() {
+    with_temp_home(|home| {
+        let skill_dir = home.join("skills").join("obsolete");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: obsolete\ndescription: Temporary skill\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, None);
+        assert!(
+            MemoryManager::new()
+                .load_global_graph()
+                .unwrap()
+                .memories
+                .contains_key("skill:obsolete")
+        );
+
+        fs::remove_dir_all(&skill_dir).expect("remove skill");
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        let report = crate::skill::reconcile_skill_memory_links(&registry, None);
+        assert_eq!(report.pruned, 1, "orphan mirror must be removed");
+        assert!(
+            !MemoryManager::new()
+                .load_global_graph()
+                .unwrap()
+                .memories
+                .contains_key("skill:obsolete"),
+            "deleted skill must not stay recallable"
+        );
+    });
+}
+
+#[test]
+fn project_cross_store_mirror_for_global_skill_is_preserved() {
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let manager = MemoryManager::new().with_project_dir(&project);
+        let evidence = manager
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "cross-store evidence")
+                    .with_id("evidence-cross"),
+            )
+            .unwrap();
+
+        let skill_dir = home.join("skills").join("global-cross");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: global-cross\ndescription: Global skill\n{evidence_tag}---\n\nSteps.\n",
+                evidence_tag = format!("evidence:\n  - {evidence}\n")
+            ),
+        )
+        .expect("write skill");
+
+        // The cross-store mirror is what `record_accepted_skill` creates when a
+        // global skill's evidence lives in a project store.
+        let mut mirror = MemoryEntry::new(MemoryCategory::Fact, "Skill `/global-cross`")
+            .with_id("skill:global-cross")
+            .with_source("skill_registry");
+        mirror.subject_key = Some("skill:global-cross".to_string());
+        manager.remember_project(mirror).unwrap();
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+
+        let graph = manager.load_project_graph().unwrap();
+        let mirror = graph
+            .get_memory("skill:global-cross")
+            .expect("cross-store mirror kept");
+        assert!(
+            mirror.artifact.is_some(),
+            "mirror enriched with artifact metadata"
+        );
+        let targets: Vec<&str> = graph
+            .get_edges("skill:global-cross")
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        assert_eq!(targets, vec![evidence.as_str()], "{targets:?}");
+    });
+}
+
+#[test]
+fn skill_mirror_reconcile_removes_stale_evidence_edges() {
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let manager = MemoryManager::new().with_project_dir(&project);
+        for (id, content) in [
+            ("evidence-a", "first procedure evidence"),
+            ("evidence-b", "second procedure evidence"),
+        ] {
+            manager
+                .remember_project(
+                    MemoryEntry::new(MemoryCategory::ProcessRule, content).with_id(id),
+                )
+                .unwrap();
+        }
+
+        let skill_dir = project.join(".jcode").join("skills").join("edge-diff");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        let write_skill = |evidence: &str| {
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: edge-diff\ndescription: Evidence diff\n{evidence}---\n\nSteps.\n"
+                ),
+            )
+            .expect("write skill");
+        };
+        write_skill("evidence:\n  - evidence-a\n  - evidence-b\n");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+        let graph = manager.load_project_graph().unwrap();
+        let targets: Vec<&str> = graph
+            .get_edges("skill:edge-diff")
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        assert!(targets.contains(&"evidence-a"));
+        assert!(targets.contains(&"evidence-b"));
+
+        write_skill("evidence:\n  - evidence-a\n");
+        let report = crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+        assert_eq!(
+            report.edges_removed, 1,
+            "removed evidence must lose its edge"
+        );
+        let graph = manager.load_project_graph().unwrap();
+        let targets: Vec<&str> = graph
+            .get_edges("skill:edge-diff")
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        assert_eq!(targets, vec!["evidence-a"], "{targets:?}");
+    });
+}
+
+#[test]
+fn skill_mirror_reconcile_follows_superseded_evidence() {
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let manager = MemoryManager::new().with_project_dir(&project);
+        manager
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "old procedure")
+                    .with_id("evidence-old"),
+            )
+            .unwrap();
+        manager
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "corrected procedure")
+                    .with_id("evidence-new"),
+            )
+            .unwrap();
+        let mut graph = manager.load_project_graph().unwrap();
+        graph.supersede("evidence-new", "evidence-old");
+        manager.save_project_graph(&graph).unwrap();
+
+        let skill_dir = project.join(".jcode").join("skills").join("supersede");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: supersede\ndescription: Follow corrections\nevidence:\n  - evidence-old\n---\n\nSteps.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+        let graph = manager.load_project_graph().unwrap();
+        let targets: Vec<&str> = graph
+            .get_edges("skill:supersede")
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        assert!(
+            targets.contains(&"evidence-old"),
+            "pinned provenance kept: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"evidence-new"),
+            "live successor linked: {targets:?}"
+        );
+        let artifact = graph
+            .get_memory("skill:supersede")
+            .and_then(|entry| entry.artifact.as_ref())
+            .expect("artifact metadata");
+        assert_eq!(artifact.resolved_evidence, vec!["evidence-new"]);
+        assert_eq!(artifact.health, "ok");
+    });
+}
+
+#[test]
+fn skill_mirror_records_artifact_metadata_and_body_search_text() {
+    with_temp_home(|home| {
+        let skill_dir = home.join("skills").join("metadata");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: metadata\ndescription: Metadata probe\n---\n\nunique-body-marker-xyz runs the probe.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, None);
+        let graph = MemoryManager::new().load_global_graph().unwrap();
+        let entry = graph.get_memory("skill:metadata").expect("mirror");
+        let artifact = entry.artifact.as_ref().expect("artifact metadata");
+        assert_eq!(artifact.kind, "skill");
+        assert_eq!(artifact.sync_state, "synced");
+        assert_eq!(artifact.health, "ok");
+        assert_eq!(artifact.content_hash.len(), 64);
+        assert_eq!(artifact.description_hash.len(), 64);
+        assert!(artifact.synced_at.is_some());
+        assert!(
+            entry.searchable_text().contains("unique body marker xyz"),
+            "full body must remain match text: {}",
+            entry.searchable_text()
+        );
+    });
+}
+
+#[test]
+fn reclassification_does_not_retype_skill_mirrors() {
+    with_temp_home(|home| {
+        let project = home.join("workspace");
+        fs::create_dir_all(&project).expect("mkdir");
+        let skill_dir = project.join(".jcode").join("skills").join("api-shape");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: api-shape\ndescription: Apply when working on api:/api/task/{param}\n---\n\nMust use the API shape.\n",
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project));
+        let manager = MemoryManager::new().with_project_dir(&project);
+        manager.reclassify_project_store(true).expect("reclassify");
+        let graph = manager.load_project_graph().unwrap();
+        assert_eq!(
+            graph.get_memory("skill:api-shape").unwrap().category,
+            MemoryCategory::Fact,
+            "link nodes must not be retyped from pointer text"
+        );
+    });
+}
+
+#[test]
 fn l1_hint_surface_a_matching_skill_mirror() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/l1-hint");
