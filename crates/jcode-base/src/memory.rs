@@ -2280,6 +2280,61 @@ impl MemoryManager {
         Ok(visited)
     }
 
+    /// Resolve declared evidence ids against every persisted store.
+    ///
+    /// A skill's `evidence:` list is global even when the memories it points at
+    /// live in different project stores. Resolving only against the store that
+    /// holds the mirror therefore reports a false `partial`/`needs_review` for
+    /// cross-store skills. This pass builds one state map over all graphs and
+    /// follows `superseded_by` chains to the live successor. It is read-only and
+    /// only called when the local/global graph cannot resolve a declaration.
+    pub fn resolve_evidence_across_stores(
+        &self,
+        ids: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut resolved = HashMap::new();
+        if ids.is_empty() {
+            return resolved;
+        }
+
+        // id -> (active_anywhere, superseded_by)
+        let mut states: HashMap<String, (bool, Option<String>)> = HashMap::new();
+        let _ = self.for_each_store(|_key, graph| {
+            for (id, entry) in &graph.memories {
+                let state = states.entry(id.clone()).or_insert((false, None));
+                state.0 |= entry.active;
+                if state.1.is_none() {
+                    state.1 = entry.superseded_by.clone();
+                }
+            }
+            false
+        });
+
+        for id in ids {
+            let mut current = id.clone();
+            let mut seen = HashSet::new();
+            for _ in 0..16 {
+                if !seen.insert(current.clone()) {
+                    break;
+                }
+                let Some((active, next)) = states.get(&current) else {
+                    break;
+                };
+                if *active {
+                    resolved.insert(id.clone(), current);
+                    break;
+                }
+                match next {
+                    Some(next) if !next.is_empty() => current = next.clone(),
+                    _ => break,
+                }
+            }
+        }
+        resolved
+    }
+
     /// Reclassify residual instances into the v2 type split.
     ///
     /// Everything written before v2 is `fact`, which the ontology aliases to

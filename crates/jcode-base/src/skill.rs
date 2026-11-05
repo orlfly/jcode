@@ -1266,24 +1266,56 @@ fn reconcile_skill_memory_links_inner(
     let mut report = SkillMemoryReconcileReport::default();
 
     let manager = crate::memory::MemoryManager::new();
-    if let Ok(mut graph) = manager.load_global_graph()
-        && reconcile_skill_graph(&mut graph, registry, None, &mut report)
-        && let Err(error) = manager.save_global_graph(&graph)
-    {
-        crate::logging::warn(&format!(
-            "global skill-memory reconcile save failed: {error}"
-        ));
+    let mut canonical_global = std::collections::HashMap::new();
+    if let Ok(mut graph) = manager.load_global_graph() {
+        // A global skill's evidence is global even when the memories live in
+        // project stores. Resolve only the ids the global graph cannot answer,
+        // so healthy all-local skills do not pay for a full-store scan.
+        let cross_store = cross_store_resolution(&manager, &graph, registry);
+        if reconcile_skill_graph(&mut graph, registry, None, &cross_store, None, &mut report)
+            && let Err(error) = manager.save_global_graph(&graph)
+        {
+            crate::logging::warn(&format!(
+                "global skill-memory reconcile save failed: {error}"
+            ));
+        }
+        canonical_global = graph
+            .memories
+            .iter()
+            .filter_map(|(id, entry)| {
+                id.strip_prefix("skill:").and_then(|name| {
+                    entry
+                        .artifact
+                        .as_ref()
+                        .map(|artifact| (name.to_string(), artifact.clone()))
+                })
+            })
+            .collect();
     }
 
     if let Some(dir) = working_dir
         && let Ok(local) = SkillRegistry::load_project_overlay(Some(dir))
     {
         let manager = crate::memory::MemoryManager::new().with_project_dir(dir);
+        // Project-local skills may also cite global evidence. Resolve those
+        // against the global graph only; another project's store must not leak
+        // into this workspace's skill health.
+        let global_resolution = manager
+            .load_global_graph()
+            .map(|global| resolve_skill_evidence_in_graph(&global, local.skills.values()))
+            .unwrap_or_default();
         if let Ok(mut graph) = manager.load_project_graph()
             // Global skills may already have a project mirror created when
             // `record_accepted_skill` linked cross-store evidence. Refresh
             // those, but never create new global mirrors in a project store.
-            && reconcile_skill_graph(&mut graph, &local, Some(registry), &mut report)
+            && reconcile_skill_graph(
+                &mut graph,
+                &local,
+                Some(registry),
+                &global_resolution,
+                Some(&canonical_global),
+                &mut report,
+            )
             && let Err(error) = manager.save_project_graph(&graph)
         {
             crate::logging::warn(&format!(
@@ -1304,6 +1336,10 @@ fn reconcile_skill_graph(
     graph: &mut crate::memory_graph::MemoryGraph,
     registry: &SkillRegistry,
     existing_global: Option<&SkillRegistry>,
+    cross_store: &std::collections::HashMap<String, String>,
+    canonical_global: Option<
+        &std::collections::HashMap<String, jcode_memory_types::ArtifactMetadata>,
+    >,
     report: &mut SkillMemoryReconcileReport,
 ) -> bool {
     let mut changed = false;
@@ -1324,7 +1360,19 @@ fn reconcile_skill_graph(
 
     for skill in skills {
         names.insert(skill.name.clone());
-        let artifact = build_artifact_metadata(graph, skill);
+        // A global skill's project mirror must report the artifact's real
+        // health, not this store's local slice of its evidence. Copy the
+        // canonical metadata computed by the global pass; `derived_from` edges
+        // below still only connect nodes that exist in this graph.
+        let is_global_skill =
+            existing_global.is_some() && !registry.skills.contains_key(&skill.name);
+        let artifact = if is_global_skill {
+            canonical_global
+                .and_then(|canonical| canonical.get(&skill.name).cloned())
+                .unwrap_or_else(|| build_artifact_metadata(graph, skill, cross_store))
+        } else {
+            build_artifact_metadata(graph, skill, cross_store)
+        };
         // Edges are the union of pinned provenance (declared ids that still
         // exist, even if superseded) and the resolved live successors. The
         // former keeps "why does this skill exist" auditable; the latter keeps
@@ -1337,7 +1385,7 @@ fn reconcile_skill_graph(
             }
         }
         for id in &artifact.resolved_evidence {
-            if seen.insert(id.clone()) {
+            if graph.memories.contains_key(id) && seen.insert(id.clone()) {
                 desired_edges.push(id.clone());
             }
         }
@@ -1386,6 +1434,7 @@ fn reconcile_skill_graph(
 fn build_artifact_metadata(
     graph: &crate::memory_graph::MemoryGraph,
     skill: &Skill,
+    cross_store: &std::collections::HashMap<String, String>,
 ) -> jcode_memory_types::ArtifactMetadata {
     let mut declared = Vec::new();
     let mut declared_seen = std::collections::HashSet::new();
@@ -1398,7 +1447,7 @@ fn build_artifact_metadata(
     let mut resolved = Vec::new();
     let mut resolved_seen = std::collections::HashSet::new();
     for id in &declared {
-        if let Some(live) = resolve_evidence_id(graph, id)
+        if let Some(live) = resolve_evidence_id(graph, id).or_else(|| cross_store.get(id).cloned())
             && resolved_seen.insert(live.clone())
         {
             resolved.push(live);
@@ -1437,6 +1486,43 @@ fn build_artifact_metadata(
         resolved_evidence: resolved,
         synced_at: Some(chrono::Utc::now()),
     }
+}
+
+/// Resolve only the declarations the given graph cannot answer itself.
+///
+/// This keeps the common all-local case cheap: an empty result means no
+/// full-store scan is needed.
+fn cross_store_resolution(
+    manager: &crate::memory::MemoryManager,
+    graph: &crate::memory_graph::MemoryGraph,
+    registry: &SkillRegistry,
+) -> std::collections::HashMap<String, String> {
+    let mut unresolved = Vec::new();
+    for skill in registry.skills.values() {
+        for id in &skill.evidence {
+            if resolve_evidence_id(graph, id).is_none() {
+                unresolved.push(id.clone());
+            }
+        }
+    }
+    unresolved.sort();
+    unresolved.dedup();
+    manager.resolve_evidence_across_stores(&unresolved)
+}
+
+fn resolve_skill_evidence_in_graph<'a>(
+    graph: &crate::memory_graph::MemoryGraph,
+    skills: impl Iterator<Item = &'a Skill>,
+) -> std::collections::HashMap<String, String> {
+    let mut resolved = std::collections::HashMap::new();
+    for skill in skills {
+        for id in &skill.evidence {
+            if let Some(live) = resolve_evidence_id(graph, id) {
+                resolved.insert(id.clone(), live);
+            }
+        }
+    }
+    resolved
 }
 
 /// Follow `superseded_by` links until an active node is found.

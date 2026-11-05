@@ -1807,10 +1807,12 @@ fn project_cross_store_mirror_for_global_skill_is_preserved() {
         let mirror = graph
             .get_memory("skill:global-cross")
             .expect("cross-store mirror kept");
-        assert!(
-            mirror.artifact.is_some(),
-            "mirror enriched with artifact metadata"
-        );
+        let artifact = mirror
+            .artifact
+            .as_ref()
+            .expect("mirror enriched with artifact metadata");
+        assert_eq!(artifact.health, "ok");
+        assert_eq!(artifact.resolved_evidence, vec![evidence.clone()]);
         let targets: Vec<&str> = graph
             .get_edges("skill:global-cross")
             .iter()
@@ -1818,6 +1820,96 @@ fn project_cross_store_mirror_for_global_skill_is_preserved() {
             .map(|edge| edge.target.as_str())
             .collect();
         assert_eq!(targets, vec![evidence.as_str()], "{targets:?}");
+
+        // The global mirror sees the same canonical health even though the
+        // evidence node lives only in the project store.
+        let global_graph = MemoryManager::new().load_global_graph().unwrap();
+        let global_artifact = global_graph
+            .get_memory("skill:global-cross")
+            .and_then(|entry| entry.artifact.as_ref())
+            .expect("global mirror metadata");
+        assert_eq!(global_artifact.health, "ok");
+        assert_eq!(global_artifact.resolved_evidence, vec![evidence]);
+    });
+}
+
+#[test]
+fn global_skill_resolves_evidence_from_multiple_project_stores() {
+    with_temp_home(|home| {
+        let project_a = home.join("workspace-a");
+        let project_b = home.join("workspace-b");
+        fs::create_dir_all(&project_a).expect("mkdir a");
+        fs::create_dir_all(&project_b).expect("mkdir b");
+
+        let manager_a = MemoryManager::new().with_project_dir(&project_a);
+        let manager_b = MemoryManager::new().with_project_dir(&project_b);
+        let evidence_a = manager_a
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "evidence in a")
+                    .with_id("evidence-a"),
+            )
+            .unwrap();
+        let evidence_b = manager_b
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::ProcessRule, "evidence in b")
+                    .with_id("evidence-b"),
+            )
+            .unwrap();
+
+        let skill_dir = home.join("skills").join("multi-store");
+        fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: multi-store\ndescription: Multi-store skill\nevidence:\n  - {evidence_a}\n  - {evidence_b}\n---\n\nSteps.\n"
+            ),
+        )
+        .expect("write skill");
+
+        // Only project A has a local mirror; its artifact must still report the
+        // canonical two-of-two health while its edges stay local.
+        let mut mirror = MemoryEntry::new(MemoryCategory::Fact, "Skill `/multi-store`")
+            .with_id("skill:multi-store")
+            .with_source("skill_registry");
+        mirror.subject_key = Some("skill:multi-store".to_string());
+        manager_a.remember_project(mirror).unwrap();
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        crate::skill::reconcile_skill_memory_links(&registry, Some(&project_a));
+
+        let global_artifact = MemoryManager::new()
+            .load_global_graph()
+            .unwrap()
+            .get_memory("skill:multi-store")
+            .and_then(|entry| entry.artifact.clone())
+            .expect("global artifact");
+        assert_eq!(global_artifact.health, "ok");
+        assert_eq!(
+            global_artifact.resolved_evidence,
+            vec![evidence_a.clone(), evidence_b.clone()]
+        );
+
+        let project_graph = manager_a.load_project_graph().unwrap();
+        let project_artifact = project_graph
+            .get_memory("skill:multi-store")
+            .and_then(|entry| entry.artifact.as_ref())
+            .expect("project artifact");
+        assert_eq!(project_artifact.health, "ok");
+        assert_eq!(
+            project_artifact.resolved_evidence,
+            vec![evidence_a.clone(), evidence_b]
+        );
+        let targets: Vec<&str> = project_graph
+            .get_edges("skill:multi-store")
+            .iter()
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::DerivedFrom))
+            .map(|edge| edge.target.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![evidence_a.as_str()],
+            "project mirror must not grow dangling cross-store edges: {targets:?}"
+        );
     });
 }
 

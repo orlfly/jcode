@@ -343,7 +343,10 @@ pub struct ArtifactMetadata {
     /// Evidence ids declared by the artifact source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_evidence: Vec<String>,
-    /// Evidence ids that resolved to a live node in this store.
+    /// Evidence ids that resolved to a live node in any accessible store.
+    ///
+    /// A skill's `evidence:` list is global, so this list is canonical even
+    /// when individual mirrors only have local `derived_from` edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolved_evidence: Vec<String>,
     /// Last successful reconciliation.
