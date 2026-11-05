@@ -43,6 +43,7 @@ mod model_selection;
 mod openai_ws_connect;
 use openai_ws_connect::connect_ws;
 mod native_compaction;
+mod openai_retry_diagnostics;
 mod openai_stream_cancellation;
 mod openai_stream_diagnostics;
 
@@ -1549,9 +1550,9 @@ mod stream;
 use self::openai_stream_runtime::try_persistent_ws_continuation;
 use self::openai_stream_runtime::{PersistentWsResult, is_retryable_error, openai_access_token};
 
-use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 #[cfg(test)]
-use self::stream::{handle_openai_output_item, parse_text_wrapped_tool_call};
+use self::stream::handle_openai_output_item;
+use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 
 mod chatgpt_web;
 mod native_web_search;

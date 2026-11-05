@@ -835,12 +835,35 @@ fn lane_titles_spans(lane_todos: &[&crate::todo::TodoItem], width: usize) -> Vec
     super::truncate_line_with_ellipsis_to_width(&Line::from(spans), width).spans
 }
 
-/// Render todos that declare stages, one row per lane:
-/// `●●○  parser 🦊  Extract lexer, Update callers, Add tests`.
-/// The status strip leads, so the left edge reads as a block of progress;
-/// then the group name; then the titles. Phases are labelled on the header
-/// row, so the body has no heading rows. Every phase is listed: finished and
-/// active phases in their phase colour, phases not yet started dimmed.
+/// Count satisfied explicit lane prerequisites. Missing IDs remain unsatisfied.
+fn lane_prerequisite_progress(
+    items: &[&crate::todo::TodoItem],
+    todos: &[&crate::todo::TodoItem],
+) -> Option<(usize, usize)> {
+    let mut ids = std::collections::HashSet::new();
+    let mut explicit = false;
+    for item in items {
+        if let Some(after) = &item.lane_after {
+            explicit = true;
+            ids.extend(after.iter().map(String::as_str));
+        }
+    }
+    explicit.then(|| {
+        let complete = ids
+            .iter()
+            .filter(|id| {
+                todos
+                    .iter()
+                    .any(|todo| todo.id == **id && todo.status == "completed")
+            })
+            .count();
+        (complete, ids.len())
+    })
+}
+
+/// Render staged todos with a bounded row per lane and optional prerequisite
+/// progress. Later lanes retain phase dimming unless explicit prerequisites
+/// replace that barrier and have been satisfied.
 pub(crate) fn push_stage_lines(
     lines: &mut Vec<Line<'static>>,
     todos: &[&crate::todo::TodoItem],
@@ -887,8 +910,33 @@ pub(crate) fn push_stage_lines(
     for (phase, lane) in lanes {
         // A lane wears its phase's colour: bold while its phase is active,
         // dimmed (with its titles and dots) while the phase has not started.
-        let later = current.is_some_and(|current| phase > current);
         let items = items_of(lane);
+        let prerequisites = lane_prerequisite_progress(&items, todos);
+        let later = prerequisites.map_or_else(
+            || current.is_some_and(|current| phase > current),
+            |(complete, total)| complete < total,
+        );
+        // Explicit prerequisites replace the phase barrier. Keep a ready
+        // later-phase lane bright even while unrelated earlier work runs.
+        let lane_style = if prerequisites.is_some() && !later && items.iter().any(|t| !is_done(t)) {
+            Style::default()
+                .fg(asap_color())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            phase_style(phase, current)
+        };
+        if let Some((complete, total)) = prerequisites {
+            let state = if complete == total { "met" } else { "waiting" };
+            let name = lane
+                .group
+                .as_deref()
+                .unwrap_or_else(|| items[0].id.as_str());
+            let note = Span::styled(
+                format!("  {name}: after {complete}/{total} · {state}"),
+                Style::default().fg(todo_meta_color()),
+            );
+            lines.push(todo_card_line(vec![note], base_indent, inner_width));
+        }
         // Expand a waiting lane so its dependency progress belongs to the
         // corresponding todo rather than an ambiguous lane-wide status dot.
         if items.iter().any(|todo| {
@@ -935,12 +983,7 @@ pub(crate) fn push_stage_lines(
                 let pad = padding.content.width().saturating_sub(1);
                 padding.content = " ".repeat(pad).into();
             }
-            let name = lane_name_spans(
-                lane.group.as_deref(),
-                phase_style(phase, current),
-                &items,
-                agents,
-            );
+            let name = lane_name_spans(lane.group.as_deref(), lane_style, &items, agents);
             let name = super::truncate_line_with_ellipsis_to_width(&Line::from(name), worker_width);
             let name_padding = worker_width.saturating_sub(name.width());
             row.extend(name.spans);
@@ -976,12 +1019,7 @@ pub(crate) fn push_stage_lines(
         }
         let mut row = lane_strip_spans(&statuses, strip_width);
         if name_width > 0 {
-            let name = lane_name_spans(
-                lane.group.as_deref(),
-                phase_style(phase, current),
-                &items,
-                agents,
-            );
+            let name = lane_name_spans(lane.group.as_deref(), lane_style, &items, agents);
             let name =
                 super::truncate_line_with_ellipsis_to_width(&Line::from(name), name_width).spans;
             let pad = name_width.saturating_sub(width_of(&name)) + 2;
@@ -1111,96 +1149,10 @@ fn dim_span(span: Span<'static>) -> Span<'static> {
     Span::styled(span.content, style)
 }
 
-/// One todo row for a list without stages, with an optional agent chip.
-///
-/// Width priority when space runs out: the activity note shrinks first, then
-/// the task text; the status glyph and agent emoji always stay visible.
-pub(crate) fn render_todo_item_line(
-    todo: &crate::todo::TodoItem,
-    agents: &[TodoCardAgent],
-    base_indent: &str,
-    inner_width: usize,
-) -> Line<'static> {
-    if crate::todo::todo_completely_blocked(todo)
-        || todo.status != "in_progress"
-        || todo
-            .group
-            .as_deref()
-            .is_some_and(|group| !group.trim().is_empty())
-    {
-        return render_todo_card_item_line(todo, base_indent, inner_width);
-    }
-    let Some(assigned) = todo
-        .assigned_to
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return render_todo_card_item_line(todo, base_indent, inner_width);
-    };
-    // Agent rows drop the confidence suffix: the agent state is the more
-    // useful signal in a width-constrained row.
-    let mut spans = todo_card_item_spans(todo, false);
-    let agent = agents.iter().find(|agent| agent.matches(assigned));
-    let owner = if assigned == "@self" {
-        Span::styled("you", Style::default().fg(rgb(255, 200, 100)))
-    } else {
-        Span::raw(
-            agent
-                .map(TodoCardAgent::icon)
-                .unwrap_or_else(|| fallback_icon(assigned)),
-        )
-    };
-    let mut chip = vec![Span::raw("  "), owner];
-    let mut note = String::new();
-    if let Some(agent) = agent {
-        if let Some((mark, color)) = agent_state_mark(&agent.status) {
-            chip.push(Span::styled(mark, Style::default().fg(color)));
-        }
-        if todo.status != "completed" && agent.live_status.is_none() {
-            note = agent_note(agent, &[todo]);
-        }
-    }
-    let chip_width = width_of(&chip);
-    let head_width = width_of(&spans);
-    if head_width + chip_width > inner_width {
-        // Shrink the task text (last span) so the emoji chip still fits.
-        let fixed: usize = width_of(&spans[..spans.len().saturating_sub(1)]);
-        let keep = inner_width.saturating_sub(fixed + chip_width + 1);
-        if let Some(content) = spans.last_mut() {
-            let truncated = truncate_to_width(&content.content, keep);
-            content.content = format!("{truncated}…").into();
-        }
-    } else if !note.is_empty() {
-        let room = inner_width.saturating_sub(head_width + chip_width + 1);
-        if room >= 4 {
-            let shown = if note.width() > room {
-                format!("{}…", truncate_to_width(&note, room - 1))
-            } else {
-                note
-            };
-            chip.push(Span::styled(
-                format!(" {shown}"),
-                Style::default().fg(todo_meta_color()),
-            ));
-        }
-    }
-    spans.extend(chip);
-    todo_card_line(spans, base_indent, inner_width)
-}
-
-fn truncate_to_width(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut width = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + w > max {
-            break;
-        }
-        width += w;
-        out.push(ch);
-    }
-    out
-}
+#[path = "ui_todo_stages/item_rows.rs"]
+mod item_rows;
+pub(crate) use item_rows::render_todo_item_line;
+use item_rows::truncate_to_width;
 
 #[cfg(test)]
 #[path = "ui_todo_stages_tests.rs"]

@@ -22,3 +22,4 @@ captures/
 /*.mp4
 /*.png
 /deb-verify/
+ios/build/

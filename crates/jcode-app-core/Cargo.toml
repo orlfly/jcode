@@ -35,6 +35,7 @@ futures-util = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.8"
 
 # CLI
 

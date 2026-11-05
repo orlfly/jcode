@@ -1,6 +1,8 @@
 use super::*;
 use crate::todo::TodoItem;
 
+#[path = "ui_todo_stages_tests/layout_and_prerequisites.rs"]
+mod layout_and_prerequisites;
 #[test]
 fn self_owned_todos_have_amber_pips_and_you_badges() {
     let local = assigned(todo("local", "Local task", "in_progress", Some(1)), "@self");

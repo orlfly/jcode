@@ -24,8 +24,11 @@ mod reconnect;
 mod server_event_handlers;
 mod server_events;
 mod session_persistence;
+mod ssh_host;
+pub(super) mod ssh_sessions;
 mod swarm_plan_core;
 mod swarm_status_core;
+pub(super) mod turn_identity;
 mod workspace;
 
 #[cfg(test)]
@@ -124,6 +127,14 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw |= app.retire_expired_status_notice();
     needs_redraw |= app.poll_usage_reset();
     needs_redraw |= app.poll_cloud_job();
+    if app.take_cloud_remote_interrupt() {
+        if let Err(error) = remote.cancel_with_reason("cloud_handoff_ready").await {
+            crate::logging::warn(&format!(
+                "Failed to interrupt turn for cloud handoff: {error}"
+            ));
+        }
+        needs_redraw = true;
+    }
     if let Some((provider, account)) = app.usage_reset.invalidate_account.take() {
         let sent = match provider {
             super::usage_reset::Provider::OpenAi => remote.invalidate_openai_usage(account).await,
@@ -198,9 +209,22 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         && app.stream_buffer.is_empty()
         && let Some(id) = app.deferred_stream_done_id.take()
     {
-        needs_redraw |= app.handle_server_event(crate::protocol::ServerEvent::Done { id }, remote);
+        let event = crate::protocol::ServerEvent::Done { id };
+        let event = match app.deferred_stream_done_identity.clone() {
+            Some(identity) => crate::protocol::ServerEvent::TurnEvent {
+                identity,
+                event: Box::new(event),
+            },
+            None => event,
+        };
+        needs_redraw |= app.handle_server_event(event, remote);
     }
 
+    if app.remote_todos_refresh_due()
+        && let Err(error) = remote.request_todos().await
+    {
+        crate::logging::warn(&format!("Remote todo refresh failed: {error}"));
+    }
     needs_redraw |= app.refresh_todos_view_if_needed();
     needs_redraw |= app.refresh_todo_card_if_needed();
     needs_redraw |= app.refresh_completed_todo_report(false);
@@ -355,6 +379,14 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             return true;
         }
     }
+
+    if app
+        .remote_queue_retry_not_before
+        .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        return needs_redraw;
+    }
+    app.remote_queue_retry_not_before = None;
 
     // Esc redirect hold. On timeout this arms pending_queued_dispatch, which
     // the next check hands to the normal follow-up path.
@@ -583,66 +615,19 @@ async fn apply_terminal_event<B: Backend>(
                     }
                 }
                 if let Some(selection) = app.pending_account_picker_action.take() {
-                    match selection {
-                        crate::tui::AccountPickerAction::Switch { provider_id, label } => {
-                            match provider_id.as_str() {
-                                "claude" => {
-                                    if let Err(e) = crate::auth::claude::set_active_account(&label)
-                                    {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.set_context_limit_and_sync_budget(
-                                            app.provider.context_window(),
-                                        );
-                                        let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(
-                                            crate::tui::app::helpers::account_switch_notice(
-                                                "Anthropic",
-                                                &label,
-                                            ),
-                                        ));
-                                        app.set_status_notice(format!(
-                                            "Account: switched to {}",
-                                            label
-                                        ));
-                                    }
-                                }
-                                "openai" => {
-                                    if let Err(e) = crate::auth::codex::set_active_account(&label) {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch OpenAI account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.set_context_limit_and_sync_budget(
-                                            app.provider.context_window(),
-                                        );
-                                        let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(
-                                            crate::tui::app::helpers::account_switch_notice(
-                                                "OpenAI", &label,
-                                            ),
-                                        ));
-                                        app.set_status_notice(format!(
-                                            "OpenAI account: switched to {}",
-                                            label
-                                        ));
-                                    }
-                                }
-                                _ => app.push_display_message(DisplayMessage::error(format!(
-                                    "Provider `{}` does not support account switching.",
-                                    provider_id
-                                ))),
-                            }
+                    if let crate::tui::AccountPickerAction::Switch { provider_id, label } =
+                        selection
+                    {
+                        let command = super::auth::AccountCommand::Switch { provider_id, label };
+                        if let Err(error) =
+                            super::auth::execute_account_command_remote(app, command, remote).await
+                        {
+                            app.push_display_message(DisplayMessage::error(format!(
+                                "Failed to request remote account switch: {error}"
+                            )));
                         }
-                        crate::tui::AccountPickerAction::Add { .. }
-                        | crate::tui::AccountPickerAction::Replace { .. }
-                        | crate::tui::AccountPickerAction::OpenCenter { .. } => {}
+                    } else {
+                        app.remote_account_management_notice();
                     }
                 }
             }
@@ -1067,7 +1052,11 @@ pub(super) async fn handle_remote_event<B: Backend>(
             Ok((RemoteEventOutcome::Continue, needs_redraw))
         }
         RemoteRead::Event(server_event) => {
+            if ssh_sessions::handle_event(app, remote, &server_event).await? {
+                return Ok((RemoteEventOutcome::Continue, true));
+            }
             let needs_redraw = handle_server_event(app, server_event, remote);
+            ssh_sessions::after_event(app, remote).await?;
             process_remote_followups(app, remote).await;
             Ok((RemoteEventOutcome::Continue, needs_redraw))
         }
@@ -1380,6 +1369,13 @@ async fn dispatch_pending_server_reload(app: &mut App, remote: &mut RemoteConnec
 }
 
 pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteConnection) {
+    if app
+        .remote_queue_retry_not_before
+        .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        return;
+    }
+    app.remote_queue_retry_not_before = None;
     if app.prepare_cloud_environment(remote).await.is_err() {
         app.revoke_cloud_environment();
         return;
@@ -1948,6 +1944,12 @@ async fn handle_debug_command(app: &mut App, cmd: &str, remote: &mut RemoteConne
     if cmd == "state" {
         return serde_json::json!({
             "processing": app.is_processing,
+            "processing_status": format!("{:?}", app.status),
+            "current_message_id": app.current_message_id,
+            "pending_soft_interrupts": app.pending_soft_interrupts.len(),
+            "pending_soft_interrupt_requests": app.pending_soft_interrupt_requests.len(),
+            "pending_queued_dispatch": app.pending_queued_dispatch,
+            "remote_session_id": app.remote_session_id,
             "messages": app.messages.len(),
             "display_messages": app.display_messages.len(),
             "input": app.input,
@@ -2053,6 +2055,9 @@ fn queue_message_for_reconnect(app: &mut App) {
 
     let prepared = input::take_prepared_input(app);
     app.queued_messages.push(prepared.expanded);
+    if crate::tui::is_ssh_remote() {
+        crate::tui::request_immediate_ssh_reconnect();
+    }
 
     let queued_count = app.queued_messages.len();
     app.set_status_notice(format!(
@@ -2095,6 +2100,10 @@ fn handle_disconnected_key_internal(
     }
 
     if input::handle_scroll_overlay_key(app, code)? {
+        return Ok(());
+    }
+
+    if input::handle_account_shortcut(app, code, modifiers) {
         return Ok(());
     }
 
