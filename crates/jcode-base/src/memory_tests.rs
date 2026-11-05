@@ -116,12 +116,27 @@ fn pending_memory_freshness_and_clear() {
         PendingMemory {
             prompt: "stale".to_string(),
             display_prompt: None,
-            computed_at: Instant::now() - Duration::from_secs(121),
+            computed_at: Instant::now() - Duration::from_secs(16 * 60),
             count: 1,
             memory_ids: Vec::new(),
         },
     );
     assert!(take_pending_memory(sid).is_none());
+
+    insert_pending_memory_for_test(
+        sid,
+        PendingMemory {
+            prompt: "slow judge".to_string(),
+            display_prompt: None,
+            computed_at: Instant::now() - Duration::from_secs(14 * 60),
+            count: 1,
+            memory_ids: Vec::new(),
+        },
+    );
+    assert!(
+        take_pending_memory(sid).is_some(),
+        "a 14-minute-old payload must survive a slow judge/tool run"
+    );
 }
 
 #[test]
@@ -2640,6 +2655,49 @@ fn retrieval_writeback_counts_access_on_injection() {
 }
 
 #[test]
+fn retrieval_candidates_are_counted_without_touching_access() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new();
+        let entry = MemoryEntry::new(MemoryCategory::Contract, "POST /api/count writes a row");
+        let id = manager.remember_global(entry).unwrap();
+
+        manager
+            .record_retrieval_candidates(&[id.clone(), id.clone()])
+            .unwrap();
+        let graph = manager.load_global_graph().unwrap();
+        let selected = graph.get_memory(&id).unwrap();
+        assert_eq!(
+            selected.metrics.retrieval_count, 1,
+            "one event, not one per list entry"
+        );
+        assert!(selected.metrics.last_retrieved_at.is_some());
+        assert_eq!(selected.metrics.injection_count, 0);
+        assert_eq!(
+            selected.access_count, 0,
+            "selection must not refresh TTL or recency"
+        );
+
+        manager.record_retrievals(&[id.clone()]).unwrap();
+        let graph = manager.load_global_graph().unwrap();
+        let injected = graph.get_memory(&id).unwrap();
+        assert_eq!(injected.metrics.injection_count, 1);
+        assert!(injected.metrics.last_injected_at.is_some());
+        assert_eq!(injected.access_count, 1, "real injection still touches");
+    });
+}
+
+#[test]
+fn outcomes_are_attributed_per_memory() {
+    let mut entry = MemoryEntry::new(MemoryCategory::ProcessRule, "run the formatter");
+    entry.record_outcome(true);
+    entry.record_outcome(true);
+    entry.record_outcome(false);
+    assert_eq!(entry.metrics.outcome_successes, 2);
+    assert_eq!(entry.metrics.outcome_failures, 1);
+    assert_eq!(entry.access_count, 0, "outcome attribution is not a touch");
+}
+
+#[test]
 fn v2_categories_are_real_variants_and_round_trip_lowercase() {
     for (text, expected) in [
         ("env_fact", MemoryCategory::EnvFact),
@@ -2812,7 +2870,7 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
             .unwrap();
 
         let base = manager.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(base.types["env_fact"].ttl_days, Some(30.0));
+        assert_eq!(base.types["env_fact"].ttl_days, Some(14.0));
 
         let patch = OntologyPatch {
             base_id: base.id.clone(),
@@ -2868,7 +2926,7 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
             .expect("rollback");
         assert_eq!(snapshot.version, base.version);
         let restored = other.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(restored.types["env_fact"].ttl_days, Some(30.0));
+        assert_eq!(restored.types["env_fact"].ttl_days, Some(14.0));
         assert_eq!(
             other
                 .load_project_graph()

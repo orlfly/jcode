@@ -354,6 +354,44 @@ pub struct ArtifactMetadata {
     pub synced_at: Option<DateTime<Utc>>,
 }
 
+/// Retrieval, injection and outcome counters for one memory instance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryMetrics {
+    /// Times this memory was selected as a retrieval candidate.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_count: u32,
+    /// Times this memory was actually injected into a model context.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub injection_count: u32,
+    /// Last time this memory was selected as a retrieval candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_retrieved_at: Option<DateTime<Utc>>,
+    /// Last time this memory was actually injected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_injected_at: Option<DateTime<Utc>>,
+    /// Successful downstream outcomes attributed to this memory.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub outcome_successes: u32,
+    /// Failed or cancelled downstream outcomes attributed to this memory.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub outcome_failures: u32,
+}
+
+impl MemoryMetrics {
+    pub fn is_empty(&self) -> bool {
+        self.retrieval_count == 0
+            && self.injection_count == 0
+            && self.last_retrieved_at.is_none()
+            && self.last_injected_at.is_none()
+            && self.outcome_successes == 0
+            && self.outcome_failures == 0
+    }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -422,6 +460,10 @@ pub struct MemoryEntry {
     /// Versioned metadata for external artifact link nodes (`goal:`/`skill:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactMetadata>,
+    /// Retrieval, injection and outcome counters. Kept separate from
+    /// `access_count`, which also counts write-time touches.
+    #[serde(default, skip_serializing_if = "MemoryMetrics::is_empty")]
+    pub metrics: MemoryMetrics,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -485,6 +527,7 @@ impl MemoryEntry {
             identity: IdentityMetadata::empty(),
             subject_key: None,
             artifact: None,
+            metrics: MemoryMetrics::default(),
         }
     }
 
@@ -644,6 +687,31 @@ impl MemoryEntry {
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
         self.access_count += 1;
+    }
+
+    /// Record that this memory was selected by retrieval but not necessarily
+    /// delivered. Deliberately leaves `updated_at` and `access_count` alone so
+    /// a selection does not refresh TTL or invalidate publication snapshots.
+    pub fn record_retrieval_candidate(&mut self) {
+        self.metrics.retrieval_count = self.metrics.retrieval_count.saturating_add(1);
+        self.metrics.last_retrieved_at = Some(Utc::now());
+    }
+
+    /// Record that this memory was actually injected into a model context.
+    /// Injection is real use, so it also refreshes the legacy touch counter.
+    pub fn record_injection(&mut self) {
+        self.metrics.injection_count = self.metrics.injection_count.saturating_add(1);
+        self.metrics.last_injected_at = Some(Utc::now());
+        self.touch();
+    }
+
+    /// Attribute a downstream success or failure to this memory.
+    pub fn record_outcome(&mut self, success: bool) {
+        if success {
+            self.metrics.outcome_successes = self.metrics.outcome_successes.saturating_add(1);
+        } else {
+            self.metrics.outcome_failures = self.metrics.outcome_failures.saturating_add(1);
+        }
     }
 
     /// Reinforce this memory (called when same info is encountered again)

@@ -69,6 +69,12 @@ const MEMORY_SET_OVERLAP_SUPPRESSION_RATIO: f32 = 0.8;
 /// the context window.
 const INJECTED_MEMORY_TTL_SECS: u64 = 45 * 60;
 
+/// Pending payloads are validated against content snapshots at consumption,
+/// so a slow judge or long tool run does not make them unsafe. Two minutes was
+/// shorter than real coding turns and produced most of the observed
+/// `stale (>120s)` discards.
+const PENDING_MEMORY_TTL_SECS: u64 = 15 * 60;
+
 fn injected_recently(at: &Instant) -> bool {
     at.elapsed().as_secs() < INJECTED_MEMORY_TTL_SECS
 }
@@ -92,7 +98,7 @@ pub struct PendingMemory {
 impl PendingMemory {
     /// Check if this pending memory is still fresh (not too old).
     pub fn is_fresh(&self) -> bool {
-        self.computed_at.elapsed().as_secs() < 120
+        self.computed_at.elapsed().as_secs() < PENDING_MEMORY_TTL_SECS
     }
 }
 
@@ -142,15 +148,16 @@ fn read_validation_graph(
 }
 
 fn semantic_signature(entry: &super::MemoryEntry) -> anyhow::Result<String> {
-    // Include everything sent to Jev plus semantic/rendering metadata. Access
-    // counters and embeddings do not change the fact that was judged.
+    // Include everything sent to Jev plus semantic/rendering metadata.
+    // `updated_at` is a write/access timestamp, not content: injecting one
+    // session's memory touches it and must not invalidate every other
+    // session's pending payload for the same entry.
     Ok(serde_json::to_string(&(
         &entry.content,
         &entry.category,
         &entry.tags,
         &entry.source,
         &entry.trust,
-        &entry.updated_at,
     ))?)
 }
 
@@ -170,11 +177,24 @@ fn snapshot_selected_memories(
     // discarded. Which file exists still decides the failure mode: a source
     // that is *present but unreadable/corrupt* must fail closed (the
     // corruption tests), only an absent source degrades to an empty graph.
-    let project = match manager.project_memory_path() {
-        Ok(Some(path)) if path.exists() => read_validation_graph(&path)?,
-        _ => manager.load_project_graph().unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new()),
+    // The sqlite backend is authoritative. Legacy JSON mirrors can exist from
+    // an older install and may be arbitrarily stale; reading them here made
+    // every selected SQLite memory fail publication validation. Only the JSON
+    // backend should use the JSON files.
+    let use_json_sources = super::active_backend_name() != "sqlite-gvec";
+    let project = if use_json_sources {
+        match manager.project_memory_path() {
+            Ok(Some(path)) if path.exists() => read_validation_graph(&path)?,
+            _ => manager
+                .load_project_graph()
+                .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new()),
+        }
+    } else {
+        manager
+            .load_project_graph()
+            .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new())
     };
-    let global = {
+    let global = if use_json_sources {
         let path = manager.global_memory_path()?;
         if path.exists() {
             read_validation_graph(&path)?
@@ -183,6 +203,10 @@ fn snapshot_selected_memories(
                 .load_global_graph()
                 .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new())
         }
+    } else {
+        manager
+            .load_global_graph()
+            .unwrap_or_else(|_| crate::memory_graph::MemoryGraph::new())
     };
     let mut snapshots = HashMap::new();
     let mut entries = Vec::with_capacity(ids.len());
@@ -266,7 +290,7 @@ fn take_pending_memory_inner(
         return None;
     }
     if !queued.pending.is_fresh() {
-        crate::memory_log::log_pending_discarded(session_id, "stale (>120s)");
+        crate::memory_log::log_pending_discarded(session_id, "stale (>15m)");
         return None;
     }
     if let Some(binding) = &queued.binding {
@@ -281,6 +305,10 @@ fn take_pending_memory_inner(
             return None;
         }
     }
+    let injection_project_dir = queued
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.project_dir.clone());
     let pending = queued.pending;
 
     // If every memory in this payload is still fresh in the session's
@@ -333,7 +361,11 @@ fn take_pending_memory_inner(
     }
 
     if !pending.memory_ids.is_empty() {
-        mark_memories_injected(session_id, &pending.memory_ids);
+        mark_memories_injected_for_project(
+            session_id,
+            &pending.memory_ids,
+            injection_project_dir.as_deref(),
+        );
     }
 
     crate::memory_log::log_pending_consumed(
@@ -369,7 +401,7 @@ pub fn set_pending_memory_with_ids_and_display(
     memory_ids: Vec<String>,
     display_prompt: Option<String>,
 ) {
-    store_pending_memory(session_id, prompt, count, memory_ids, display_prompt, None);
+    let _ = store_pending_memory(session_id, prompt, count, memory_ids, display_prompt, None);
 }
 
 /// Publish a result bound to the selected project and its current memory
@@ -473,17 +505,21 @@ fn publish_scoped_memory(
         );
         return;
     }
-    store_pending_memory(
+    let stored_ids = memory_ids;
+    let published = store_pending_memory(
         session_id,
         prompt,
         count,
-        memory_ids,
+        stored_ids.clone(),
         display_prompt,
         Some(PendingBinding {
             project_dir: project_dir.map(str::to_owned),
             snapshots,
         }),
     );
+    if published {
+        record_memory_retrieval_candidates(&stored_ids, project_dir);
+    }
 }
 
 fn store_pending_memory(
@@ -493,7 +529,7 @@ fn store_pending_memory(
     memory_ids: Vec<String>,
     display_prompt: Option<String>,
     binding: Option<PendingBinding>,
-) {
+) -> bool {
     crate::memory_log::log_pending_prepared(session_id, &prompt, count, &memory_ids);
 
     if let Ok(mut guard) = PENDING_MEMORY.lock() {
@@ -513,7 +549,7 @@ fn store_pending_memory(
                     session_id,
                     "similar pending payload already queued",
                 );
-                return;
+                return false;
             }
         }
 
@@ -530,14 +566,29 @@ fn store_pending_memory(
                 binding,
             },
         );
+        true
+    } else {
+        false
     }
 }
 
 /// Mark memory IDs as already injected for a session (prevents re-injection on future turns).
 pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
+    mark_memories_injected_for_project(session_id, ids, None);
+}
+
+/// Same as [`mark_memories_injected`], but scopes metric writeback to the
+/// project that produced the payload. Without the project directory the
+/// manager only sees the global store, so project memories never accumulated
+/// access counts.
+pub fn mark_memories_injected_for_project(
+    session_id: &str,
+    ids: &[String],
+    project_dir: Option<&str>,
+) {
     crate::memory_log::log_marked_injected(session_id, ids);
     insert_injected_ids(session_id, ids);
-    record_memory_retrieval(ids);
+    record_memory_retrieval(ids, project_dir);
 }
 
 /// Count one retrieval for each ID that was actually injected.
@@ -546,24 +597,43 @@ pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
 /// ontology depends on: before this hook, `access_count` stayed zero for the
 /// entire store (measured 2026-10-14: all 4321 instances had never been
 /// accessed), so `touch()`-based TTL refresh and access-boosted confidence
-/// decay had no data to work with. Best-effort and fire-and-forget: a failed
-/// or slow graph save must not delay the injection it is accounting for, so
-/// the write happens on a detached task.
-fn record_memory_retrieval(ids: &[String]) {
+/// decay had no data to work with. Best-effort, but synchronous: a detached
+/// read-modify-write can outlive the store it loaded and overwrite a newer
+/// save (observed as tests losing entries when a previous test's writeback
+/// landed in the next test's home).
+fn record_memory_retrieval(ids: &[String], project_dir: Option<&str>) {
     if ids.is_empty() {
         return;
     }
-    let ids = ids.to_vec();
-    let _ = std::thread::Builder::new()
-        .name("memory-retrieval-writeback".to_string())
-        .spawn(move || {
-            let manager = super::MemoryManager::new();
-            if let Err(e) = manager.record_retrievals(&ids) {
-                crate::logging::info(&format!(
-                    "memory retrieval writeback failed: {e}"
-                ));
-            }
-        });
+    let manager = match project_dir {
+        Some(dir) => super::MemoryManager::new().with_project_dir(dir),
+        None => super::MemoryManager::new(),
+    };
+    if let Err(e) = manager.record_retrievals(ids) {
+        crate::logging::info(&format!("memory retrieval writeback failed: {e}"));
+    }
+}
+
+/// Count a retrieval *selection* as soon as a payload is published.
+///
+/// Selection happens before delivery, so this intentionally does not mark the
+/// IDs injected or refresh their TTL. The gap between this counter and
+/// `injection_count` is the real pipeline loss.
+///
+/// Runs synchronously: a detached write could load a graph, then save it after
+/// the caller forgot or superseded an entry, resurrecting stale content. The
+/// publication path is already off the model's critical path.
+pub fn record_memory_retrieval_candidates(ids: &[String], project_dir: Option<&str>) {
+    if ids.is_empty() {
+        return;
+    }
+    let manager = match project_dir {
+        Some(dir) => super::MemoryManager::new().with_project_dir(dir),
+        None => super::MemoryManager::new(),
+    };
+    if let Err(e) = manager.record_retrieval_candidates(ids) {
+        crate::logging::info(&format!("memory candidate writeback failed: {e}"));
+    }
 }
 
 /// Mark memory IDs as already KNOWN to a session without them having been

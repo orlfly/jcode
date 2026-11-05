@@ -625,13 +625,15 @@ mod tests {
     }
 
     #[test]
-    fn fact_remember_adds_provenance_and_touch() {
+    fn fact_remember_preserves_provenance_and_touches() {
         let ctx = ctx(EVENT_REMEMBER, TYPE_OBSERVATION);
         let plan = dispatch_event(&ctx);
         assert!(
-            plan.effects
+            !plan
+                .effects
                 .iter()
-                .any(|e| matches!(e, Effect::SetProvenance { .. }))
+                .any(|e| matches!(e, Effect::SetProvenance { .. })),
+            "remember must not overwrite the extractor's real provenance"
         );
         assert!(plan.effects.iter().any(|e| matches!(e, Effect::Touch)));
     }
@@ -658,13 +660,14 @@ mod tests {
     fn effects_kinds_for_event() {
         let onto = default_ontology();
         let kinds = declared_effect_kinds(&onto, EVENT_REMEMBER);
-        assert!(kinds.contains(&"set_provenance"));
+        assert!(!kinds.contains(&"set_provenance"));
         assert!(kinds.contains(&"touch"));
     }
 
     #[test]
     fn action_outcome_rules_validate_and_invalidate() {
         let mut ctx = ctx(EVENT_ACTION_OUTCOME, "custom");
+        ctx.entry.tags = vec!["skill-invalidated".to_string()];
         ctx.entry.artifact = Some(crate::ArtifactMetadata {
             kind: "skill".to_string(),
             health: "ok".to_string(),
@@ -679,12 +682,17 @@ mod tests {
         let deferred = apply_entry_effects(&plan, &mut entry);
         assert_eq!(entry.artifact.as_ref().unwrap().health, "ok");
         assert!(entry.tags.iter().any(|tag| tag == "skill-validated"));
+        assert!(
+            !entry.tags.iter().any(|tag| tag == "skill-invalidated"),
+            "outcome tags must be mutually exclusive"
+        );
         assert!(deferred.iter().any(|effect| matches!(
             effect,
             Effect::ReinforceEvidence { .. }
         )));
 
         ctx.outcome = Some(crate::actions::ActionOutcome::Failed);
+        ctx.entry.tags = vec!["skill-validated".to_string()];
         let plan = dispatch_event(&ctx);
         assert!(
             plan.applied_rules

@@ -1705,11 +1705,11 @@ impl MemoryManager {
         }
         let id_set: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
 
-        let mut project = self.load_project_graph()?;
+        let mut project = self.load_project_graph_for_writeback()?;
         let mut project_changed = false;
         for entry in project.memories.values_mut() {
             if id_set.contains(entry.id.as_str()) {
-                entry.touch();
+                entry.record_injection();
                 project_changed = true;
             }
         }
@@ -1717,11 +1717,85 @@ impl MemoryManager {
             self.save_project_graph(&project)?;
         }
 
-        let mut global = self.load_global_graph()?;
+        let mut global = self.load_global_graph_for_writeback()?;
         let mut global_changed = false;
         for entry in global.memories.values_mut() {
             if id_set.contains(entry.id.as_str()) {
-                entry.touch();
+                entry.record_injection();
+                global_changed = true;
+            }
+        }
+        if global_changed {
+            self.save_global_graph(&global)?;
+        }
+        Ok(())
+    }
+
+    /// Load a JSON graph from disk instead of the process cache.
+    ///
+    /// Metric writeback is a read-modify-write of a whole graph. Using the
+    /// cache here can persist content that was changed on disk after the cache
+    /// was filled (the scoped-pending tests deliberately rewrite while
+    /// preserving mtime). The sqlite backend is authoritative, so it needs no
+    /// special path.
+    fn load_project_graph_for_writeback(&self) -> Result<MemoryGraph> {
+        if active_backend_name() == "sqlite-gvec" {
+            return self.load_project_graph();
+        }
+        match self.project_memory_path()? {
+            Some(path) if path.exists() => match storage::read_json::<MemoryGraph>(&path) {
+                Ok(graph) if graph.graph_version == GRAPH_VERSION => Ok(graph),
+                _ => self.load_project_graph(),
+            },
+            _ => self.load_project_graph(),
+        }
+    }
+
+    fn load_global_graph_for_writeback(&self) -> Result<MemoryGraph> {
+        if active_backend_name() == "sqlite-gvec" {
+            return self.load_global_graph();
+        }
+        let path = self.global_memory_path()?;
+        if path.exists() {
+            if let Ok(graph) = storage::read_json::<MemoryGraph>(&path)
+                && graph.graph_version == GRAPH_VERSION
+            {
+                return Ok(graph);
+            }
+        }
+        self.load_global_graph()
+    }
+
+    /// Count one retrieval *selection* for each ID.
+    ///
+    /// This runs when a payload becomes pending, before the model actually
+    /// receives it. It deliberately does not touch `updated_at` or
+    /// `access_count`, so selection cannot refresh TTL or invalidate the
+    /// publication snapshot. Comparing this with `record_retrievals` gives the
+    /// real selection-to-injection conversion rate.
+    pub fn record_retrieval_candidates(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id_set: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+
+        let mut project = self.load_project_graph_for_writeback()?;
+        let mut project_changed = false;
+        for entry in project.memories.values_mut() {
+            if id_set.contains(entry.id.as_str()) {
+                entry.record_retrieval_candidate();
+                project_changed = true;
+            }
+        }
+        if project_changed {
+            self.save_project_graph(&project)?;
+        }
+
+        let mut global = self.load_global_graph_for_writeback()?;
+        let mut global_changed = false;
+        for entry in global.memories.values_mut() {
+            if id_set.contains(entry.id.as_str()) {
+                entry.record_retrieval_candidate();
                 global_changed = true;
             }
         }
@@ -2556,6 +2630,11 @@ impl MemoryManager {
             };
             for id in &resolved {
                 if let Some(evidence) = graph.get_memory_mut(id) {
+                    if outcome.is_success() {
+                        evidence.record_outcome(true);
+                    } else if outcome.is_failure() {
+                        evidence.record_outcome(false);
+                    }
                     evidence.confidence = (evidence.confidence + delta).clamp(0.0, 1.0);
                     if delta > 0.0 {
                         evidence.strength = evidence.strength.saturating_add(1);

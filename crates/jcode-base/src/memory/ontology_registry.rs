@@ -400,7 +400,8 @@ mod tests {
         let reg = OntologyRegistry::with_default();
         let onto = reg.default_ontology();
         let kinds = declared_effect_kinds(&onto, "event.remember");
-        assert!(kinds.contains(&"set_provenance"));
+        assert!(!kinds.contains(&"set_provenance"));
+        assert!(kinds.contains(&"touch"));
         let conds = declared_condition_kinds(&onto, "event.remember");
         assert!(conds.contains(&"has_content"));
     }

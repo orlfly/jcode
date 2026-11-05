@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::graph::{EdgeKind, MemoryGraph};
 use crate::instance::{ExtractionMethod, MemoryStatus};
 use crate::ontology::{
-    Activity, DecayPolicy, Ontology, OntologyType, RelationshipDef, Rule, ScoringPolicy,
-    TYPE_CONTRACT, TYPE_ENV_FACT, TYPE_OBSERVATION, TYPE_PROCESS_RULE, is_link_id,
+    Activity, DecayPolicy, Ontology, OntologyType, PropertyDef, RelationshipDef, Rule,
+    ScoringPolicy, TYPE_CONTRACT, TYPE_ENV_FACT, TYPE_OBSERVATION, TYPE_PROCESS_RULE, is_link_id,
 };
 use crate::{MemoryCategory, MemoryEntry};
 
@@ -190,6 +190,10 @@ pub struct TypePatch {
     pub extraction_methods: Option<Vec<ExtractionMethod>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_category: Option<String>,
+    /// Replace this type's local property list. Inherited properties from the
+    /// parent remain available through `OntologyType::effective_properties`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Vec<PropertyDef>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +416,9 @@ fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>>
             if let Some(legacy) = &patch.legacy_category {
                 type_def.legacy_category = Some(legacy.clone());
                 ontology.category_aliases.insert(legacy.clone(), id.clone());
+            }
+            if let Some(properties) = &patch.properties {
+                type_def.properties = properties.clone();
             }
             Ok(())
         }
@@ -1199,7 +1206,7 @@ pub fn describe_ontology(ontology: &Ontology) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ontology::{DEFAULT_ONTOLOGY_VERSION, default_ontology};
+    use crate::ontology::{DEFAULT_ONTOLOGY_VERSION, PropertyDef, PropertyKind, default_ontology};
 
     fn patch(
         base: &Ontology,
@@ -1245,7 +1252,36 @@ mod tests {
         assert_eq!(next.version, DEFAULT_ONTOLOGY_VERSION + 1);
         assert_eq!(next.types[TYPE_ENV_FACT].ttl_days, Some(45.0));
         // Base is untouched.
-        assert_eq!(base.types[TYPE_ENV_FACT].ttl_days, Some(30.0));
+        assert_eq!(base.types[TYPE_ENV_FACT].ttl_days, Some(14.0));
+    }
+
+    #[test]
+    fn patch_replaces_type_properties() {
+        let base = default_ontology();
+        let property = PropertyDef {
+            id: "confidence".to_string(),
+            kind: PropertyKind::Float,
+            required: true,
+            default: Some(serde_json::json!(1.0)),
+            description: Some("declared through a runtime patch".to_string()),
+        };
+        let patch = patch(
+            &base,
+            vec![OntologyOp::UpdateType {
+                id: TYPE_OBSERVATION.to_string(),
+                patch: TypePatch {
+                    properties: Some(vec![property.clone()]),
+                    ..Default::default()
+                },
+            }],
+            Vec::new(),
+        );
+        let next = apply_patch(&base, &patch).expect("patch applies");
+        assert_eq!(next.types[TYPE_OBSERVATION].properties, vec![property]);
+        assert!(
+            base.types[TYPE_OBSERVATION].properties.is_empty(),
+            "base ontology must stay untouched"
+        );
     }
 
     #[test]

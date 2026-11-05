@@ -43,7 +43,13 @@ use crate::instance::{ExtractionMethod, MemoryStatus};
 /// `skill` types (skills are an external artifact linked through
 /// [`LINK_SKILL`]), drops the never-maintained `in_cluster` relationship, and
 /// replaces the unused continuous decay with declarative TTLs.
-pub const DEFAULT_ONTOLOGY_VERSION: u32 = 2;
+///
+/// v3 tunes the type mix from observed access data: shorter `env_fact`
+/// lifetime and lower production weight, higher `observation`/`entity`
+/// baselines, lower `preference` baseline, a stricter write-time `relate`
+/// threshold, provenance-preserving remember, mutually exclusive skill
+/// outcome tags, and aliases for legacy category spellings.
+pub const DEFAULT_ONTOLOGY_VERSION: u32 = 3;
 pub const DEFAULT_ONTOLOGY_ID: &str = "jcode/default/v1";
 
 // ---------------------------------------------------------------------------
@@ -1023,7 +1029,7 @@ fn default_supersede_at() -> f32 {
     0.5
 }
 fn default_relate_at() -> f32 {
-    0.3
+    0.4
 }
 fn default_min_evidence() -> usize {
     3
@@ -1044,7 +1050,7 @@ pub fn skill_outcome_rules() -> Vec<Rule> {
     vec![
         Rule::new(RULE_SKILL_VALIDATED, EVENT_ACTION_OUTCOME)
             .with_description(
-                "A successful action strengthens its evidence and keeps the artifact healthy.",
+                "A successful action strengthens its evidence, keeps the artifact healthy, and clears stale invalidation tags.",
             )
             .with_condition(Condition::ActionOutcomeIs {
                 values: vec!["succeeded".to_string()],
@@ -1055,10 +1061,13 @@ pub fn skill_outcome_rules() -> Vec<Rule> {
             .with_effect(Effect::ReinforceEvidence { amount: 0.05 })
             .with_effect(Effect::AddTag {
                 tag: "skill-validated".to_string(),
+            })
+            .with_effect(Effect::RemoveTag {
+                tag: "skill-invalidated".to_string(),
             }),
         Rule::new(RULE_SKILL_INVALIDATED, EVENT_ACTION_OUTCOME)
             .with_description(
-                "A failed or cancelled action weakens its evidence and marks the artifact for review.",
+                "A failed or cancelled action weakens its evidence, marks the artifact for review, and clears stale validation tags.",
             )
             .with_condition(Condition::ActionOutcomeIs {
                 values: vec!["failed".to_string(), "cancelled".to_string()],
@@ -1069,6 +1078,9 @@ pub fn skill_outcome_rules() -> Vec<Rule> {
             .with_effect(Effect::InvalidateEvidence { amount: 0.10 })
             .with_effect(Effect::AddTag {
                 tag: "skill-invalidated".to_string(),
+            })
+            .with_effect(Effect::RemoveTag {
+                tag: "skill-validated".to_string(),
             }),
     ]
 }
@@ -1091,19 +1103,17 @@ pub fn default_ontology() -> Ontology {
     // the store converges instead of growing monotonically.
     let env_fact = OntologyType::new(TYPE_ENV_FACT, "Environment Fact")
         .with_legacy_category("env_fact")
-        .with_extraction_method(ExtractionMethod::UserStated)
         .with_extraction_method(ExtractionMethod::StructuredMapping)
         .with_extraction_method(ExtractionMethod::RuleExtraction)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_scoring(ScoringPolicy {
-            base_score: 15.0,
+            base_score: 8.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
             half_life_days: 7.0,
             access_boost: true,
         })
-        .with_ttl_days(30.0);
+        .with_ttl_days(14.0);
 
     let contract = OntologyType::new(TYPE_CONTRACT, "Contract")
         .with_legacy_category("contract")
@@ -1141,7 +1151,7 @@ pub fn default_ontology() -> Ontology {
         .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_extraction_method(ExtractionMethod::RuleInference)
         .with_scoring(ScoringPolicy {
-            base_score: 10.0,
+            base_score: 20.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
@@ -1155,7 +1165,7 @@ pub fn default_ontology() -> Ontology {
         .with_extraction_method(ExtractionMethod::UserStated)
         .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_scoring(ScoringPolicy {
-            base_score: 30.0,
+            base_score: 20.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
@@ -1169,7 +1179,7 @@ pub fn default_ontology() -> Ontology {
         .with_extraction_method(ExtractionMethod::StructuredMapping)
         .with_extraction_method(ExtractionMethod::LlmExtraction)
         .with_scoring(ScoringPolicy {
-            base_score: 25.0,
+            base_score: 35.0,
             ..Default::default()
         })
         .with_decay(DecayPolicy {
@@ -1223,6 +1233,14 @@ pub fn default_ontology() -> Ontology {
         onto.category_aliases
             .insert(type_id.to_string(), type_id.to_string());
     }
+    // Spellings emitted by older extractors and the `MemoryCategory` serde
+    // representation. Keep them as aliases rather than renaming stored rows.
+    onto.category_aliases
+        .insert("medium".to_string(), TYPE_OBSERVATION.to_string());
+    onto.category_aliases
+        .insert("envfact".to_string(), TYPE_ENV_FACT.to_string());
+    onto.category_aliases
+        .insert("processrule".to_string(), TYPE_PROCESS_RULE.to_string());
 
     // ---- Relationships ---------------------------------------------------
     let has_tag = RelationshipDef {
@@ -1284,14 +1302,11 @@ pub fn default_ontology() -> Ontology {
 
     // ---- Rules -----------------------------------------------------------
     let remember_rule = Rule::new(RULE_REMEMBER, EVENT_REMEMBER)
-        .with_description("Validate + write a new memory instance.")
+        .with_description(
+            "Validate and write a new memory instance without overwriting its real provenance.",
+        )
         .with_condition(Condition::HasContent)
-        .with_condition(Condition::ConfidenceAtLeast { min: 0.0 })
-        .with_effect(Effect::SetProvenance {
-            source: "agent".to_string(),
-            method: ExtractionMethod::UserStated,
-            confidence: 1.0,
-        })
+        .with_condition(Condition::ConfidenceAtLeast { min: 0.7 })
         .with_effect(Effect::Touch);
 
     // Global-scope write gate. Global memory is injected into every project's
@@ -1338,7 +1353,7 @@ pub fn default_ontology() -> Ontology {
     // the declarative contract it must satisfy.
     let write_reconcile_rule = Rule::new(RULE_WRITE_RECONCILE, EVENT_REMEMBER)
         .with_description(
-            "Classify an incoming instance against its store: reinforce (>=0.85), supersede (>=0.5), contradict/relate (>=0.3) or insert.",
+            "Classify an incoming instance against its store: reinforce (>=0.85), supersede (>=0.5), contradict/relate (>=0.4) or insert.",
         )
         .with_condition(Condition::HasContent)
         .with_effect(Effect::SetField {
@@ -1346,7 +1361,7 @@ pub fn default_ontology() -> Ontology {
             value: Some(serde_json::json!({
                 "reinforce_at": 0.85,
                 "supersede_at": 0.5,
-                "relate_at": 0.3,
+                "relate_at": 0.4,
             })),
         });
 
@@ -1400,17 +1415,17 @@ pub fn default_ontology() -> Ontology {
         });
 
     onto = onto
-        .with_rule(remember_rule)
         .with_rule(remember_global_gate_rule)
         .with_rule(upsert_rule)
-        .with_rule(write_reconcile_rule)
         .with_rule(reject_rule)
         .with_rule(dedup_rule)
         .with_rule(supersede_rule)
         .with_rule(contradict_rule)
         .with_rule(tag_rule)
         .with_rule(untag_rule)
-        .with_rule(link_rule);
+        .with_rule(link_rule)
+        .with_rule(remember_rule)
+        .with_rule(write_reconcile_rule);
 
     // Action feedback rules: the outcome of executing a skill validates or
     // invalidates the knowledge that justified it. This is the "action
@@ -1434,7 +1449,7 @@ pub fn default_ontology() -> Ontology {
     .with_step(ActivityStep::ReconcileOnWrite {
         reinforce_at: 0.85,
         supersede_at: 0.5,
-        relate_at: 0.3,
+        relate_at: 0.4,
     });
 
     let final_extract = Activity::new(
@@ -1468,10 +1483,10 @@ pub fn default_ontology() -> Ontology {
     });
 
     onto = onto
-        .with_activity(write_reconcile)
         .with_activity(final_extract)
         .with_activity(periodic_gc)
-        .with_activity(skill_distill);
+        .with_activity(skill_distill)
+        .with_activity(write_reconcile);
 
     onto
 }
@@ -1552,7 +1567,7 @@ mod tests {
         let onto = default_ontology();
         assert_eq!(onto.id, DEFAULT_ONTOLOGY_ID);
         assert_eq!(onto.version, DEFAULT_ONTOLOGY_VERSION);
-        assert_eq!(onto.version, 2);
+        assert_eq!(onto.version, 3);
         for type_id in [
             TYPE_ENV_FACT,
             TYPE_CONTRACT,
@@ -1574,7 +1589,7 @@ mod tests {
         // v2 rule: every declared type must carry a TTL or an explicit
         // retention justification, and the TTL-bearing types are the two
         // perishable ones.
-        assert_eq!(onto.types[TYPE_ENV_FACT].ttl_days, Some(30.0));
+        assert_eq!(onto.types[TYPE_ENV_FACT].ttl_days, Some(14.0));
         assert_eq!(onto.types[TYPE_OBSERVATION].ttl_days, Some(90.0));
         assert_eq!(onto.types[TYPE_CONTRACT].ttl_days, None);
         assert_eq!(onto.types[TYPE_PROCESS_RULE].ttl_days, None);
@@ -1582,6 +1597,14 @@ mod tests {
         for removed in ["note", "skill", "goal", "fact"] {
             assert!(!onto.types.contains_key(removed), "{removed} must not be a type");
         }
+    }
+
+    #[test]
+    fn default_ontology_v3_hash_is_canonical() {
+        // The compiled default must match the ontology that runtime v3 patches
+        // produced in existing stores. Changing declared semantics requires a
+        // version bump and an update to this hash.
+        assert_eq!(default_ontology().content_hash(), "97e4e5ba401d8927");
     }
 
     #[test]
