@@ -107,6 +107,10 @@ pub enum EdgeKind {
     Contradicts,
     /// Procedural knowledge derived from facts
     DerivedFrom,
+    /// Structural containment: an artifact/root contains an index part.
+    Contains,
+    /// Ordered step edge between consecutive procedural steps.
+    NextStep,
 }
 
 fn default_weight() -> f32 {
@@ -123,6 +127,8 @@ impl EdgeKind {
             EdgeKind::Supersedes => 0.9,
             EdgeKind::Contradicts => 0.3,
             EdgeKind::DerivedFrom => 0.7,
+            EdgeKind::Contains => 0.9,
+            EdgeKind::NextStep => 0.8,
         }
     }
 }

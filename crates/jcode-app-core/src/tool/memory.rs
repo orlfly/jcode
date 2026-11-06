@@ -781,11 +781,13 @@ fn reconcile_skill_links_after_ontology(working_dir: Option<&std::path::Path>) -
     };
     let report = crate::skill::reconcile_skill_memory_links(&registry, working_dir);
     format!(
-        "\nskill-memory reconcile: {} mirror(s), {} part(s), {} pruned, {} part(s) pruned, +{} edges, -{} edges, {} need review",
+        "\nskill-memory reconcile: {} mirror(s), {} part(s), {} pruned, {} part(s) pruned, +{} part edges, -{} part edges, +{} edges, -{} edges, {} need review",
         report.mirrored,
         report.parts_mirrored,
         report.pruned,
         report.parts_pruned,
+        report.part_edges_added,
+        report.part_edges_removed,
         report.edges_added,
         report.edges_removed,
         report.needs_review

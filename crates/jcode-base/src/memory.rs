@@ -1160,6 +1160,7 @@ impl MemoryManager {
             existing.category = entry.category;
             existing.content = entry.content;
             existing.tags = entry.tags;
+            existing.properties = entry.properties;
             existing.updated_at = entry.updated_at;
             existing.source = entry.source;
             existing.trust = entry.trust;
@@ -2126,40 +2127,72 @@ impl MemoryManager {
         if entries.is_empty() {
             return entries;
         }
-        let mut roots: std::collections::HashMap<String, Option<MemoryEntry>> =
+        let mut contexts: std::collections::HashMap<String, Option<(MemoryGraph, MemoryEntry)>> =
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(entries.len());
         let mut seen = std::collections::HashSet::new();
 
         for entry in entries {
+            let mut adjacent_entries = Vec::new();
             if let Some(root_id) = skill_root_id_for_part(&entry.id) {
-                let root = roots
+                let context = contexts
                     .entry(root_id.clone())
-                    .or_insert_with(|| self.load_skill_root(&root_id))
-                    .clone();
-                if let Some(root) = root
-                    && seen.insert(root.id.clone())
-                {
-                    out.push(root);
+                    .or_insert_with(|| self.load_skill_root_context(&root_id));
+                if let Some((graph, root)) = context.as_ref() {
+                    if seen.insert(root.id.clone()) {
+                        out.push(root.clone());
+                    }
+                    if entry
+                        .property("skill.part_kind")
+                        .and_then(|value| value.as_str())
+                        == Some("step")
+                    {
+                        let next = graph
+                            .get_edges(&entry.id)
+                            .iter()
+                            .find(|edge| {
+                                matches!(edge.kind, jcode_memory_types::EdgeKind::NextStep)
+                            })
+                            .and_then(|edge| graph.get_memory(&edge.target));
+                        let previous = graph
+                            .get_incoming(&entry.id)
+                            .into_iter()
+                            .find(|source| {
+                                graph.get_edges(source).iter().any(|edge| {
+                                    edge.target == entry.id
+                                        && matches!(
+                                            edge.kind,
+                                            jcode_memory_types::EdgeKind::NextStep
+                                        )
+                                })
+                            })
+                            .and_then(|source| graph.get_memory(source));
+                        adjacent_entries.extend([previous, next].into_iter().flatten().cloned());
+                    }
                 }
             }
             if seen.insert(entry.id.clone()) {
                 out.push(entry);
+            }
+            for adjacent in adjacent_entries {
+                if seen.insert(adjacent.id.clone()) {
+                    out.push(adjacent);
+                }
             }
         }
         out.truncate(limit.max(1));
         out
     }
 
-    fn load_skill_root(&self, root_id: &str) -> Option<MemoryEntry> {
-        self.load_project_graph()
-            .ok()
-            .and_then(|graph| graph.get_memory(root_id).cloned())
-            .or_else(|| {
-                self.load_global_graph()
-                    .ok()
-                    .and_then(|graph| graph.get_memory(root_id).cloned())
-            })
+    fn load_skill_root_context(&self, root_id: &str) -> Option<(MemoryGraph, MemoryEntry)> {
+        if let Ok(graph) = self.load_project_graph()
+            && let Some(root) = graph.get_memory(root_id).cloned()
+        {
+            return Some((graph, root));
+        }
+        let graph = self.load_global_graph().ok()?;
+        let root = graph.get_memory(root_id).cloned()?;
+        Some((graph, root))
     }
 
     /// L1 recall shaped as a [`MemoryRelevanceResult`] so the memory agent can

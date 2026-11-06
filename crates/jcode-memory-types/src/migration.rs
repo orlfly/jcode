@@ -944,6 +944,8 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::Supersedes => "supersedes",
         EdgeKind::Contradicts => "contradicts",
         EdgeKind::DerivedFrom => "derived_from",
+        EdgeKind::Contains => "contains",
+        EdgeKind::NextStep => "next_step",
     }
 }
 
@@ -955,6 +957,8 @@ fn parse_edge_kind(name: &str) -> Option<EdgeKind> {
         "supersedes" => EdgeKind::Supersedes,
         "contradicts" => EdgeKind::Contradicts,
         "derived_from" => EdgeKind::DerivedFrom,
+        "contains" => EdgeKind::Contains,
+        "next_step" => EdgeKind::NextStep,
         _ => return None,
     })
 }

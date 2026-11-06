@@ -115,6 +115,50 @@ fn builds_sections_steps_code_and_script_metadata() {
     assert!(script.content.contains("scripts/run.py"));
     assert!(script.content.contains("Symbols: main, Runner"));
     assert!(script.tags.iter().any(|tag| tag == "lang:python"));
+    assert_eq!(
+        script.property("skill.part_kind").and_then(|v| v.as_str()),
+        Some("script")
+    );
+    assert_eq!(
+        script.property("skill.language").and_then(|v| v.as_str()),
+        Some("python")
+    );
+    assert!(
+        script
+            .property("skill.symbols")
+            .and_then(|v| v.as_array())
+            .is_some_and(|symbols| symbols.iter().any(|v| v.as_str() == Some("main")))
+    );
+
+    let first_step = parts
+        .iter()
+        .filter(|part| part.property("skill.part_kind").and_then(|v| v.as_str()) == Some("step"))
+        .min_by_key(|part| {
+            part.property("skill.step_order")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX)
+        })
+        .expect("first step");
+    assert_eq!(
+        first_step
+            .property("skill.step_order")
+            .and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        first_step
+            .property("skill.section")
+            .and_then(|v| v.as_str()),
+        Some("workflow")
+    );
+    let code = parts
+        .iter()
+        .find(|part| part.id.contains("::code:"))
+        .expect("code part");
+    assert_eq!(
+        code.property("skill.language").and_then(|v| v.as_str()),
+        Some("bash")
+    );
 
     let mut ids = HashSet::new();
     for part in &parts {
@@ -168,9 +212,10 @@ fn sync_creates_parent_edges_and_prunes_removed_parts() {
     );
     let skill = test_skill("stable", temp.path(), BODY);
 
-    let (mirrored, pruned) = sync_skill_parts(&mut graph, &skill);
-    assert!(mirrored > 0);
-    assert_eq!(pruned, 0);
+    let sync = sync_skill_parts(&mut graph, &skill);
+    assert!(sync.mirrored > 0);
+    assert_eq!(sync.pruned, 0);
+    assert!(sync.edges_added > 0);
     let part_ids: Vec<String> = graph
         .memories
         .keys()
@@ -187,18 +232,47 @@ fn sync_creates_parent_edges_and_prunes_removed_parts() {
                     && matches!(edge.kind, EdgeKind::DerivedFrom)),
             "missing parent edge for {id}"
         );
+        assert!(
+            graph
+                .get_edges("skill:stable")
+                .iter()
+                .any(|edge| edge.target == *id && matches!(edge.kind, EdgeKind::Contains)),
+            "missing contains edge for {id}"
+        );
     }
+    let step_ids: Vec<String> = part_ids
+        .iter()
+        .filter(|id| id.contains("::step:"))
+        .cloned()
+        .collect();
+    assert!(step_ids.len() >= 2);
+    let next_edges = graph
+        .memories
+        .keys()
+        .flat_map(|id| graph.get_edges(id))
+        .filter(|edge| matches!(edge.kind, EdgeKind::NextStep))
+        .count();
+    assert!(next_edges >= 1, "steps in one section need next_step edges");
 
-    let (mirrored, pruned) = sync_skill_parts(&mut graph, &skill);
-    assert_eq!((mirrored, pruned), (0, 0), "rerun must be idempotent");
+    let sync = sync_skill_parts(&mut graph, &skill);
+    assert_eq!(
+        (
+            sync.mirrored,
+            sync.pruned,
+            sync.edges_added,
+            sync.edges_removed
+        ),
+        (0, 0, 0, 0),
+        "rerun must be idempotent"
+    );
 
     let changed = test_skill(
         "stable",
         temp.path(),
         &BODY.replace("- Validate improvements with repeated benchmarks.\n", ""),
     );
-    let (_, pruned) = sync_skill_parts(&mut graph, &changed);
-    assert!(pruned > 0, "edited body must prune old derived nodes");
+    let sync = sync_skill_parts(&mut graph, &changed);
+    assert!(sync.pruned > 0, "edited body must prune old derived nodes");
     assert!(
         graph.memories.keys().all(|id| !id.contains("step:3-")),
         "removed step node must be gone"

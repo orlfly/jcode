@@ -464,6 +464,13 @@ pub struct MemoryEntry {
     /// `access_count`, which also counts write-time touches.
     #[serde(default, skip_serializing_if = "MemoryMetrics::is_empty")]
     pub metrics: MemoryMetrics,
+    /// Structured metadata for typed/link nodes.
+    ///
+    /// Ordinary extracted memories leave this empty. Skill index nodes use it
+    /// for stable part kind, section, order, language and source fields, so
+    /// consumers do not have to parse ids or tags.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, serde_json::Value>,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -528,7 +535,23 @@ impl MemoryEntry {
             subject_key: None,
             artifact: None,
             metrics: MemoryMetrics::default(),
+            properties: BTreeMap::new(),
         }
+    }
+
+    /// Attach a typed property, replacing any existing value for `key`.
+    pub fn with_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.properties.insert(key.into(), value.into());
+        self
+    }
+
+    /// Read a typed property by key.
+    pub fn property(&self, key: &str) -> Option<&serde_json::Value> {
+        self.properties.get(key)
     }
 
     /// Attach or replace artifact metadata (link nodes only).
@@ -1341,6 +1364,35 @@ pub mod ranking {
         fn top_k_zero_limit_is_empty() {
             assert!(top_k_by_score([("a", 1.0)], 0).is_empty());
             assert!(top_k_by_ord([("a", 1)], 0).is_empty());
+        }
+
+        #[test]
+        fn entry_properties_round_trip_and_keep_default_empty() {
+            use crate::{MemoryCategory, MemoryEntry};
+
+            let entry = MemoryEntry::new(MemoryCategory::Fact, "typed metadata")
+                .with_property("subject", "api:/task")
+                .with_property("weight", 33);
+            assert_eq!(
+                entry.property("subject"),
+                Some(&serde_json::json!("api:/task"))
+            );
+            assert_eq!(entry.property("weight"), Some(&serde_json::json!(33)));
+
+            let json = serde_json::to_value(&entry).expect("serialize entry");
+            assert!(json.get("properties").is_some());
+            let restored: MemoryEntry = serde_json::from_value(json).expect("deserialize entry");
+            assert_eq!(restored.properties, entry.properties);
+
+            let plain = MemoryEntry::new(MemoryCategory::Fact, "plain");
+            let json = serde_json::to_value(&plain).expect("serialize plain");
+            assert!(
+                json.get("properties").is_none(),
+                "empty properties should stay out of stored JSON"
+            );
+            let restored: MemoryEntry =
+                serde_json::from_value(json).expect("legacy entry without properties");
+            assert!(restored.properties.is_empty());
         }
     }
 }

@@ -1607,7 +1607,63 @@ cargo test --profile selfdev
                     .any(|edge| edge.target == "skill:indexed-opt"),
                 "missing root edge for {id}"
             );
+            assert!(
+                graph
+                    .get_edges("skill:indexed-opt")
+                    .iter()
+                    .any(|edge| edge.target == *id
+                        && matches!(edge.kind, jcode_memory_types::EdgeKind::Contains)),
+                "missing contains edge for {id}"
+            );
         }
+        let next_steps = part_ids
+            .iter()
+            .flat_map(|id| graph.get_edges(id))
+            .filter(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::NextStep))
+            .count();
+        assert!(next_steps >= 1, "steps need next_step edges: {part_ids:?}");
+        let step = graph
+            .get_memory(
+                part_ids
+                    .iter()
+                    .find(|id| id.contains("::step:"))
+                    .expect("step id"),
+            )
+            .expect("step entry");
+        assert_eq!(
+            step.property("skill.part_kind")
+                .and_then(|value| value.as_str()),
+            Some("step")
+        );
+        assert!(step.property("skill.step_order").is_some());
+        let mut workflow_steps: Vec<_> = part_ids
+            .iter()
+            .filter_map(|id| graph.get_memory(id))
+            .filter(|entry| {
+                entry
+                    .property("skill.part_kind")
+                    .and_then(|value| value.as_str())
+                    == Some("step")
+            })
+            .collect();
+        workflow_steps.sort_by_key(|entry| {
+            entry
+                .property("skill.step_order")
+                .and_then(|value| value.as_u64())
+        });
+        assert!(workflow_steps.len() >= 2);
+        let expanded = manager.expand_skill_parts(vec![workflow_steps[1].clone()], 6);
+        let expanded_ids: Vec<&str> = expanded.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(
+            expanded_ids.first().copied(),
+            Some("skill:indexed-opt"),
+            "root must lead the expanded payload: {expanded_ids:?}"
+        );
+        assert!(
+            expanded_ids.contains(&workflow_steps[0].id.as_str()),
+            "previous step must be adjacent: {expanded_ids:?}"
+        );
+        assert!(expanded_ids.contains(&workflow_steps[1].id.as_str()));
 
         let selected = manager
             .l1_relevant("Attribute bottlenecks to concrete components", 6)

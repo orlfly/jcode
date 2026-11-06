@@ -158,6 +158,7 @@ fn semantic_signature(entry: &super::MemoryEntry) -> anyhow::Result<String> {
         &entry.tags,
         &entry.source,
         &entry.trust,
+        &entry.properties,
     ))?)
 }
 

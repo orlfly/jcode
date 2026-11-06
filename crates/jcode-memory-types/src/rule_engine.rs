@@ -421,6 +421,8 @@ pub fn apply_graph_effects(plan: &RulePlan, new_id: &str, graph: &mut MemoryGrap
                         "relates_to" => crate::graph::EdgeKind::RelatesTo { weight: 0.5 },
                         "supersedes" => crate::graph::EdgeKind::Supersedes,
                         "contradicts" => crate::graph::EdgeKind::Contradicts,
+                        "contains" => crate::graph::EdgeKind::Contains,
+                        "next_step" => crate::graph::EdgeKind::NextStep,
                         _ => crate::graph::EdgeKind::DerivedFrom,
                     };
                     graph.add_edge(source_id, new_id, edge_kind);
@@ -440,6 +442,8 @@ pub fn apply_graph_effects(plan: &RulePlan, new_id: &str, graph: &mut MemoryGrap
                         "supersedes" => crate::graph::EdgeKind::Supersedes,
                         "contradicts" => crate::graph::EdgeKind::Contradicts,
                         "derived_from" => crate::graph::EdgeKind::DerivedFrom,
+                        "contains" => crate::graph::EdgeKind::Contains,
+                        "next_step" => crate::graph::EdgeKind::NextStep,
                         _ => crate::graph::EdgeKind::RelatesTo {
                             weight: weight.unwrap_or(0.5),
                         },

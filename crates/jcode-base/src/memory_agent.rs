@@ -159,15 +159,19 @@ fn run_finalize_maintenance(working_dir: Option<&str>) {
         || report.parts_mirrored > 0
         || report.pruned > 0
         || report.parts_pruned > 0
+        || report.part_edges_added > 0
+        || report.part_edges_removed > 0
         || report.edges_added > 0
         || report.edges_removed > 0
     {
         crate::logging::info(&format!(
-            "Skill-memory reconcile: {} mirror(s), {} part(s), {} pruned, {} part(s) pruned, +{} edges, -{} edges, {} need review",
+            "Skill-memory reconcile: {} mirror(s), {} part(s), {} pruned, {} part(s) pruned, +{} part edges, -{} part edges, +{} edges, -{} edges, {} need review",
             report.mirrored,
             report.parts_mirrored,
             report.pruned,
             report.parts_pruned,
+            report.part_edges_added,
+            report.part_edges_removed,
             report.edges_added,
             report.edges_removed,
             report.needs_review

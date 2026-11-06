@@ -48,6 +48,14 @@ struct SectionDraft {
     steps: Vec<String>,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SkillPartsSync {
+    pub mirrored: usize,
+    pub pruned: usize,
+    pub edges_added: usize,
+    pub edges_removed: usize,
+}
+
 fn overview_section() -> SectionDraft {
     SectionDraft {
         level: 0,
@@ -60,16 +68,17 @@ fn overview_section() -> SectionDraft {
 
 /// Reconcile the derived index nodes for one skill.
 ///
-/// Returns `(mirrored, pruned)`. The caller owns the store save.
-pub(super) fn sync_skill_parts(graph: &mut MemoryGraph, skill: &Skill) -> (usize, usize) {
+/// Returns the node/edge change counts. The caller owns the store save.
+pub(super) fn sync_skill_parts(graph: &mut MemoryGraph, skill: &Skill) -> SkillPartsSync {
     let root = format!("skill:{}", skill.name);
     let parts = build_skill_parts(skill);
     let desired: HashSet<String> = parts.iter().map(|part| part.id.clone()).collect();
+    let step_chain = desired_step_chain(&parts);
 
-    let mut mirrored = 0;
+    let mut sync = SkillPartsSync::default();
     for part in parts {
         if upsert_part(graph, &root, part) {
-            mirrored += 1;
+            sync.mirrored += 1;
         }
     }
 
@@ -80,13 +89,15 @@ pub(super) fn sync_skill_parts(graph: &mut MemoryGraph, skill: &Skill) -> (usize
         .filter(|id| id.starts_with(&prefix) && !desired.contains(*id))
         .cloned()
         .collect();
-    let mut pruned = 0;
     for id in stale {
         if graph.remove_memory(&id).is_some() {
-            pruned += 1;
+            sync.pruned += 1;
         }
     }
-    (mirrored, pruned)
+    let (added, removed) = reconcile_step_edges(graph, &desired, &step_chain);
+    sync.edges_added = added;
+    sync.edges_removed = removed;
+    sync
 }
 
 /// Remove every derived part for a skill, for example when a global skill's
@@ -142,7 +153,8 @@ fn upsert_part(graph: &mut MemoryGraph, root: &str, entry: MemoryEntry) -> bool 
             || existing.subject_key != entry.subject_key
             || existing.search_text != entry.search_text
             || existing.source != entry.source
-            || existing.trust != entry.trust;
+            || existing.trust != entry.trust
+            || existing.properties != entry.properties;
         let next_updated_at = entry.updated_at;
         if let Some(existing) = graph.get_memory_mut(&id) {
             existing.category = entry.category;
@@ -152,6 +164,7 @@ fn upsert_part(graph: &mut MemoryGraph, root: &str, entry: MemoryEntry) -> bool 
             existing.trust = entry.trust;
             existing.subject_key = entry.subject_key;
             existing.search_text = entry.search_text;
+            existing.properties = entry.properties;
             existing.active = true;
             existing.superseded_by = None;
             existing.artifact = None;
@@ -175,12 +188,78 @@ fn upsert_part(graph: &mut MemoryGraph, root: &str, entry: MemoryEntry) -> bool 
             edge.target == root && matches!(edge.kind, crate::memory_types::EdgeKind::DerivedFrom)
         });
         graph.add_edge(&id, root, crate::memory_types::EdgeKind::DerivedFrom);
-        changed || !had_parent_edge
+        let had_contains = graph.get_edges(root).iter().any(|edge| {
+            edge.target == id && matches!(edge.kind, crate::memory_types::EdgeKind::Contains)
+        });
+        graph.add_edge(root, &id, crate::memory_types::EdgeKind::Contains);
+        changed || !had_parent_edge || !had_contains
     } else {
+        let id = entry.id.clone();
         graph.add_memory(entry);
         graph.add_edge(&id, root, crate::memory_types::EdgeKind::DerivedFrom);
+        graph.add_edge(root, &id, crate::memory_types::EdgeKind::Contains);
         true
     }
+}
+
+fn desired_step_chain(parts: &[MemoryEntry]) -> Vec<(String, String)> {
+    let mut steps: Vec<(u64, String, String)> = parts
+        .iter()
+        .filter_map(|part| {
+            if part.property("skill.part_kind")?.as_str()? != "step" {
+                return None;
+            }
+            let order = part.property("skill.step_order")?.as_u64()?;
+            let section = part.property("skill.section")?.as_str()?.to_string();
+            Some((order, part.id.clone(), section))
+        })
+        .collect();
+    steps.sort_by_key(|(order, _, _)| *order);
+    let mut chain = Vec::new();
+    for pair in steps.windows(2) {
+        if pair[0].2 == pair[1].2 {
+            chain.push((pair[0].1.clone(), pair[1].1.clone()));
+        }
+    }
+    chain
+}
+
+fn reconcile_step_edges(
+    graph: &mut MemoryGraph,
+    desired_ids: &HashSet<String>,
+    chain: &[(String, String)],
+) -> (usize, usize) {
+    let desired: HashSet<(String, String)> = chain
+        .iter()
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    let mut removed = 0;
+    for id in desired_ids {
+        let stale_targets: Vec<String> = graph
+            .get_edges(id)
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, crate::memory_types::EdgeKind::NextStep)
+                    && !desired.contains(&(id.clone(), edge.target.clone()))
+            })
+            .map(|edge| edge.target.clone())
+            .collect();
+        for target in stale_targets {
+            graph.remove_edge(id, &target, &crate::memory_types::EdgeKind::NextStep);
+            removed += 1;
+        }
+    }
+    let mut added = 0;
+    for (from, to) in chain {
+        let exists = graph.get_edges(from).iter().any(|edge| {
+            edge.target == *to && matches!(edge.kind, crate::memory_types::EdgeKind::NextStep)
+        });
+        if !exists {
+            graph.add_edge(from, to, crate::memory_types::EdgeKind::NextStep);
+            added += 1;
+        }
+    }
+    (added, removed)
 }
 
 /// Build the derived nodes without touching a graph. Exposed for tests.
@@ -344,14 +423,23 @@ fn push_code_part(
     tags.push(format!("lang:{lang}"));
     tags.push(format!("skill-section:{}", section.slug));
     let category = MemoryCategory::Observation;
-    parts.push(part_entry(
+    let mut entry = part_entry(
         skill,
         "code",
         &format!("{lang}-{}", &section.slug),
         category,
         body,
         tags,
-    ));
+    );
+    entry.properties.insert(
+        "skill.section".to_string(),
+        serde_json::Value::String(section.slug.clone()),
+    );
+    entry.properties.insert(
+        "skill.language".to_string(),
+        serde_json::Value::String(lang.clone()),
+    );
+    parts.push(entry);
 }
 
 fn flush_step(
@@ -380,14 +468,23 @@ fn flush_step(
         section.title,
         truncate_chars(text, MAX_STEP_CHARS)
     );
-    parts.push(part_entry(
+    let mut entry = part_entry(
         skill,
         "step",
         &format!("{}-{}", *step_order, section.slug),
         MemoryCategory::ProcessRule,
         content,
         tags,
-    ));
+    );
+    entry.properties.insert(
+        "skill.section".to_string(),
+        serde_json::Value::String(section.slug.clone()),
+    );
+    entry.properties.insert(
+        "skill.step_order".to_string(),
+        serde_json::Value::Number((*step_order as u64).into()),
+    );
+    parts.push(entry);
 }
 
 fn flush_section(skill: &Skill, section: &mut SectionDraft, parts: &mut Vec<MemoryEntry>) {
@@ -419,14 +516,19 @@ fn flush_section(skill: &Skill, section: &mut SectionDraft, parts: &mut Vec<Memo
     }
     let mut tags = part_tags(skill, "section");
     tags.push(format!("skill-section:{}", section.slug));
-    parts.push(part_entry(
+    let mut entry = part_entry(
         skill,
         "section",
         &section.slug,
         MemoryCategory::ProcessRule,
         truncate_chars(&content, MAX_SECTION_CHARS),
         tags,
-    ));
+    );
+    entry.properties.insert(
+        "skill.section".to_string(),
+        serde_json::Value::String(section.slug.clone()),
+    );
+    parts.push(entry);
     *section = overview_section();
 }
 
@@ -447,6 +549,18 @@ fn part_entry(
     entry.source = Some("skill_registry".to_string());
     entry.trust = crate::memory::TrustLevel::High;
     entry.subject_key = Some(subject_key);
+    entry.properties.insert(
+        "skill.name".to_string(),
+        serde_json::Value::String(skill.name.clone()),
+    );
+    entry.properties.insert(
+        "skill.part_kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    entry.properties.insert(
+        "skill.part_key".to_string(),
+        serde_json::Value::String(key.clone()),
+    );
     entry.search_text =
         crate::memory_types::normalize_memory_search_text(&entry.content, &entry.tags);
     entry
@@ -520,6 +634,27 @@ fn script_parts(skill: &Skill) -> Vec<MemoryEntry> {
             MemoryCategory::Observation,
             truncate_chars(&content, MAX_SCRIPT_CHARS),
             tags,
+        );
+        entry.properties.insert(
+            "skill.language".to_string(),
+            serde_json::Value::String(lang.to_string()),
+        );
+        entry.properties.insert(
+            "skill.source_path".to_string(),
+            serde_json::Value::String(relative.clone()),
+        );
+        entry.properties.insert(
+            "skill.content_hash".to_string(),
+            serde_json::Value::String(hash.clone()),
+        );
+        entry.properties.insert(
+            "skill.symbols".to_string(),
+            serde_json::Value::Array(
+                symbols
+                    .iter()
+                    .map(|symbol| serde_json::Value::String(symbol.clone()))
+                    .collect(),
+            ),
         );
         let search_text = format!("{content}\n{}", truncate_chars(&text, MAX_CODE_CHARS));
         entry.search_text =

@@ -1115,6 +1115,10 @@ pub struct SkillMemoryReconcileReport {
     pub pruned: usize,
     /// Stale derived index nodes removed.
     pub parts_pruned: usize,
+    /// Structural `contains` / `next_step` edges added.
+    pub part_edges_added: usize,
+    /// Structural `contains` / `next_step` edges removed.
+    pub part_edges_removed: usize,
     /// Missing `derived_from` edges added.
     pub edges_added: usize,
     /// Outdated `derived_from` edges removed.
@@ -1129,6 +1133,8 @@ impl SkillMemoryReconcileReport {
         self.parts_mirrored += other.parts_mirrored;
         self.pruned += other.pruned;
         self.parts_pruned += other.parts_pruned;
+        self.part_edges_added += other.part_edges_added;
+        self.part_edges_removed += other.part_edges_removed;
         self.edges_added += other.edges_added;
         self.edges_removed += other.edges_removed;
         self.needs_review += other.needs_review;
@@ -1418,10 +1424,15 @@ fn reconcile_skill_graph(
             report.parts_pruned += pruned;
             changed |= pruned > 0;
         } else {
-            let (mirrored, pruned) = skill_index::sync_skill_parts(graph, skill);
-            report.parts_mirrored += mirrored;
-            report.parts_pruned += pruned;
-            changed |= mirrored > 0 || pruned > 0;
+            let sync = skill_index::sync_skill_parts(graph, skill);
+            report.parts_mirrored += sync.mirrored;
+            report.parts_pruned += sync.pruned;
+            report.part_edges_added += sync.edges_added;
+            report.part_edges_removed += sync.edges_removed;
+            changed |= sync.mirrored > 0
+                || sync.pruned > 0
+                || sync.edges_added > 0
+                || sync.edges_removed > 0;
         }
         if graph
             .get_memory(&format!("skill:{}", skill.name))

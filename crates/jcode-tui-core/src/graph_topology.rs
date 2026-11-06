@@ -287,6 +287,8 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::Supersedes => "supersedes",
         EdgeKind::Contradicts => "contradicts",
         EdgeKind::DerivedFrom => "derived_from",
+        EdgeKind::Contains => "contains",
+        EdgeKind::NextStep => "next_step",
     }
 }
 
