@@ -1557,6 +1557,75 @@ fn skill_mirrors_are_written_as_link_nodes() {
 }
 
 #[test]
+fn skill_reconcile_writes_retrievable_index_parts() {
+    with_temp_home(|home| {
+        let skill_dir = home.join("skills").join("indexed-opt");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: indexed-opt
+description: Measure before optimizing
+---
+
+# Indexed Optimization
+
+Define target metrics first.
+
+## Workflow
+
+- Measure the full path before changing any code.
+- Attribute bottlenecks to concrete components.
+
+```bash
+cargo test --profile selfdev
+```
+"#,
+        )
+        .expect("write skill");
+
+        let registry = crate::skill::SkillRegistry::load_global().expect("registry");
+        let report = crate::skill::reconcile_skill_memory_links(&registry, None);
+        assert!(report.parts_mirrored >= 3, "parts: {report:?}");
+
+        let manager = MemoryManager::new();
+        let graph = manager.load_global_graph().unwrap();
+        let part_ids: Vec<&str> = graph
+            .memories
+            .keys()
+            .map(String::as_str)
+            .filter(|id| id.starts_with("skill:indexed-opt::"))
+            .collect();
+        assert!(part_ids.iter().any(|id| id.contains("::section:")));
+        assert!(part_ids.iter().any(|id| id.contains("::step:")));
+        assert!(part_ids.iter().any(|id| id.contains("::code:")));
+        for id in &part_ids {
+            assert!(
+                graph
+                    .get_edges(id)
+                    .iter()
+                    .any(|edge| edge.target == "skill:indexed-opt"),
+                "missing root edge for {id}"
+            );
+        }
+
+        let selected = manager
+            .l1_relevant("Attribute bottlenecks to concrete components", 6)
+            .unwrap();
+        let ids: Vec<&str> = selected.iter().map(|entry| entry.id.as_str()).collect();
+        let root = ids
+            .iter()
+            .position(|id| *id == "skill:indexed-opt")
+            .expect("root pointer selected");
+        let part = ids
+            .iter()
+            .position(|id| id.starts_with("skill:indexed-opt::"))
+            .expect("part selected");
+        assert!(root < part, "root must be injected before its part: {ids:?}");
+    });
+}
+
+#[test]
 fn accepted_skill_records_derived_from_evidence_edges() {
     with_temp_home(|home| {
         let project = home.join("workspace");

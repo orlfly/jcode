@@ -268,8 +268,13 @@ impl SkillTool {
                     let report =
                         crate::skill::reconcile_skill_memory_links(&global_snapshot, working_dir);
                     crate::logging::info(&format!(
-                        "Skill reload reconcile: {} mirror(s), {} pruned, +{} edges, -{} edges",
-                        report.mirrored, report.pruned, report.edges_added, report.edges_removed
+                        "Skill reload reconcile: {} mirror(s), {} part(s), {} pruned, {} part(s) pruned, +{} edges, -{} edges",
+                        report.mirrored,
+                        report.parts_mirrored,
+                        report.pruned,
+                        report.parts_pruned,
+                        report.edges_added,
+                        report.edges_removed
                     ));
                 }
                 let mut output = format!(

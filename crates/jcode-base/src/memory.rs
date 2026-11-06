@@ -2113,7 +2113,53 @@ impl MemoryManager {
                 None => by_id.push((entry.id.clone(), entry)),
             }
         }
-        Ok(by_id.into_iter().map(|(_, entry)| entry).collect())
+        let entries = by_id.into_iter().map(|(_, entry)| entry).collect();
+        Ok(self.expand_skill_parts(entries, limit))
+    }
+
+    /// Add the root pointer of any selected skill part before the part itself.
+    ///
+    /// Part nodes are independently retrievable, but a model that sees only a
+    /// step or code block does not know which skill owns it. The root pointer
+    /// is bounded and cheap, so attach it once per skill.
+    fn expand_skill_parts(&self, entries: Vec<MemoryEntry>, limit: usize) -> Vec<MemoryEntry> {
+        if entries.is_empty() {
+            return entries;
+        }
+        let mut roots: std::collections::HashMap<String, Option<MemoryEntry>> =
+            std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(entries.len());
+        let mut seen = std::collections::HashSet::new();
+
+        for entry in entries {
+            if let Some(root_id) = skill_root_id_for_part(&entry.id) {
+                let root = roots
+                    .entry(root_id.clone())
+                    .or_insert_with(|| self.load_skill_root(&root_id))
+                    .clone();
+                if let Some(root) = root
+                    && seen.insert(root.id.clone())
+                {
+                    out.push(root);
+                }
+            }
+            if seen.insert(entry.id.clone()) {
+                out.push(entry);
+            }
+        }
+        out.truncate(limit.max(1));
+        out
+    }
+
+    fn load_skill_root(&self, root_id: &str) -> Option<MemoryEntry> {
+        self.load_project_graph()
+            .ok()
+            .and_then(|graph| graph.get_memory(root_id).cloned())
+            .or_else(|| {
+                self.load_global_graph()
+                    .ok()
+                    .and_then(|graph| graph.get_memory(root_id).cloned())
+            })
     }
 
     /// L1 recall shaped as a [`MemoryRelevanceResult`] so the memory agent can
@@ -2184,7 +2230,7 @@ impl MemoryManager {
             .ok()?
             .into_iter()
             .find(|entry| {
-                entry.id.starts_with("skill:")
+                is_skill_root_id(&entry.id)
                     && !selected_ids.contains(entry.id.as_str())
                     && score_l1_relevance(entry, &terms, &normalized) >= L1_MIN_SCORE
             })?;
@@ -3053,13 +3099,12 @@ impl MemoryManager {
         context: &str,
         max_candidates: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        Ok(
-            crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
-                .await?
-                .into_iter()
-                .map(|(entry, _)| entry)
-                .collect(),
-        )
+        let entries = crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
+            .await?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect();
+        Ok(self.expand_skill_parts(entries, max_candidates))
     }
 
     /// Local keyword lookup, available without a remote decision provider.
@@ -3990,6 +4035,20 @@ pub fn active_backend_name() -> &'static str {
             }
         }
     })
+}
+
+/// A skill root mirror has the exact `skill:<name>` shape. Derived index nodes
+/// add `::<kind>:...` segments after the name.
+pub(crate) fn is_skill_root_id(id: &str) -> bool {
+    id.starts_with("skill:") && !id.contains("::")
+}
+
+pub(crate) fn skill_root_id_for_part(id: &str) -> Option<String> {
+    if !id.starts_with("skill:") || !id.contains("::") {
+        return None;
+    }
+    let name = id.strip_prefix("skill:")?.split("::").next()?.trim();
+    (!name.is_empty()).then(|| format!("skill:{name}"))
 }
 
 /// Whether this build is a test build that must ignore an ambient backend.

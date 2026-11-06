@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 mod invocation;
 pub use invocation::SkillInvocation;
+mod skill_index;
 
 /// A skill definition from SKILL.md
 #[derive(Debug, Clone)]
@@ -1108,8 +1109,12 @@ pub struct AcceptedSkill {
 pub struct SkillMemoryReconcileReport {
     /// Skill mirrors that were written or refreshed.
     pub mirrored: usize,
+    /// Derived section/step/code/script index nodes written or refreshed.
+    pub parts_mirrored: usize,
     /// Stale `skill:*` mirrors removed because the skill no longer exists.
     pub pruned: usize,
+    /// Stale derived index nodes removed.
+    pub parts_pruned: usize,
     /// Missing `derived_from` edges added.
     pub edges_added: usize,
     /// Outdated `derived_from` edges removed.
@@ -1121,7 +1126,9 @@ pub struct SkillMemoryReconcileReport {
 impl SkillMemoryReconcileReport {
     fn merge(&mut self, other: Self) {
         self.mirrored += other.mirrored;
+        self.parts_mirrored += other.parts_mirrored;
         self.pruned += other.pruned;
+        self.parts_pruned += other.parts_pruned;
         self.edges_added += other.edges_added;
         self.edges_removed += other.edges_removed;
         self.needs_review += other.needs_review;
@@ -1244,6 +1251,8 @@ pub fn drain_skill_reconcile_outbox() -> SkillMemoryReconcileReport {
 /// registry. Unlike the old additive sync, this pass is authoritative:
 ///
 /// * every registered skill gets exactly one mirror per scope;
+/// * each non-duplicated skill mirror gets deterministic section, step, code
+///   and script metadata child nodes under its reserved id;
 /// * mirrors for skills that no longer exist are pruned;
 /// * `derived_from` edges are diffed against the frontmatter evidence list,
 ///   so removed evidence entries also lose their edge;
@@ -1400,6 +1409,20 @@ fn reconcile_skill_graph(
             changed = true;
         }
         report.mirrored += 1;
+        if is_global_skill {
+            // Canonical part nodes live with the global mirror. A global
+            // skill's project mirror exists for local evidence edges only, so
+            // keep it part-free instead of duplicating every section in every
+            // workspace that cites the skill.
+            let pruned = skill_index::prune_skill_parts(graph, &skill.name);
+            report.parts_pruned += pruned;
+            changed |= pruned > 0;
+        } else {
+            let (mirrored, pruned) = skill_index::sync_skill_parts(graph, skill);
+            report.parts_mirrored += mirrored;
+            report.parts_pruned += pruned;
+            changed |= mirrored > 0 || pruned > 0;
+        }
         if graph
             .get_memory(&format!("skill:{}", skill.name))
             .and_then(|entry| entry.artifact.as_ref())
@@ -1419,7 +1442,7 @@ fn reconcile_skill_graph(
     let stale: Vec<String> = graph
         .memories
         .keys()
-        .filter(|id| id.starts_with("skill:"))
+        .filter(|id| id.starts_with("skill:") && !id.contains("::"))
         .filter(|id| !names.contains(&id["skill:".len()..]))
         .filter(|id| {
             // A global skill's cross-store mirror is legitimate; keep it even
@@ -1431,6 +1454,8 @@ fn reconcile_skill_graph(
     for id in stale {
         if graph.remove_memory(&id).is_some() {
             report.pruned += 1;
+            let parts = skill_index::prune_skill_parts_under(graph, &id);
+            report.parts_pruned += parts;
             changed = true;
         }
     }
