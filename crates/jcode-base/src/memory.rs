@@ -2417,7 +2417,11 @@ impl MemoryManager {
     /// depending on which backend it happens to run.
     ///
     /// The visitor returns `true` when it modified the graph; only those are
-    /// written back. Returns the number of stores visited.
+    /// written back. Each store is saved immediately after it is visited so a
+    /// maintenance pass cannot hold a stale snapshot for the whole scan and
+    /// overwrite rows another session wrote in the meantime.
+    ///
+    /// Returns the number of stores visited.
     fn for_each_store(
         &self,
         mut visit: impl FnMut(&str, &mut MemoryGraph) -> bool,
@@ -2428,14 +2432,18 @@ impl MemoryManager {
             graph_backend()
         };
         let mut visited = 0usize;
-        let mut backend_saves: Vec<(StoreKey, MemoryGraph)> = Vec::new();
         for key in backend.list_keys().unwrap_or_default() {
             let Ok(mut graph) = backend.load(&key) else {
                 continue;
             };
             visited += 1;
             if visit(key.as_str(), &mut graph) {
-                backend_saves.push((key, graph));
+                if let Err(e) = backend.save(&key, &graph) {
+                    crate::logging::warn(&format!(
+                        "store save after maintenance failed for {}: {e}",
+                        key.as_str()
+                    ));
+                }
             }
         }
         if let Ok(base) = crate::storage::jcode_dir() {
@@ -2457,11 +2465,6 @@ impl MemoryManager {
                         crate::storage::write_json(&path, &graph)?;
                     }
                 }
-            }
-        }
-        for (key, graph) in backend_saves {
-            if let Err(e) = backend.save(&key, &graph) {
-                crate::logging::warn(&format!("store save after maintenance failed: {e}"));
             }
         }
         Ok(visited)
