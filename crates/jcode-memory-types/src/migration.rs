@@ -705,6 +705,33 @@ pub fn apply_migrations(
     report
 }
 
+/// Deterministic data plan that brings every stored graph onto the current
+/// ontology's instance shape.
+///
+/// This is the all-store counterpart of a single ontology patch's
+/// `migrations`: it retypes residual rows, canonicalizes the legacy `fact`
+/// bucket, cleans tags, fills missing anchors, repairs lifecycle flags, drops
+/// the deprecated `in_cluster` relation and removes dangling edges. It is
+/// idempotent, so running it on every daemon upgrade is safe.
+pub fn default_data_migrations() -> Vec<MigrationStep> {
+    vec![
+        MigrationStep::DemoteIdentitylessEntities,
+        MigrationStep::ReclassifyResidual,
+        MigrationStep::RemapCategory {
+            from: "fact".to_string(),
+            to: TYPE_OBSERVATION.to_string(),
+        },
+        MigrationStep::ResanitizeTags,
+        MigrationStep::RecomputeSubjectKey { overwrite: false },
+        MigrationStep::NormalizeLifecycle,
+        MigrationStep::RewireEdge {
+            from_kind: "in_cluster".to_string(),
+            to_kind: None,
+        },
+        MigrationStep::DropDanglingEdges,
+    ]
+}
+
 fn category_matches(entry: &MemoryEntry, from: &str) -> bool {
     entry.category.to_string() == from
 }
@@ -851,7 +878,7 @@ fn demote_identityless_entities(graph: &mut MemoryGraph) -> usize {
     let mut changed = 0;
     for entry in graph.memories.values_mut() {
         if entry.category == MemoryCategory::Entity && entry.identity.is_empty() {
-            entry.category = MemoryCategory::Fact;
+            entry.category = MemoryCategory::Observation;
             entry.updated_at = Utc::now();
             changed += 1;
         }
@@ -1434,5 +1461,58 @@ mod tests {
             graph.get_memory(&env_id).unwrap().category,
             MemoryCategory::EnvFact
         );
+    }
+
+    #[test]
+    fn default_data_migrations_canonicalize_residual_and_drop_deprecated_edges() {
+        let mut graph = MemoryGraph::new();
+        let residual_id = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "a plain note without a typed marker",
+        ));
+        let rule_id = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "you must always validate the token before caching it",
+        ));
+        let entity_id = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Entity,
+            "anonymous entity without an identity key",
+        ));
+        graph.add_edge(
+            &residual_id,
+            "mem_missing",
+            EdgeKind::RelatesTo { weight: 0.5 },
+        );
+        graph.add_edge(&residual_id, "cluster:legacy", EdgeKind::InCluster);
+
+        let ontology = default_ontology();
+        let report = apply_migrations(&mut graph, &default_data_migrations(), &ontology);
+
+        assert_eq!(
+            graph.get_memory(&residual_id).unwrap().category,
+            MemoryCategory::Observation
+        );
+        assert_eq!(
+            graph.get_memory(&rule_id).unwrap().category,
+            MemoryCategory::ProcessRule
+        );
+        assert_eq!(
+            graph.get_memory(&entity_id).unwrap().category,
+            MemoryCategory::Observation
+        );
+        assert!(report.remapped >= 1);
+        assert!(report.entities_demoted >= 1);
+        assert!(report.edges_rewired >= 1);
+        assert!(report.edges_dropped >= 1);
+        assert!(
+            graph
+                .get_edges(&residual_id)
+                .iter()
+                .all(|edge| !matches!(edge.kind, EdgeKind::InCluster)
+                    && edge.target != "mem_missing")
+        );
+
+        let second = apply_migrations(&mut graph, &default_data_migrations(), &ontology);
+        assert_eq!(second.changed(), 0, "the plan must be idempotent");
     }
 }

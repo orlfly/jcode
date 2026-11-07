@@ -2628,6 +2628,91 @@ fn reclassify_can_backfill_subject_keys() {
 }
 
 #[test]
+fn default_ontology_migration_canonicalizes_all_stores_idempotently() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-migrate");
+        let prose = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "the garden has red flowers",
+            ))
+            .unwrap();
+        let rule = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "you must always validate the token before caching it",
+            ))
+            .unwrap();
+        let mut graph = manager.load_project_graph().unwrap();
+        let mut entity = MemoryEntry::new(
+            MemoryCategory::Entity,
+            "anonymous entity without an identity key",
+        );
+        entity.id = "mem_identityless_entity".to_string();
+        let entity_id = graph.add_memory(entity);
+        graph.add_edge(&prose, "cluster:legacy", edge_kind_in_cluster());
+        graph.add_edge(&prose, "mem_missing", edge_kind_relates_to());
+        manager.save_project_graph(&graph).unwrap();
+
+        let dry = manager
+            .apply_default_ontology_migrations(false)
+            .expect("dry run");
+        assert!(dry.dry_run);
+        assert!(dry.migrations.remapped >= 1);
+        assert!(dry.migrations.entities_demoted >= 1);
+        assert!(dry.migrations.edges_rewired >= 1);
+        assert!(dry.migrations.edges_dropped >= 1);
+        let before = manager.load_project_graph().unwrap();
+        assert_eq!(
+            before.get_memory(&prose).unwrap().category,
+            MemoryCategory::Fact,
+            "dry run must not write"
+        );
+
+        let applied = manager
+            .apply_default_ontology_migrations(true)
+            .expect("apply");
+        assert_eq!(applied.migrations.remapped, dry.migrations.remapped);
+        let after = manager.load_project_graph().unwrap();
+        assert_eq!(
+            after.get_memory(&prose).unwrap().category,
+            MemoryCategory::Observation
+        );
+        assert_eq!(
+            after.get_memory(&rule).unwrap().category,
+            MemoryCategory::ProcessRule
+        );
+        assert_eq!(
+            after.get_memory(&entity_id).unwrap().category,
+            MemoryCategory::Observation
+        );
+        assert!(
+            after
+                .get_edges(&prose)
+                .iter()
+                .all(|edge| edge.target != "cluster:legacy" && edge.target != "mem_missing")
+        );
+        assert_eq!(
+            manager
+                .apply_default_ontology_migrations(true)
+                .unwrap()
+                .migrations
+                .changed(),
+            0,
+            "the migration must be idempotent"
+        );
+    });
+}
+
+fn edge_kind_in_cluster() -> jcode_memory_types::EdgeKind {
+    jcode_memory_types::EdgeKind::InCluster
+}
+
+fn edge_kind_relates_to() -> jcode_memory_types::EdgeKind {
+    jcode_memory_types::EdgeKind::RelatesTo { weight: 0.5 }
+}
+
+#[test]
 fn proposal_subjects_must_name_reusable_things() {
     use crate::memory::proposal_eligible_subject as eligible;
 

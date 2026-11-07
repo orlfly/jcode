@@ -494,7 +494,7 @@ fn prepare_for_write_demotes_identityless_entities() {
         MemoryCategory::Entity,
         "ki-agent-v2 project env: GitLab kingsware group and internal hosts",
     ));
-    assert_eq!(demoted.category, MemoryCategory::Fact);
+    assert_eq!(demoted.category, MemoryCategory::Observation);
 }
 
 #[test]

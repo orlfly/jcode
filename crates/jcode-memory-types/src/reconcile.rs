@@ -642,7 +642,8 @@ pub fn prepare_for_write(mut entry: MemoryEntry) -> MemoryEntry {
             "env_fact" | "envfact" => Some(MemoryCategory::EnvFact),
             "contract" => Some(MemoryCategory::Contract),
             "process_rule" | "processrule" => Some(MemoryCategory::ProcessRule),
-            "observation" => Some(MemoryCategory::Observation),
+            "skill" | "Skills" => Some(MemoryCategory::ProcessRule),
+            "fact" | "note" | "medium" | "observation" => Some(MemoryCategory::Observation),
             _ => None,
         };
         if let Some(canonical) = canonical {
@@ -662,7 +663,7 @@ pub fn prepare_for_write(mut entry: MemoryEntry) -> MemoryEntry {
     // they are demoted to the residual type instead of polluting the entity
     // layer with anonymous rows (v1: 175 entities, 0 identities).
     if entry.category == MemoryCategory::Entity && entry.identity.is_empty() {
-        entry.category = MemoryCategory::Fact;
+        entry.category = MemoryCategory::Observation;
     }
     entry
 }

@@ -288,6 +288,40 @@ impl TtlGcReport {
     }
 }
 
+/// Outcome of an all-store ontology data migration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OntologyMigrationReport {
+    /// Stores visited by the pass.
+    pub stores: usize,
+    /// Whether this was a dry run.
+    pub dry_run: bool,
+    /// Aggregated per-step migration counts.
+    pub migrations: jcode_memory_types::migration::MigrationReport,
+}
+
+impl OntologyMigrationReport {
+    /// Human-readable one-liner shared by the CLI and maintenance logs.
+    pub fn summary(&self) -> String {
+        let migrations = &self.migrations;
+        format!(
+            "{} store(s), {} change(s): {} remapped, {} split, {} retired, {} archived, {} anchor(s), {} tag pass(es), {} lifecycle fix(es), {} entity demotion(s), {} dangling edge(s), {} rewired edge(s), {} reclassified",
+            self.stores,
+            migrations.changed(),
+            migrations.remapped,
+            migrations.split,
+            migrations.retired,
+            migrations.archived,
+            migrations.subject_keys,
+            migrations.tags_resanitized,
+            migrations.lifecycle_fixed,
+            migrations.entities_demoted,
+            migrations.edges_dropped,
+            migrations.edges_rewired,
+            migrations.reclassified,
+        )
+    }
+}
+
 /// Classify every eligible instance in one graph.
 ///
 /// Returns true when the graph was modified (and therefore needs saving).
@@ -2540,6 +2574,43 @@ impl MemoryManager {
         if classify_graph(&mut graph, &ontology, true, apply, &mut report) {
             self.save_project_graph(&graph)?;
         }
+        Ok(report)
+    }
+
+    /// Apply the deterministic ontology data plan to every persisted store.
+    ///
+    /// Dry-run clones each graph before migrating, so callers can inspect the
+    /// exact counts without writing. The real pass reuses `for_each_store`,
+    /// which covers the SQLite named graphs and legacy JSON project files.
+    ///
+    /// The apply pass rewrites whole store snapshots. Callers must ensure no
+    /// other session is writing the same store concurrently, otherwise a
+    /// read-modify-write snapshot can overwrite newer rows.
+    pub fn apply_default_ontology_migrations(
+        &self,
+        apply: bool,
+    ) -> Result<OntologyMigrationReport> {
+        use jcode_memory_types::migration::{apply_migrations, default_data_migrations};
+
+        let steps = default_data_migrations();
+        let mut report = OntologyMigrationReport {
+            dry_run: !apply,
+            ..Default::default()
+        };
+        report.stores = self.for_each_store(|_key, graph| {
+            let ontology = self.ontology_for_graph(graph);
+            if apply {
+                let migrated = apply_migrations(graph, &steps, &ontology);
+                let changed = migrated.changed() > 0;
+                report.migrations.merge(migrated);
+                changed
+            } else {
+                let mut probe = graph.clone();
+                let migrated = apply_migrations(&mut probe, &steps, &ontology);
+                report.migrations.merge(migrated);
+                false
+            }
+        })?;
         Ok(report)
     }
 

@@ -1618,6 +1618,9 @@ pub enum MemorySubcommand {
         apply: bool,
         subject_keys: bool,
     },
+    Migrate {
+        apply: bool,
+    },
     Ontology {
         action: String,
         scope: String,
@@ -1959,6 +1962,18 @@ async fn run_memory_command_for_dir(
                 report.summary()
             );
             if report.dry_run && report.total_changes() > 0 {
+                println!("Re-run with --apply to write these changes.");
+            }
+        }
+
+        MemorySubcommand::Migrate { apply } => {
+            let report = manager.apply_default_ontology_migrations(apply)?;
+            println!(
+                "{} ontology data migration: {}",
+                if report.dry_run { "Dry run:" } else { "Applied" },
+                report.summary()
+            );
+            if report.dry_run && report.migrations.changed() > 0 {
                 println!("Re-run with --apply to write these changes.");
             }
         }

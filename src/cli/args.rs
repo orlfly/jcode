@@ -1231,6 +1231,20 @@ pub(crate) enum MemoryCommand {
         subject_keys: bool,
     },
 
+    /// Normalize every stored memory graph onto the current ontology.
+    ///
+    /// Retypes residual `fact` rows, canonicalizes the legacy `fact` bucket to
+    /// `observation`, cleans tags, fills missing `subject_key` anchors, repairs
+    /// lifecycle flags, demotes identityless entities, drops deprecated
+    /// `in_cluster` edges and removes dangling edges. Dry run unless `--apply`
+    /// is passed. Run while other jcode sessions are idle: the apply pass
+    /// rewrites each store snapshot.
+    Migrate {
+        /// Write the changes instead of reporting them
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Inspect, validate, apply or roll back the ontology stored with memory
     Ontology {
         #[command(subcommand)]

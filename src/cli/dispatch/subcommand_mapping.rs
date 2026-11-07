@@ -33,6 +33,7 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             apply,
             subject_keys,
         },
+        MemoryCommand::Migrate { apply } => commands::MemorySubcommand::Migrate { apply },
         MemoryCommand::Ontology { action } => match action {
             OntologyCommand::Show { scope, json } => commands::MemorySubcommand::Ontology {
                 action: "show".to_string(),
