@@ -874,3 +874,50 @@ fn skill_update_requires_changelog_and_l3_confirmation_and_rolls_back() {
         update_skill_from_draft(&l3, Some(project), true).expect("confirmed L3 update");
     });
 }
+
+#[test]
+fn health_counts_only_non_draft_valid_proposals_as_actionable() {
+    with_skill_temp_home(|home| {
+        let project = tempfile::tempdir().expect("project");
+        let global_proposals = home.join("skills").join(".proposals");
+        let write_proposal = |dir: &Path, name: &str, content: &str| {
+            std::fs::create_dir_all(dir).expect("create proposals dir");
+            std::fs::write(dir.join(format!("{name}.md")), content).expect("write proposal");
+        };
+        write_proposal(
+            &global_proposals,
+            "ready",
+            "---\nname: ready\ndescription: ready skill\nversion: 0.1.0\nstatus: active\ntriggers:\n  - ready\n---\n\nDo the ready thing.\n",
+        );
+        write_proposal(
+            &global_proposals,
+            "draft-flag",
+            "---\nname: draft-flag\ndescription: draft skill\nversion: 0.1.0\nstatus: active\ntriggers:\n  - draft\nneeds_human_draft: true\n---\n\nDo the draft thing.\n",
+        );
+        write_proposal(
+            &global_proposals,
+            "draft-todo",
+            "---\nname: draft-todo\ndescription: todo skill\nversion: 0.1.0\nstatus: active\ntriggers:\n  - todo\n---\n\n## TODO\n\nFill this in.\n",
+        );
+        write_proposal(
+            &global_proposals,
+            "invalid",
+            "---\nname: invalid\ndescription: invalid skill\nversion: nope\nstatus: active\n---\n\nInvalid version.\n",
+        );
+        let project_proposals = project
+            .path()
+            .join(".jcode")
+            .join("skills")
+            .join(".proposals");
+        write_proposal(
+            &project_proposals,
+            "project-ready",
+            "---\nname: project-ready\ndescription: project skill\nversion: 0.1.0\nstatus: active\ntriggers:\n  - project\n---\n\nDo the project thing.\n",
+        );
+
+        let report = skill_health(Some(project.path())).expect("health");
+        assert_eq!(report.proposals, 5);
+        assert_eq!(report.actionable_proposals, 2);
+        assert_eq!(report.draft_proposals, 2);
+    });
+}

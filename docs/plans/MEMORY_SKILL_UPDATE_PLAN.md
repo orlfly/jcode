@@ -13,9 +13,11 @@ Implemented surfaces:
 
 Remaining from the design: a candidate-set batch diff for G4 (the gate type
 exists and is evaluated by the generic action API, but extraction writes are
-still judged one candidate at a time), enforced skill effects at the tool
-layer (manifests are currently advisory metadata), and a hard query router
-(routing is currently a lexical skill-prior, not a filter).
+still judged one candidate at a time), body-similarity proposal merging
+(dedup is subject-key only), skill-health signals for unused/failing skills
+and disappeared evidence, enforced skill effects at the tool layer (manifests
+are currently advisory metadata), and a hard query router (routing is
+currently a lexical skill-prior, not a filter).
 
 Reference: `/home/cc/Downloads/enterprise-ontology` skill design, read in full
 (SKILL.md plus modeling-rules, lifecycle-ops, data-pipeline and query-routing).
@@ -115,7 +117,8 @@ quality inspection and source health.
   active project store.
 - At baseline no memory carried `critical=true` and no memory-level review
   queue existed. After implementation the queue is empty on existing data
-  (no new gated writes yet) and `skill health` reports 44 draft proposals.
+  (no new gated writes yet) and `skill health` reports 44 proposals, 0
+  actionable and 44 draft skeletons.
 
 This is the core conclusion: jcode has a good **write and recall** pipeline but
 a weak **change-governance** pipeline. This stage optimizes update quality
@@ -367,7 +370,7 @@ whether any selected item is `needs_review` or conflicted.
 
 ## 9. Code-level work breakdown
 
-### Phase P0: governance foundations (1 week)
+### Phase P0: governance foundations (1 week, implemented; G4 batch diff remaining)
 
 - `jcode-memory-types`: add `ProvenanceRecord.locator`, `needs_review` flag,
   review-item type, change-level enum.
@@ -380,7 +383,7 @@ whether any selected item is `needs_review` or conflicted.
 Acceptance: a low-confidence extraction is not admitted; a user-stated
 preference overwrite creates a review item; health shows the backlog.
 
-### Phase P1: skill contract and lifecycle (2-3 weeks)
+### Phase P1: skill contract and lifecycle (2-3 weeks, implemented; body-similarity merge and extended health remaining)
 
 - `jcode-base/src/skill.rs`: manifest v2 parser/validator, version snapshots,
   diff/classify, update/rollback APIs.
@@ -388,10 +391,11 @@ preference overwrite creates a review item; health shows the backlog.
 - CLI/tool: `skill list|show|validate|update|rollback`, `skill health`.
 - Tests: v1 compatibility, L2/L3 diff gates, snapshot restore, proposal dedup.
 
-Acceptance: 44 backlog proposals collapse to a ranked, deduplicated set; an
-installed skill can be updated with a changelog and rolled back.
+Acceptance: re-running distillation caps and subject-dedupes the queue (the
+existing 44 files remain until that re-run); an installed skill can be updated
+with a changelog and rolled back.
 
-### Phase P2: source health and routing (3-5 weeks)
+### Phase P2: source health and routing (3-5 weeks, implemented core; optional action audit remaining)
 
 - Extraction source health metrics and pause/resume.
 - Memory health source scan and coverage report.
@@ -414,7 +418,7 @@ with provenance.
   exposure rate.
 - Source health: extraction failure rate, confidence drift, duplicate ratio.
 
-Targets after P1:
+Targets after P1 (not yet measured on a fresh review cycle):
 
 - Review backlog < 50 items, oldest < 7 days.
 - Proposal to accepted ratio improves from 1/44 to at least 1/5 for actionable
@@ -428,7 +432,7 @@ Targets after P1:
   Start conservative for `critical` and authoritative rows only.
 - **Lexical reconcile false positives**: keep the current conservative
   thresholds; review gates are the safety net, not a reason to loosen them.
-- **Skill format compatibility**: existing 1 installed skill and 44 proposals
+- **Skill format compatibility**: existing 2 installed skills and 44 proposals
   must continue to parse; v2 fields optional.
 - **Storage for reviews**: JSONL is enough initially; moving to SQLite is a
   later optimization if the queue grows.

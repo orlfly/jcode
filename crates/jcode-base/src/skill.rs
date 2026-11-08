@@ -1822,11 +1822,11 @@ pub fn skill_health(working_dir: Option<&Path>) -> Result<SkillHealthReport> {
                 }
                 if let Ok(skill) = SkillRegistry::parse_skill(&path) {
                     let validation = validate_skill_manifest(&skill);
-                    if validation.is_valid() {
-                        report.actionable_proposals += 1;
-                    }
-                    if skill.needs_human_draft || skill.content.contains("## TODO") {
+                    let is_draft = skill.needs_human_draft || skill.content.contains("## TODO");
+                    if is_draft {
                         report.draft_proposals += 1;
+                    } else if validation.is_valid() {
+                        report.actionable_proposals += 1;
                     }
                 }
             }
