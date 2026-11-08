@@ -52,8 +52,8 @@ pub use activity::{
 };
 use cache::{cache_graph, cache_graph_for_backend, cached_graph};
 pub use jcode_memory_types::{
-    AdmissionTier, ChangeLevel, MemoryReviewItem, MemoryReviewState, ReviewRecommendation,
-    ReviewStatus, admission_tier,
+    AdmissionTier, ChangeLevel, ConfirmationGate, MemoryReviewItem, MemoryReviewState,
+    ReviewRecommendation, ReviewStatus, admission_tier,
 };
 use ontology_registry::OntologyRegistry;
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
@@ -917,6 +917,29 @@ fn apply_critical_policy(entry: &mut MemoryEntry) {
     }
 }
 
+/// G4 threshold: more than five changed records in one batch, or more than
+/// 20% of the category's existing active rows.
+const BATCH_CHANGE_ABSOLUTE_LIMIT: usize = 5;
+
+fn batch_change_categories(
+    candidates: &[MemoryCategory],
+    existing_counts: &std::collections::HashMap<MemoryCategory, usize>,
+) -> std::collections::HashSet<MemoryCategory> {
+    let mut counts = std::collections::HashMap::new();
+    for category in candidates {
+        *counts.entry(category.clone()).or_insert(0usize) += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(category, count)| {
+            let existing = existing_counts.get(&category).copied().unwrap_or(0);
+            let over_absolute = count > BATCH_CHANGE_ABSOLUTE_LIMIT;
+            let over_share = existing > 0 && count * 5 > existing;
+            (over_absolute || over_share).then_some(category)
+        })
+        .collect()
+}
+
 /// Confirmation gates for a single proposed memory write.
 fn write_confirmation_gates(
     old: Option<&MemoryEntry>,
@@ -1261,6 +1284,15 @@ impl MemoryManager {
     /// review-queue parking. Returns `PendingReview` without mutating the graph
     /// when a human decision is required.
     pub fn remember_project_governed(&self, entry: MemoryEntry) -> Result<MemoryWriteOutcome> {
+        self.remember_project_governed_with_policy(entry, &[], None)
+    }
+
+    fn remember_project_governed_with_policy(
+        &self,
+        entry: MemoryEntry,
+        forced_gates: &[ConfirmationGate],
+        forced_reason: Option<&str>,
+    ) -> Result<MemoryWriteOutcome> {
         anyhow::ensure!(
             self.project_memory_path()?.is_some(),
             "Project memory requires a working directory; use global scope explicitly"
@@ -1274,6 +1306,8 @@ impl MemoryManager {
             &ontology,
             "project",
             project_dir.as_deref(),
+            forced_gates,
+            forced_reason,
         )?;
         if let MemoryWriteOutcome::Stored { .. } = outcome {
             self.save_project_graph(&graph)?;
@@ -1301,7 +1335,8 @@ impl MemoryManager {
                  write environment-specific facts to project scope instead"
             ));
         }
-        let outcome = self.governed_write(&mut graph, entry, &ontology, "global", None)?;
+        let outcome =
+            self.governed_write(&mut graph, entry, &ontology, "global", None, &[], None)?;
         if let MemoryWriteOutcome::Stored { .. } = outcome {
             self.save_global_graph(&graph)?;
         }
@@ -1394,6 +1429,8 @@ impl MemoryManager {
         ontology: &jcode_memory_types::Ontology,
         scope: &str,
         project_dir: Option<&std::path::Path>,
+        forced_gates: &[ConfirmationGate],
+        forced_reason: Option<&str>,
     ) -> Result<MemoryWriteOutcome> {
         let mut entry = jcode_memory_types::reconcile::prepare_for_write(entry);
         apply_critical_policy(&mut entry);
@@ -1423,7 +1460,9 @@ impl MemoryManager {
             }
         }
 
-        let gates = write_confirmation_gates(old.as_ref(), &entry);
+        let mut gates = write_confirmation_gates(old.as_ref(), &entry);
+        gates.extend_from_slice(forced_gates);
+        gates.dedup();
         if tier == AdmissionTier::PendingOnly || !gates.is_empty() {
             let reason = if tier == AdmissionTier::PendingOnly {
                 format!(
@@ -1432,6 +1471,8 @@ impl MemoryManager {
                     jcode_memory_types::REVIEW_BADGE_CONFIDENCE,
                     provenance.method
                 )
+            } else if let Some(reason) = forced_reason {
+                reason.to_string()
             } else {
                 gates
                     .iter()
@@ -3883,13 +3924,29 @@ impl MemoryManager {
 
         let mut ids = Vec::new();
         let candidates = extracted.len();
+        let candidate_categories: Vec<MemoryCategory> = extracted
+            .iter()
+            .map(|memory| memory.category.parse().unwrap_or(MemoryCategory::Fact))
+            .collect();
+        let existing_counts = self
+            .load_project_graph()
+            .map(|graph| {
+                let mut counts = std::collections::HashMap::new();
+                for entry in graph.active_memories() {
+                    *counts.entry(entry.category.clone()).or_insert(0usize) += 1;
+                }
+                counts
+            })
+            .unwrap_or_default();
+        let batch_gated_categories =
+            batch_change_categories(&candidate_categories, &existing_counts);
         let mut unique_contents = std::collections::HashSet::new();
         let mut confidence_sum = 0.0f32;
         let mut admitted = 0usize;
         let mut queued = 0usize;
         let mut failed = 0usize;
-        for memory in extracted {
-            let category: MemoryCategory = memory.category.parse().unwrap_or(MemoryCategory::Fact);
+        for (memory, category) in extracted.into_iter().zip(candidate_categories) {
+            let batch_gated = batch_gated_categories.contains(&category);
             let trust = match memory.trust.as_str() {
                 "high" => TrustLevel::High,
                 "medium" => TrustLevel::Medium,
@@ -3922,7 +3979,16 @@ impl MemoryManager {
 
             // Store in project scope by default. A single bad candidate must
             // not abort the batch: the failure rate feeds source health.
-            match self.remember_project_governed(entry) {
+            let outcome = if batch_gated {
+                self.remember_project_governed_with_policy(
+                    entry,
+                    &[ConfirmationGate::BatchChange],
+                    Some("extraction batch exceeds the G4 bulk-change threshold for this category"),
+                )
+            } else {
+                self.remember_project_governed(entry)
+            };
+            match outcome {
                 Ok(MemoryWriteOutcome::Stored { id, .. }) => {
                     ids.push(id);
                     admitted += 1;

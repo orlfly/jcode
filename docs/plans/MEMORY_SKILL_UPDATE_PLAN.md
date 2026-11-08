@@ -11,13 +11,14 @@ Implemented surfaces:
 - `memory` tool actions `review`, `health`
 - `skill_manage` tool actions `validate`, `health`, `update`, `rollback`
 
-Remaining from the design: a candidate-set batch diff for G4 (the gate type
-exists and is evaluated by the generic action API, but extraction writes are
-still judged one candidate at a time), body-similarity proposal merging
-(dedup is subject-key only), skill-health signals for unused/failing skills
-and disappeared evidence, enforced skill effects at the tool layer (manifests
-are currently advisory metadata), and a hard query router (routing is
-currently a lexical skill-prior, not a filter).
+Remaining from the design: field-level G4 batch-diff refinement (extraction
+batches now force review when more than five rows or more than 20% of an
+active category change, but the diff is category-level rather than per
+property field), body-similarity proposal merging (dedup is subject-key only),
+skill-health signals for unused/failing skills and disappeared evidence,
+enforced skill effects at the tool layer (manifests are currently advisory
+metadata), and a hard query router (routing is currently a lexical
+skill-prior, not a filter).
 
 Reference: `/home/cc/Downloads/enterprise-ontology` skill design, read in full
 (SKILL.md plus modeling-rules, lifecycle-ops, data-pipeline and query-routing).
@@ -374,7 +375,7 @@ whether any selected item is `needs_review` or conflicted.
 
 ## 9. Code-level work breakdown
 
-### Phase P0: governance foundations (1 week, implemented; G4 batch diff remaining)
+### Phase P0: governance foundations (1 week, implemented; field-level G4 refinement remaining)
 
 - `jcode-memory-types`: add `ProvenanceRecord.locator`, `needs_review` flag,
   review-item type, change-level enum.

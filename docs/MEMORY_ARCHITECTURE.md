@@ -164,6 +164,9 @@ policy before mutating a graph:
 - Destructive changes to an existing critical row, authoritative overwrites,
   status loss, and authoritative contradictions require confirmation.
   Rejected or parked writes leave the old value active.
+- Extraction batches that would change more than five rows, or more than 20%
+  of an active category, are parked with a G4 `BatchChange` gate. This is a
+  category-level diff today, not a per-property comparison.
 - Review items live in `<jcode_dir>/memory/reviews/pending.jsonl`; resolve
   them with `jcode memory review list|accept|reject|defer`.
 - `jcode memory health` reports type distribution, contradictions, duplicate

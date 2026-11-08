@@ -3310,6 +3310,66 @@ fn low_confidence_write_is_parked_in_review_queue() {
 }
 
 #[test]
+fn batch_change_gate_uses_absolute_and_share_thresholds() {
+    let existing = std::collections::HashMap::from([
+        (MemoryCategory::Observation, 100usize),
+        (MemoryCategory::Contract, 3usize),
+        (MemoryCategory::Preference, 100usize),
+    ]);
+    let six_observations = vec![MemoryCategory::Observation; 6];
+    assert!(
+        batch_change_categories(&six_observations, &existing)
+            .contains(&MemoryCategory::Observation)
+    );
+
+    let five_observations = vec![MemoryCategory::Observation; 5];
+    assert!(
+        !batch_change_categories(&five_observations, &existing)
+            .contains(&MemoryCategory::Observation)
+    );
+
+    let one_contract = vec![MemoryCategory::Contract];
+    assert!(
+        batch_change_categories(&one_contract, &existing).contains(&MemoryCategory::Contract),
+        "one change in a three-row category is more than 20%"
+    );
+
+    let two_preferences = vec![MemoryCategory::Preference; 2];
+    assert!(
+        !batch_change_categories(&two_preferences, &existing).contains(&MemoryCategory::Preference)
+    );
+}
+
+#[test]
+fn forced_batch_gate_parks_even_a_high_confidence_write() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-batch-gate");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "A batch of inferred observations needs review",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.99)
+                .with_locator("session:test"),
+        );
+        let outcome = manager
+            .remember_project_governed_with_policy(
+                entry,
+                &[ConfirmationGate::BatchChange],
+                Some("extraction batch exceeds the G4 threshold"),
+            )
+            .unwrap();
+        assert!(outcome.is_pending_review(), "{outcome:?}");
+        let pending = manager.list_reviews(Some(ReviewStatus::Pending)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].gates.contains(&ConfirmationGate::BatchChange));
+        assert!(pending[0].reason.contains("G4"));
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 0);
+    });
+}
+
+#[test]
 fn mid_confidence_write_is_admitted_with_review_badge() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/review-badge");
