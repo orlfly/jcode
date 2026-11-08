@@ -421,8 +421,8 @@ with provenance.
 Targets after P1 (not yet measured on a fresh review cycle):
 
 - Review backlog < 50 items, oldest < 7 days.
-- Proposal to accepted ratio improves from 1/44 to at least 1/5 for actionable
-  drafts.
+- At least one in five actionable proposals is accepted, instead of leaving
+  the current 44-file unreviewed backlog.
 - Zero silent overwrites of `user_stated`/`structured_mapping` values.
 - Every installed skill has version, evidence, and last outcome.
 
