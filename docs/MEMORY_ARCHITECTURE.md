@@ -174,3 +174,7 @@ migrations before installing the new definition. See
 
 Historical references: `docs/plans/MEMORY_GRAPH_PLAN.md` (graph-rerank
 proposal, partially implemented), `docs/plans/MCP_SKILLS_PLAN.md`.
+
+The next update-governance plan (provenance locators, confidence gates, review
+queue, skill contracts/versioning, health inspection) is in
+[`plans/MEMORY_SKILL_UPDATE_PLAN.md`](plans/MEMORY_SKILL_UPDATE_PLAN.md).
