@@ -5,8 +5,8 @@ pub use graph::{
 
 pub mod instance;
 pub use instance::{
-    ExtractionMethod, IdentityMetadata, LifecycleMetadata, MemoryStatus, ProvenanceRecord,
-    default_lifecycle_transition_table,
+    ExtractionMethod, IdentityMetadata, LifecycleMetadata, MemoryReviewState, MemoryStatus,
+    ProvenanceRecord, default_lifecycle_transition_table,
 };
 
 pub mod ontology;
@@ -51,6 +51,12 @@ pub use actions::{
 
 pub mod backend;
 pub use backend::{GraphBackend, GraphMutation, StoreKey, apply_mutations_in_place};
+
+pub mod review;
+pub use review::{
+    AUTO_ADMIT_CONFIDENCE, AdmissionTier, ChangeLevel, MemoryReviewItem, REVIEW_BADGE_CONFIDENCE,
+    ReviewRecommendation, ReviewStatus, admission_tier, diff_entries,
+};
 
 pub mod migration;
 pub use migration::{
@@ -303,7 +309,7 @@ impl TrustLevel {
 }
 
 /// A reinforcement breadcrumb tracking when/where a memory was reinforced
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Reinforcement {
     pub session_id: String,
     pub message_index: usize,
@@ -393,7 +399,7 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 /// A single memory entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
     pub category: MemoryCategory,
@@ -441,6 +447,9 @@ pub struct MemoryEntry {
     /// Lifecycle metadata: status, effective windows, deprecation.
     #[serde(default)]
     pub lifecycle: LifecycleMetadata,
+    /// Review state: mid-confidence admission badge or pending review linkage.
+    #[serde(default, skip_serializing_if = "MemoryReviewState::is_empty")]
+    pub review: MemoryReviewState,
     /// Critical memories require confirmation for destructive updates.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub critical: bool,
@@ -530,6 +539,7 @@ impl MemoryEntry {
             confidence: 1.0,
             provenance: None,
             lifecycle: LifecycleMetadata::active(),
+            review: MemoryReviewState::default(),
             critical: false,
             identity: IdentityMetadata::empty(),
             subject_key: None,
@@ -650,6 +660,16 @@ impl MemoryEntry {
 
     pub fn with_critical(mut self, critical: bool) -> Self {
         self.critical = critical;
+        self
+    }
+
+    pub fn with_review(mut self, review: MemoryReviewState) -> Self {
+        self.review = review;
+        self
+    }
+
+    pub fn with_needs_review(mut self) -> Self {
+        self.review.needs_review = true;
         self
     }
 
@@ -1041,7 +1061,17 @@ fn format_entries_for_prompt_with_header(
         }
         output.push_str(&format!("## {title}\n"));
         for (idx, item) in items.into_iter().enumerate() {
-            output.push_str(&format!("{}. {}\n", idx + 1, item.content.trim()));
+            let badge = if item.review.needs_review {
+                " [needs review]"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "{}. {}{}\n",
+                idx + 1,
+                item.content.trim(),
+                badge
+            ));
             if include_updated_at_comments {
                 output.push_str(&format!(
                     "<!-- updated_at: {} -->\n",

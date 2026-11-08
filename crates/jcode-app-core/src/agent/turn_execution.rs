@@ -1573,39 +1573,20 @@ impl Agent {
         }
 
         // Extract using sidecar
+        let manager = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(|dir| crate::memory::MemoryManager::new().with_project_dir(dir))
+            .unwrap_or_default();
         let sidecar = crate::sidecar::Sidecar::for_session(&self.session);
-        match sidecar.extract_memories(&transcript).await {
-            Ok(extracted) if !extracted.is_empty() => {
-                let manager = self
-                    .session
-                    .working_dir
-                    .as_deref()
-                    .map(|dir| crate::memory::MemoryManager::new().with_project_dir(dir))
-                    .unwrap_or_default();
-                let mut stored_count = 0;
-
-                for memory in &extracted {
-                    let category = crate::memory::MemoryCategory::from_extracted(&memory.category);
-
-                    let trust = match memory.trust.as_str() {
-                        "high" => crate::memory::TrustLevel::High,
-                        "low" => crate::memory::TrustLevel::Low,
-                        _ => crate::memory::TrustLevel::Medium,
-                    };
-
-                    let entry = crate::memory::MemoryEntry::new(category, &memory.content)
-                        .with_source(&self.session.id)
-                        .with_trust(trust);
-
-                    if manager.remember_project(entry).is_ok() {
-                        stored_count += 1;
-                    }
-                }
-
-                if stored_count > 0 {
-                    logging::info(&format!("Extracted {} memories from session", stored_count));
-                }
-                stored_count
+        match manager
+            .extract_with_sidecar(&transcript, &self.session.id, &sidecar)
+            .await
+        {
+            Ok(ids) if !ids.is_empty() => {
+                logging::info(&format!("Extracted {} memories from session", ids.len()));
+                ids.len()
             }
             Ok(_) => 0,
             Err(e) => {

@@ -5,6 +5,16 @@ fn test_skill(name: &str, description: &str, content: &str) -> Skill {
         name: name.to_string(),
         description: description.to_string(),
         allowed_tools: None,
+        version: "0.0.0".to_string(),
+        status: "active".to_string(),
+        triggers: Vec::new(),
+        inputs: Vec::new(),
+        preconditions: Vec::new(),
+        effects: Vec::new(),
+        validation: Vec::new(),
+        changelog: Vec::new(),
+        provenance: None,
+        needs_human_draft: false,
         evidence: Vec::new(),
         content: content.to_string(),
         path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
@@ -209,7 +219,10 @@ fn skill_as_memory_entry_formats_invocation_and_prompt() {
     let entry = skill.as_memory_entry();
 
     assert_eq!(entry.id, "skill:firefox-browser");
-    assert!(matches!(entry.category, crate::memory::MemoryCategory::Fact));
+    assert!(matches!(
+        entry.category,
+        crate::memory::MemoryCategory::Fact
+    ));
     assert!(entry.content.contains("/firefox-browser"));
     assert!(entry.content.contains("Control Firefox browser sessions"));
     assert_eq!(entry.source.as_deref(), Some("skill_registry"));
@@ -682,4 +695,182 @@ fn plugin_skill_dirs_empty_for_missing_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     let missing = temp.path().join("does-not-exist");
     assert!(SkillRegistry::plugin_skill_dirs_under(&missing).is_empty());
+}
+
+fn with_skill_temp_home<F, T>(f: F) -> T
+where
+    F: FnOnce(&Path) -> T,
+{
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("jcode-skill-test-{unique}"));
+    std::fs::create_dir_all(&dir).expect("temp home");
+    crate::env::set_var("JCODE_HOME", &dir);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
+    match old {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    result.expect("test panicked")
+}
+
+#[test]
+fn legacy_skill_manifest_parses_with_v2_defaults() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = write_skill_file(
+        &temp.path().join("skills"),
+        "legacy",
+        "---\nname: legacy\ndescription: Legacy skill\n---\n\nDo the legacy thing.\n",
+    );
+    let skill = SkillRegistry::parse_skill_file(&path).expect("parse");
+    assert_eq!(skill.version_label(), "0.0.0");
+    assert_eq!(skill.status, "active");
+    assert!(skill.triggers.is_empty());
+    assert!(!skill.needs_human_draft);
+    assert!(validate_skill_manifest(&skill).is_valid());
+}
+
+#[test]
+fn v2_skill_manifest_parses_contract_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = write_skill_file(
+        &temp.path().join("skills"),
+        "v2",
+        r#"---
+name: v2
+description: A contract-bearing skill
+version: 1.2.0
+status: active
+triggers:
+  - build an ontology
+inputs:
+  - id: source
+    type: text
+    required: true
+allowed-tools: [read, apply_patch, bash]
+preconditions:
+  - schema_validation_available
+effects:
+  - kind: write_file
+    scope: workspace
+validation:
+  - reference_integrity
+changelog:
+  - version: 1.2.0
+    level: l2
+    summary: add contract fields
+needs_human_draft: false
+evidence:
+  - mem_1
+---
+Body.
+"#,
+    );
+    let skill = SkillRegistry::parse_skill_file(&path).expect("parse");
+    assert_eq!(skill.version_label(), "1.2.0");
+    assert_eq!(skill.inputs.len(), 1);
+    assert_eq!(skill.inputs[0].input_type, "text");
+    assert!(skill.inputs[0].required);
+    assert_eq!(skill.effects[0].kind, "write_file");
+    assert_eq!(skill.changelog[0].level, ChangeLevel::L2);
+    assert!(validate_skill_manifest(&skill).is_valid());
+}
+
+#[test]
+fn invalid_skill_contract_is_rejected() {
+    let mut skill = test_skill("bad", "bad skill", "body");
+    skill.version = "1.2".to_string();
+    skill.status = "draft".to_string();
+    skill.effects.push(SkillEffect {
+        kind: String::new(),
+        scope: "workspace".to_string(),
+    });
+    let report = validate_skill_manifest(&skill);
+    assert!(!report.is_valid());
+    let codes = report
+        .errors()
+        .map(|issue| issue.code.as_str())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"S04"));
+    assert!(codes.contains(&"S05"));
+    assert!(codes.contains(&"S09"));
+}
+
+#[test]
+fn skill_diff_classifies_contract_changes() {
+    let old = test_skill("diff", "old description", "old body");
+    let mut new = old.clone();
+    new.content = "new body".to_string();
+    assert_eq!(diff_skills(&old, &new).level, ChangeLevel::L1);
+
+    let mut new = old.clone();
+    new.triggers.push("do the thing".to_string());
+    assert_eq!(diff_skills(&old, &new).level, ChangeLevel::L2);
+
+    let mut new = old.clone();
+    new.allowed_tools = Some(vec!["bash".to_string()]);
+    assert_eq!(diff_skills(&old, &new).level, ChangeLevel::L2);
+
+    let mut new = old.clone();
+    new.preconditions.push("workspace_clean".to_string());
+    assert_eq!(diff_skills(&old, &new).level, ChangeLevel::L3);
+}
+
+#[test]
+fn skill_update_requires_changelog_and_l3_confirmation_and_rolls_back() {
+    with_skill_temp_home(|_home| {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path();
+        let skills = project.join(".jcode").join("skills");
+        write_skill_file(
+            &skills,
+            "governed",
+            "---\nname: governed\ndescription: version one\nversion: 1.0.0\nstatus: active\ntriggers:\n  - govern\nallowed-tools: [read]\n---\n\nOld body.\n",
+        );
+        let draft = temp.path().join("draft.md");
+        std::fs::write(
+            &draft,
+            "---\nname: governed\ndescription: version two\nversion: 1.1.0\nstatus: active\ntriggers:\n  - govern\n  - review\nallowed-tools: [read]\n---\n\nNew body.\n",
+        )
+        .expect("draft");
+        let err =
+            update_skill_from_draft(&draft, Some(project), false).expect_err("L2 needs changelog");
+        assert!(err.to_string().contains("changelog"), "{err}");
+
+        std::fs::write(
+            &draft,
+            "---\nname: governed\ndescription: version two\nversion: 1.1.0\nstatus: active\ntriggers:\n  - govern\n  - review\nallowed-tools: [read]\nchangelog:\n  - version: 1.1.0\n    level: l2\n    summary: add review trigger\n---\n\nNew body.\n",
+        )
+        .expect("draft with changelog");
+        let result = update_skill_from_draft(&draft, Some(project), false).expect("L2 update");
+        assert_eq!(result.level, ChangeLevel::L2);
+        assert!(result.snapshot.as_ref().is_some_and(|path| path.exists()));
+
+        let rollback = rollback_skill("governed", "1.0.0", Some(project)).expect("rollback");
+        assert!(rollback.snapshot.as_ref().is_some_and(|path| path.exists()));
+        let restored = SkillRegistry::parse_skill_file(
+            &project
+                .join(".jcode")
+                .join("skills")
+                .join("governed")
+                .join("SKILL.md"),
+        )
+        .expect("restored");
+        assert_eq!(restored.version_label(), "1.0.0");
+        assert_eq!(restored.content, "Old body.");
+
+        let l3 = temp.path().join("l3.md");
+        std::fs::write(
+            &l3,
+            "---\nname: governed\ndescription: version three\nversion: 1.2.0\nstatus: active\ntriggers:\n  - govern\nallowed-tools: [read]\neffects:\n  - kind: run_command\n    scope: workspace\nchangelog:\n  - version: 1.2.0\n    level: l3\n    summary: add command effect\n---\n\nL3 body.\n",
+        )
+        .expect("l3 draft");
+        let err = update_skill_from_draft(&l3, Some(project), false).expect_err("L3 needs confirm");
+        assert!(err.to_string().contains("L3"), "{err}");
+        update_skill_from_draft(&l3, Some(project), true).expect("confirmed L3 update");
+    });
 }

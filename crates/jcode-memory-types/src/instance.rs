@@ -75,6 +75,12 @@ pub struct ProvenanceRecord {
     /// should be routed to a pending-confirmation queue rather than committed.
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// Reviewer who confirmed this record, when it passed a review gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
+    /// When the record was confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<DateTime<Utc>>,
 }
 
 impl ProvenanceRecord {
@@ -85,6 +91,8 @@ impl ProvenanceRecord {
             method,
             extracted_at: Utc::now(),
             confidence: 1.0,
+            confirmed_by: None,
+            confirmed_at: None,
         }
     }
 
@@ -103,6 +111,13 @@ impl ProvenanceRecord {
         self
     }
 
+    /// Record that a human/agent reviewer confirmed this provenance.
+    pub fn with_confirmation(mut self, reviewer: impl Into<String>, at: DateTime<Utc>) -> Self {
+        self.confirmed_by = Some(reviewer.into());
+        self.confirmed_at = Some(at);
+        self
+    }
+
     /// Default heuristic provenance for legacy or unannotated memories.
     /// Mirrors mem-plugin's DEFAULT_PROVENANCE (method=user_stated, confidence=0.5).
     pub fn default_heuristic() -> Self {
@@ -112,12 +127,55 @@ impl ProvenanceRecord {
             method: ExtractionMethod::UserStated,
             extracted_at: Utc::now(),
             confidence: 0.5,
+            confirmed_by: None,
+            confirmed_at: None,
         }
     }
 
     /// Whether this provenance meets its own method's quality bar.
     pub fn is_admissible(&self) -> bool {
         self.confidence >= self.method.admission_threshold()
+    }
+}
+
+/// Review state carried by a memory instance.
+///
+/// `needs_review` marks an admitted row whose provenance is mid-confidence;
+/// `review_id` points at the queue item when the row is still awaiting a
+/// decision. The state is intentionally small so ordinary memories stay
+/// compact on disk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryReviewState {
+    /// Whether this instance should be reviewed before being treated as final.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_review: bool,
+    /// Queue item that produced or tracks this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    /// Last time a reviewer acted on this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reviewed_at: Option<DateTime<Utc>>,
+}
+
+impl MemoryReviewState {
+    pub fn is_empty(&self) -> bool {
+        !self.needs_review && self.review_id.is_none() && self.last_reviewed_at.is_none()
+    }
+
+    pub fn pending(review_id: impl Into<String>) -> Self {
+        Self {
+            needs_review: true,
+            review_id: Some(review_id.into()),
+            last_reviewed_at: None,
+        }
+    }
+
+    pub fn confirmed(at: DateTime<Utc>) -> Self {
+        Self {
+            needs_review: false,
+            review_id: None,
+            last_reviewed_at: Some(at),
+        }
     }
 }
 
@@ -142,6 +200,15 @@ pub enum MemoryStatus {
 }
 
 impl MemoryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryStatus::Active => "active",
+            MemoryStatus::Expired => "expired",
+            MemoryStatus::Archived => "archived",
+            MemoryStatus::Disputed => "disputed",
+        }
+    }
+
     pub fn is_retrievable(self) -> bool {
         matches!(self, MemoryStatus::Active)
     }

@@ -22,6 +22,25 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             overwrite,
         },
         MemoryCommand::Stats => commands::MemorySubcommand::Stats,
+        MemoryCommand::Review {
+            action,
+            id,
+            status,
+            reviewer,
+            note,
+            json,
+        } => commands::MemorySubcommand::Review {
+            action,
+            id,
+            status,
+            reviewer,
+            note,
+            json,
+        },
+        MemoryCommand::Health { json } => commands::MemorySubcommand::Health { json },
+        MemoryCommand::Source { action, json } => {
+            commands::MemorySubcommand::Source { action, json }
+        }
         MemoryCommand::Distill { dry_run } => commands::MemorySubcommand::Distill { dry_run },
         MemoryCommand::SkillAccept { draft } => commands::MemorySubcommand::SkillAccept { draft },
         MemoryCommand::Forget { id } => commands::MemorySubcommand::Forget { id },

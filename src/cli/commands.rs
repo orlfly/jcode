@@ -7,6 +7,7 @@ use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
+use super::args::SkillCommand;
 use crate::{browser, gateway, memory, session, storage, tui};
 
 use super::{output::terminal_title, terminal::init_tui_runtime};
@@ -1604,6 +1605,21 @@ pub enum MemorySubcommand {
         overwrite: bool,
     },
     Stats,
+    Review {
+        action: String,
+        id: Option<String>,
+        status: String,
+        reviewer: String,
+        note: Option<String>,
+        json: bool,
+    },
+    Health {
+        json: bool,
+    },
+    Source {
+        action: String,
+        json: bool,
+    },
     Distill {
         dry_run: bool,
     },
@@ -1633,6 +1649,214 @@ pub enum MemorySubcommand {
 
 pub async fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
     run_memory_command_for_dir(cmd, std::env::current_dir().ok()).await
+}
+
+pub(crate) async fn run_skill_command(cmd: SkillCommand) -> Result<()> {
+    use crate::skill::{self, SkillRegistry};
+
+    let working_dir = std::env::current_dir().ok();
+    match cmd {
+        SkillCommand::List => {
+            let global = SkillRegistry::load_global()?;
+            let registry =
+                SkillRegistry::effective_for_working_dir(&global, working_dir.as_deref());
+            let skills = registry.list();
+            if skills.is_empty() {
+                println!("No skills installed.");
+            } else {
+                println!("{} skill(s):\n", skills.len());
+                for skill in skills {
+                    println!(
+                        "- {} v{} [{}]{}{}",
+                        skill.name,
+                        skill.version_label(),
+                        if skill.status.is_empty() {
+                            "active"
+                        } else {
+                            &skill.status
+                        },
+                        if skill.needs_human_draft {
+                            " draft"
+                        } else {
+                            ""
+                        },
+                        if skill.triggers.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" triggers: {}", skill.triggers.join("; "))
+                        }
+                    );
+                }
+            }
+        }
+        SkillCommand::Show { name, json } => {
+            let global = SkillRegistry::load_global()?;
+            let registry =
+                SkillRegistry::effective_for_working_dir(&global, working_dir.as_deref());
+            let skill = registry
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("skill '{name}' is not installed"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "name": skill.name,
+                        "description": skill.description,
+                        "version": skill.version_label(),
+                        "status": skill.status,
+                        "triggers": skill.triggers,
+                        "inputs": skill.inputs,
+                        "allowed_tools": skill.allowed_tools,
+                        "preconditions": skill.preconditions,
+                        "effects": skill.effects,
+                        "validation": skill.validation,
+                        "changelog": skill.changelog,
+                        "needs_human_draft": skill.needs_human_draft,
+                        "evidence": skill.evidence,
+                        "path": skill.path,
+                    }))?
+                );
+            } else {
+                println!(
+                    "{} v{} [{}]",
+                    skill.name,
+                    skill.version_label(),
+                    skill.status
+                );
+                println!("path: {}", skill.path.display());
+                println!("description: {}", skill.description);
+                if !skill.triggers.is_empty() {
+                    println!("triggers: {}", skill.triggers.join("; "));
+                }
+                if !skill.preconditions.is_empty() {
+                    println!("preconditions: {}", skill.preconditions.join("; "));
+                }
+                if !skill.effects.is_empty() {
+                    println!(
+                        "effects: {}",
+                        skill
+                            .effects
+                            .iter()
+                            .map(|effect| format!("{}({})", effect.kind, effect.scope))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                }
+                println!("evidence: {} id(s)", skill.evidence.len());
+                if skill.needs_human_draft {
+                    println!("WARNING: body is still a distilled skeleton");
+                }
+                println!("\n{}", skill.content);
+            }
+        }
+        SkillCommand::Validate { target, json } => {
+            let path = resolve_skill_path(&target, working_dir.as_deref())?;
+            let skill = SkillRegistry::parse_skill_file(&path)?;
+            let report = skill::validate_skill_manifest(&skill);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}: {}", path.display(), report.summary());
+            }
+            if !report.is_valid() {
+                anyhow::bail!("skill manifest has validation errors");
+            }
+        }
+        SkillCommand::Update { draft, confirm } => {
+            let path = resolve_skill_draft(&draft)?;
+            let result = skill::update_skill_from_draft(&path, working_dir.as_deref(), confirm)?;
+            println!(
+                "Updated skill '{}' ({}) at {}",
+                result.name,
+                result.level.as_str(),
+                result.path.display()
+            );
+            if let Some(diff) = result.diff {
+                println!("changes: {}", diff.summary.join(", "));
+            }
+            if let Some(snapshot) = result.snapshot {
+                println!("previous version saved to {}", snapshot.display());
+            }
+        }
+        SkillCommand::Rollback { name, version } => {
+            let result = skill::rollback_skill(&name, &version, working_dir.as_deref())?;
+            println!(
+                "Rolled back '{}' to {} ({})",
+                result.name,
+                version,
+                result.path.display()
+            );
+            if let Some(snapshot) = result.snapshot {
+                println!("replaced version saved to {}", snapshot.display());
+            }
+        }
+        SkillCommand::History { name } => {
+            let history = skill::list_skill_history(&name, working_dir.as_deref())?;
+            if history.is_empty() {
+                println!("No snapshots for skill '{name}'.");
+            } else {
+                println!("{} snapshot(s) for '{name}':\n", history.len());
+                for path in history {
+                    println!(
+                        "- {}",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("<unknown>")
+                    );
+                }
+            }
+        }
+        SkillCommand::Health { json } => {
+            let report = skill::skill_health(working_dir.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Skill health: {}", report.summary());
+                for item in &report.skills {
+                    println!(
+                        "  {} v{} [{}]{}{}",
+                        item.name,
+                        item.version,
+                        item.status,
+                        if item.needs_human_draft { " draft" } else { "" },
+                        if item.validation_errors > 0 {
+                            format!(" {} validation error(s)", item.validation_errors)
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_skill_path(target: &str, working_dir: Option<&Path>) -> Result<PathBuf> {
+    let direct = PathBuf::from(target);
+    if direct.exists() {
+        return Ok(direct);
+    }
+    let global = crate::skill::SkillRegistry::load_global()?;
+    let registry = crate::skill::SkillRegistry::effective_for_working_dir(&global, working_dir);
+    registry
+        .get(target)
+        .map(|skill| skill.path.clone())
+        .ok_or_else(|| anyhow::anyhow!("no such skill or file: {target}"))
+}
+
+fn resolve_skill_draft(draft: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(draft);
+    if path.is_absolute() || path.components().count() > 1 {
+        return Ok(path);
+    }
+    let proposals = storage::jcode_dir()?.join("skills").join(".proposals");
+    let candidate = proposals.join(path);
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        Ok(PathBuf::from(draft))
+    }
 }
 
 async fn run_memory_command_for_dir(
@@ -1880,6 +2104,158 @@ async fn run_memory_command_for_dir(
             }
         }
 
+        MemorySubcommand::Review {
+            action,
+            id,
+            status,
+            reviewer,
+            note,
+            json,
+        } => match action.as_str() {
+            "list" => {
+                let filter = if status.eq_ignore_ascii_case("all") {
+                    None
+                } else {
+                    Some(memory::ReviewStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown review status '{}'; use pending, accepted, rejected, deferred or all",
+                            status
+                        )
+                    })?)
+                };
+                let items = manager.list_reviews(filter)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                } else if items.is_empty() {
+                    println!("No review items.");
+                } else {
+                    println!("{} review item(s):\n", items.len());
+                    for item in items {
+                        println!("- {}", item.summary());
+                        println!("  status: {:?}", item.status);
+                        println!("  diff: {}", item.diff.join(", "));
+                        println!("  proposed: {}", item.new.content);
+                        if let Some(old) = item.old.as_ref() {
+                            println!("  current:  {}", old.content);
+                        }
+                        println!();
+                    }
+                }
+            }
+            "accept" | "reject" | "defer" => {
+                let id = id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("review id required for {}", action))?;
+                let item = match action.as_str() {
+                    "accept" => manager.accept_review(id, &reviewer, note.as_deref())?,
+                    "reject" => manager.reject_review(id, &reviewer, note.as_deref())?,
+                    _ => manager.defer_review(id, &reviewer, note.as_deref())?,
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&item)?);
+                } else {
+                    println!(
+                        "{} review {}: {}",
+                        match item.status {
+                            memory::ReviewStatus::Accepted => "Accepted",
+                            memory::ReviewStatus::Rejected => "Rejected",
+                            memory::ReviewStatus::Deferred => "Deferred",
+                            memory::ReviewStatus::Pending => "Pending",
+                        },
+                        item.id,
+                        item.new.content
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "unknown review action '{}'; use list, accept, reject or defer",
+                other
+            ),
+        },
+
+        MemorySubcommand::Health { json } => {
+            let report = manager.health_report()?;
+            let source = manager.extraction_health()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "memory": report,
+                        "extraction": source,
+                    }))?
+                );
+            } else {
+                println!("Memory health:");
+                println!("  Stores:           {}", report.stores);
+                println!("  Memories:         {}", report.memories);
+                println!("  Active:           {}", report.active);
+                println!("  Archived:         {}", report.archived);
+                println!("  Expired:          {}", report.expired);
+                println!("  Disputed:         {}", report.disputed);
+                println!("  Critical:         {}", report.critical);
+                println!("  Needs review:     {}", report.needs_review);
+                println!("  Low confidence:   {}", report.low_confidence);
+                println!("  Missing prov.:    {}", report.missing_provenance);
+                println!("  Missing locator:  {}", report.missing_locator);
+                println!("  Contradictions:   {}", report.contradictions);
+                println!("  Duplicate subjects: {}", report.duplicate_subjects);
+                println!(
+                    "  Review backlog:   {} pending, {} deferred, {} accepted, {} rejected (oldest {} d)",
+                    report.reviews.pending,
+                    report.reviews.deferred,
+                    report.reviews.accepted,
+                    report.reviews.rejected,
+                    report.reviews.oldest_pending_days.unwrap_or_default()
+                );
+                if !report.categories.is_empty() {
+                    println!("\nBy category:");
+                    for (category, count) in &report.categories {
+                        println!("  {}: {}", category, count);
+                    }
+                }
+                if !report.reviews.by_gate.is_empty() {
+                    println!("\nPending review gates:");
+                    for (gate, count) in &report.reviews.by_gate {
+                        println!("  {}: {}", gate, count);
+                    }
+                }
+                println!("\nExtraction source: {}", source.summary());
+            }
+        }
+
+        MemorySubcommand::Source { action, json } => {
+            let health = match action.as_str() {
+                "status" => manager.extraction_health()?,
+                "resume" => manager.resume_extraction()?,
+                other => anyhow::bail!("unknown source action '{}'; use status or resume", other),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&health)?);
+            } else {
+                println!("Extraction source: {}", health.summary());
+                for batch in health.recent_batches().iter().rev().take(5) {
+                    println!(
+                        "  {} {} candidates={} admitted={} queued={} failed={} conf={:.2} dup={:.2}",
+                        batch.at.format("%Y-%m-%d %H:%M"),
+                        if batch.session_id.is_empty() {
+                            "-"
+                        } else {
+                            &batch.session_id
+                        },
+                        batch.candidates,
+                        batch.admitted,
+                        batch.queued,
+                        batch.failed,
+                        batch.avg_confidence,
+                        batch.duplicate_ratio
+                    );
+                }
+                if action == "resume" {
+                    println!("Automatic extraction resumed.");
+                }
+            }
+        }
+
         MemorySubcommand::Distill { dry_run } => {
             let proposals = if dry_run {
                 manager.collect_skill_evidence()?
@@ -1943,7 +2319,9 @@ async fn run_memory_command_for_dir(
                             "Warning: no evidence ids resolved in this store's global graph - the draft's evidence list may reference other projects."
                         );
                     }
-                    println!("New/updated skills are picked up by the next session start (or /skills to verify).");
+                    println!(
+                        "New/updated skills are picked up by the next session start (or /skills to verify)."
+                    );
                 }
                 Err(e) => {
                     anyhow::bail!("{e}");
@@ -1958,7 +2336,11 @@ async fn run_memory_command_for_dir(
             let report = manager.reclassify_observations(apply, subject_keys)?;
             println!(
                 "{} memory classification pass: {}",
-                if report.dry_run { "Dry run:" } else { "Applied" },
+                if report.dry_run {
+                    "Dry run:"
+                } else {
+                    "Applied"
+                },
                 report.summary()
             );
             if report.dry_run && report.total_changes() > 0 {
@@ -1970,7 +2352,11 @@ async fn run_memory_command_for_dir(
             let report = manager.apply_default_ontology_migrations(apply)?;
             println!(
                 "{} ontology data migration: {}",
-                if report.dry_run { "Dry run:" } else { "Applied" },
+                if report.dry_run {
+                    "Dry run:"
+                } else {
+                    "Applied"
+                },
                 report.summary()
             );
             if report.dry_run && report.migrations.changed() > 0 {
@@ -2098,9 +2484,7 @@ async fn run_memory_command_for_dir(
                         for snapshot in &history {
                             println!(
                                 "  v{:<4} {} {}",
-                                snapshot.version,
-                                snapshot.hash,
-                                snapshot.rationale
+                                snapshot.version, snapshot.hash, snapshot.rationale
                             );
                         }
                     }

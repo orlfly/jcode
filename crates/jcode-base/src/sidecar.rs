@@ -1105,15 +1105,18 @@ IMPORTANT - Do NOT extract:
 
 Quality bar: Only extract information that would ACTUALLY BE USEFUL if recalled in a future session on a different topic. Ask: "Would a developer benefit from knowing this weeks from now?"
 
-For each memory, output in this format (one per line):
-TYPE|CONTENT|TRUST
+For each memory, output ONE JSON object per line (JSONL):
+
+{"type":"process_rule","content":"...","trust":"high","locator":"file:src/foo.rs:42","properties":{"key":"value"}}
 
 Where:
-- TYPE is one of: process_rule, contract, env_fact, correction, preference, entity, observation
-- CONTENT is a concise statement (1-2 sentences max, under 200 characters preferred)
-- TRUST is one of: high (user stated), medium (observed), low (inferred)
+- type is one of: process_rule, contract, env_fact, correction, preference, entity, observation
+- content is a concise statement (1-2 sentences max, under 200 characters preferred)
+- trust is one of: high (user stated), medium (observed), low (inferred)
+- locator is optional but preferred: the transcript turn, tool call id, or file:line that supports the claim
+- properties is optional structured metadata (for example an endpoint, status code, or config key)
 
-Output ONLY the formatted lines, no other text. If no NEW memories worth extracting, output nothing."#,
+Output ONLY the JSONL lines, no other text. If no NEW memories worth extracting, output nothing."#,
         );
 
         if !existing.is_empty() {
@@ -1129,25 +1132,8 @@ Output ONLY the formatted lines, no other text. If no NEW memories worth extract
 
         let memories = response
             .lines()
-            .filter(|line| line.contains('|'))
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() >= 3 {
-                    let content = parts[1].trim().to_string();
-                    // P0-3: drop low-value noise before it reaches storage so it
-                    // never pollutes vector recall (bare ids, fragments, hashes).
-                    if crate::memory::is_extraction_noise(&content) {
-                        return None;
-                    }
-                    Some(ExtractedMemory {
-                        category: parts[0].trim().to_lowercase(),
-                        content,
-                        trust: parts[2].trim().to_lowercase(),
-                    })
-                } else {
-                    None
-                }
-            })
+            .filter_map(|line| parse_extracted_line(line.trim()))
+            .filter(|memory| !crate::memory::is_extraction_noise(&memory.content))
             .collect();
 
         Ok(memories)
@@ -1291,6 +1277,68 @@ pub struct ExtractedMemory {
     pub category: String,
     pub content: String,
     pub trust: String,
+    /// Optional provenance locator within the transcript/source.
+    pub locator: Option<String>,
+    /// Optional structured properties.
+    pub properties: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Parse one extractor output line. JSONL is the current format; the legacy
+/// `TYPE|CONTENT|TRUST` form stays supported for older prompts and models.
+fn parse_extracted_line(line: &str) -> Option<ExtractedMemory> {
+    if line.is_empty() {
+        return None;
+    }
+    if line.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let category = value
+            .get("type")
+            .or_else(|| value.get("category"))
+            .and_then(|v| v.as_str())?
+            .trim()
+            .to_lowercase();
+        let content = value.get("content")?.as_str()?.trim().to_string();
+        let trust = value
+            .get("trust")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium")
+            .trim()
+            .to_lowercase();
+        let locator = value
+            .get("locator")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        let properties = value
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|object| {
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some(ExtractedMemory {
+            category,
+            content,
+            trust,
+            locator,
+            properties,
+        });
+    }
+    let parts: Vec<&str> = line.split('|').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some(ExtractedMemory {
+        category: parts[0].trim().to_lowercase(),
+        content: parts[1].trim().to_string(),
+        trust: parts[2].trim().to_lowercase(),
+        locator: None,
+        properties: Default::default(),
+    })
 }
 
 /// Collect text from an OpenAI Responses API SSE stream.
@@ -2923,5 +2971,38 @@ mod tests {
             !anthropic_sidecar_prefers_api_key(),
             "claude (oauth) runtime => do not force API key"
         );
+    }
+
+    #[test]
+    fn parses_structured_extraction_line() {
+        let parsed = parse_extracted_line(
+            r#"{"type":"contract","content":"GET /api/task returns tasks","trust":"high","locator":"api.md:12","properties":{"status":200}}"#,
+        )
+        .expect("structured line");
+        assert_eq!(parsed.category, "contract");
+        assert_eq!(parsed.trust, "high");
+        assert_eq!(parsed.locator.as_deref(), Some("api.md:12"));
+        assert_eq!(
+            parsed.properties.get("status"),
+            Some(&serde_json::json!(200))
+        );
+    }
+
+    #[test]
+    fn parses_legacy_pipe_extraction_line() {
+        let parsed =
+            parse_extracted_line("process_rule|Always run the formatter|medium").expect("legacy");
+        assert_eq!(parsed.category, "process_rule");
+        assert_eq!(parsed.content, "Always run the formatter");
+        assert_eq!(parsed.trust, "medium");
+        assert!(parsed.locator.is_none());
+        assert!(parsed.properties.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_extraction_lines() {
+        assert!(parse_extracted_line("").is_none());
+        assert!(parse_extracted_line("{not json}").is_none());
+        assert!(parse_extracted_line("process_rule|missing trust").is_none());
     }
 }

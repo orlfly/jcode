@@ -358,6 +358,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Memory(MemoryCommand),
 
+    /// Skill lifecycle commands
+    #[command(subcommand)]
+    Skill(SkillCommand),
+
     /// Session management commands
     #[command(subcommand)]
     Session(SessionCommand),
@@ -1211,6 +1215,50 @@ pub(crate) enum MemoryCommand {
     /// Show memory statistics
     Stats,
 
+    /// Inspect and resolve the memory review queue
+    Review {
+        /// list, accept, reject, or defer
+        #[arg(default_value = "list")]
+        action: String,
+
+        /// Review item id (required for accept/reject/defer)
+        id: Option<String>,
+
+        /// Filter for list: pending, accepted, rejected, deferred, all
+        #[arg(long, default_value = "pending")]
+        status: String,
+
+        /// Reviewer name recorded on accept/reject/defer
+        #[arg(long, default_value = "user")]
+        reviewer: String,
+
+        /// Optional note
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show memory health: distribution, conflicts, review backlog and provenance gaps
+    Health {
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect or resume automatic extraction source health
+    Source {
+        /// status or resume
+        #[arg(default_value = "status")]
+        action: String,
+
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Clear test memory storage (used by debug sessions)
     ClearTest,
 
@@ -1249,6 +1297,49 @@ pub(crate) enum MemoryCommand {
     Ontology {
         #[command(subcommand)]
         action: OntologyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SkillCommand {
+    /// List installed skills with version and status
+    List,
+
+    /// Show one installed skill
+    Show {
+        name: String,
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate an installed skill name or a SKILL.md path
+    Validate {
+        target: String,
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update an installed skill from a draft
+    Update {
+        draft: String,
+        /// Confirm an L3 contract change
+        #[arg(long)]
+        confirm: bool,
+    },
+
+    /// Restore a snapshotted skill version
+    Rollback { name: String, version: String },
+
+    /// List snapshotted versions for a skill
+    History { name: String },
+
+    /// Show skill and proposal health
+    Health {
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
     },
 }
 

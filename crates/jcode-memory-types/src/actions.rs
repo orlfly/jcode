@@ -275,6 +275,10 @@ pub enum ConfirmationGate {
     StatusTransition,
     /// G4: a batch change affecting more than 20% of memories of a category.
     BatchChange,
+    /// G5: an installed skill's body or contract is being upgraded.
+    SkillUpgrade,
+    /// G6: an authoritative contradiction would be created.
+    Contradiction,
 }
 
 impl ConfirmationGate {
@@ -292,6 +296,12 @@ impl ConfirmationGate {
             }
             ConfirmationGate::BatchChange => {
                 "More than 20% of memories in a category are affected."
+            }
+            ConfirmationGate::SkillUpgrade => {
+                "An installed skill's contract or body would be replaced."
+            }
+            ConfirmationGate::Contradiction => {
+                "Two authoritative memories would be marked contradictory."
             }
         }
     }
@@ -385,6 +395,23 @@ pub fn evaluate_gates(proposal: ChangeProposal<'_>) -> Vec<ConfirmationGate> {
     if let (Some(count), Some(total)) = (proposal.category_count, proposal.total_in_category) {
         if total > 0 && count * 5 > total {
             gates.push(ConfirmationGate::BatchChange);
+        }
+    }
+
+    // G6: two authoritative memories disagree.
+    if let (Some(old), Some(new)) = (proposal.target, proposal.new_entry) {
+        let authoritative = |entry: &MemoryEntry| {
+            entry
+                .provenance
+                .as_ref()
+                .map(|p| {
+                    p.method.authority_rank()
+                        >= ExtractionMethod::StructuredMapping.authority_rank()
+                })
+                .unwrap_or(false)
+        };
+        if authoritative(old) && authoritative(new) && crate::reconcile::detect_conflict(old, new) {
+            gates.push(ConfirmationGate::Contradiction);
         }
     }
 

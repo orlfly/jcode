@@ -1,6 +1,21 @@
 # Memory and skill update plan
 
-Status: proposal, 2026-11-08
+Status: implemented (P0/P1/P2 core), 2026-11-08
+
+Implemented surfaces:
+
+- `jcode memory review list|accept|reject|defer`
+- `jcode memory health`
+- `jcode memory source status|resume`
+- `jcode skill list|show|validate|update|rollback|history|health`
+- `memory` tool actions `review`, `health`
+- `skill_manage` tool actions `validate`, `health`, `update`, `rollback`
+
+Remaining from the design: a candidate-set batch diff for G4 (the gate type
+exists and is evaluated by the generic action API, but extraction writes are
+still judged one candidate at a time), enforced skill effects at the tool
+layer (manifests are currently advisory metadata), and a hard query router
+(routing is currently a lexical skill-prior, not a filter).
 
 Reference: `/home/cc/Downloads/enterprise-ontology` skill design, read in full
 (SKILL.md plus modeling-rules, lifecycle-ops, data-pipeline and query-routing).

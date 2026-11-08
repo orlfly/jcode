@@ -105,6 +105,15 @@ struct MemoryInput {
     /// For ontology rollback: target version
     #[serde(default)]
     version: Option<u32>,
+    /// For review action: list | accept | reject | defer
+    #[serde(default)]
+    review_action: Option<String>,
+    /// For review list: pending | accepted | rejected | deferred | all
+    #[serde(default)]
+    status: Option<String>,
+    /// Optional reviewer note
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[async_trait]
@@ -127,7 +136,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "ontology"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -173,6 +182,19 @@ impl Tool for MemoryTool {
                 "version": {
                     "type": "integer",
                     "description": "For ontology rollback: target version."
+                },
+                "review_action": {
+                    "type": "string",
+                    "enum": ["list", "accept", "reject", "defer"],
+                    "description": "For action=review."
+                },
+                "status": {
+                    "type": "string",
+                    "description": "For review listing: pending, accepted, rejected, deferred, all."
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional reviewer note."
                 }
             },
             "required": ["action"]
@@ -228,8 +250,8 @@ impl Tool for MemoryTool {
                 if let Some(id) = input.id {
                     entry = entry.with_id(id);
                 }
-                let id = if scope == "global" {
-                    match manager.remember_global(entry) {
+                let outcome = if scope == "global" {
+                    match manager.remember_global_governed(entry) {
                         Ok(id) => id,
                         Err(error) if error.to_string().contains("scope gate") => {
                             memory::set_state(MemoryState::Idle);
@@ -242,26 +264,47 @@ impl Tool for MemoryTool {
                         Err(error) => return Err(error),
                     }
                 } else {
-                    manager.remember_project(entry)?
+                    manager.remember_project_governed(entry)?
                 };
-                // The agent just wrote this memory itself; the content is in
-                // the transcript (tool call + result), so auto-recall should
-                // not inject it back into this session.
-                memory::mark_memories_known(
-                    &session_id,
-                    std::slice::from_ref(&id),
-                    "stored via memory tool in this session",
-                );
                 memory::add_event(MemoryEventKind::ToolRemembered {
                     content: truncate_for_widget(&content, 60),
                     scope: scope.to_string(),
                     category: category.to_string(),
                 });
                 memory::set_state(MemoryState::Idle);
-                Ok(ToolOutput::new(format!(
-                    "Remembered {} ({}): \"{}\" [id: {}]",
-                    category, scope, content, id
-                )))
+                match outcome {
+                    memory::MemoryWriteOutcome::Stored { id, needs_review } => {
+                        // The agent just wrote this memory itself; the content is
+                        // in the transcript, so auto-recall should not inject it
+                        // back into this session.
+                        memory::mark_memories_known(
+                            &session_id,
+                            std::slice::from_ref(&id),
+                            "stored via memory tool in this session",
+                        );
+                        Ok(ToolOutput::new(format!(
+                            "Remembered {} ({}): \"{}\" [id: {}]{}",
+                            category,
+                            scope,
+                            content,
+                            id,
+                            if needs_review {
+                                " (marked needs review)"
+                            } else {
+                                ""
+                            }
+                        )))
+                    }
+                    memory::MemoryWriteOutcome::PendingReview {
+                        review_id,
+                        target_id,
+                    } => Ok(ToolOutput::new(format!(
+                        "Queued for review [{review_id}]: {category} ({scope}) \"{content}\"{}",
+                        target_id
+                            .map(|id| format!("; target {id} stays unchanged"))
+                            .unwrap_or_default()
+                    ))),
+                }
             }
             "recall" => {
                 let limit = input.limit.unwrap_or(10);
@@ -527,6 +570,81 @@ impl Tool for MemoryTool {
                     }
                     Ok(ToolOutput::new(out))
                 }
+            }
+            "review" => {
+                let review_action = input.review_action.as_deref().unwrap_or("list");
+                match review_action {
+                    "list" => {
+                        let filter = match input.status.as_deref().unwrap_or("pending") {
+                            "all" => None,
+                            other => Some(crate::memory::ReviewStatus::parse(other).ok_or_else(
+                                || anyhow::anyhow!("unknown review status: {other}"),
+                            )?),
+                        };
+                        let items = manager.list_reviews(filter)?;
+                        if items.is_empty() {
+                            Ok(ToolOutput::new("No review items."))
+                        } else {
+                            let mut out = format!("{} review item(s):\n\n", items.len());
+                            for item in items {
+                                out.push_str(&format!(
+                                    "- {} [{:?}]\n  reason: {}\n  diff: {}\n  proposed: {}\n  current: {}\n\n",
+                                    item.id,
+                                    item.status,
+                                    item.reason,
+                                    item.diff.join(", "),
+                                    item.new.content,
+                                    item.old
+                                        .as_ref()
+                                        .map(|old| old.content.as_str())
+                                        .unwrap_or("<new>")
+                                ));
+                            }
+                            Ok(ToolOutput::new(out))
+                        }
+                    }
+                    "accept" | "reject" | "defer" => {
+                        let id = input
+                            .id
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("id required for review {review_action}"))?;
+                        let reviewer = if session_id.is_empty() {
+                            "agent"
+                        } else {
+                            session_id.as_str()
+                        };
+                        let item = match review_action {
+                            "accept" => manager.accept_review(id, reviewer, input.note.as_deref())?,
+                            "reject" => manager.reject_review(id, reviewer, input.note.as_deref())?,
+                            _ => manager.defer_review(id, reviewer, input.note.as_deref())?,
+                        };
+                        Ok(ToolOutput::new(format!(
+                            "{} review {}: {}",
+                            review_action,
+                            item.id,
+                            item.new.content
+                        )))
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "unknown review action: {other}; use list, accept, reject or defer"
+                    )),
+                }
+            }
+            "health" => {
+                let report = manager.health_report()?;
+                let source = manager.extraction_health()?;
+                Ok(ToolOutput::new(format!(
+                    "{}\n\nreview backlog: {} pending, {} deferred, {} accepted, {} rejected\nlow confidence: {}, missing locator: {}, contradictions: {}\nextraction: {}",
+                    report.summary(),
+                    report.reviews.pending,
+                    report.reviews.deferred,
+                    report.reviews.accepted,
+                    report.reviews.rejected,
+                    report.low_confidence,
+                    report.missing_locator,
+                    report.contradictions,
+                    source.summary()
+                )))
             }
             "ontology" => {
                 use crate::memory::OntologyScope;
@@ -1384,7 +1502,7 @@ mod tests {
 
         let patch = json!({
             "base_id": "jcode/default/v1",
-            "base_version": 2,
+            "base_version": crate::memory_types::ontology::DEFAULT_ONTOLOGY_VERSION,
             "base_hash": "",
             "rationale": "tool test: extend env_fact retention",
             "ops": [{

@@ -151,6 +151,28 @@ not only compiled into the binary. A reflection pass can propose an
 migrations before installing the new definition. See
 [MEMORY_ONTOLOGY_RUNTIME.md](./MEMORY_ONTOLOGY_RUNTIME.md).
 
+## Update governance (added 2026-11-08)
+
+Writes now pass a confidence and confirmation policy before mutating a graph:
+
+- `>= 0.9` admits; `0.7-0.9` admits with a `[needs review]` badge; `< 0.7`
+  goes to the durable review queue instead of being stored.
+- Critical memories (user-stated preferences, corrections and contracts),
+  authoritative overwrites, status loss, and authoritative contradictions
+  require confirmation. Rejected or parked writes leave the old value active.
+- Review items live in `<jcode_dir>/memory/reviews/pending.jsonl`; resolve
+  them with `jcode memory review list|accept|reject|defer`.
+- `jcode memory health` reports type distribution, contradictions, duplicate
+  subjects, missing provenance/locators, review backlog and extraction source
+  health. `jcode memory source status|resume` controls the extraction pause.
+- Skills have a v2 manifest contract (version, status, triggers, inputs,
+  allowed tools, preconditions, effects, validation, changelog, provenance)
+  while remaining backward compatible with legacy `SKILL.md` files.
+  `jcode skill list|show|validate|update|rollback|history|health` manages
+  snapshots under `.history/<name>/`; L3 contract changes need `--confirm`.
+- Distilled skill proposals are scored by evidence diversity, positive and
+  negative feedback and recency, capped per pass, and expired after 30 days.
+
 ## Implementation map
 
 - `crates/jcode-memory-types/src/{lib,graph,ontology,instance,reconcile}.rs`:
@@ -160,8 +182,12 @@ migrations before installing the new definition. See
 - `crates/jcode-base/src/memory_agent.rs`: async coordinator, finalize.
 - `crates/jcode-base/src/memory/pending.rs`: scope-bound injection and
   retrieval writeback.
-- `crates/jcode-base/src/skill.rs`: mirrors, invocation records, acceptance.
+- `crates/jcode-base/src/memory/review.rs`: review queue and health counters.
+- `crates/jcode-base/src/memory/source_health.rs`: extraction batch health.
+- `crates/jcode-base/src/skill.rs`: manifest v2, validation/diff, mirrors,
+  invocation records, acceptance, snapshots and rollback.
 - `crates/jcode-app-core/src/tool/memory.rs`: the `memory` tool surface.
+- `crates/jcode-app-core/src/tool/skill.rs`: the `skill_manage` tool surface.
 
 ## Known gaps (tracked in the landing record)
 
@@ -173,8 +199,6 @@ migrations before installing the new definition. See
 - macOS/Windows behaviors of the runtime are untested on this machine.
 
 Historical references: `docs/plans/MEMORY_GRAPH_PLAN.md` (graph-rerank
-proposal, partially implemented), `docs/plans/MCP_SKILLS_PLAN.md`.
-
-The next update-governance plan (provenance locators, confidence gates, review
-queue, skill contracts/versioning, health inspection) is in
+proposal, partially implemented), `docs/plans/MCP_SKILLS_PLAN.md`. The
+update-governance design record is
 [`plans/MEMORY_SKILL_UPDATE_PLAN.md`](plans/MEMORY_SKILL_UPDATE_PLAN.md).

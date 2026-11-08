@@ -42,6 +42,15 @@ struct SkillInput {
     /// needs to load the prompt, so args are currently accepted and ignored.
     #[serde(default)]
     args: Option<String>,
+    /// For validate/update: explicit SKILL.md or draft path.
+    #[serde(default)]
+    path: Option<String>,
+    /// For rollback: target version.
+    #[serde(default)]
+    version: Option<String>,
+    /// For update: confirm an L3 contract change.
+    #[serde(default)]
+    confirm: Option<bool>,
 }
 
 fn default_action() -> String {
@@ -65,12 +74,24 @@ impl Tool for SkillTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["load", "list", "reload", "reload_all", "read"],
+                    "enum": ["load", "list", "reload", "reload_all", "read", "validate", "health", "update", "rollback"],
                     "description": "Action."
                 },
                 "name": {
                     "type": "string",
                     "description": "Skill name."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "SKILL.md or draft path for validate/update."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Target version for rollback."
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Confirm an L3 skill contract update."
                 }
             }
         })
@@ -94,8 +115,88 @@ impl Tool for SkillTool {
                 self.read_skill(params.name, ctx.working_dir.as_deref())
                     .await
             }
+            "validate" => {
+                let path = match params.path.as_deref() {
+                    Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+                    _ => {
+                        let name = normalize_skill_name(params.name, "validate")?;
+                        let registry = self.effective_registry(ctx.working_dir.as_deref()).await;
+                        registry
+                            .get(&name)
+                            .map(|skill| skill.path.clone())
+                            .ok_or_else(|| anyhow::anyhow!("skill '{name}' is not installed"))?
+                    }
+                };
+                let skill = SkillRegistry::parse_skill_file(&path)?;
+                let report = crate::skill::validate_skill_manifest(&skill);
+                Ok(ToolOutput::new(format!(
+                    "{}\n{}",
+                    path.display(),
+                    report.summary()
+                )))
+            }
+            "health" => {
+                let report = crate::skill::skill_health(ctx.working_dir.as_deref())?;
+                Ok(ToolOutput::new(format!(
+                    "{}\n\n{}",
+                    report.summary(),
+                    report
+                        .skills
+                        .iter()
+                        .map(|item| format!(
+                            "- {} v{} [{}]{}{}",
+                            item.name,
+                            item.version,
+                            item.status,
+                            if item.needs_human_draft { " draft" } else { "" },
+                            if item.validation_errors > 0 {
+                                format!(" {} validation error(s)", item.validation_errors)
+                            } else {
+                                String::new()
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )))
+            }
+            "update" => {
+                let path = params
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("path required for skill update"))?;
+                let result = crate::skill::update_skill_from_draft(
+                    std::path::Path::new(path),
+                    ctx.working_dir.as_deref(),
+                    params.confirm.unwrap_or(false),
+                )?;
+                Ok(ToolOutput::new(format!(
+                    "Updated skill '{}' ({}) at {}{}",
+                    result.name,
+                    result.level.as_str(),
+                    result.path.display(),
+                    result
+                        .snapshot
+                        .map(|path| format!("; previous version saved to {}", path.display()))
+                        .unwrap_or_default()
+                )))
+            }
+            "rollback" => {
+                let name = normalize_skill_name(params.name, "rollback")?;
+                let version = params
+                    .version
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("version required for rollback"))?;
+                let result =
+                    crate::skill::rollback_skill(&name, version, ctx.working_dir.as_deref())?;
+                Ok(ToolOutput::new(format!(
+                    "Rolled back '{}' to {} at {}",
+                    result.name,
+                    version,
+                    result.path.display()
+                )))
+            }
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', or 'read'.",
+                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', 'validate', 'health', 'update', or 'rollback'.",
                 params.action
             ))),
         }
@@ -545,7 +646,12 @@ mod tests {
         let invocation = graph
             .get_memory("skill-invocation:optimization")
             .expect("load must record an invocation row");
-        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:started"));
+        assert!(
+            invocation
+                .tags
+                .iter()
+                .any(|tag| tag == "skill-outcome:started")
+        );
     }
 
     #[tokio::test]

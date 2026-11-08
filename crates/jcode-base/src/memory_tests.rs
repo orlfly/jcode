@@ -516,7 +516,7 @@ fn graph_based_memory_operations() {
 }
 
 #[test]
-fn remember_rejects_inadmissible_provenance() {
+fn remember_routes_inadmissible_provenance_to_review() {
     use crate::memory_types::{ExtractionMethod, ProvenanceRecord};
     with_temp_home(|_home| {
         let manager = MemoryManager::new_test();
@@ -524,9 +524,20 @@ fn remember_rejects_inadmissible_provenance() {
             .with_provenance(
                 ProvenanceRecord::new("llm", ExtractionMethod::LlmExtraction).with_confidence(0.5),
             );
+        let outcome = manager
+            .remember_project_governed(entry)
+            .expect("low confidence is parked, not an error");
+        assert!(outcome.is_pending_review());
         assert!(
-            manager.remember_project(entry).is_err(),
-            "llm extraction below admission threshold should be rejected"
+            manager.load_project_graph().unwrap().memory_count() == 0,
+            "low-confidence extraction must not enter the graph"
+        );
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            1
         );
     });
 }
@@ -1409,7 +1420,11 @@ fn ttl_sweep_archives_expired_env_facts_and_keeps_contracts() {
 fn ttl_sweep_exempts_link_nodes() {
     with_temp_home(|_| {
         let manager = MemoryManager::new();
-        let mut link = backdated(MemoryCategory::Fact, "Skill `/deploy`: deploys things.", 999);
+        let mut link = backdated(
+            MemoryCategory::Fact,
+            "Skill `/deploy`: deploys things.",
+            999,
+        );
         link.id = "skill:deploy".to_string();
         manager.upsert_global_memory(link).unwrap();
 
@@ -1447,7 +1462,10 @@ fn skill_invocation_is_recorded_as_evidence() {
         let manager = MemoryManager::new().with_project_dir("/skill-invocation");
         let first = manager.remember_skill_invocation("optimization").unwrap();
         let again = manager.remember_skill_invocation("optimization").unwrap();
-        assert_eq!(first, again, "one row per skill, refreshed on re-invocation");
+        assert_eq!(
+            first, again,
+            "one row per skill, refreshed on re-invocation"
+        );
 
         let entry = manager
             .list_all()
@@ -1488,10 +1506,8 @@ fn skill_distillation_proposes_from_agreeing_evidence() {
             ),
         ];
         for (session, content) in evidence {
-            let mut entry = MemoryEntry::new(
-                MemoryCategory::Custom("process_rule".to_string()),
-                content,
-            );
+            let mut entry =
+                MemoryEntry::new(MemoryCategory::Custom("process_rule".to_string()), content);
             entry.source = Some(session.to_string());
             manager.remember_project(entry).unwrap();
         }
@@ -1511,13 +1527,19 @@ fn skill_distillation_proposes_from_agreeing_evidence() {
         assert_eq!(drill.evidence.len(), 3);
         assert!(drill.sessions.len() >= 3);
         assert!(
-            !proposals.iter().any(|p| p.subject_key == "api:/api/drill/other"),
+            !proposals
+                .iter()
+                .any(|p| p.subject_key == "api:/api/drill/other"),
             "single-session evidence must not produce a proposal"
         );
 
         // The proposal pipeline writes a reviewable draft, never an install.
         let written = manager.distill_skill_evidence().expect("distill");
-        assert!(written.iter().any(|p| p.subject_key == "api:/api/drill/sign-off"));
+        assert!(
+            written
+                .iter()
+                .any(|p| p.subject_key == "api:/api/drill/sign-off")
+        );
         let draft = home
             .join("skills")
             .join(".proposals")
@@ -1677,7 +1699,10 @@ cargo test --profile selfdev
             .iter()
             .position(|id| id.starts_with("skill:indexed-opt::"))
             .expect("part selected");
-        assert!(root < part, "root must be injected before its part: {ids:?}");
+        assert!(
+            root < part,
+            "root must be injected before its part: {ids:?}"
+        );
     });
 }
 
@@ -1704,7 +1729,10 @@ fn accepted_skill_records_derived_from_evidence_edges() {
 
         // A proposal that has been accepted: the draft's `evidence:` list kept
         // intact in the installed skill.
-        let skill_dir = project.join(".jcode").join("skills").join("task-42-merge-gate");
+        let skill_dir = project
+            .join(".jcode")
+            .join("skills")
+            .join("task-42-merge-gate");
         fs::create_dir_all(&skill_dir).expect("mkdir");
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -1859,9 +1887,7 @@ fn skill_reconcile_outbox_survives_and_drains() {
         .expect("write skill");
 
         crate::skill::queue_skill_reconcile("unit_test", None);
-        let path = home
-            .join("memory")
-            .join("skill-reconcile-outbox.json");
+        let path = home.join("memory").join("skill-reconcile-outbox.json");
         let outbox: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("outbox file"))
                 .expect("outbox json");
@@ -1896,8 +1922,8 @@ fn artifact_kinds_are_configurable_from_disk() {
 
         crate::memory::load_artifact_kind_config();
         assert!(jcode_memory_types::is_link_id("workflow:deploy"));
-        let kind = jcode_memory_types::artifact_kind_for_id("workflow:deploy")
-            .expect("configured kind");
+        let kind =
+            jcode_memory_types::artifact_kind_for_id("workflow:deploy").expect("configured kind");
         assert_eq!(kind.id, "workflow");
         // Built-ins survive the override.
         assert!(jcode_memory_types::is_link_id("skill:optimization"));
@@ -2099,7 +2125,12 @@ fn skill_outcome_validates_or_invalidates_evidence() {
             "successful execution must reinforce the evidence"
         );
         let invocation = graph.get_memory("skill-invocation:outcome-probe").unwrap();
-        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:succeeded"));
+        assert!(
+            invocation
+                .tags
+                .iter()
+                .any(|tag| tag == "skill-outcome:succeeded")
+        );
 
         let confidence_before = graph.get_memory(evidence_id).unwrap().confidence;
         manager
@@ -2114,7 +2145,12 @@ fn skill_outcome_validates_or_invalidates_evidence() {
             "failed execution must weaken the evidence"
         );
         let invocation = graph.get_memory("skill-invocation:outcome-probe").unwrap();
-        assert!(invocation.tags.iter().any(|tag| tag == "skill-outcome:failed"));
+        assert!(
+            invocation
+                .tags
+                .iter()
+                .any(|tag| tag == "skill-outcome:failed")
+        );
     });
 }
 
@@ -2322,14 +2358,10 @@ fn l1_hint_surface_a_matching_skill_mirror() {
         // Hint-and-selection: the mirror itself is the selected entry (so
         // publication has an ID to validate and the access feedback counts it).
         assert_eq!(result.selected_entries.len(), 1);
-        assert_eq!(
-            result.selected_entries[0].id,
-            "skill:api-api-task-param"
-        );
+        assert_eq!(result.selected_entries[0].id, "skill:api-api-task-param");
         assert!(prompt.chars().count() < 400, "bounded: {prompt}");
     });
 }
-
 
 #[test]
 fn l1_hint_appends_pointer_when_other_entries_selected() {
@@ -2353,8 +2385,9 @@ fn l1_hint_appends_pointer_when_other_entries_selected() {
         mirror.subject_key = Some("skill:api-api-task-param".to_string());
         manager.remember_global(mirror).unwrap();
 
-        let result = manager
-            .l1_relevance_result("accepting work through /api-api-task-param mentions /api/task/claim");
+        let result = manager.l1_relevance_result(
+            "accepting work through /api-api-task-param mentions /api/task/claim",
+        );
         let prompt = result.prompt.expect("prompt present");
         // The mirror wins its own L1 selection (its anchor head is literally in
         // the query) and is surfaced as a normal observation row; the hint
@@ -2369,7 +2402,10 @@ fn l1_hint_appends_pointer_when_other_entries_selected() {
                 .any(|entry| entry.id == "skill:api-api-task-param"),
             "mirror surfaced as a selectable row: {prompt}"
         );
-        assert!(prompt.contains("api-api-task-param"), "pointer text visible");
+        assert!(
+            prompt.contains("api-api-task-param"),
+            "pointer text visible"
+        );
         assert!(prompt.chars().count() < 700, "bounded: {prompt}");
     });
 }
@@ -2468,10 +2504,8 @@ fn skill_distillation_aggregates_evidence_across_project_stores() {
         ];
         for (dir, session, content) in evidence {
             let manager = MemoryManager::new().with_project_dir(dir);
-            let mut entry = MemoryEntry::new(
-                MemoryCategory::Custom("process_rule".to_string()),
-                content,
-            );
+            let mut entry =
+                MemoryEntry::new(MemoryCategory::Custom("process_rule".to_string()), content);
             entry.source = Some(session.to_string());
             manager.remember_project(entry).unwrap();
         }
@@ -2554,7 +2588,9 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
             ))
             .unwrap();
 
-        let dry = manager.reclassify_observations(false, false).expect("dry run");
+        let dry = manager
+            .reclassify_observations(false, false)
+            .expect("dry run");
         assert!(dry.dry_run);
         assert_eq!(dry.scanned, 5, "every active instance is visited");
         assert_eq!(dry.residual, 4, "the correction is not a candidate");
@@ -2584,7 +2620,13 @@ fn reclassify_splits_residual_facts_and_leaves_other_types_alone() {
         assert_eq!(label(&ids[2]), "env_fact");
         assert_eq!(label(&ids[3]), "fact", "prose stays residual");
         // And the pass is idempotent: a second apply changes nothing.
-        assert_eq!(manager.reclassify_observations(true, false).unwrap().type_changes, 0);
+        assert_eq!(
+            manager
+                .reclassify_observations(true, false)
+                .unwrap()
+                .type_changes,
+            0
+        );
     });
 }
 
@@ -2727,7 +2769,10 @@ fn proposal_subjects_must_name_reusable_things() {
     // Instances and environment details are not, even though they are good
     // retrieval anchors for the memory itself.
     assert!(!eligible("task:#117"), "a single task is not a skill");
-    assert!(!eligible("mr:!387"), "a single merge request is not a skill");
+    assert!(
+        !eligible("mr:!387"),
+        "a single merge request is not a skill"
+    );
     assert!(!eligible("host:localhost:1337"));
     // A bare JS-ecosystem name is usually a dependency, not a repo file ...
     assert!(!eligible("file:Next.js"));
@@ -2757,12 +2802,16 @@ fn accepting_a_proposal_installs_the_skill_and_links_its_evidence() {
 
         // Two evidence instances in the global store.
         let manager = MemoryManager::new();
-        let mut rule =
-            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/merge/gate requires the smoke suite before merge");
+        let mut rule = MemoryEntry::new(
+            MemoryCategory::ProcessRule,
+            "POST /api/merge/gate requires the smoke suite before merge",
+        );
         rule.source = Some("session_a_1".to_string());
         let id1 = manager.remember_global(rule).unwrap();
-        let mut rule2 =
-            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/merge/gate blocks merge until the smoke suite passes");
+        let mut rule2 = MemoryEntry::new(
+            MemoryCategory::ProcessRule,
+            "POST /api/merge/gate blocks merge until the smoke suite passes",
+        );
         rule2.source = Some("session_b_2".to_string());
         let id2 = manager.remember_global(rule2).unwrap();
 
@@ -2779,14 +2828,23 @@ fn accepting_a_proposal_installs_the_skill_and_links_its_evidence() {
         let accepted = crate::skill::accept_skill_proposal(&draft, None).unwrap();
         assert_eq!(accepted.name, "api-api-merge-gate");
         assert!(accepted.path.is_file(), "skill installed on disk");
-        assert_eq!(fs::read_to_string(&accepted.path).unwrap(), body, "draft body installed verbatim");
+        assert_eq!(
+            fs::read_to_string(&accepted.path).unwrap(),
+            body,
+            "draft body installed verbatim"
+        );
         assert!(!draft.exists(), "draft removed after acceptance");
         assert_eq!(accepted.evidence_linked, 2, "only existing ids linked");
 
         // The mirror node records the derived_from edges.
         let graph = manager.load_global_graph().unwrap();
-        let mirror = graph.get_memory("skill:api-api-merge-gate").expect("mirror");
-        assert_eq!(mirror.subject_key.as_deref(), Some("skill:api-api-merge-gate"));
+        let mirror = graph
+            .get_memory("skill:api-api-merge-gate")
+            .expect("mirror");
+        assert_eq!(
+            mirror.subject_key.as_deref(),
+            Some("skill:api-api-merge-gate")
+        );
         let derived = graph
             .get_edges("skill:api-api-merge-gate")
             .iter()
@@ -2797,7 +2855,9 @@ fn accepting_a_proposal_installs_the_skill_and_links_its_evidence() {
         // One invocation row (acceptance itself is the first use evidence).
         // The invocation is written into the same (global) store as the mirror.
         assert!(
-            graph.get_memory("skill-invocation:api-api-merge-gate").is_some(),
+            graph
+                .get_memory("skill-invocation:api-api-merge-gate")
+                .is_some(),
             "invocation recorded alongside the mirror"
         );
     });
@@ -2811,7 +2871,11 @@ fn acceptance_refuses_drafts_without_evidence_and_existing_skill_names() {
 
         // Draft without evidence: refuse.
         let no_evidence = proposals.join("no-evidence.md");
-        fs::write(&no_evidence, "---\nname: no-evidence\ndescription: x\n---\n\nBody.\n").unwrap();
+        fs::write(
+            &no_evidence,
+            "---\nname: no-evidence\ndescription: x\n---\n\nBody.\n",
+        )
+        .unwrap();
         let err = crate::skill::accept_skill_proposal(&no_evidence, None)
             .expect_err("no-evidence draft must be refused");
         assert!(err.to_string().contains("evidence:"), "{err}");
@@ -2819,14 +2883,18 @@ fn acceptance_refuses_drafts_without_evidence_and_existing_skill_names() {
 
         // Existing skill with the same name: refuse and keep the draft.
         let manager = MemoryManager::new();
-        let mut rule =
-            MemoryEntry::new(MemoryCategory::ProcessRule, "POST /api/gate/keep requires care");
+        let mut rule = MemoryEntry::new(
+            MemoryCategory::ProcessRule,
+            "POST /api/gate/keep requires care",
+        );
         rule.source = Some("session_c_3".to_string());
         let id = manager.remember_global(rule).unwrap();
         let dup = proposals.join("existing-skill.md");
         fs::write(
             &dup,
-            format!("---\nname: existing-skill\ndescription: x\nevidence:\n  - {id}\n---\n\nBody.\n"),
+            format!(
+                "---\nname: existing-skill\ndescription: x\nevidence:\n  - {id}\n---\n\nBody.\n"
+            ),
         )
         .unwrap();
         let skills = home.join("skills").join("existing-skill");
@@ -2847,20 +2915,35 @@ fn acceptance_refuses_drafts_without_evidence_and_existing_skill_names() {
 fn retrieval_writeback_counts_access_on_injection() {
     with_temp_home(|_home| {
         let manager = MemoryManager::new();
-        let mut entry =
-            MemoryEntry::new(MemoryCategory::Contract, "POST /api/count writes a row");
+        let mut entry = MemoryEntry::new(MemoryCategory::Contract, "POST /api/count writes a row");
         entry.source = Some("session_w_1".to_string());
         let id = manager.remember_global(entry).unwrap();
 
-        assert_eq!(manager.load_global_graph().unwrap().get_memory(&id).unwrap().access_count, 0);
+        assert_eq!(
+            manager
+                .load_global_graph()
+                .unwrap()
+                .get_memory(&id)
+                .unwrap()
+                .access_count,
+            0
+        );
         manager.record_retrievals(&[id.clone()]).unwrap();
-        manager.record_retrievals(&[id.clone(), id.clone()]).unwrap();
+        manager
+            .record_retrievals(&[id.clone(), id.clone()])
+            .unwrap();
         let graph = manager.load_global_graph().unwrap();
         let counted = graph.get_memory(&id).unwrap();
         // One retrieval per injection event: duplicate IDs in one event
         // (the set is deduped) count once.
-        assert_eq!(counted.access_count, 2, "one count per call, not per list entry");
-        assert_eq!(counted.strength, 1, "access is not reinforcement (default strength stays)");
+        assert_eq!(
+            counted.access_count, 2,
+            "one count per call, not per list entry"
+        );
+        assert_eq!(
+            counted.strength, 1,
+            "access is not reinforcement (default strength stays)"
+        );
     });
 }
 
@@ -2948,10 +3031,11 @@ fn prepare_for_write_canonicalizes_dict_shaped_categories() {
     let prepared = jcode_memory_types::reconcile::prepare_for_write(entry);
     assert_eq!(prepared.category, MemoryCategory::ProcessRule);
 
-    // Unknown custom labels are preserved as-is.
+    // The legacy `Skills` label is a write-time alias for the skill procedure
+    // bucket; it must not survive as a second custom category.
     let entry = MemoryEntry::new(MemoryCategory::Custom("Skills".to_string()), "x".repeat(32));
     let prepared = jcode_memory_types::reconcile::prepare_for_write(entry);
-    assert_eq!(prepared.category, MemoryCategory::Custom("Skills".to_string()));
+    assert_eq!(prepared.category, MemoryCategory::ProcessRule);
 }
 
 #[test]
@@ -2962,18 +3046,34 @@ fn colliding_proposal_slugs_do_not_overwrite_each_other() {
         // same file name. Each item lives in its own store so write-time
         // reconciliation cannot fold them together.
         let items = [
-            ("file:a.b", "alpha rule: always run the smoke suite before merge"),
-            ("file:a.b", "beta rule: merge needs the smoke suite result attached"),
-            ("file:a.b", "gamma rule: smoke suite must pass on the merge target"),
-            ("file:a-b", "delta rule: never merge without the guard suite green"),
-            ("file:a-b", "epsilon rule: the guard suite gates every merge"),
-            ("file:a-b", "zeta rule: guard suite failures block the merge path"),
+            (
+                "file:a.b",
+                "alpha rule: always run the smoke suite before merge",
+            ),
+            (
+                "file:a.b",
+                "beta rule: merge needs the smoke suite result attached",
+            ),
+            (
+                "file:a.b",
+                "gamma rule: smoke suite must pass on the merge target",
+            ),
+            (
+                "file:a-b",
+                "delta rule: never merge without the guard suite green",
+            ),
+            (
+                "file:a-b",
+                "epsilon rule: the guard suite gates every merge",
+            ),
+            (
+                "file:a-b",
+                "zeta rule: guard suite failures block the merge path",
+            ),
         ];
         for (index, (subject, content)) in items.into_iter().enumerate() {
-            let mut entry = MemoryEntry::new(
-                MemoryCategory::Custom("process_rule".to_string()),
-                content,
-            );
+            let mut entry =
+                MemoryEntry::new(MemoryCategory::Custom("process_rule".to_string()), content);
             entry.source = Some(format!("session_slug_{index}"));
             entry.subject_key = Some(subject.to_string());
             MemoryManager::new()
@@ -3026,10 +3126,8 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
                 "POST /api/merge/gate needs a passing smoke suite first",
             ),
         ] {
-            let mut entry = MemoryEntry::new(
-                MemoryCategory::Custom("process_rule".to_string()),
-                content,
-            );
+            let mut entry =
+                MemoryEntry::new(MemoryCategory::Custom("process_rule".to_string()), content);
             entry.source = Some(session.to_string());
             MemoryManager::new()
                 .with_project_dir(dir)
@@ -3057,15 +3155,17 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
 
         // ... while an explicit request (the `memory distill` CLI) still writes.
         let explicit = manager.write_skill_proposals_now().unwrap();
-        assert!(explicit.iter().any(|p| p.subject_key == "api:/api/merge/gate"));
+        assert!(
+            explicit
+                .iter()
+                .any(|p| p.subject_key == "api:/api/merge/gate")
+        );
     });
 }
 
 #[test]
 fn ontology_patch_persists_migrates_and_rolls_back() {
-    use jcode_memory_types::migration::{
-        MigrationStep, OntologyOp, OntologyPatch, TypePatch,
-    };
+    use jcode_memory_types::migration::{MigrationStep, OntologyOp, OntologyPatch, TypePatch};
 
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/ontology-runtime");
@@ -3110,13 +3210,7 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
 
         let graph = manager.load_project_graph().unwrap();
         assert_eq!(
-            graph
-                .metadata
-                .ontology
-                .as_ref()
-                .unwrap()
-                .types["env_fact"]
-                .ttl_days,
+            graph.metadata.ontology.as_ref().unwrap().types["env_fact"].ttl_days,
             Some(45.0)
         );
         let entry = graph.get_memory(&id).unwrap();
@@ -3159,10 +3253,7 @@ fn json_store_persists_default_ontology_on_first_load() {
             .ontology
             .as_ref()
             .expect("JSON store must persist the ontology");
-        assert_eq!(
-            graph.metadata.ontology_hash,
-            ontology.content_hash()
-        );
+        assert_eq!(graph.metadata.ontology_hash, ontology.content_hash());
         assert_eq!(
             graph.metadata.ontology_version,
             jcode_memory_types::ontology::DEFAULT_ONTOLOGY_VERSION
@@ -3176,14 +3267,245 @@ fn json_store_persists_default_ontology_on_first_load() {
             graph.metadata.ontology_hash
         );
         assert_eq!(
-            reloaded
-                .metadata
-                .ontology
-                .as_ref()
-                .unwrap()
-                .types
-                .len(),
+            reloaded.metadata.ontology.as_ref().unwrap().types.len(),
             ontology.types.len()
         );
     });
+}
+
+#[test]
+fn low_confidence_write_is_parked_in_review_queue() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-low-confidence");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "The deployment uses a blue-green switch",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.4)
+                .with_locator("session:test"),
+        );
+        let outcome = manager.remember_project_governed(entry).unwrap();
+        assert!(outcome.is_pending_review(), "{outcome:?}");
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 0);
+        let pending = manager.list_reviews(Some(ReviewStatus::Pending)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].gates.is_empty());
+
+        let accepted = manager
+            .accept_review(&pending[0].id, "tester", Some("verified"))
+            .unwrap();
+        assert_eq!(accepted.status, ReviewStatus::Accepted);
+        let graph = manager.load_project_graph().unwrap();
+        assert_eq!(graph.memory_count(), 1);
+        let stored = graph.get_memory(&pending[0].new.id).unwrap();
+        assert_eq!(
+            stored.provenance.as_ref().unwrap().confirmed_by.as_deref(),
+            Some("tester")
+        );
+        assert!(stored.provenance.as_ref().unwrap().confidence >= 0.95);
+        assert!(!stored.review.needs_review);
+    });
+}
+
+#[test]
+fn mid_confidence_write_is_admitted_with_review_badge() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-badge");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "The staging cluster restarts nightly at 02:00",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.8),
+        );
+        let outcome = manager.remember_project_governed(entry).unwrap();
+        let MemoryWriteOutcome::Stored { id, needs_review } = outcome else {
+            panic!("mid-confidence write should be admitted");
+        };
+        assert!(needs_review);
+        let graph = manager.load_project_graph().unwrap();
+        assert!(graph.get_memory(&id).unwrap().review.needs_review);
+    });
+}
+
+#[test]
+fn critical_overwrite_requires_review_and_keeps_old_value() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-critical");
+        let mut old = MemoryEntry::new(
+            MemoryCategory::Preference,
+            "User prefers tabs for indentation",
+        )
+        .with_provenance(ProvenanceRecord::new("user", ExtractionMethod::UserStated));
+        old.subject_key = Some("pref:indent".to_string());
+        let old_id = manager.remember_project(old).unwrap();
+        assert!(
+            manager
+                .load_project_graph()
+                .unwrap()
+                .get_memory(&old_id)
+                .unwrap()
+                .critical
+        );
+
+        let mut new = MemoryEntry::new(
+            MemoryCategory::Preference,
+            "User prefers two spaces for indentation",
+        )
+        .with_provenance(ProvenanceRecord::new("user", ExtractionMethod::UserStated));
+        new.subject_key = Some("pref:indent".to_string());
+        let outcome = manager.remember_project_governed(new).unwrap();
+        let MemoryWriteOutcome::PendingReview { target_id, .. } = outcome else {
+            panic!("critical overwrite should require review");
+        };
+        assert_eq!(target_id.as_deref(), Some(old_id.as_str()));
+        let graph = manager.load_project_graph().unwrap();
+        assert_eq!(graph.memory_count(), 1);
+        assert_eq!(
+            graph.get_memory(&old_id).unwrap().content,
+            "User prefers tabs for indentation"
+        );
+    });
+}
+
+#[test]
+fn reject_review_leaves_graph_unchanged() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-reject");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "The backup bucket is named archive-2024",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.3),
+        );
+        let MemoryWriteOutcome::PendingReview { review_id, .. } =
+            manager.remember_project_governed(entry).unwrap()
+        else {
+            panic!("low confidence should queue");
+        };
+        let rejected = manager
+            .reject_review(&review_id, "tester", Some("unverified"))
+            .unwrap();
+        assert_eq!(rejected.status, ReviewStatus::Rejected);
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 0);
+        assert!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn health_report_counts_reviews_and_provenance_gaps() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-health");
+        manager
+            .remember_project(
+                MemoryEntry::new(MemoryCategory::Observation, "A healthy stored observation")
+                    .with_provenance(
+                        ProvenanceRecord::new("session", ExtractionMethod::LlmExtraction)
+                            .with_confidence(0.95),
+                    ),
+            )
+            .unwrap();
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "A queued low confidence observation",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session", ExtractionMethod::LlmExtraction).with_confidence(0.4),
+        );
+        manager.remember_project_governed(entry).unwrap();
+
+        let report = manager.health_report().unwrap();
+        assert!(report.memories >= 1);
+        assert_eq!(report.reviews.pending, 1);
+        assert!(report.missing_locator >= 1);
+        assert!(report.categories.contains_key("observation"));
+    });
+}
+
+#[test]
+fn extraction_source_pauses_on_failure_rate() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new_test();
+        for _ in 0..3 {
+            manager
+                .record_extraction_batch("session", 5, 4, 0, 1, 0.9, 0.0)
+                .expect("record batch");
+        }
+        let health = manager.extraction_health().expect("health");
+        assert!(health.paused);
+        assert!(
+            health
+                .pause_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failure rate"))
+        );
+        assert!(manager.extraction_is_paused());
+
+        let resumed = manager.resume_extraction().expect("resume");
+        assert!(!resumed.paused);
+        assert!(resumed.pause_reason.is_none());
+        assert!(!manager.extraction_is_paused());
+    });
+}
+
+#[test]
+fn extraction_source_pauses_on_confidence_drop() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new_test();
+        manager
+            .record_extraction_batch("session", 5, 5, 0, 0, 0.95, 0.0)
+            .expect("batch 1");
+        manager
+            .record_extraction_batch("session", 5, 5, 0, 0, 0.95, 0.0)
+            .expect("batch 2");
+        manager
+            .record_extraction_batch("session", 5, 5, 0, 0, 0.5, 0.0)
+            .expect("batch 3");
+        let health = manager.extraction_health().expect("health");
+        assert!(health.paused);
+        assert!(
+            health
+                .pause_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("confidence"))
+        );
+    });
+}
+
+#[test]
+fn memory_route_classifies_common_query_shapes() {
+    assert_eq!(
+        route_memory_query("how to deploy the service"),
+        MemoryRoute::Procedure
+    );
+    assert_eq!(route_memory_query("安装这个工具"), MemoryRoute::Operation);
+    assert_eq!(
+        route_memory_query("why does this fail"),
+        MemoryRoute::MultiHop
+    );
+    assert_eq!(
+        route_memory_query("what port is the server on"),
+        MemoryRoute::Fact
+    );
+}
+
+#[test]
+fn needs_review_badge_is_visible_in_prompt() {
+    let entry = MemoryEntry::new(MemoryCategory::Observation, "Unconfirmed deployment detail")
+        .with_provenance(
+            ProvenanceRecord::new("session", ExtractionMethod::LlmExtraction).with_confidence(0.8),
+        )
+        .with_needs_review();
+    let prompt = crate::memory_types::format_entries_for_prompt(&[entry], 5).expect("prompt");
+    assert!(prompt.contains("[needs review]"), "{prompt}");
 }

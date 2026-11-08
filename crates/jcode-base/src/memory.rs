@@ -33,6 +33,10 @@ mod ontology_registry;
 mod pending;
 #[path = "memory_prompt.rs"]
 mod prompt_support;
+#[path = "memory/review.rs"]
+mod review;
+#[path = "memory/source_health.rs"]
+mod source_health;
 
 pub use crate::memory_types::{
     ExtractionMethod, MemoryCategory, MemoryEntry, MemoryScope, MemoryStore, ProvenanceRecord,
@@ -47,6 +51,10 @@ pub use activity::{
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
 use cache::{cache_graph, cache_graph_for_backend, cached_graph};
+pub use jcode_memory_types::{
+    AdmissionTier, ChangeLevel, MemoryReviewItem, MemoryReviewState, ReviewRecommendation,
+    ReviewStatus, admission_tier,
+};
 use ontology_registry::OntologyRegistry;
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
@@ -64,6 +72,8 @@ pub(crate) use prompt_support::format_context_for_extraction;
 pub use prompt_support::{
     focus_query_text, format_context_for_relevance, format_focused_query_for_relevance,
 };
+pub use review::{MemoryHealthReport, ReviewHealth};
+pub use source_health::{ExtractionBatch, ExtractionHealth};
 
 const LEGACY_NOTE_CATEGORY: &str = "note";
 const MEMORY_RELEVANCE_MAX_CANDIDATES: usize = 30;
@@ -185,7 +195,11 @@ pub const L1_MAX_RESULTS: usize = 3;
 /// `subject_key` held by the query (1.0), a query term appearing in a tag
 /// (0.6), and term overlap with the instance's searchable text (up to 0.5).
 /// Returns entries ordered best-first.
-pub fn score_l1_relevance(entry: &MemoryEntry, query_terms: &[String], normalized_query: &str) -> f32 {
+pub fn score_l1_relevance(
+    entry: &MemoryEntry,
+    query_terms: &[String],
+    normalized_query: &str,
+) -> f32 {
     if !entry.active {
         return 0.0;
     }
@@ -263,11 +277,7 @@ impl ReclassifyReport {
     pub fn summary(&self) -> String {
         let mut out = format!(
             "{} store(s), {} visited, {} residual, {} type change(s), {} subject key(s)",
-            self.stores,
-            self.scanned,
-            self.residual,
-            self.type_changes,
-            self.subject_keys
+            self.stores, self.scanned, self.residual, self.type_changes, self.subject_keys
         );
         if !self.by_type.is_empty() {
             let detail: Vec<String> = self
@@ -481,6 +491,9 @@ fn proposal_eligible_subject(key: &str) -> bool {
 const SKILL_DISTILL_MIN_EVIDENCE: usize = 3;
 /// Minimum number of distinct stores the evidence must span.
 const SKILL_DISTILL_MIN_STORES: usize = 2;
+/// Upper bound on emitted proposals per pass. The queue is for review, not a
+/// dump of every subject the store has ever mentioned.
+const SKILL_DISTILL_MAX_PROPOSALS: usize = 20;
 
 /// A procedure that the memory store has accumulated enough evidence for.
 ///
@@ -495,12 +508,29 @@ pub struct SkillEvidenceProposal {
     pub stores: Vec<String>,
     pub sessions: Vec<String>,
     pub weight: f32,
+    /// Composite ranking score (evidence, diversity, outcomes, recency).
+    #[serde(default)]
+    pub score: f32,
+    /// Evidence entries carrying `skill-validated`.
+    #[serde(default)]
+    pub positive: u32,
+    /// Evidence entries carrying `skill-invalidated` or failed outcomes.
+    #[serde(default)]
+    pub negative: u32,
+    /// Most recent evidence update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<DateTime<Utc>>,
+    /// True while the draft body is still a skeleton.
+    #[serde(default)]
+    pub needs_human_draft: bool,
 }
 
 impl SkillEvidenceProposal {
     /// Stable file name for the draft, derived from the subject anchor.
     fn slug(&self) -> String {
-        let raw = self.subject_key.replace([':', '/', '{', '}', '.', ' '], "-");
+        let raw = self
+            .subject_key
+            .replace([':', '/', '{', '}', '.', ' '], "-");
         let filtered: String = raw
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -532,6 +562,11 @@ impl SkillEvidenceProposal {
         let mut out = String::new();
         out.push_str("---\n");
         out.push_str(&format!("name: {proposed_name}\n"));
+        out.push_str("version: 0.1.0\n");
+        out.push_str("status: active\n");
+        out.push_str("needs_human_draft: true\n");
+        out.push_str("triggers:\n");
+        out.push_str(&format!("  - work with {}\n", self.subject_key));
         out.push_str(&format!(
             "description: Apply when working on {}. Derived from {} memory evidence item(s) across {} store(s).\n",
             self.subject_key,
@@ -548,12 +583,15 @@ impl SkillEvidenceProposal {
         }
         out.push_str("---\n\n");
         out.push_str(&format!(
-            "# {proposed_name}\n\nDerived from accumulated memory evidence.\n\n- subject: `{}`\n- evidence: {} instance(s)\n- stores: {}\n- sessions: {}\n- weight (corrections count double): {:.1}\n\n## Evidence\n",
+            "# {proposed_name}\n\nDerived from accumulated memory evidence.\n\n- subject: `{}`\n- evidence: {} instance(s)\n- stores: {}\n- sessions: {}\n- weight (corrections count double): {:.1}\n- score: {:.1}\n- positive: {}, negative: {}\n\n## Evidence\n",
             self.subject_key,
             self.evidence.len(),
             self.stores.len(),
             self.sessions.len(),
-            self.weight
+            self.weight,
+            self.score,
+            self.positive,
+            self.negative
         ));
         for id in &self.evidence {
             out.push_str(&format!("- `{id}`\n"));
@@ -583,9 +621,6 @@ fn claim_maintenance_slot(base: &Path, stamp: &str, interval_secs: u64) -> bool 
 /// place (they are derived, not authored), and nothing outside `.proposals/` is
 /// touched - installing a skill stays an explicit act.
 fn write_skill_proposals(base: &Path, proposals: &[SkillEvidenceProposal]) -> Result<()> {
-    if proposals.is_empty() {
-        return Ok(());
-    }
     let dir = base.join("skills").join(".proposals");
     std::fs::create_dir_all(&dir)?;
     // The slug is human-readable, not injective: `api:/api/task/:id` and
@@ -593,6 +628,7 @@ fn write_skill_proposals(base: &Path, proposals: &[SkillEvidenceProposal]) -> Re
     // per-batch guard the second draft silently overwrote the first (observed:
     // 26 proposals produced 25 files), so duplicates get a numeric suffix.
     let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
     for proposal in proposals {
         let slug = proposal.slug();
         let seen = used.entry(slug.clone()).or_insert(0);
@@ -602,7 +638,38 @@ fn write_skill_proposals(base: &Path, proposals: &[SkillEvidenceProposal]) -> Re
         } else {
             format!("{slug}-{seen}")
         };
-        std::fs::write(dir.join(format!("{file_slug}.md")), proposal.draft(&file_slug))?;
+        kept.insert(format!("{file_slug}.md"));
+        std::fs::write(
+            dir.join(format!("{file_slug}.md")),
+            proposal.draft(&file_slug),
+        )?;
+    }
+    // Retire proposals nobody acted on. Keeping stale TODOs forever is how the
+    // queue grew to 44 files with one installed skill.
+    const PROPOSAL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let expired = dir.join(".expired");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if kept.contains(name) {
+                continue;
+            }
+            let stale = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age > PROPOSAL_TTL);
+            if stale {
+                std::fs::create_dir_all(&expired)?;
+                let _ = std::fs::rename(&path, expired.join(name));
+            }
+        }
     }
     Ok(())
 }
@@ -627,8 +694,7 @@ pub const MIN_MEANINGFUL_MEMORY_LEN: usize =
 ///
 /// Returns true when the content looks like noise that should NOT be stored.
 pub fn is_extraction_noise(content: &str) -> bool {
-    content.trim().is_empty()
-        || jcode_memory_types::reconcile::noise_reason(content).is_some()
+    content.trim().is_empty() || jcode_memory_types::reconcile::noise_reason(content).is_some()
 }
 
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
@@ -728,6 +794,180 @@ pub struct MemoryManager {
     /// the snapshot cannot overwrite the newer sqlite store
     /// (`self-suppress`, the fallback is read-only by construction).
     suppress_next_legacy_save: std::sync::atomic::AtomicBool,
+}
+
+/// Result of a governed memory write.
+///
+/// A write can be stored immediately, stored with a review badge, or parked in
+/// the durable review queue without touching the graph. Callers that need to
+/// tell the difference should use the `remember_*_governed` methods; the legacy
+/// `remember_*` methods return the stored id or the review id as a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryWriteOutcome {
+    Stored {
+        id: String,
+        needs_review: bool,
+    },
+    PendingReview {
+        review_id: String,
+        target_id: Option<String>,
+    },
+}
+
+/// High-level retrieval route chosen from the query shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRoute {
+    /// Fact or state lookup.
+    Fact,
+    /// How-to / procedure lookup; skills should lead.
+    Procedure,
+    /// Why/which/compare question; graph traversal matters.
+    MultiHop,
+    /// A requested operation; skill contracts and safety matter.
+    Operation,
+}
+
+impl MemoryRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            MemoryRoute::Fact => "fact",
+            MemoryRoute::Procedure => "procedure",
+            MemoryRoute::MultiHop => "multi_hop",
+            MemoryRoute::Operation => "operation",
+        }
+    }
+}
+
+/// Classify a query into a retrieval route with cheap lexical signals.
+pub fn route_memory_query(query: &str) -> MemoryRoute {
+    let lower = query.to_lowercase();
+    let procedure = [
+        "how to",
+        "how do i",
+        "how can i",
+        "steps",
+        "workflow",
+        "procedure",
+        "walk me through",
+        "怎么",
+        "如何",
+        "步骤",
+        "流程",
+    ];
+    if procedure.iter().any(|signal| lower.contains(signal)) {
+        return MemoryRoute::Procedure;
+    }
+    let operation = [
+        "install", "deploy", "delete", "remove", "create", "run ", "execute", "apply", "migrate",
+        "rollback", "安装", "部署", "删除", "执行", "迁移", "回滚",
+    ];
+    if operation.iter().any(|signal| lower.contains(signal)) {
+        return MemoryRoute::Operation;
+    }
+    let multi_hop = [
+        "why",
+        "which",
+        "compare",
+        "difference",
+        "relationship",
+        "depends on",
+        "为什么",
+        "哪个",
+        "比较",
+        "区别",
+        "关系",
+        "依赖",
+    ];
+    if multi_hop.iter().any(|signal| lower.contains(signal)) {
+        return MemoryRoute::MultiHop;
+    }
+    MemoryRoute::Fact
+}
+
+impl MemoryWriteOutcome {
+    pub fn id(&self) -> &str {
+        match self {
+            MemoryWriteOutcome::Stored { id, .. } => id,
+            MemoryWriteOutcome::PendingReview { review_id, .. } => review_id,
+        }
+    }
+
+    pub fn is_pending_review(&self) -> bool {
+        matches!(self, MemoryWriteOutcome::PendingReview { .. })
+    }
+}
+
+/// Mark durable user-stated preferences, corrections and contracts critical.
+///
+/// This is deliberately conservative: only an authoritative `UserStated`
+/// provenance qualifies, so ordinary LLM observations and agent tool writes do
+/// not turn every row into a confirmation gate.
+fn apply_critical_policy(entry: &mut MemoryEntry) {
+    if entry.critical {
+        return;
+    }
+    let method = entry.effective_provenance().method;
+    if method == ExtractionMethod::UserStated
+        && matches!(
+            entry.category,
+            MemoryCategory::Preference | MemoryCategory::Correction | MemoryCategory::Contract
+        )
+    {
+        entry.critical = true;
+    }
+}
+
+/// Confirmation gates for a single proposed memory write.
+fn write_confirmation_gates(
+    old: Option<&MemoryEntry>,
+    new: &MemoryEntry,
+) -> Vec<jcode_memory_types::ConfirmationGate> {
+    use jcode_memory_types::ConfirmationGate;
+
+    let Some(old) = old else {
+        return Vec::new();
+    };
+    let changed = old.content != new.content
+        || old.tags != new.tags
+        || old.category != new.category
+        || old.properties != new.properties
+        || old.lifecycle.status != new.lifecycle.status
+        || old.active != new.active;
+    if !changed {
+        return Vec::new();
+    }
+
+    let mut gates = Vec::new();
+    // Only an *existing* critical memory makes a destructive update sensitive.
+    // A new critical row replacing a non-critical one is an upgrade, not a
+    // loss of protected data.
+    if old.critical {
+        gates.push(ConfirmationGate::CriticalData);
+    }
+    let authoritative = |entry: &MemoryEntry| {
+        entry
+            .provenance
+            .as_ref()
+            .map(|provenance| {
+                provenance.method.authority_rank()
+                    >= ExtractionMethod::StructuredMapping.authority_rank()
+            })
+            .unwrap_or(false)
+    };
+    if authoritative(old) {
+        gates.push(ConfirmationGate::AuthoritativeOverwrite);
+    }
+    if old.lifecycle.status != new.lifecycle.status || (old.active && !new.active) {
+        gates.push(ConfirmationGate::StatusTransition);
+    }
+    if authoritative(old)
+        && authoritative(new)
+        && jcode_memory_types::reconcile::detect_conflict(old, new)
+    {
+        gates.push(ConfirmationGate::Contradiction);
+    }
+    gates.dedup();
+    gates
 }
 
 impl std::fmt::Debug for MemoryManager {
@@ -1014,22 +1254,39 @@ impl MemoryManager {
     /// different project. Inadmissible provenance (below the extraction
     /// method's admission threshold) is rejected instead of committed.
     pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
+        Ok(self.remember_project_governed(entry)?.id().to_string())
+    }
+
+    /// Governed project write: confidence admission, confirmation gates and
+    /// review-queue parking. Returns `PendingReview` without mutating the graph
+    /// when a human decision is required.
+    pub fn remember_project_governed(&self, entry: MemoryEntry) -> Result<MemoryWriteOutcome> {
         anyhow::ensure!(
             self.project_memory_path()?.is_some(),
             "Project memory requires a working directory; use global scope explicitly"
         );
-        crate::memory_types::validate_new_entry(&entry)
-            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+        let project_dir = self.get_project_dir();
         let mut graph = self.load_project_graph()?;
         let ontology = self.ontology_for_graph(&graph);
-        let id = Self::remember_in_graph(&mut graph, entry, &ontology);
-        self.save_project_graph(&graph)?;
-        Ok(id)
+        let outcome = self.governed_write(
+            &mut graph,
+            entry,
+            &ontology,
+            "project",
+            project_dir.as_deref(),
+        )?;
+        if let MemoryWriteOutcome::Stored { .. } = outcome {
+            self.save_project_graph(&graph)?;
+        }
+        Ok(outcome)
     }
 
     pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
-        crate::memory_types::validate_new_entry(&entry)
-            .map_err(|issues| anyhow::anyhow!("memory validation failed: {:?}", issues))?;
+        Ok(self.remember_global_governed(entry)?.id().to_string())
+    }
+
+    /// Governed global write, including the ontology global-scope gate.
+    pub fn remember_global_governed(&self, entry: MemoryEntry) -> Result<MemoryWriteOutcome> {
         let mut graph = self.load_global_graph()?;
         let ontology = self.ontology_for_graph(&graph);
         // Ontology gate: global memory must stay conceptual / generalized /
@@ -1044,9 +1301,11 @@ impl MemoryManager {
                  write environment-specific facts to project scope instead"
             ));
         }
-        let id = Self::remember_in_graph(&mut graph, entry, &ontology);
-        self.save_global_graph(&graph)?;
-        Ok(id)
+        let outcome = self.governed_write(&mut graph, entry, &ontology, "global", None)?;
+        if let MemoryWriteOutcome::Stored { .. } = outcome {
+            self.save_global_graph(&graph)?;
+        }
+        Ok(outcome)
     }
 
     /// Run the ontology global-scope gate for `entry`. `Some(reason)` means
@@ -1084,27 +1343,16 @@ impl MemoryManager {
         None
     }
 
-    fn remember_in_graph(
+    /// Apply a precomputed reconcile outcome to a graph.
+    fn apply_reconcile(
         graph: &mut MemoryGraph,
         entry: MemoryEntry,
-        ontology: &jcode_memory_types::Ontology,
+        outcome: jcode_memory_types::reconcile::ReconcileOutcome,
     ) -> String {
-        // v2 write path: sanitize (derived `subject_key`, tag vocabulary,
-        // identity-less entity demotion) and then reconcile against the store
-        // so `dedup` / `supersedes` / `contradicts` / `relates_to` are decided
-        // by one deterministic local pass instead of never running at all.
-        let entry = jcode_memory_types::reconcile::prepare_for_write(entry);
-        let (reinforce_at, supersede_at, relate_at) =
-            jcode_memory_types::migration::reconcile_thresholds(ontology);
-        let outcome = jcode_memory_types::reconcile::reconcile_with_thresholds(
-            &entry,
-            graph,
-            reinforce_at,
-            supersede_at,
-            relate_at,
-        );
-        let source_label = entry.source.clone().unwrap_or_else(|| "reconcile".to_string());
-
+        let source_label = entry
+            .source
+            .clone()
+            .unwrap_or_else(|| "reconcile".to_string());
         match outcome.action {
             jcode_memory_types::reconcile::ReconcileAction::Insert => graph.add_memory(entry),
             jcode_memory_types::reconcile::ReconcileAction::Reinforce { existing_id } => {
@@ -1136,6 +1384,406 @@ impl MemoryManager {
                 new_id
             }
         }
+    }
+
+    /// Shared governed-write implementation for project and global scopes.
+    fn governed_write(
+        &self,
+        graph: &mut MemoryGraph,
+        entry: MemoryEntry,
+        ontology: &jcode_memory_types::Ontology,
+        scope: &str,
+        project_dir: Option<&std::path::Path>,
+    ) -> Result<MemoryWriteOutcome> {
+        let mut entry = jcode_memory_types::reconcile::prepare_for_write(entry);
+        apply_critical_policy(&mut entry);
+
+        let (reinforce_at, supersede_at, relate_at) =
+            jcode_memory_types::migration::reconcile_thresholds(ontology);
+        let outcome = jcode_memory_types::reconcile::reconcile_with_thresholds(
+            &entry,
+            graph,
+            reinforce_at,
+            supersede_at,
+            relate_at,
+        );
+        let old = outcome
+            .action
+            .existing_id()
+            .and_then(|id| graph.get_memory(id))
+            .cloned();
+        let provenance = entry.effective_provenance().into_owned();
+        let tier = admission_tier(provenance.method, provenance.confidence);
+
+        let validation = crate::memory_types::validate_new_entry(&entry);
+        if let Err(issues) = validation {
+            let only_admission = issues.iter().all(|issue| issue.code == "E22");
+            if !(tier == AdmissionTier::PendingOnly && only_admission) {
+                return Err(anyhow::anyhow!("memory validation failed: {:?}", issues));
+            }
+        }
+
+        let gates = write_confirmation_gates(old.as_ref(), &entry);
+        if tier == AdmissionTier::PendingOnly || !gates.is_empty() {
+            let reason = if tier == AdmissionTier::PendingOnly {
+                format!(
+                    "confidence {:.2} is below the {:.2} admission floor for {:?}",
+                    provenance.confidence,
+                    jcode_memory_types::REVIEW_BADGE_CONFIDENCE,
+                    provenance.method
+                )
+            } else {
+                gates
+                    .iter()
+                    .map(|gate| gate.description())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let mut item = MemoryReviewItem::new(scope, old.clone(), entry.clone(), gates, reason)
+                .with_action(outcome.action.label());
+            if let Some(dir) = project_dir {
+                item = item.with_project_dir(dir.to_string_lossy().to_string());
+            }
+            self.enqueue_review_item(&item)?;
+            return Ok(MemoryWriteOutcome::PendingReview {
+                review_id: item.id,
+                target_id: old.map(|entry| entry.id),
+            });
+        }
+
+        let needs_review = tier == AdmissionTier::NeedsReview;
+        if needs_review {
+            entry.review.needs_review = true;
+        }
+        let id = Self::apply_reconcile(graph, entry, outcome);
+        Ok(MemoryWriteOutcome::Stored { id, needs_review })
+    }
+
+    fn enqueue_review_item(&self, item: &MemoryReviewItem) -> Result<()> {
+        let path = review::queue_path(self.test_mode)?;
+        review::append_item(&path, item)
+    }
+
+    /// List review items, newest first. `status = None` lists everything.
+    pub fn list_reviews(&self, status: Option<ReviewStatus>) -> Result<Vec<MemoryReviewItem>> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        if let Some(status) = status {
+            items.retain(|item| item.status == status);
+        }
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(items)
+    }
+
+    pub fn get_review(&self, id: &str) -> Result<Option<MemoryReviewItem>> {
+        let path = review::queue_path(self.test_mode)?;
+        let items = review::load_items(&path)?;
+        Ok(review::find_item(&items, id).cloned())
+    }
+
+    /// Accept a pending review and apply its proposed change.
+    pub fn accept_review(
+        &self,
+        id: &str,
+        reviewer: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryReviewItem> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        let item = review::find_item(&items, id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Review item not found: {id}"))?;
+        anyhow::ensure!(item.is_pending(), "Review item {id} is not pending");
+
+        let now = Utc::now();
+        let provenance = item
+            .new
+            .effective_provenance()
+            .into_owned()
+            .with_confirmation(reviewer, now)
+            .with_confidence(item.new.effective_provenance().confidence.max(0.95));
+        let mut entry = item.new.clone();
+        entry.provenance = Some(provenance);
+        entry.review = MemoryReviewState::confirmed(now);
+        entry.updated_at = now;
+
+        let manager = self.manager_for_review(&item)?;
+        manager.apply_reviewed_change(&item, entry)?;
+
+        let updated =
+            review::update_status(&mut items, id, ReviewStatus::Accepted, Some(reviewer), note)?;
+        review::save_items(&path, &items)?;
+        Ok(updated)
+    }
+
+    pub fn reject_review(
+        &self,
+        id: &str,
+        reviewer: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryReviewItem> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        anyhow::ensure!(
+            review::find_item(&items, id).is_some_and(MemoryReviewItem::is_pending),
+            "Review item {id} is not pending"
+        );
+        let updated =
+            review::update_status(&mut items, id, ReviewStatus::Rejected, Some(reviewer), note)?;
+        review::save_items(&path, &items)?;
+        Ok(updated)
+    }
+
+    pub fn defer_review(
+        &self,
+        id: &str,
+        reviewer: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryReviewItem> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        anyhow::ensure!(
+            review::find_item(&items, id).is_some_and(MemoryReviewItem::is_pending),
+            "Review item {id} is not pending"
+        );
+        let updated =
+            review::update_status(&mut items, id, ReviewStatus::Deferred, Some(reviewer), note)?;
+        review::save_items(&path, &items)?;
+        Ok(updated)
+    }
+
+    fn manager_for_review(&self, item: &MemoryReviewItem) -> Result<MemoryManager> {
+        match item.project_dir.as_deref() {
+            Some(dir) if !dir.trim().is_empty() => Ok(self.clone().with_project_dir(dir)),
+            _ => {
+                anyhow::ensure!(
+                    item.scope != "project" || self.get_project_dir().is_some(),
+                    "review item {} targets project scope but has no project directory; run it from that project",
+                    item.id
+                );
+                Ok(self.clone())
+            }
+        }
+    }
+
+    fn apply_reviewed_change(&self, item: &MemoryReviewItem, entry: MemoryEntry) -> Result<()> {
+        let mut graph = if item.scope == "global" {
+            self.load_global_graph()?
+        } else {
+            anyhow::ensure!(
+                self.project_memory_path()?.is_some(),
+                "project memory requires a working directory"
+            );
+            self.load_project_graph()?
+        };
+
+        match item.action.as_str() {
+            "reinforce" => {
+                let target_id = item
+                    .old
+                    .as_ref()
+                    .map(|old| old.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("reinforce review has no target"))?;
+                let existing = graph
+                    .get_memory_mut(&target_id)
+                    .ok_or_else(|| anyhow::anyhow!("target memory {target_id} no longer exists"))?;
+                existing.reinforce("review", 0);
+                for tag in &entry.tags {
+                    existing.tags.push(tag.clone());
+                }
+                existing.tags.sort();
+                existing.tags.dedup();
+                existing.refresh_search_text();
+            }
+            "supersede" => {
+                let old_id = item
+                    .old
+                    .as_ref()
+                    .map(|old| old.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("supersede review has no target"))?;
+                let new_id = graph.add_memory(entry);
+                graph.supersede(&new_id, &old_id);
+            }
+            "contradict" => {
+                let old_id = item
+                    .old
+                    .as_ref()
+                    .map(|old| old.id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("contradict review has no target"))?;
+                let new_id = graph.add_memory(entry);
+                graph.mark_contradiction(&new_id, &old_id);
+            }
+            "insert" | "relate" => {
+                graph.add_memory(entry);
+            }
+            _ => {
+                graph.add_memory(entry);
+            }
+        }
+
+        if item.scope == "global" {
+            self.save_global_graph(&graph)
+        } else {
+            self.save_project_graph(&graph)
+        }
+    }
+
+    /// Aggregate memory and review-queue health across every persisted store.
+    pub fn health_report(&self) -> Result<MemoryHealthReport> {
+        use std::collections::HashMap;
+
+        let mut report = MemoryHealthReport::default();
+        let mut subjects: HashMap<String, usize> = HashMap::new();
+        let visited = self.for_each_store(|key, graph| {
+            for entry in graph.all_memories() {
+                report.memories += 1;
+                match entry.lifecycle.status {
+                    jcode_memory_types::MemoryStatus::Active => report.active += 1,
+                    jcode_memory_types::MemoryStatus::Archived => report.archived += 1,
+                    jcode_memory_types::MemoryStatus::Expired => report.expired += 1,
+                    jcode_memory_types::MemoryStatus::Disputed => report.disputed += 1,
+                }
+                if entry.critical {
+                    report.critical += 1;
+                }
+                if entry.review.needs_review {
+                    report.needs_review += 1;
+                }
+                match entry.provenance.as_ref() {
+                    None => report.missing_provenance += 1,
+                    Some(provenance) if provenance.locator.is_none() => {
+                        report.missing_locator += 1;
+                    }
+                    Some(_) => {}
+                }
+                let provenance = entry.effective_provenance();
+                if !matches!(
+                    provenance.method,
+                    ExtractionMethod::UserStated | ExtractionMethod::StructuredMapping
+                ) && provenance.confidence < jcode_memory_types::REVIEW_BADGE_CONFIDENCE
+                {
+                    report.low_confidence += 1;
+                }
+                *report
+                    .categories
+                    .entry(entry.category.to_string())
+                    .or_default() += 1;
+                if let Some(subject) = entry.subject_key.as_deref() {
+                    *subjects
+                        .entry(format!(
+                            "{key}:{}",
+                            jcode_memory_types::reconcile::normalize_subject_key(subject)
+                        ))
+                        .or_default() += 1;
+                }
+            }
+            for edge in graph.edges.values().flatten() {
+                if matches!(edge.kind, jcode_memory_types::EdgeKind::Contradicts) {
+                    report.contradictions += 1;
+                }
+            }
+            false
+        })?;
+        report.stores = visited;
+        report.duplicate_subjects = subjects.values().filter(|count| **count > 1).count();
+
+        let path = review::queue_path(self.test_mode)?;
+        let now = Utc::now();
+        for item in review::load_items(&path)? {
+            report.reviews.observe(&item, now);
+        }
+        Ok(report)
+    }
+
+    /// Current extraction source health.
+    pub fn extraction_health(&self) -> Result<ExtractionHealth> {
+        let path = source_health::health_path(self.test_mode)?;
+        source_health::load(&path)
+    }
+
+    pub fn extraction_is_paused(&self) -> bool {
+        self.extraction_health()
+            .map(|health| health.paused)
+            .unwrap_or(false)
+    }
+
+    /// Resume automatic extraction after a health pause.
+    pub fn resume_extraction(&self) -> Result<ExtractionHealth> {
+        let path = source_health::health_path(self.test_mode)?;
+        let mut health = source_health::load(&path)?;
+        health.paused = false;
+        health.pause_reason = None;
+        source_health::save(&path, &health)?;
+        Ok(health)
+    }
+
+    /// Record one extraction batch and pause the source when it degrades.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_extraction_batch(
+        &self,
+        session_id: &str,
+        candidates: usize,
+        admitted: usize,
+        queued: usize,
+        failed: usize,
+        avg_confidence: f32,
+        duplicate_ratio: f32,
+    ) -> Result<ExtractionHealth> {
+        let path = source_health::health_path(self.test_mode)?;
+        let mut health = source_health::load(&path)?;
+        health.batches.push(ExtractionBatch {
+            at: Utc::now(),
+            session_id: session_id.to_string(),
+            candidates,
+            admitted,
+            queued,
+            failed,
+            avg_confidence,
+            duplicate_ratio,
+        });
+        if health.batches.len() > 100 {
+            health.batches.drain(0..health.batches.len() - 100);
+        }
+
+        let recent = health.recent_batches().to_vec();
+        let total_candidates = recent.iter().map(|batch| batch.candidates).sum::<usize>();
+        let total_failed = recent.iter().map(|batch| batch.failed).sum::<usize>();
+        let total = total_candidates.max(total_failed);
+        if recent.len() >= 3 && total >= source_health::MIN_CANDIDATES_FOR_PAUSE {
+            let failure_rate =
+                recent.iter().map(|batch| batch.failed as f32).sum::<f32>() / total as f32;
+            if failure_rate > source_health::MAX_FAILURE_RATE {
+                health.paused = true;
+                health.pause_reason = Some(format!(
+                    "extraction failure rate {:.1}% exceeds {:.0}%",
+                    failure_rate * 100.0,
+                    source_health::MAX_FAILURE_RATE * 100.0
+                ));
+            }
+            if recent.len() >= 2 {
+                let baseline = recent[..recent.len() - 1]
+                    .iter()
+                    .map(|batch| batch.avg_confidence)
+                    .sum::<f32>()
+                    / (recent.len() - 1) as f32;
+                let current = recent
+                    .last()
+                    .map(|batch| batch.avg_confidence)
+                    .unwrap_or(0.0);
+                if baseline > 0.0
+                    && baseline - current > source_health::MAX_CONFIDENCE_DROP
+                    && !health.paused
+                {
+                    health.paused = true;
+                    health.pause_reason = Some(format!(
+                        "extraction confidence dropped from {:.2} to {:.2}",
+                        baseline, current
+                    ));
+                }
+            }
+        }
+        source_health::save(&path, &health)?;
+        Ok(health)
     }
 
     /// Insert or update a memory with a stable ID in the project graph.
@@ -1201,10 +1849,15 @@ impl MemoryManager {
             existing.active = entry.active;
             existing.superseded_by = entry.superseded_by;
             existing.confidence = entry.confidence;
+            existing.provenance = entry.provenance;
+            existing.lifecycle = entry.lifecycle;
+            existing.review = entry.review;
+            existing.critical = entry.critical;
+            existing.identity = entry.identity;
+            existing.subject_key = entry.subject_key;
             if is_link_node {
                 // The subsystem that owns the artifact is authoritative for
                 // its match text and versioned metadata.
-                existing.subject_key = entry.subject_key;
                 existing.search_text = entry.search_text;
                 existing.artifact = entry.artifact;
             }
@@ -1644,7 +2297,11 @@ impl MemoryManager {
             if !graph.memories.contains_key(id) {
                 continue;
             }
-            graph.add_edge(&format!("skill:{name}"), id, jcode_memory_types::EdgeKind::DerivedFrom);
+            graph.add_edge(
+                &format!("skill:{name}"),
+                id,
+                jcode_memory_types::EdgeKind::DerivedFrom,
+            );
             linked += 1;
         }
         if let Err(e) = self.save_global_graph(&graph) {
@@ -1660,7 +2317,10 @@ impl MemoryManager {
         // goes into the same store as the mirror: invocation without a working
         // dir cannot reach the project store (`remember_skill_invocation`
         // routes there), so write the row directly alongside the mirror.
-        if graph.get_memory(&format!("skill-invocation:{name}")).is_none() {
+        if graph
+            .get_memory(&format!("skill-invocation:{name}"))
+            .is_none()
+        {
             let mut invocation = crate::memory::MemoryEntry::new(
                 MemoryCategory::Fact,
                 format!("Skill `/{name}` was accepted from distilled memory evidence."),
@@ -1706,7 +2366,9 @@ impl MemoryManager {
             if graph.get_memory(&format!("skill:{name}")).is_none() {
                 let mut mirror = MemoryEntry::new(
                     MemoryCategory::Custom("observation".to_string()),
-                    format!("Skill `/{name}` distilled from memory evidence; invoke with `/{name}`."),
+                    format!(
+                        "Skill `/{name}` distilled from memory evidence; invoke with `/{name}`."
+                    ),
                 )
                 .with_id(format!("skill:{name}"))
                 .with_tags(vec![format!("skill:{name}"), "skill-accepted".to_string()])
@@ -1720,8 +2382,11 @@ impl MemoryManager {
                 if !graph.memories.contains_key(id) {
                     continue;
                 }
-                graph
-                    .add_edge(&format!("skill:{name}"), id, jcode_memory_types::EdgeKind::DerivedFrom);
+                graph.add_edge(
+                    &format!("skill:{name}"),
+                    id,
+                    jcode_memory_types::EdgeKind::DerivedFrom,
+                );
                 changed = true;
             }
             changed
@@ -2291,7 +2956,9 @@ impl MemoryManager {
         }
         let selected_ids: std::collections::HashSet<&str> =
             selected.iter().map(|entry| entry.id.as_str()).collect();
-        let terms = collect_skill_query_terms(query).into_iter().collect::<Vec<_>>();
+        let terms = collect_skill_query_terms(query)
+            .into_iter()
+            .collect::<Vec<_>>();
         let skill = self
             .collect_memories_scoped(MemoryScope::All)
             .ok()?
@@ -2715,15 +3382,16 @@ impl MemoryManager {
     ) -> bool {
         use jcode_memory_types::actions::MemoryActionSpec;
         use jcode_memory_types::ontology::Effect;
-        use jcode_memory_types::rule_engine::{
-            RuleContext, apply_entry_effects, dispatch_event,
-        };
+        use jcode_memory_types::rule_engine::{RuleContext, apply_entry_effects, dispatch_event};
 
         let mirror_id = format!("skill:{name}");
         let Some(mut mirror) = graph.get_memory(&mirror_id).cloned() else {
             return false;
         };
-        let implementation = mirror.artifact.as_ref().map(|artifact| artifact.path.clone());
+        let implementation = mirror
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.path.clone());
         // Stores author their own ontology snapshot. Add the action-outcome
         // rules when an older snapshot predates them, so execution feedback
         // works without forcing an ontology version bump or migration.
@@ -2744,10 +3412,7 @@ impl MemoryManager {
             source_label: "skill_outcome".to_string(),
             event: jcode_memory_types::ontology::EVENT_ACTION_OUTCOME.to_string(),
             scope: String::new(),
-            action: Some(MemoryActionSpec::skill(
-                name,
-                implementation.as_deref(),
-            )),
+            action: Some(MemoryActionSpec::skill(name, implementation.as_deref())),
             outcome: Some(outcome),
         };
         let plan = dispatch_event(&context);
@@ -2876,12 +3541,13 @@ impl MemoryManager {
                 if !proposal_eligible_subject(&subject) {
                     continue;
                 }
-                let proposal = groups
-                    .entry(subject.clone())
-                    .or_insert_with(|| SkillEvidenceProposal {
-                        subject_key: subject.clone(),
-                        ..Default::default()
-                    });
+                let proposal =
+                    groups
+                        .entry(subject.clone())
+                        .or_insert_with(|| SkillEvidenceProposal {
+                            subject_key: subject.clone(),
+                            ..Default::default()
+                        });
                 if !proposal.evidence.contains(&entry.id) {
                     proposal.evidence.push(entry.id.clone());
                 }
@@ -2894,6 +3560,19 @@ impl MemoryManager {
                 {
                     proposal.sessions.push(source.to_string());
                 }
+                if entry.tags.iter().any(|tag| tag == "skill-validated") {
+                    proposal.positive += 1;
+                }
+                if entry.tags.iter().any(|tag| tag == "skill-invalidated")
+                    || entry.metrics.outcome_failures > 0
+                {
+                    proposal.negative += 1;
+                }
+                proposal.last_seen = Some(
+                    proposal
+                        .last_seen
+                        .map_or(entry.updated_at, |seen| seen.max(entry.updated_at)),
+                );
                 proposal.weight += weight;
             }
         };
@@ -2903,7 +3582,7 @@ impl MemoryManager {
         // and on this corpus it is the normal case (185 near-duplicate pairs
         // across stores). `list_keys` enumerates them from durable state, so a
         // store written weeks ago still counts.
-        let mut scanned = self.for_each_store(|key, graph| {
+        let scanned = self.for_each_store(|key, graph| {
             consider(key, graph);
             false
         })?;
@@ -2914,11 +3593,9 @@ impl MemoryManager {
                 && let Ok(graph) = self.load_project_graph()
             {
                 consider(&project_store_key(&dir), &graph);
-                scanned += 1;
             }
             if let Ok(global) = self.load_global_graph() {
                 consider(crate::memory::global_store_key(), &global);
-                scanned += 1;
             }
         }
 
@@ -2930,12 +3607,31 @@ impl MemoryManager {
                         || p.sessions.len() >= SKILL_DISTILL_MIN_EVIDENCE)
             })
             .collect();
+        let now = Utc::now();
+        for proposal in &mut out {
+            let age_days = proposal
+                .last_seen
+                .map(|seen| (now - seen).num_days().max(0) as f32)
+                .unwrap_or(365.0);
+            proposal.score = proposal.weight
+                + proposal.evidence.len() as f32 * 0.5
+                + proposal.stores.len() as f32 * 1.5
+                + proposal.sessions.len() as f32 * 0.3
+                + proposal.positive as f32 * 0.5
+                - proposal.negative as f32 * 2.0
+                - (age_days / 90.0).min(3.0);
+            proposal.needs_human_draft = true;
+        }
+        // A procedure whose evidence is entirely negative should be archived,
+        // not promoted. Mixed evidence stays visible with a lower score.
+        out.retain(|proposal| proposal.negative < proposal.evidence.len() as u32);
         out.sort_by(|a, b| {
-            b.evidence
-                .len()
-                .cmp(&a.evidence.len())
+            b.score
+                .total_cmp(&a.score)
                 .then_with(|| b.weight.total_cmp(&a.weight))
+                .then_with(|| b.evidence.len().cmp(&a.evidence.len()))
         });
+        out.truncate(SKILL_DISTILL_MAX_PROPOSALS);
         Ok(out)
     }
 
@@ -3002,10 +3698,7 @@ impl MemoryManager {
         let next = match apply_patch(&base, patch) {
             Ok(next) => next,
             Err(errors) => {
-                anyhow::bail!(
-                    "ontology patch rejected:\n- {}",
-                    errors.join("\n- ")
-                );
+                anyhow::bail!("ontology patch rejected:\n- {}", errors.join("\n- "));
             }
         };
         let old_hash = base.content_hash();
@@ -3017,13 +3710,10 @@ impl MemoryManager {
             apply_migrations(&mut probe, &patch.migrations, &next)
         } else {
             // Keep a bounded history so rollback does not need external files.
-            graph
-                .metadata
-                .ontology_history
-                .push(OntologySnapshot::new(
-                    (*base).clone(),
-                    patch.rationale.clone(),
-                ));
+            graph.metadata.ontology_history.push(OntologySnapshot::new(
+                (*base).clone(),
+                patch.rationale.clone(),
+            ));
             const MAX_HISTORY: usize = 10;
             if graph.metadata.ontology_history.len() > MAX_HISTORY {
                 let drain = graph.metadata.ontology_history.len() - MAX_HISTORY;
@@ -3163,17 +3853,41 @@ impl MemoryManager {
         transcript: &str,
         session_id: &str,
     ) -> Result<Vec<String>> {
+        let sidecar = crate::session::Session::load_startup_stub(session_id)
+            .map(|session| Sidecar::for_session(&session))
+            .unwrap_or_else(|_| Sidecar::new());
+        self.extract_with_sidecar(transcript, session_id, &sidecar)
+            .await
+    }
+
+    /// Extract through a caller-supplied sidecar.
+    ///
+    /// Live session finalization already holds the exact sidecar/provider for
+    /// the session; passing it through avoids re-resolving credentials from a
+    /// startup stub.
+    pub async fn extract_with_sidecar(
+        &self,
+        transcript: &str,
+        session_id: &str,
+        sidecar: &Sidecar,
+    ) -> Result<Vec<String>> {
         if !memory_llm_judge_available() {
             crate::logging::info("Memory transcript extraction skipped: LLM judge unavailable");
             return Ok(Vec::new());
         }
-
-        let sidecar = crate::session::Session::load_startup_stub(session_id)
-            .map(|session| Sidecar::for_session(&session))
-            .unwrap_or_else(|_| Sidecar::new());
+        if self.extraction_is_paused() {
+            crate::logging::info("Memory transcript extraction skipped: source health is paused");
+            return Ok(Vec::new());
+        }
         let extracted = sidecar.extract_memories(transcript).await?;
 
         let mut ids = Vec::new();
+        let candidates = extracted.len();
+        let mut unique_contents = std::collections::HashSet::new();
+        let mut confidence_sum = 0.0f32;
+        let mut admitted = 0usize;
+        let mut queued = 0usize;
+        let mut failed = 0usize;
         for memory in extracted {
             let category: MemoryCategory = memory.category.parse().unwrap_or(MemoryCategory::Fact);
             let trust = match memory.trust.as_str() {
@@ -3183,17 +3897,73 @@ impl MemoryManager {
             };
 
             let confidence = trust.provenance_confidence();
-            let entry = MemoryEntry::new(category, memory.content)
+            confidence_sum += confidence;
+            unique_contents.insert(normalize_memory_search_text(&memory.content, &[]));
+            let method = if trust == TrustLevel::High {
+                ExtractionMethod::UserStated
+            } else {
+                ExtractionMethod::LlmExtraction
+            };
+            let locator = memory
+                .locator
+                .clone()
+                .unwrap_or_else(|| format!("session:{session_id}"));
+            let mut entry = MemoryEntry::new(category, memory.content)
                 .with_source(session_id)
                 .with_trust(trust)
                 .with_provenance(
-                    ProvenanceRecord::new(session_id, ExtractionMethod::LlmExtraction)
-                        .with_confidence(confidence),
+                    ProvenanceRecord::new(session_id, method)
+                        .with_confidence(confidence)
+                        .with_locator(locator),
                 );
+            for (key, value) in memory.properties {
+                entry = entry.with_property(key, value);
+            }
 
-            // Store in project scope by default
-            let id = self.remember_project(entry)?;
-            ids.push(id);
+            // Store in project scope by default. A single bad candidate must
+            // not abort the batch: the failure rate feeds source health.
+            match self.remember_project_governed(entry) {
+                Ok(MemoryWriteOutcome::Stored { id, .. }) => {
+                    ids.push(id);
+                    admitted += 1;
+                }
+                Ok(MemoryWriteOutcome::PendingReview { .. }) => {
+                    queued += 1;
+                }
+                Err(error) => {
+                    failed += 1;
+                    crate::logging::warn(&format!("Memory extraction candidate rejected: {error}"));
+                }
+            }
+        }
+
+        let duplicate_ratio = if candidates == 0 {
+            0.0
+        } else {
+            (candidates - unique_contents.len()) as f32 / candidates as f32
+        };
+        let avg_confidence = if candidates == 0 {
+            0.0
+        } else {
+            confidence_sum / candidates as f32
+        };
+        if let Ok(health) = self.record_extraction_batch(
+            session_id,
+            candidates,
+            admitted,
+            queued,
+            failed,
+            avg_confidence,
+            duplicate_ratio,
+        ) && health.paused
+        {
+            crate::logging::warn(&format!(
+                "Memory extraction paused: {}",
+                health
+                    .pause_reason
+                    .as_deref()
+                    .unwrap_or("source health degraded")
+            ));
         }
 
         Ok(ids)
@@ -3206,11 +3976,24 @@ impl MemoryManager {
         context: &str,
         max_candidates: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        let entries = crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
-            .await?
-            .into_iter()
-            .map(|(entry, _)| entry)
-            .collect();
+        let route = route_memory_query(context);
+        let mut entries: Vec<MemoryEntry> =
+            crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
+                .await?
+                .into_iter()
+                .map(|(entry, _)| entry)
+                .collect();
+        if matches!(route, MemoryRoute::Procedure | MemoryRoute::Operation) {
+            // Stable sort: skills first, preserve relevance order within each
+            // group. Route selection is a cheap prior, not a hard filter.
+            entries.sort_by_key(|entry| !jcode_memory_types::is_skill_memory(entry));
+        }
+        crate::logging::info(&format!(
+            "Memory route={} candidates={} for query: {}",
+            route.label(),
+            entries.len(),
+            crate::util::truncate_str(context, 120)
+        ));
         Ok(self.expand_skill_parts(entries, max_candidates))
     }
 
@@ -3619,7 +4402,8 @@ impl MemoryManager {
                     // back — measured: it erased generalized rules and
                     // skill-invocation records written after the last JSON
                     // export.
-                    self.suppress_next_legacy_save.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.suppress_next_legacy_save
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -3732,7 +4516,8 @@ impl MemoryManager {
                     crate::logging::warn(&format!(
                         "load_global_graph via {e}; returning the legacy JSON snapshot read-only"
                     ));
-                    self.suppress_next_legacy_save.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.suppress_next_legacy_save
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -3819,7 +4604,10 @@ impl MemoryManager {
                 ));
                 // Same suppression as the load fallback: a manager that served
                 // its graph from the staler JSON snapshot must not persist it.
-                if self.suppress_next_legacy_save.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                if self
+                    .suppress_next_legacy_save
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
                     crate::logging::warn(
                         "save_project_graph suppressed: legacy JSON snapshot may be staler than the sqlite store",
                     );
@@ -3873,7 +4661,10 @@ impl MemoryManager {
                 ));
                 // Same suppression as the load fallback (see
                 // `save_project_graph`).
-                if self.suppress_next_legacy_save.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                if self
+                    .suppress_next_legacy_save
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
                     crate::logging::warn(
                         "save_global_graph suppressed: legacy JSON snapshot may be staler than the sqlite store",
                     );
