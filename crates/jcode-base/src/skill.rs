@@ -1760,6 +1760,17 @@ impl SkillHealthReport {
     }
 }
 
+/// A proposal is still a draft when it carries the explicit flag or a TODO
+/// heading. Match headings case-insensitively so hand-edited drafts are not
+/// reported as actionable.
+fn proposal_body_is_todo(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_uppercase()
+            .starts_with("## TODO")
+    })
+}
+
 /// Scan installed skills and the proposal/history queues.
 pub fn skill_health(working_dir: Option<&Path>) -> Result<SkillHealthReport> {
     let global = SkillRegistry::load_global()?;
@@ -1822,7 +1833,7 @@ pub fn skill_health(working_dir: Option<&Path>) -> Result<SkillHealthReport> {
                 }
                 if let Ok(skill) = SkillRegistry::parse_skill(&path) {
                     let validation = validate_skill_manifest(&skill);
-                    let is_draft = skill.needs_human_draft || skill.content.contains("## TODO");
+                    let is_draft = skill.needs_human_draft || proposal_body_is_todo(&skill.content);
                     if is_draft {
                         report.draft_proposals += 1;
                     } else if validation.is_valid() {

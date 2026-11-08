@@ -910,6 +910,11 @@ fn health_counts_only_non_draft_valid_proposals_as_actionable() {
             "---\nname: draft-both\ndescription: both flags\nversion: 0.1.0\nstatus: active\ntriggers:\n  - both\nneeds_human_draft: true\n---\n\n## TODO\n\nFill this in.\n",
         );
         write_proposal(&global_proposals, "malformed", "not a skill manifest\n");
+        write_proposal(
+            &global_proposals,
+            "lowercase-todo",
+            "---\nname: lowercase-todo\ndescription: lowercase todo\nversion: 0.1.0\nstatus: active\ntriggers:\n  - todo\n---\n\n## todo\n\nFill this in.\n",
+        );
         let project_proposals = project
             .path()
             .join(".jcode")
@@ -927,8 +932,8 @@ fn health_counts_only_non_draft_valid_proposals_as_actionable() {
         );
 
         let report = skill_health(Some(project.path())).expect("health");
-        assert_eq!(report.proposals, 8);
+        assert_eq!(report.proposals, 9);
         assert_eq!(report.actionable_proposals, 2);
-        assert_eq!(report.draft_proposals, 4);
+        assert_eq!(report.draft_proposals, 5);
     });
 }
