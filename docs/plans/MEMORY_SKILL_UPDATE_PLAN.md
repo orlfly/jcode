@@ -107,11 +107,13 @@ quality inspection and source health.
 
 ### Live evidence (2026-11-08)
 
-- Baseline current-project + global store: 522 memories (487 + 35), 0 `fact`,
-  0 identityless entities, 0 deprecated `in_cluster` edges after the ontology
-  migration. An all-store `memory health` scan after implementation reports
-  10,316 memories across 68 stores, 271 contradictions and 9,368 missing
-  locators, which is why provenance/health work matters beyond one project.
+- Baseline current-project + global store: 522 memories (487 + 35), 0
+  identityless entities and 0 deprecated `in_cluster` edges after the ontology
+  migration. The migration-era zero `fact` count has since drifted: the active
+  project store now has 2 active `fact` rows and the all-store scan has 4, so
+  residual reclassification is still a live check. That scan reports 10,316
+  memories across 68 stores, 271 contradictions and 9,368 missing locators,
+  which is why provenance/health work matters beyond one project.
 - 44 files in `~/.jcode/skills/.proposals/`; 2 installed skills.
 - Skill evidence graph: 41 `contains`, 26 `next_step`, 42 `derived_from` in the
   active project store.
