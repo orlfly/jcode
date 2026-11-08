@@ -112,8 +112,10 @@ quality inspection and source health.
   migration. The migration-era zero `fact` count has since drifted: the active
   project store now has 2 active `fact` rows and the all-store scan has 4, so
   residual reclassification is still a live check. That scan reports 10,316
-  memories across 68 stores, 271 contradictions and 9,368 missing locators,
-  which is why provenance/health work matters beyond one project.
+  memories across 68 stores, 271 detected contradictions and 9,368 missing
+  locators; a manual sample includes lexical false positives, so conflict
+  quality still needs review. This is why provenance/health work matters
+  beyond one project.
 - 44 files in `~/.jcode/skills/.proposals/`; 2 installed skills.
 - Skill evidence graph: 41 `contains`, 26 `next_step`, 42 `derived_from` in the
   active project store.
@@ -393,8 +395,9 @@ preference overwrite creates a review item; health shows the backlog.
 - CLI/tool: `skill list|show|validate|update|rollback`, `skill health`.
 - Tests: v1 compatibility, L2/L3 diff gates, snapshot restore, proposal dedup.
 
-Acceptance: re-running distillation caps and subject-dedupes the queue (the
-existing 44 files remain until that re-run); an installed skill can be updated
+Acceptance: a distillation pass caps emission at 20 and dedupes by subject
+key; files not refreshed expire after 30 days, so the existing 44-file queue
+drains over time rather than all at once. An installed skill can be updated
 with a changelog and rolled back.
 
 ### Phase P2: source health and routing (3-5 weeks, implemented core; optional action audit remaining)

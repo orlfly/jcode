@@ -153,13 +153,17 @@ migrations before installing the new definition. See
 
 ## Update governance (added 2026-11-08)
 
-Writes now pass a confidence and confirmation policy before mutating a graph:
+Governed remember and extraction writes pass a confidence and confirmation
+policy before mutating a graph:
 
-- `>= 0.9` admits; `0.7-0.9` admits with a `[needs review]` badge; `< 0.7`
-  goes to the durable review queue instead of being stored.
-- Critical memories (user-stated preferences, corrections and contracts),
-  authoritative overwrites, status loss, and authoritative contradictions
-  require confirmation. Rejected or parked writes leave the old value active.
+- For probabilistic provenance, `>= 0.9` admits; `0.7-0.9` admits with a
+  `[needs review]` badge; `< 0.7` goes to the durable review queue instead of
+  being stored. Direct user statements and structured mappings bypass the
+  confidence tier because their confidence describes extraction certainty, not
+  authority.
+- Destructive changes to an existing critical row, authoritative overwrites,
+  status loss, and authoritative contradictions require confirmation.
+  Rejected or parked writes leave the old value active.
 - Review items live in `<jcode_dir>/memory/reviews/pending.jsonl`; resolve
   them with `jcode memory review list|accept|reject|defer`.
 - `jcode memory health` reports type distribution, contradictions, duplicate
@@ -192,8 +196,10 @@ Writes now pass a confidence and confirmation policy before mutating a graph:
 ## Known gaps (tracked in the landing record)
 
 - `supersedes`/`contradicts` edges: the reconcile branches are wired and an
-  all-store health scan now reports 271 contradictions, so they are no longer
-  absent. Per-store conflict surfacing still needs a sampled relevance review.
+  all-store health scan now reports 271 detected contradictions, so they are
+  no longer absent. A manual sample contains lexical pairs that are not real
+  conflicts, so the count is a detection metric, not a quality metric; per-store
+  relevance review is still required before surfacing them as truth.
 - Review gates only apply to new writes: existing rows were not retroactively
   marked `needs_review`, and the review queue is empty on migrated data.
 - `memory_judge_metrics` auto-disable: driven by the judged path; on a machine

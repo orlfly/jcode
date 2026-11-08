@@ -904,6 +904,12 @@ fn health_counts_only_non_draft_valid_proposals_as_actionable() {
             "invalid",
             "---\nname: invalid\ndescription: invalid skill\nversion: nope\nstatus: active\n---\n\nInvalid version.\n",
         );
+        write_proposal(
+            &global_proposals,
+            "draft-both",
+            "---\nname: draft-both\ndescription: both flags\nversion: 0.1.0\nstatus: active\ntriggers:\n  - both\nneeds_human_draft: true\n---\n\n## TODO\n\nFill this in.\n",
+        );
+        write_proposal(&global_proposals, "malformed", "not a skill manifest\n");
         let project_proposals = project
             .path()
             .join(".jcode")
@@ -914,10 +920,15 @@ fn health_counts_only_non_draft_valid_proposals_as_actionable() {
             "project-ready",
             "---\nname: project-ready\ndescription: project skill\nversion: 0.1.0\nstatus: active\ntriggers:\n  - project\n---\n\nDo the project thing.\n",
         );
+        write_proposal(
+            &project_proposals,
+            "project-draft",
+            "---\nname: project-draft\ndescription: project draft\nversion: 0.1.0\nstatus: active\ntriggers:\n  - project\n---\n\n## TODO\n\nFill this in.\n",
+        );
 
         let report = skill_health(Some(project.path())).expect("health");
-        assert_eq!(report.proposals, 5);
+        assert_eq!(report.proposals, 8);
         assert_eq!(report.actionable_proposals, 2);
-        assert_eq!(report.draft_proposals, 2);
+        assert_eq!(report.draft_proposals, 4);
     });
 }
