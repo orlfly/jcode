@@ -86,7 +86,7 @@ quality inspection and source health.
   invocation recording and outcome-driven validation/invalidation.
 - Deterministic skill distillation with cross-store thresholds.
 
-### Gaps, in update-control terms
+### Gaps, in update-control terms (before this change)
 
 | Area | Current behavior | Risk |
 |---|---|---|
@@ -98,23 +98,28 @@ quality inspection and source health.
 | Conflicts | `contradicts` edges exist but are not surfaced in recall or review | Users see one side without knowing a conflict exists |
 | Skill contract | Markdown skeleton with `TODO`; only name/description/evidence are machine-read | Skills cannot declare inputs, tools, preconditions or effects |
 | Skill versioning | Installed skills are never overwritten; no diff, changelog, snapshot or rollback | Improvements cannot be shipped; stale skills persist |
-| Proposal quality | 44 pending proposals, 1 installed skill; drafts are TODO skeletons and near-duplicate API subjects are common | Proposal backlog is not actionable and hides real candidates |
+| Proposal quality | 44 pending proposals, 1 installed skill at baseline; drafts are TODO skeletons and near-duplicate API subjects are common | Proposal backlog is not actionable and hides real candidates |
 | Skill feedback | Invocation/outcome tags exist, but proposal ranking does not use usage, failure or recency | Failed or unused procedures can still rank highly |
 | Health inspection | TTL GC and residual reclassification exist | No schema/instance/freshness/coverage/review-backlog report |
 | Source health | Extraction failures are logged | No failure-rate, confidence-drift or duplicate-rate pause/alert |
 
 ### Live evidence (2026-11-08)
 
-- 522 memories (project 487 + global 35), 0 `fact`, 0 identityless entities,
-  0 deprecated `in_cluster` edges after the ontology migration.
-- 44 files in `~/.jcode/skills/.proposals/`; only 1 installed skill.
+- Baseline current-project + global store: 522 memories (487 + 35), 0 `fact`,
+  0 identityless entities, 0 deprecated `in_cluster` edges after the ontology
+  migration. An all-store `memory health` scan after implementation reports
+  10,316 memories across 68 stores, 271 contradictions and 9,368 missing
+  locators, which is why provenance/health work matters beyond one project.
+- 44 files in `~/.jcode/skills/.proposals/`; 2 installed skills.
 - Skill evidence graph: 41 `contains`, 26 `next_step`, 42 `derived_from` in the
   active project store.
-- No memory records carry `critical=true`; no memory-level review queue exists.
+- At baseline no memory carried `critical=true` and no memory-level review
+  queue existed. After implementation the queue is empty on existing data
+  (no new gated writes yet) and `skill health` reports 44 draft proposals.
 
 This is the core conclusion: jcode has a good **write and recall** pipeline but
-a weak **change-governance** pipeline. The next stage should optimize update
-quality, not add more memory types.
+a weak **change-governance** pipeline. This stage optimizes update quality
+instead of adding more memory types.
 
 ## 3. Target update model
 

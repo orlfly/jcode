@@ -191,9 +191,11 @@ Writes now pass a confidence and confirmation policy before mutating a graph:
 
 ## Known gaps (tracked in the landing record)
 
-- `supersedes`/`contradicts` edges: the reconcile branches exist and are
-  wired, but the real store still carries almost exclusively v1-era edges;
-  verify production counts before relying on conflict surfacing.
+- `supersedes`/`contradicts` edges: the reconcile branches are wired and an
+  all-store health scan now reports 271 contradictions, so they are no longer
+  absent. Per-store conflict surfacing still needs a sampled relevance review.
+- Review gates only apply to new writes: existing rows were not retroactively
+  marked `needs_review`, and the review queue is empty on migrated data.
 - `memory_judge_metrics` auto-disable: driven by the judged path; on a machine
   whose judge never runs, the metric stays silent by design.
 - macOS/Windows behaviors of the runtime are untested on this machine.
