@@ -31,6 +31,7 @@ pub mod claude_live;
 pub mod client_focus;
 pub mod client_input;
 pub mod cloud_environment;
+pub mod code_ontology;
 pub mod compaction;
 pub mod companion_client;
 pub mod config;

@@ -6,8 +6,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
 
 use super::args::{
-    AmbientCommand, Args, AuthCommand, CloudCommand, CloudSessionsCommand, Command, MemoryCommand,
-    ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
+    AmbientCommand, Args, AuthCommand, CloudCommand, CloudSessionsCommand, CodeCommand, Command,
+    MemoryCommand, ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
     TranscriptModeArg,
 };
 use crate::{
@@ -458,6 +458,19 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::Skill(subcmd)) => {
             commands::run_skill_command(subcmd).await?;
         }
+        Some(Command::Code(subcmd)) => match subcmd {
+            CodeCommand::Validate {
+                file,
+                root,
+                ontology,
+                json,
+            } => commands::run_code_validate_command(
+                &file,
+                root.as_deref(),
+                ontology.as_deref(),
+                json,
+            )?,
+        },
         Some(Command::Session(subcmd)) => match subcmd {
             SessionCommand::Rename {
                 session,

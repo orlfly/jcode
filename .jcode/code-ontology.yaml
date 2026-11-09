@@ -1,0 +1,25 @@
+version: 1
+concepts:
+  - id: skill
+    kind: aggregate
+    rust_type: Skill
+    source: crates/jcode-base/src/skill.rs
+    ontology_type: process_rule
+    fields: []
+    invariants:
+      - "Version must increase when a skill contract changes."
+      - "L3 contract changes require --confirm."
+      - "An installed skill is snapshotted before update or rollback."
+    ontology:
+      id: jcode/default/v1
+      version: 3
+      hash: 97e4e5ba401d8927
+
+  - id: memory-review-item
+    kind: value_object
+    rust_type: MemoryReviewItem
+    source: crates/jcode-memory-types/src/review.rs
+    unmapped_reason: "queue transport record; its old/new payloads are the ontology instances"
+    fields: []
+    invariants:
+      - "Accepting a review item records confirmation provenance."

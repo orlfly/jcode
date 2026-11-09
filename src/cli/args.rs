@@ -362,6 +362,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Skill(SkillCommand),
 
+    /// Code design ontology bridge helpers
+    #[command(subcommand)]
+    Code(CodeCommand),
+
     /// Session management commands
     #[command(subcommand)]
     Session(SessionCommand),
@@ -1337,6 +1341,27 @@ pub(crate) enum SkillCommand {
 
     /// Show skill and proposal health
     Health {
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CodeCommand {
+    /// Validate a code-ontology design map against an ontology and source tree
+    Validate {
+        /// Path to the YAML/JSON design map
+        file: String,
+
+        /// Repository root used to resolve source paths (defaults to cwd)
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Ontology JSON file (defaults to the compiled default ontology)
+        #[arg(long)]
+        ontology: Option<String>,
+
         /// Emit JSON instead of plain text
         #[arg(long)]
         json: bool,

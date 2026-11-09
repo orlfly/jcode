@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use super::args::SkillCommand;
-use crate::{browser, gateway, memory, session, storage, tui};
+use crate::{browser, code_ontology, gateway, memory, session, storage, tui};
 
 use super::{output::terminal_title, terminal::init_tui_runtime};
 
@@ -1649,6 +1649,51 @@ pub enum MemorySubcommand {
 
 pub async fn run_memory_command(cmd: MemorySubcommand) -> Result<()> {
     run_memory_command_for_dir(cmd, std::env::current_dir().ok()).await
+}
+
+pub(crate) fn run_code_validate_command(
+    file: &str,
+    root: Option<&str>,
+    ontology_file: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let root = root
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)?;
+    let document = code_ontology::load_code_ontology(Path::new(file))?;
+    let ontology = match ontology_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|error| anyhow::anyhow!("read ontology {path}: {error}"))?;
+            serde_json::from_str(&raw)
+                .map_err(|error| anyhow::anyhow!("parse ontology {path}: {error}"))?
+        }
+        None => crate::memory_types::default_ontology(),
+    };
+    let report = code_ontology::validate_code_ontology(&document, &ontology, &root);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Code ontology: {}", report.summary());
+        for issue in &report.issues {
+            let concept = issue
+                .concept
+                .as_deref()
+                .map(|concept| format!(" [{concept}]"))
+                .unwrap_or_default();
+            println!(
+                "  {:?} {}{}: {}",
+                issue.severity, issue.code, concept, issue.message
+            );
+        }
+    }
+    anyhow::ensure!(
+        report.is_valid(),
+        "code ontology validation failed with {} error(s)",
+        report.error_count()
+    );
+    Ok(())
 }
 
 pub(crate) async fn run_skill_command(cmd: SkillCommand) -> Result<()> {

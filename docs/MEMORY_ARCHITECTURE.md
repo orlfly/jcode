@@ -193,6 +193,7 @@ policy before mutating a graph:
 - `crates/jcode-base/src/memory/source_health.rs`: extraction batch health.
 - `crates/jcode-base/src/skill.rs`: manifest v2, validation/diff, mirrors,
   invocation records, acceptance, snapshots and rollback.
+- `crates/jcode-base/src/code_ontology.rs`: design-time code/ontology bridge.
 - `crates/jcode-app-core/src/tool/memory.rs`: the `memory` tool surface.
 - `crates/jcode-app-core/src/tool/skill.rs`: the `skill_manage` tool surface.
 
