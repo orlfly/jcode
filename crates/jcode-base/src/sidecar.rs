@@ -9,6 +9,8 @@
 
 use crate::auth;
 use anyhow::{Context, Result};
+use jcode_memory_types::migration::OntologyPatch;
+use jcode_memory_types::{MemoryEntry, Ontology};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -1138,6 +1140,77 @@ Output ONLY the JSONL lines, no other text. If no NEW memories worth extracting,
 
         Ok(memories)
     }
+
+    /// Ask the sidecar whether recent session evidence justifies a runtime-safe
+    /// ontology patch. Returns `None` when the model says no change is needed.
+    pub async fn propose_ontology_patch(
+        &self,
+        ontology: &Ontology,
+        evidence: &[MemoryEntry],
+        transcript: &str,
+    ) -> Result<Option<OntologyPatch>> {
+        let mut types = String::new();
+        for type_def in ontology.types.values() {
+            types.push_str(&format!(
+                "- {} ({:?}): ttl={:?}, half_life={}, base_score={}, prompt={}, extraction={:?}\n",
+                type_def.id,
+                type_def.display_name,
+                type_def.ttl_days,
+                type_def.decay.half_life_days,
+                type_def.scoring.base_score,
+                type_def.present_in_prompt,
+                type_def.extraction_methods
+            ));
+        }
+        let mut evidence_text = String::new();
+        for entry in evidence.iter().take(40) {
+            let provenance = entry.effective_provenance();
+            evidence_text.push_str(&format!(
+                "- {} [{}] method={:?} confidence={:.2}: {}\n",
+                entry.id,
+                entry.category,
+                provenance.method,
+                provenance.confidence,
+                crate::util::truncate_str(&entry.content, 240)
+            ));
+        }
+        let system = r#"You are an ontology reflection assistant for a coding agent's memory system.
+
+Given the current runtime ontology and new evidence extracted from a session, decide whether a small, runtime-safe ontology adjustment is justified.
+
+You may ONLY emit `update_type` operations. Allowed patch fields are:
+- ttl_days
+- clear_ttl
+- scoring
+- decay
+- present_in_prompt
+- extraction_methods
+- legacy_category
+
+Do NOT add or remove types, relationships, rules, activities, properties, or lifecycle states. Do not change ids.
+
+Return ONE JSON object with this shape:
+{"base_version": <current version>, "rationale": "<short reason>", "evidence": ["mem_..."], "ops": [{"op": "update_type", "id": "<type>", "patch": {"ttl_days": 45.0}}], "migrations": []}
+
+Rules:
+- `evidence` must use only memory ids listed below.
+- `base_version` must equal the current version.
+- Prefer no change over a speculative change.
+- If no change is justified, return exactly `NONE`.
+- Output JSON only, no markdown fences, no explanation outside the JSON."#;
+
+        let prompt = format!(
+            "## Current ontology\nid: {}\nversion: {}\nhash: {}\n\n### Types\n{}\n### New session evidence\n{}\n## Transcript excerpt\n{}\n\nPropose a runtime-safe patch, or NONE.",
+            ontology.id,
+            ontology.version,
+            ontology.content_hash(),
+            types,
+            evidence_text,
+            crate::util::truncate_str(transcript, 4000)
+        );
+        let response = self.complete(system, &prompt).await?;
+        Ok(parse_ontology_patch_response(&response))
+    }
 }
 
 impl Default for Sidecar {
@@ -1269,6 +1342,19 @@ impl OpenAiSidecarError {
             Self::Other(err) => err,
         }
     }
+}
+
+fn parse_ontology_patch_response(response: &str) -> Option<OntologyPatch> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NONE") {
+        return None;
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&trimmed[start..=end]).ok()
 }
 
 /// A memory extracted by the sidecar
@@ -3004,5 +3090,22 @@ mod tests {
         assert!(parse_extracted_line("").is_none());
         assert!(parse_extracted_line("{not json}").is_none());
         assert!(parse_extracted_line("process_rule|missing trust").is_none());
+    }
+
+    #[test]
+    fn parses_ontology_patch_responses() {
+        assert!(parse_ontology_patch_response("").is_none());
+        assert!(parse_ontology_patch_response("NONE").is_none());
+        let patch = parse_ontology_patch_response(
+            r#"{"base_version":3,"rationale":"shorter ttl","evidence":["mem_1"],"ops":[{"op":"update_type","id":"fact","patch":{"ttl_days":45.0}}]}"#,
+        )
+        .expect("plain patch");
+        assert_eq!(patch.base_version, 3);
+        assert_eq!(patch.ops.len(), 1);
+        let wrapped = parse_ontology_patch_response(
+            "Here is my proposal:\n{\"base_version\":3,\"ops\":[]}\nThanks.",
+        )
+        .expect("wrapped patch");
+        assert_eq!(wrapped.base_version, 3);
     }
 }

@@ -104,6 +104,20 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
         Ok(ids) => {
             memory::mark_memories_known(&session_id, &ids, "extracted from this session");
             memory::add_event(MemoryEventKind::ExtractionComplete { count: ids.len() });
+            // Proposal-only ontology reflection: validate a small patch against
+            // the current ontology and leave it in the review queue. Applying
+            // still requires an explicit confirmed `ontology` call.
+            match manager
+                .propose_ontology_from_session(&transcript, &session_id, &ids)
+                .await
+            {
+                Ok(Some(path)) => crate::logging::info(&format!(
+                    "Ontology reflection wrote proposal {}",
+                    path.display()
+                )),
+                Ok(None) => {}
+                Err(err) => crate::logging::info(&format!("Ontology reflection failed: {err}")),
+            }
         }
         Err(_) => crate::logging::info("Optional memory extraction failed"),
     }

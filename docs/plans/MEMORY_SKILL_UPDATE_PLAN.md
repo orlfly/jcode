@@ -1,6 +1,6 @@
 # Memory and skill update plan
 
-Status: implemented (P0/P1/P2 core), 2026-11-08
+Status: implemented (P0/P1/P2 core), 2026-11-09
 
 Implemented surfaces:
 
@@ -10,6 +10,8 @@ Implemented surfaces:
 - `jcode skill list|show|validate|update|rollback|history|health`
 - `memory` tool actions `review`, `health`
 - `skill_manage` tool actions `validate`, `health`, `update`, `rollback`
+- Finalize-time automatic ontology reflection (proposal-only, low-risk
+  `update_type` ops, 5-evidence minimum, one proposal per project per day)
 
 Remaining from the design: field-level G4 batch-diff refinement (extraction
 batches now force review when more than five rows or more than 20% of an

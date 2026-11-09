@@ -3244,6 +3244,89 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
 }
 
 #[test]
+fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
+    use jcode_memory_types::migration::{MigrationStep, OntologyOp, OntologyPatch, TypePatch};
+
+    with_temp_home(|home| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-reflection");
+        let mut ids = Vec::new();
+        for text in [
+            "You must call POST /api/task/claim with the team id",
+            "Never force-push the shared branch",
+            "Prefer rg over grep in this repository",
+            "Run the formatter before committing",
+            "The daemon lives in ~/.jcode/builds/shared-server",
+        ] {
+            ids.push(
+                manager
+                    .remember_project(MemoryEntry::new(MemoryCategory::Fact, text))
+                    .unwrap(),
+            );
+        }
+
+        let base = manager.stored_ontology(OntologyScope::Project).unwrap();
+        let raw = OntologyPatch {
+            base_id: "wrong-id".to_string(),
+            base_version: 0,
+            base_hash: String::new(),
+            rationale: String::new(),
+            evidence: vec!["mem_not_in_session".to_string()],
+            ops: vec![
+                OntologyOp::UpdateType {
+                    id: "env_fact".to_string(),
+                    patch: TypePatch {
+                        ttl_days: Some(45.0),
+                        properties: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                },
+                OntologyOp::RemoveType {
+                    id: "fact".to_string(),
+                    fallback: "env_fact".to_string(),
+                },
+            ],
+            migrations: vec![MigrationStep::ReclassifyResidual],
+        };
+        let prepared = prepare_reflection_patch(&base, raw, &ids).expect("valid low-risk patch");
+        assert_eq!(prepared.base_id, base.id);
+        assert_eq!(prepared.base_version, base.version);
+        assert_eq!(prepared.base_hash, base.content_hash());
+        assert!(prepared.migrations.is_empty());
+        assert_eq!(prepared.ops.len(), 1, "structural ops are dropped");
+        match &prepared.ops[0] {
+            OntologyOp::UpdateType { patch, .. } => assert!(
+                patch.properties.is_none(),
+                "property schema changes are not part of automatic reflection"
+            ),
+            other => panic!("unexpected op retained: {other:?}"),
+        }
+        assert_eq!(
+            prepared.evidence, ids,
+            "evidence is restricted to the session"
+        );
+        assert!(!prepared.rationale.trim().is_empty());
+
+        let report = manager
+            .apply_ontology_patch(OntologyScope::Project, &prepared, false)
+            .expect("prepared patch applies");
+        assert!(report.validation_ok);
+
+        let path = write_ontology_proposal(&prepared).expect("proposal written");
+        assert!(path.starts_with(home.join("memory/ontology/.proposals")));
+        let stored: OntologyPatch =
+            serde_json::from_slice(&fs::read(&path).unwrap()).expect("proposal json");
+        assert_eq!(stored.ops.len(), 1);
+
+        assert!(manager.ontology_reflection_due().unwrap());
+        manager.mark_ontology_reflection_run().unwrap();
+        assert!(
+            !manager.ontology_reflection_due().unwrap(),
+            "the daily gate suppresses a second reflection"
+        );
+    });
+}
+
+#[test]
 fn json_store_persists_default_ontology_on_first_load() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/ontology-json-bind");

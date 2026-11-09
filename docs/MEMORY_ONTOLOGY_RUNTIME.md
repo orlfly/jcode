@@ -159,6 +159,30 @@ jcode memory ontology rollback 2 --scope project
 Applying persists the new ontology, hash, version, history snapshot and
 applied migration ids, then installs it into the process registry.
 
+### Automatic finalize reflection
+
+Session finalize also runs a proposal-only reflection pass after memory
+extraction succeeds (`run_final_extraction` -> `propose_ontology_from_session`).
+It samples the memories extracted from that session and asks the sidecar for a
+small patch. It never applies the result.
+
+The automatic envelope is narrower than the tool/CLI path:
+
+- only `update_type` ops are kept; add/remove type, rule, activity,
+  relationship, alias and all migrations are dropped;
+- evidence ids are restricted to the session's extracted memory ids;
+- base id/version/hash are overwritten from the current ontology and the patch
+  must pass `apply_patch` plus `validate_ontology`, or nothing is written;
+- at least 5 extracted memories are required;
+- at most one automatic proposal per project per 24 hours;
+- output is written as `<timestamp>-auto-<ontology-id>-<nonce>.json` in the
+  proposals directory above.
+
+Disable it with `JCODE_ONTOLOGY_REFLECTION=0`. A no-change (`NONE`) response is
+recorded in `memory/ontology/.reflection-<project-store-key>.json` and still
+consumes that project's daily window. Applying an automatic proposal uses the
+same confirmed `ontology` tool call or CLI path as any other proposal.
+
 ## 6. Rollback
 
 Each apply pushes the previous ontology into `ontology_history` (bounded to 10

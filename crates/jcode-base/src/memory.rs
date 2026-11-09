@@ -494,6 +494,96 @@ const SKILL_DISTILL_MIN_STORES: usize = 2;
 /// Upper bound on emitted proposals per pass. The queue is for review, not a
 /// dump of every subject the store has ever mentioned.
 const SKILL_DISTILL_MAX_PROPOSALS: usize = 20;
+/// Minimum new-session evidence before an automatic ontology reflection call.
+const ONTOLOGY_REFLECTION_MIN_EVIDENCE: usize = 5;
+/// At most one automatic reflection proposal per project per day.
+const ONTOLOGY_REFLECTION_INTERVAL_HOURS: i64 = 24;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OntologyReflectionState {
+    last_run: DateTime<Utc>,
+}
+
+fn ontology_reflection_enabled() -> bool {
+    match std::env::var("JCODE_ONTOLOGY_REFLECTION") {
+        Ok(value) => !matches!(value.trim(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    }
+}
+
+fn ontology_reflection_dir() -> Result<PathBuf> {
+    Ok(storage::jcode_dir()?.join("memory").join("ontology"))
+}
+
+fn ontology_reflection_state_path(project_dir: &Path) -> Result<PathBuf> {
+    let key = crate::memory::project_store_key(project_dir).replace(':', "-");
+    Ok(ontology_reflection_dir()?.join(format!(".reflection-{key}.json")))
+}
+
+fn write_ontology_proposal(
+    patch: &jcode_memory_types::migration::OntologyPatch,
+) -> Result<PathBuf> {
+    let dir = ontology_reflection_dir()?.join(".proposals");
+    std::fs::create_dir_all(&dir)?;
+    let slug: String = patch
+        .base_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let path = dir.join(format!(
+        "{}-auto-{}-{:08x}.json",
+        Utc::now().format("%Y%m%dT%H%M%S"),
+        slug,
+        rand::random::<u32>()
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(patch)?)?;
+    Ok(path)
+}
+
+/// Keep an automatic reflection patch inside the low-risk envelope:
+/// type-parameter updates only, evidence from this session only, and a patch
+/// that must validate against the current ontology. Anything else is dropped
+/// rather than written as a misleading proposal.
+fn prepare_reflection_patch(
+    ontology: &jcode_memory_types::Ontology,
+    mut patch: jcode_memory_types::migration::OntologyPatch,
+    memory_ids: &[String],
+) -> Option<jcode_memory_types::migration::OntologyPatch> {
+    use jcode_memory_types::migration::{OntologyOp, apply_patch, validate_ontology};
+
+    patch.base_id = ontology.id.clone();
+    patch.base_version = ontology.version;
+    patch.base_hash = ontology.content_hash();
+    patch.migrations.clear();
+    patch
+        .ops
+        .retain(|op| matches!(op, OntologyOp::UpdateType { .. }));
+    for op in &mut patch.ops {
+        if let OntologyOp::UpdateType { patch, .. } = op {
+            // `properties` changes the type's schema, not a runtime parameter.
+            patch.properties = None;
+        }
+    }
+    if patch.ops.is_empty() {
+        return None;
+    }
+    let allowed: std::collections::BTreeSet<&str> = memory_ids.iter().map(String::as_str).collect();
+    patch.evidence.retain(|id| allowed.contains(id.as_str()));
+    if patch.evidence.is_empty() {
+        patch.evidence = memory_ids.to_vec();
+    }
+    if patch.rationale.trim().is_empty() {
+        patch.rationale = "automatic reflection from session evidence".to_string();
+    }
+    let next = apply_patch(ontology, &patch).ok()?;
+    if !validate_ontology(&next).is_empty() {
+        return None;
+    }
+    if next.content_hash() == ontology.content_hash() {
+        return None;
+    }
+    Some(patch)
+}
 
 /// A procedure that the memory store has accumulated enough evidence for.
 ///
@@ -3798,6 +3888,90 @@ impl MemoryManager {
             migrations,
             patch: patch.clone(),
         })
+    }
+
+    /// Automatically reflect session evidence into an ontology patch proposal.
+    ///
+    /// This is proposal-only: it never calls [`Self::apply_ontology_patch`].
+    /// The patch is validated against the project ontology, evidence is
+    /// restricted to the supplied memory ids, and only low-risk type parameter
+    /// updates are kept. Writes go to `memory/ontology/.proposals/`.
+    ///
+    /// Returns `Ok(None)` when reflection is disabled, throttled, or produced
+    /// no valid change.
+    pub async fn propose_ontology_from_session(
+        &self,
+        transcript: &str,
+        session_id: &str,
+        memory_ids: &[String],
+    ) -> Result<Option<PathBuf>> {
+        if !ontology_reflection_enabled() || memory_ids.len() < ONTOLOGY_REFLECTION_MIN_EVIDENCE {
+            return Ok(None);
+        }
+        let graph = self.load_project_graph()?;
+        if !self.ontology_reflection_due()? {
+            return Ok(None);
+        }
+        let ontology = self.ontology_for_graph(&graph);
+        let wanted: std::collections::BTreeSet<&str> =
+            memory_ids.iter().map(String::as_str).collect();
+        let evidence: Vec<jcode_memory_types::MemoryEntry> = graph
+            .all_memories()
+            .filter(|entry| wanted.contains(entry.id.as_str()))
+            .cloned()
+            .collect();
+        if evidence.len() < ONTOLOGY_REFLECTION_MIN_EVIDENCE {
+            return Ok(None);
+        }
+
+        let sidecar = crate::session::Session::load_startup_stub(session_id)
+            .map(|session| Sidecar::for_session(&session))
+            .unwrap_or_else(|_| Sidecar::new());
+        let proposed = sidecar
+            .propose_ontology_patch(&ontology, &evidence, transcript)
+            .await?;
+        let Some(patch) = proposed else {
+            self.mark_ontology_reflection_run()?;
+            return Ok(None);
+        };
+        let Some(patch) = prepare_reflection_patch(&ontology, patch, memory_ids) else {
+            self.mark_ontology_reflection_run()?;
+            return Ok(None);
+        };
+
+        let path = write_ontology_proposal(&patch)?;
+        self.mark_ontology_reflection_run()?;
+        Ok(Some(path))
+    }
+
+    fn ontology_reflection_due(&self) -> Result<bool> {
+        let project_dir = self
+            .get_project_dir()
+            .unwrap_or_else(|| PathBuf::from("no-project"));
+        let path = ontology_reflection_state_path(&project_dir)?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(true);
+        };
+        let Ok(state) = serde_json::from_str::<OntologyReflectionState>(&raw) else {
+            return Ok(true);
+        };
+        Ok(Utc::now() - state.last_run
+            >= chrono::Duration::hours(ONTOLOGY_REFLECTION_INTERVAL_HOURS))
+    }
+
+    fn mark_ontology_reflection_run(&self) -> Result<()> {
+        let project_dir = self
+            .get_project_dir()
+            .unwrap_or_else(|| PathBuf::from("no-project"));
+        let path = ontology_reflection_state_path(&project_dir)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let state = OntologyReflectionState {
+            last_run: Utc::now(),
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+        Ok(())
     }
 
     /// Restore an ontology snapshot from a store's history.
