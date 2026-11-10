@@ -742,7 +742,7 @@ fn remap_category(graph: &mut MemoryGraph, from: &str, to: &str) -> usize {
         .unwrap_or_else(|_| MemoryCategory::Custom(to.to_string()));
     let mut changed = 0;
     for entry in graph.memories.values_mut() {
-        if category_matches(entry, from) {
+        if !is_link_id(&entry.id) && category_matches(entry, from) {
             entry.category = target.clone();
             entry.updated_at = Utc::now();
             changed += 1;
@@ -1478,6 +1478,10 @@ mod tests {
             MemoryCategory::Entity,
             "anonymous entity without an identity key",
         ));
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "skill mirror root")
+                .with_id("skill:demo".to_string()),
+        );
         graph.add_edge(
             &residual_id,
             "mem_missing",
@@ -1499,6 +1503,11 @@ mod tests {
         assert_eq!(
             graph.get_memory(&entity_id).unwrap().category,
             MemoryCategory::Observation
+        );
+        assert_eq!(
+            graph.get_memory("skill:demo").unwrap().category,
+            MemoryCategory::Fact,
+            "link nodes are not memories and must not be remapped"
         );
         assert!(report.remapped >= 1);
         assert!(report.entities_demoted >= 1);

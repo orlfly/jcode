@@ -13,7 +13,9 @@
 //! environment-specific facts can never leak through.
 
 use crate::ambient::GlobalPromotionCandidate;
-use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
+use crate::memory::{
+    ExtractionMethod, MemoryCategory, MemoryEntry, MemoryManager, ProvenanceRecord, TrustLevel,
+};
 use anyhow::{Context, Result};
 
 /// Default cadence for the generalization pass (6 hours).
@@ -206,6 +208,11 @@ pub async fn run_generalization_pass() -> usize {
         let entry = MemoryEntry::new(parse_category(&category), &content)
             .with_id(id)
             .with_trust(TrustLevel::Medium)
+            .with_source("memory_generalizer")
+            .with_provenance(
+                ProvenanceRecord::new("memory_generalizer", ExtractionMethod::RuleInference)
+                    .with_confidence(0.85),
+            )
             .with_tags(vec!["generalized".to_string()]);
         match manager.remember_global(entry) {
             Ok(_) => written += 1,

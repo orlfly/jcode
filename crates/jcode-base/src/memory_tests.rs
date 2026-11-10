@@ -3962,6 +3962,100 @@ fn health_report_counts_reviews_and_provenance_gaps() {
 }
 
 #[test]
+fn health_report_does_not_double_count_legacy_json_shadowed_by_backend() {
+    with_temp_home(|_| {
+        let project_dir = "/review-health-shadow";
+        let manager = MemoryManager::new_test().with_project_dir(project_dir);
+        let key = crate::memory::project_store_key(Path::new(project_dir));
+        let hash = key
+            .strip_prefix("project:")
+            .expect("project store key")
+            .to_string();
+
+        // Seed the exact backend `for_each_store` later reads.
+        let mut backend_graph = MemoryGraph::new();
+        backend_graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Custom("backend_only_marker".into()),
+            "backend-owned memory",
+        ));
+        crate::memory::test_backend()
+            .save(&StoreKey::new(key), &backend_graph)
+            .expect("save backend graph");
+
+        // Same store key, legacy layout.
+        let path = crate::storage::jcode_dir()
+            .unwrap()
+            .join("memory")
+            .join("projects")
+            .join(format!("{hash}.json"));
+        let mut legacy = MemoryGraph::new();
+        let mut entry = MemoryEntry::new(
+            MemoryCategory::Custom("legacy_only_marker".into()),
+            "legacy-only memory",
+        );
+        entry.id = "legacy-shadow-1".into();
+        legacy.memories.insert(entry.id.clone(), entry);
+        storage::write_json(&path, &legacy).expect("write legacy json");
+
+        let report = manager.health_report().unwrap();
+        assert!(
+            report.categories.contains_key("backend_only_marker"),
+            "the backend store should be counted: {:?}",
+            report.categories
+        );
+        assert!(
+            !report.categories.contains_key("legacy_only_marker"),
+            "a shadowed legacy snapshot must not be counted twice: {:?}",
+            report.categories
+        );
+    });
+}
+
+#[test]
+fn health_report_skips_link_nodes_and_counts_superseded_separately() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-health-links");
+        let before = manager.health_report().unwrap();
+
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Observation, "live observation").with_provenance(
+                ProvenanceRecord::new("session_live", ExtractionMethod::LlmExtraction)
+                    .with_confidence(0.95),
+            ),
+        );
+        let mut superseded =
+            MemoryEntry::new(MemoryCategory::Observation, "superseded observation")
+                .with_provenance(
+                    ProvenanceRecord::new("session_old", ExtractionMethod::LlmExtraction)
+                        .with_confidence(0.95),
+                );
+        superseded.active = false;
+        graph.add_memory(superseded);
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "skill mirror step")
+                .with_id("skill:demo".to_string()),
+        );
+        manager.save_project_graph(&graph).unwrap();
+
+        let after = manager.health_report().unwrap();
+        assert_eq!(after.memories - before.memories, 2);
+        assert_eq!(after.active - before.active, 1);
+        assert_eq!(after.superseded - before.superseded, 1);
+        assert_eq!(
+            after.missing_provenance - before.missing_provenance,
+            0,
+            "link nodes must not create provenance gaps"
+        );
+        assert_eq!(
+            after.categories.get("fact").copied().unwrap_or_default(),
+            before.categories.get("fact").copied().unwrap_or_default(),
+            "link nodes must not enter the type distribution"
+        );
+    });
+}
+
+#[test]
 fn extraction_source_pauses_on_failure_rate() {
     with_temp_home(|_| {
         let manager = MemoryManager::new_test();

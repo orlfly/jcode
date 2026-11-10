@@ -2234,6 +2234,7 @@ async fn run_memory_command_for_dir(
                 println!("  Stores:           {}", report.stores);
                 println!("  Memories:         {}", report.memories);
                 println!("  Active:           {}", report.active);
+                println!("  Superseded:       {}", report.superseded);
                 println!("  Archived:         {}", report.archived);
                 println!("  Expired:          {}", report.expired);
                 println!("  Disputed:         {}", report.disputed);

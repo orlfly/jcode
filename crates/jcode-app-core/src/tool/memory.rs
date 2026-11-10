@@ -242,8 +242,16 @@ impl Tool for MemoryTool {
                     action: "remember".into(),
                     detail: truncate_for_widget(&content, 40),
                 });
-                let mut entry =
-                    MemoryEntry::new(category.clone(), &content).with_source(ctx.session_id);
+                let session_id = ctx.session_id.clone();
+                let mut entry = MemoryEntry::new(category.clone(), &content)
+                    .with_source(session_id.clone())
+                    .with_provenance(
+                        crate::memory::ProvenanceRecord::new(
+                            session_id.clone(),
+                            crate::memory::ExtractionMethod::UserStated,
+                        )
+                        .with_locator(format!("session:{session_id}")),
+                    );
                 if let Some(tags) = input.tags {
                     entry = entry.with_tags(tags);
                 }
@@ -1126,6 +1134,47 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.output.matches("\n  id: ").count(), 2);
         assert!(!remaining.output.contains("global gamma"));
+    }
+
+    #[tokio::test]
+    async fn remember_records_user_stated_provenance_and_locator() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new();
+
+        let output = tool
+            .execute(
+                json!({"action":"remember", "content":"manual provenance probe"}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .unwrap()
+            .output;
+        let id = output
+            .rsplit_once("[id: ")
+            .and_then(|(_, tail)| tail.split(']').next())
+            .map(str::to_string)
+            .expect("remember returned an ID");
+
+        let graph = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path())
+            .load_project_graph()
+            .unwrap();
+        let provenance = graph
+            .get_memory(&id)
+            .expect("remembered memory")
+            .provenance
+            .as_ref()
+            .expect("manual remember should carry provenance");
+        assert_eq!(
+            provenance.method,
+            crate::memory::ExtractionMethod::UserStated
+        );
+        assert_eq!(provenance.locator.as_deref(), Some("session:test-session"));
     }
 
     /// Issue #491 regression: project-scoped remember followed by list must

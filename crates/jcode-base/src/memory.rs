@@ -2083,9 +2083,16 @@ impl MemoryManager {
         let mut subjects: HashMap<String, usize> = HashMap::new();
         let visited = self.for_each_store(|key, graph| {
             for entry in graph.all_memories() {
+                // Skill/goal mirrors are link nodes, not user memories. They
+                // have no provenance or locator by design, so counting them
+                // inflated every provenance gap and type distribution.
+                if jcode_memory_types::is_link_id(&entry.id) {
+                    continue;
+                }
                 report.memories += 1;
                 match entry.lifecycle.status {
-                    jcode_memory_types::MemoryStatus::Active => report.active += 1,
+                    jcode_memory_types::MemoryStatus::Active if entry.active => report.active += 1,
+                    jcode_memory_types::MemoryStatus::Active => report.superseded += 1,
                     jcode_memory_types::MemoryStatus::Archived => report.archived += 1,
                     jcode_memory_types::MemoryStatus::Expired => report.expired += 1,
                     jcode_memory_types::MemoryStatus::Disputed => report.disputed += 1,
@@ -3546,10 +3553,12 @@ impl MemoryManager {
             graph_backend()
         };
         let mut visited = 0usize;
+        let mut seen_keys = std::collections::HashSet::new();
         for key in backend.list_keys().unwrap_or_default() {
             let Ok(mut graph) = backend.load(&key) else {
                 continue;
             };
+            seen_keys.insert(key.as_str().to_string());
             visited += 1;
             if visit(key.as_str(), &mut graph) {
                 if let Err(e) = backend.save(&key, &graph) {
@@ -3571,11 +3580,18 @@ impl MemoryManager {
                     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                         continue;
                     };
+                    // The backend may already own this store. Visiting the
+                    // legacy snapshot as well double-counted every health
+                    // metric and reran maintenance twice on the same key.
+                    let legacy_key = format!("project:{stem}");
+                    if seen_keys.contains(&legacy_key) {
+                        continue;
+                    }
                     let Ok(mut graph) = crate::storage::read_json::<MemoryGraph>(&path) else {
                         continue;
                     };
                     visited += 1;
-                    if visit(&format!("project:{stem}"), &mut graph) {
+                    if visit(&legacy_key, &mut graph) {
                         crate::storage::write_json(&path, &graph)?;
                     }
                 }

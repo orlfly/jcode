@@ -113,6 +113,8 @@ pub struct MemoryHealthReport {
     pub stores: usize,
     pub memories: usize,
     pub active: usize,
+    #[serde(default)]
+    pub superseded: usize,
     pub archived: usize,
     pub expired: usize,
     pub disputed: usize,
@@ -130,10 +132,11 @@ pub struct MemoryHealthReport {
 impl MemoryHealthReport {
     pub fn summary(&self) -> String {
         format!(
-            "{} store(s), {} memories ({} active), {} needs review, {} critical, {} contradiction(s), {} pending review(s), oldest {} day(s)",
+            "{} store(s), {} memories ({} active, {} superseded), {} needs review, {} critical, {} contradiction(s), {} pending review(s), oldest {} day(s)",
             self.stores,
             self.memories,
             self.active,
+            self.superseded,
             self.needs_review,
             self.critical,
             self.contradictions,
