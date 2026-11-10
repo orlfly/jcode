@@ -530,6 +530,29 @@ fn layer_is_empty(layer: &OntologyLayer) -> bool {
         && layer.disabled_aliases.is_empty()
 }
 
+fn same_by_id<T: PartialEq, F: Fn(&T) -> &str>(left: &[T], right: &[T], id: F) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let by_id: std::collections::HashMap<&str, &T> =
+        left.iter().map(|value| (id(value), value)).collect();
+    by_id.len() == right.len()
+        && right
+            .iter()
+            .all(|value| by_id.get(id(value)) == Some(&value))
+}
+
+fn same_rules(left: &[jcode_memory_types::Rule], right: &[jcode_memory_types::Rule]) -> bool {
+    same_by_id(left, right, |rule| rule.id.as_str())
+}
+
+fn same_activities(
+    left: &[jcode_memory_types::Activity],
+    right: &[jcode_memory_types::Activity],
+) -> bool {
+    same_by_id(left, right, |activity| activity.id.as_str())
+}
+
 fn ontology_reflection_dir() -> Result<PathBuf> {
     Ok(storage::jcode_dir()?.join("memory").join("ontology"))
 }
@@ -1457,14 +1480,19 @@ impl MemoryManager {
     /// hashes make a changed global ontology or overlay invalidate that copy on
     /// the next load, without treating recomposition as a data migration.
     fn compose_project_ontology(&self, graph: &mut MemoryGraph) -> Result<()> {
-        let layer = self.load_project_ontology_layer()?;
+        let parent = self.global_ontology_for_composition()?;
+        let mut layer = self.load_project_ontology_layer()?;
         let had_layer = !graph.metadata.ontology_layer_hash.is_empty()
             || !graph.metadata.ontology_parent_hash.is_empty();
         if layer.is_none() && !had_layer {
-            // A store that predates overlays keeps its own snapshot.
-            return Ok(());
+            if self.adopt_legacy_project_overlay(&parent, graph)? {
+                layer = self.load_project_ontology_layer()?;
+            } else {
+                // A store that predates overlays keeps its own snapshot unless
+                // it is safely expressible as additive project concepts.
+                return Ok(());
+            }
         }
-        let parent = self.global_ontology_for_composition()?;
         let layers: Vec<OntologyLayer> = layer.into_iter().collect();
         let layer_hash = layer_stack_hash(&layers);
         let parent_hash = parent.content_hash();
@@ -1492,6 +1520,78 @@ impl MemoryManager {
         graph.metadata.ontology_layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
         graph.metadata.ontology = Some(effective);
         Ok(())
+    }
+
+    /// Adopt a legacy project snapshot as an overlay only when it is provably
+    /// additive over the current global ontology.
+    ///
+    /// Older stores persisted a full ontology copy. Turning that copy into an
+    /// overlay is safe when every global type, relationship, rule and activity
+    /// is unchanged and the store only adds extra project types. If any core
+    /// definition differs, the snapshot may include stale compiled defaults or
+    /// an offline core update, so it is left alone instead of pinning old
+    /// behavior in the repository.
+    fn adopt_legacy_project_overlay(
+        &self,
+        parent: &jcode_memory_types::Ontology,
+        graph: &MemoryGraph,
+    ) -> Result<bool> {
+        let Some(stored) = graph.metadata.ontology.as_ref() else {
+            return Ok(false);
+        };
+        if stored.id != parent.id {
+            return Ok(false);
+        }
+        for (id, type_def) in &parent.types {
+            if stored.types.get(id) != Some(type_def) {
+                return Ok(false);
+            }
+        }
+        if stored.relationships != parent.relationships
+            || !same_rules(&stored.rules, &parent.rules)
+            || !same_activities(&stored.activities, &parent.activities)
+        {
+            return Ok(false);
+        }
+        for (alias, target) in &parent.category_aliases {
+            if stored.category_aliases.get(alias) != Some(target) {
+                return Ok(false);
+            }
+        }
+
+        let extra: std::collections::BTreeMap<_, _> = stored
+            .types
+            .iter()
+            .filter(|(id, _)| !parent.types.contains_key(*id))
+            .map(|(id, type_def)| (id.clone(), type_def.clone()))
+            .collect();
+        if extra.is_empty() {
+            return Ok(false);
+        }
+
+        let mut layer =
+            OntologyLayer::new("project/legacy-adopted", stored.version.max(parent.version))
+                .with_priority(100);
+        layer.types = extra;
+        for (alias, target) in &stored.category_aliases {
+            if !parent.category_aliases.contains_key(alias) && layer.types.contains_key(target) {
+                layer.category_aliases.insert(alias.clone(), target.clone());
+            }
+        }
+        // Validate before writing so a broken legacy parent chain or alias can
+        // never turn into an overlay that fails on every later load.
+        compose_ontology_layers(parent, std::slice::from_ref(&layer)).map_err(|errors| {
+            anyhow::anyhow!(
+                "legacy project ontology cannot be adopted:\n- {}",
+                errors.join("\n- ")
+            )
+        })?;
+        self.write_project_ontology_layer(&layer)?;
+        crate::logging::info(&format!(
+            "Adopted legacy project ontology as overlay: {} type(s)",
+            layer.types.len()
+        ));
+        Ok(true)
     }
 
     fn write_project_ontology_layer(&self, layer: &OntologyLayer) -> Result<()> {
@@ -3959,6 +4059,16 @@ impl MemoryManager {
         Ok(self.ontology_for_graph(&graph))
     }
 
+    /// Layer ids and parent hash that produced a store's effective ontology.
+    /// Empty values mean the store uses a plain snapshot.
+    pub fn ontology_layer_status(&self, scope: OntologyScope) -> Result<(Vec<String>, String)> {
+        let graph = self.load_scope_graph(scope)?;
+        Ok((
+            graph.metadata.ontology_layer_ids.clone(),
+            graph.metadata.ontology_parent_hash.clone(),
+        ))
+    }
+
     /// Installed ontology snapshots for a store, newest last.
     pub fn ontology_history(
         &self,
@@ -4065,10 +4175,10 @@ impl MemoryManager {
         patch: &jcode_memory_types::OntologyPatch,
         dry_run: bool,
     ) -> Result<jcode_memory_types::OntologyApplyReport> {
+        use jcode_memory_types::migration::OntologyOp;
         use jcode_memory_types::migration::{
             MigrationState, OntologyApplyReport, OntologySnapshot, apply_migrations, apply_patch,
         };
-        use jcode_memory_types::migration::OntologyOp;
 
         if patch.ops.iter().any(|op| {
             matches!(

@@ -2422,6 +2422,7 @@ async fn run_memory_command_for_dir(
             match action.as_str() {
                 "show" => {
                     let ontology = manager.stored_ontology(scope)?;
+                    let (layer_ids, parent_hash) = manager.ontology_layer_status(scope)?;
                     if json {
                         println!(
                             "{}",
@@ -2429,6 +2430,8 @@ async fn run_memory_command_for_dir(
                                 "base_id": ontology.id,
                                 "base_version": ontology.version,
                                 "base_hash": ontology.content_hash(),
+                                "layers": layer_ids,
+                                "parent_hash": parent_hash,
                                 "ontology": &*ontology,
                             }))?
                         );
@@ -2436,6 +2439,12 @@ async fn run_memory_command_for_dir(
                         println!("base_id: {}", ontology.id);
                         println!("base_version: {}", ontology.version);
                         println!("base_hash: {}", ontology.content_hash());
+                        if !layer_ids.is_empty() {
+                            println!("layers: {}", layer_ids.join(", "));
+                        }
+                        if !parent_hash.is_empty() {
+                            println!("parent_hash: {parent_hash}");
+                        }
                         print!(
                             "{}",
                             crate::memory_types::migration::describe_ontology(&ontology)

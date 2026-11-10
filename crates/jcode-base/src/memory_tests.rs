@@ -3243,6 +3243,88 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
     });
 }
 
+fn save_legacy_project_snapshot(
+    manager: &MemoryManager,
+    mutate: impl FnOnce(&mut jcode_memory_types::Ontology),
+) {
+    let mut graph = manager.load_project_graph().unwrap();
+    let mut ontology = (*manager.ontology_for_graph(&graph)).clone();
+    mutate(&mut ontology);
+    ontology.version += 1;
+    graph.metadata.ontology_id = ontology.id.clone();
+    graph.metadata.ontology_version = ontology.version;
+    graph.metadata.ontology_hash = ontology.content_hash();
+    graph.metadata.ontology_parent_hash.clear();
+    graph.metadata.ontology_layer_hash.clear();
+    graph.metadata.ontology_layer_ids.clear();
+    graph.metadata.ontology = Some(ontology);
+    manager.save_project_graph(&graph).unwrap();
+}
+
+#[test]
+fn additive_legacy_project_snapshot_is_adopted_as_overlay() {
+    use jcode_memory_types::OntologyType;
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+
+        save_legacy_project_snapshot(&manager, |ontology| {
+            ontology.types.insert(
+                "acme.legacy_flow".to_string(),
+                OntologyType::new("acme.legacy_flow", "Legacy flow")
+                    .with_parent("contract")
+                    .with_description("Concept from a pre-overlay store"),
+            );
+        });
+        assert!(!overlay_path.exists());
+
+        let effective = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(overlay_path.exists(), "additive legacy snapshot is adopted");
+        assert!(effective.types.contains_key("acme.legacy_flow"));
+        let layer = manager
+            .load_project_ontology_layer()
+            .unwrap()
+            .expect("adopted overlay");
+        assert_eq!(layer.id, "project/legacy-adopted");
+        assert!(layer.types.contains_key("acme.legacy_flow"));
+        assert!(
+            !manager
+                .stored_ontology(OntologyScope::Global)
+                .unwrap()
+                .types
+                .contains_key("acme.legacy_flow")
+        );
+    });
+}
+
+#[test]
+fn stale_legacy_project_snapshot_is_not_adopted() {
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+
+        save_legacy_project_snapshot(&manager, |ontology| {
+            ontology.types.get_mut("env_fact").unwrap().ttl_days = Some(99.0);
+        });
+
+        let effective = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(
+            !overlay_path.exists(),
+            "a changed core type may be stale compiled data and is not adopted"
+        );
+        assert_eq!(
+            effective.types["env_fact"].ttl_days,
+            Some(99.0),
+            "the legacy store keeps its own snapshot until explicitly migrated"
+        );
+    });
+}
+
 #[test]
 fn project_overlay_inherits_global_and_stays_local() {
     use jcode_memory_types::{OntologyType, Rule};

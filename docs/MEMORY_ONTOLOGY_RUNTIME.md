@@ -232,10 +232,20 @@ Metadata records `ontology_parent_hash`, `ontology_layer_hash` and
 `ontology_layer_ids`; a changed global ontology or overlay invalidates the
 materialized copy on the next load.
 
+An older project store that persisted a full ontology snapshot is adopted
+automatically only when the snapshot is provably additive: every current global
+type, relationship, rule and activity is unchanged and the store only adds extra
+project types. A snapshot that changes a core definition may contain stale
+compiled defaults, so it keeps its own snapshot until an explicit migration.
+
 Extraction uses the effective type catalog. Project types are appended to the
 extractor prompt with their description and parent, and the returned id is
 stored as `MemoryCategory::Custom(id)`. Types with `present_in_prompt: false`
 are excluded.
+
+`jcode memory ontology show --scope project` prints `layers` and `parent_hash`
+alongside the effective ontology, so it is clear which overlay produced the
+result. JSON output carries the same fields.
 
 ## 6. Rollback
 

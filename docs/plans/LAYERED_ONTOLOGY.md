@@ -271,12 +271,13 @@ TTL/scoring, and whether the type is visible to the extractor.
 - Test that a project type is extracted as `Custom(id)` and is invisible in the
   global store.
 
-### Phase 3: patch and rollback redirection (implemented, legacy diff migration pending)
+### Phase 3: patch and rollback redirection (implemented)
 
 - Make project `apply_ontology_patch` write an overlay diff.
 - Make project rollback rewrite the overlay.
-- Migrate legacy project snapshots to overlays (not yet: a store without an
-  overlay keeps its own snapshot).
+- Adopt legacy project snapshots as overlays only when they are provably
+  additive over the current global ontology. A snapshot that changes a core
+  definition keeps its own snapshot until an explicit migration.
 - Test that deleting an overlay type removes it after reload and that a core field
   change still flows through when only another field was overridden.
 
