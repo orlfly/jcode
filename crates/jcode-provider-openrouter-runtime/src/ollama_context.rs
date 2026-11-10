@@ -18,6 +18,7 @@
 //!   model's trained maximum.
 
 use anyhow::{Context, Result};
+use jcode_provider_core::DEFAULT_CONTEXT_LIMIT;
 use jcode_provider_openrouter::ModelInfo;
 use reqwest::Client;
 use serde_json::Value;
@@ -79,16 +80,18 @@ pub(crate) fn effective_serving_context(trained: Option<u64>, server_default: Op
 
 /// Resolve a model's effective window without applying local-runner limits to
 /// Ollama cloud models. For cloud routes, `/api/show` metadata describes the
-/// remote serving window and is authoritative when available.
+/// remote serving window and is authoritative when available. If it is not
+/// available, fall back to the generic context limit rather than the local
+/// server default: `/api/ps` and `OLLAMA_CONTEXT_LENGTH` describe only the
+/// local runner, and a 4096-token budget makes every cloud request exceed the
+/// compaction threshold, producing repeated emergency hard compactions.
 pub(crate) fn effective_context_for_model(
     model: &str,
     trained: Option<u64>,
     server_default: Option<u64>,
 ) -> u64 {
     if is_cloud_model(model) {
-        trained
-            .or(server_default)
-            .unwrap_or(OLLAMA_DEFAULT_SERVING_CONTEXT)
+        trained.unwrap_or(DEFAULT_CONTEXT_LIMIT as u64)
     } else {
         effective_serving_context(trained, server_default)
     }
@@ -317,6 +320,34 @@ mod tests {
         assert_eq!(
             effective_context_for_model("glm-5.2", Some(1_000_000), Some(4096)),
             4096
+        );
+    }
+
+    #[test]
+    fn cloud_model_without_show_metadata_ignores_local_server_default() {
+        // Regression: `/api/show` can omit metadata for a cloud model, and
+        // `/api/ps` still reports the local runner's 4096 default. Applying
+        // that to a remote model made every request exceed the compaction
+        // threshold, causing repeated emergency hard compactions.
+        assert_eq!(
+            effective_context_for_model(
+                "deepseek-v4.1-flash:cloud",
+                None,
+                Some(OLLAMA_DEFAULT_SERVING_CONTEXT)
+            ),
+            DEFAULT_CONTEXT_LIMIT as u64
+        );
+        assert_eq!(
+            effective_context_for_model("unknown-model:cloud", None, Some(64_000)),
+            DEFAULT_CONTEXT_LIMIT as u64
+        );
+    }
+
+    #[test]
+    fn cloud_model_without_any_probe_data_still_gets_a_usable_window() {
+        assert_eq!(
+            effective_context_for_model("deepseek-v4.1-flash:cloud", None, None),
+            DEFAULT_CONTEXT_LIMIT as u64
         );
     }
 
