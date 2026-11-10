@@ -241,12 +241,22 @@ memories. The global store never retrieves project-only types.
 
 ## 7. CLI
 
+Implemented today:
+
+```bash
+jcode memory ontology show --scope project          # effective ontology + layers + parent_hash
+jcode memory ontology validate proposal.json
+jcode memory ontology apply proposal.json --scope project --apply
+jcode memory ontology history --scope project
+jcode memory ontology rollback <version> --scope project
+```
+
+Planned with the pack/promotion phases:
+
 ```bash
 jcode memory ontology layers --scope project
 jcode memory ontology compose --scope project --json
 jcode memory ontology explain acme.billing.invoice_flow --scope project
-jcode memory ontology validate .jcode/memory/ontology.yaml
-jcode memory ontology apply proposal.json --scope project --apply
 jcode memory ontology promote acme.billing.invoice_flow --to-global
 ```
 
