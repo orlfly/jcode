@@ -332,6 +332,7 @@ impl App {
             display_edit_line_counts: (0, 0),
             terminal_title: RefCell::new(terminal_title::TerminalTitleState::default()),
             compacted_history_lazy: CompactedHistoryLazyState::default(),
+            recent_history_paging: Default::default(),
             pending_history_anchor: None,
             pending_resize_anchor: None,
             input: String::new(),
@@ -373,6 +374,7 @@ impl App {
             remote_interrupt_ack_deadline: None,
             pending_reload_reconnect_status: None,
             scheduled_reload_recoveries: HashSet::new(),
+            reload_recovery_dispatch_pending: false,
             status: ProcessingStatus::default(),
             subagent_status: None,
             batch_progress: None,
@@ -525,6 +527,7 @@ impl App {
             side_pane_images_signature_cache: std::cell::Cell::new(None),
             remote_swarm_members: Vec::new(),
             remote_swarm_members_received_at: None,
+            swarm_last_message_at: std::collections::HashMap::new(),
             swarm_plan_items: Vec::new(),
             swarm_plan_version: None,
             swarm_plan_swarm_id: None,
@@ -636,6 +639,7 @@ impl App {
             voice_input_key: keybind::load_voice_input_key(),
             voice_input: None,
             voice_input_last_press: None,
+            external_voice: None,
             fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             keybindings_config_generation: crate::config::config_reload_generation(),
@@ -727,6 +731,7 @@ impl App {
             account_picker_overlay: None,
             usage_overlay: None,
             usage_report_refreshing: false,
+            usage_provider_filter: None,
             usage_reset: Default::default(),
             productivity_refreshing: false,
             last_overnight_card_refresh: None,
@@ -836,6 +841,7 @@ impl App {
             display_edit_line_counts: (0, 0),
             terminal_title: RefCell::new(terminal_title::TerminalTitleState::default()),
             compacted_history_lazy: CompactedHistoryLazyState::default(),
+            recent_history_paging: Default::default(),
             pending_history_anchor: None,
             pending_resize_anchor: None,
             input: String::new(),
@@ -877,6 +883,7 @@ impl App {
             remote_interrupt_ack_deadline: None,
             pending_reload_reconnect_status: None,
             scheduled_reload_recoveries: HashSet::new(),
+            reload_recovery_dispatch_pending: false,
             status: ProcessingStatus::default(),
             subagent_status: None,
             batch_progress: None,
@@ -1029,6 +1036,7 @@ impl App {
             side_pane_images_signature_cache: std::cell::Cell::new(None),
             remote_swarm_members: Vec::new(),
             remote_swarm_members_received_at: None,
+            swarm_last_message_at: std::collections::HashMap::new(),
             swarm_plan_items: Vec::new(),
             swarm_plan_version: None,
             swarm_plan_swarm_id: None,
@@ -1140,6 +1148,7 @@ impl App {
             voice_input_key: keybind::load_voice_input_key(),
             voice_input: None,
             voice_input_last_press: None,
+            external_voice: None,
             fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             keybindings_config_generation: crate::config::config_reload_generation(),
@@ -1231,6 +1240,7 @@ impl App {
             account_picker_overlay: None,
             usage_overlay: None,
             usage_report_refreshing: false,
+            usage_provider_filter: None,
             usage_reset: Default::default(),
             productivity_refreshing: false,
             last_overnight_card_refresh: None,
@@ -1620,6 +1630,9 @@ impl App {
         }
 
         app.resume_session_id = resume_session;
+        // Paint persisted todos with the first frame, not a throttled tick after
+        // the server has finished loading the resumed conversation.
+        app.refresh_pinned_todos_now();
         // After `resume_session_id`: the hint needs to know whether this is a
         // new session (configured effort applies) or a resumed one.
         app.apply_remote_header_hint();

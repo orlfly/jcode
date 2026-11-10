@@ -67,7 +67,7 @@ fn authorize(request: reqwest::RequestBuilder, access_token: &str) -> reqwest::R
                 "User-Agent",
                 crate::provider::anthropic::CLAUDE_CLI_USER_AGENT,
             )
-            .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219"),
+            .header("anthropic-beta", "oauth-2025-04-20"),
         &crate::provider::anthropic::new_oauth_request_id(),
     )
 }
@@ -113,15 +113,16 @@ async fn get_json(client: &reqwest::Client, url: &str, token: &str) -> Result<se
 
 /// Read-only offer lookup, including before the five-hour wall. A missing or
 /// malformed availability field is unknown, never a confirmed zero balance.
-pub(super) async fn fetch_limit_reset_offer(
+pub(super) fn cached_limit_reset_offer(
     access_token: &str,
     account_label: Option<&str>,
 ) -> (Option<AnthropicLimitResetOffer>, bool) {
-    let Ok(client) = reset_client() else {
-        return (None, false);
-    };
-    let Ok(value) = get_json(&client, &format!("{API_BASE}{STATUS_PATH}"), access_token).await
-    else {
+    // This endpoint is the quota endpoint too. A second uncached request here
+    // used to bypass its cross-process flight lock and Retry-After backoff on
+    // every /usage report, even when the quota itself came from cache.
+    // Explicit reset preparation below still validates with a fresh request.
+    let key = anthropic_usage_cache_key(access_token, account_label);
+    let Some(value) = super::disk_cache::reset_status(&key) else {
         return (None, false);
     };
     (
@@ -408,6 +409,9 @@ async fn consume_with_client(
 /// reset. Only local state changes, so this is safe to repeat.
 pub fn invalidate_anthropic_usage_reset_state(account_label: Option<&str>) {
     super::cache::invalidate_anthropic_usage_after_reset(account_label);
+    if let Some(label) = account_label {
+        super::banked::record_anthropic_offer(label, None);
+    }
     crate::provider::clear_claude_provider_unavailability_for_account_label(account_label);
 }
 

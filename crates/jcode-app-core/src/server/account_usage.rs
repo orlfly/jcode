@@ -99,13 +99,35 @@ async fn fetch() -> Snapshot {
     Snapshot {
         anthropic: anthropic
             .into_iter()
-            .map(|value| wire_snapshot(value, true))
+            .map(|value| {
+                with_banked(
+                    wire_snapshot(value, true),
+                    MultiAccountProviderKind::Anthropic,
+                )
+            })
             .collect(),
         openai: openai
             .into_iter()
-            .map(|value| wire_snapshot(value, false))
+            .map(|value| {
+                with_banked(
+                    wire_snapshot(value, false),
+                    MultiAccountProviderKind::OpenAI,
+                )
+            })
             .collect(),
     }
+}
+
+fn with_banked(
+    mut snapshot: AccountUsageSnapshot,
+    provider: crate::usage::MultiAccountProviderKind,
+) -> AccountUsageSnapshot {
+    if let Some(banked) = crate::usage::cached_account_banked_resets(provider, &snapshot.label) {
+        snapshot.banked_resets = Some(banked.available);
+        snapshot.banked_expires_at = banked.expires_at;
+        snapshot.banked_next_at = banked.next_available_at;
+    }
+    snapshot
 }
 
 fn wire_snapshot(
@@ -118,7 +140,10 @@ fn wire_snapshot(
             || lower.contains("rate limit")
             || lower.contains("too many requests")
         {
-            "Couldn't fetch usage (429: lookup throttled)".to_string()
+            match crate::usage::usage_error_retry_at(&error) {
+                Some(at) => format!("Couldn't fetch usage (429: lookup throttled) (retry at {at})"),
+                None => "Couldn't fetch usage (429: lookup throttled)".to_string(),
+            }
         } else if lower.contains("401") || lower.contains("unauthorized") {
             "Usage authentication failed (401)".to_string()
         } else {
@@ -143,6 +168,9 @@ fn wire_snapshot(
         resets_at: value.resets_at,
         // Raw endpoint failures can contain request diagnostics. Only send a safe status.
         error,
+        banked_resets: None,
+        banked_expires_at: None,
+        banked_next_at: None,
     }
 }
 
@@ -183,6 +211,10 @@ mod tests {
                 "Usage authentication failed (401)",
             ),
             ("secret transport diagnostic", "Usage unavailable"),
+            (
+                "HTTP 429 secret (retry at 2026-01-01T00:00:00Z)",
+                "Couldn't fetch usage (429: lookup throttled) (retry at 2026-01-01T00:00:00Z)",
+            ),
         ] {
             let account = wire_snapshot(account(Some(raw)), true);
             assert_eq!(account.error.as_deref(), Some(safe));

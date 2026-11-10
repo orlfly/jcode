@@ -469,6 +469,7 @@ fn subscribe_request(working_dir: Option<&str>) -> Request {
         continue_on_disconnect: false,
         terminal_env: Vec::new(),
         session_env: Vec::new(),
+        client_name: None,
     }
 }
 
@@ -1295,7 +1296,10 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
         start_processing_message(
             ProcessingMessage {
                 id: 78,
-                content: "continue after reload".to_string(),
+                // Reminder-only replay: a non-empty body is now a queued
+                // follow-up and is allowed through after stripping the
+                // already-delivered reminder.
+                content: String::new(),
                 images: Vec::new(),
                 system_reminder: Some(continuation.to_string()),
                 active_skill: Some("nonexistent-replay-skill".to_string()),

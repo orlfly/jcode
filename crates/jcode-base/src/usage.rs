@@ -8,6 +8,8 @@ mod account_fetch;
 pub use account_fetch::fetch_oauth_account_usage;
 mod anthropic_reset;
 mod api_keys;
+mod banked;
+pub use banked::{AccountBankedResets, cached_account_banked_resets};
 mod cache;
 mod disk_cache;
 mod display;
@@ -42,10 +44,13 @@ pub use openai_reset::{
 };
 use provider_fetch::*;
 pub use remote_accounts::{
-    clear_remote_account_usage, remote_account_list, remote_account_usage_received,
-    set_remote_account_usage,
+    clear_remote_account_usage, remote_account_banked_resets, remote_account_list,
+    remote_account_usage_received, set_remote_account_usage,
 };
-pub use startup_snapshot::{AccountUsageStartupPublisher, hydrate_remote_account_usage};
+pub use startup_snapshot::{
+    AccountUsageStartupPublisher, hydrate_remote_account_usage,
+    hydrate_remote_account_usage_for_generation,
+};
 
 use anyhow::{Context, Result};
 pub use display::{format_reset_time, format_usage_bar};
@@ -58,7 +63,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Usage API endpoint
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1";
 
 /// OpenAI ChatGPT usage endpoint
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -122,7 +127,7 @@ async fn fetch_anthropic_usage_data_uncached(
                 crate::provider::anthropic::CLAUDE_CLI_USER_AGENT,
             )
             .header("Authorization", format!("Bearer {}", access_token))
-            .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219"),
+            .header("anthropic-beta", "oauth-2025-04-20"),
         &crate::provider::anthropic::new_oauth_request_id(),
     )
     .send()
@@ -180,6 +185,7 @@ async fn fetch_anthropic_usage_data_uncached(
             .as_ref()
             .and_then(|window| window.utilization)
             .is_some();
+    let reset_status = serde_json::json!({ "juniper_tide": data.juniper_tide });
     let usage = UsageData {
         five_hour: data
             .five_hour
@@ -239,7 +245,7 @@ async fn fetch_anthropic_usage_data_uncached(
             probe_started,
         );
     }
-    let usage = disk_cache::store_success(&cache_key, &usage);
+    let usage = disk_cache::store_success_with_reset_status(&cache_key, &usage, Some(reset_status));
     store_anthropic_usage(cache_key, usage.clone());
     Ok(usage)
 }

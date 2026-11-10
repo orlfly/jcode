@@ -7,7 +7,11 @@ mod menubar;
 mod power;
 mod session;
 pub use session::{HibernationMode, SessionConfig};
-pub use {display::DisplayConfig, menubar::MenubarConfig, power::PowerConfig};
+pub use {
+    display::{DisplayConfig, ResumeTimeMode},
+    menubar::MenubarConfig,
+    power::PowerConfig,
+};
 pub mod keybindings;
 mod serde_lenient;
 pub use keybindings::{
@@ -1206,7 +1210,8 @@ pub struct FeatureConfig {
     /// incomplete todos). `/poke on` / `/poke off` still override this per session
     /// (default: true)
     pub auto_poke: bool,
-    /// Opt in to one aggregate todo weak-point follow-up per completion cycle.
+    /// Opt in to automatic todo quality reviews: weak-point digests, confidence
+    /// validation and spike checks, ownership checks, and long-session reviews.
     /// Requires auto-poke; independent of the display-only completion report.
     /// Disabled by default for every user.
     pub todo_gate_digest: bool,
