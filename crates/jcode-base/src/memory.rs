@@ -542,6 +542,14 @@ fn same_by_id<T: PartialEq, F: Fn(&T) -> &str>(left: &[T], right: &[T], id: F) -
             .all(|value| by_id.get(id(value)) == Some(&value))
 }
 
+fn is_subset_by_id<T: PartialEq, F: Fn(&T) -> &str>(subset: &[T], superset: &[T], id: F) -> bool {
+    let by_id: std::collections::HashMap<&str, &T> =
+        superset.iter().map(|value| (id(value), value)).collect();
+    subset
+        .iter()
+        .all(|value| by_id.get(id(value)) == Some(&value))
+}
+
 fn same_rules(left: &[jcode_memory_types::Rule], right: &[jcode_memory_types::Rule]) -> bool {
     same_by_id(left, right, |rule| rule.id.as_str())
 }
@@ -1487,9 +1495,10 @@ impl MemoryManager {
         if layer.is_none() && !had_layer {
             if self.adopt_legacy_project_overlay(&parent, graph)? {
                 layer = self.load_project_ontology_layer()?;
-            } else {
+            } else if !self.project_snapshot_is_disposable(&parent, graph) {
                 // A store that predates overlays keeps its own snapshot unless
-                // it is safely expressible as additive project concepts.
+                // it is safely expressible as additive project concepts or is
+                // only a copy of the compiled default.
                 return Ok(());
             }
         }
@@ -1520,6 +1529,51 @@ impl MemoryManager {
         graph.metadata.ontology_layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
         graph.metadata.ontology = Some(effective);
         Ok(())
+    }
+
+    /// Whether a project's stored ontology carries no project-specific content.
+    ///
+    /// This is true when it is exactly the compiled default, or when every type,
+    /// relationship, rule, activity and alias it contains is also present with
+    /// the same definition in the current global ontology. Such a snapshot is a
+    /// stale copy, not an override, so the project can inherit global changes.
+    fn project_snapshot_is_disposable(
+        &self,
+        parent: &jcode_memory_types::Ontology,
+        graph: &MemoryGraph,
+    ) -> bool {
+        let Some(stored) = graph.metadata.ontology.as_ref() else {
+            return true;
+        };
+        let default = self.ontology_registry().default_ontology();
+        if stored == &*default {
+            return true;
+        }
+        if stored.id != parent.id {
+            return false;
+        }
+        for (id, type_def) in &stored.types {
+            if parent.types.get(id) != Some(type_def) {
+                return false;
+            }
+        }
+        for (id, relationship) in &stored.relationships {
+            if parent.relationships.get(id) != Some(relationship) {
+                return false;
+            }
+        }
+        if !is_subset_by_id(&stored.rules, &parent.rules, |rule| rule.id.as_str()) {
+            return false;
+        }
+        if !is_subset_by_id(&stored.activities, &parent.activities, |activity| {
+            activity.id.as_str()
+        }) {
+            return false;
+        }
+        stored
+            .category_aliases
+            .iter()
+            .all(|(alias, target)| parent.category_aliases.get(alias) == Some(target))
     }
 
     /// Adopt a legacy project snapshot as an overlay only when it is provably

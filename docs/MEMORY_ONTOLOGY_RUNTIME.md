@@ -6,6 +6,8 @@ This document describes the implemented runtime path that lets the memory
 ontology live inside the memory store, be adjusted during a reflection pass,
 and carry existing memory instances along when it changes.
 
+Detailed design (Chinese): [MEMORY_ONTOLOGY_DESIGN.zh.md](./MEMORY_ONTOLOGY_DESIGN.zh.md).
+
 ## 1. Storage
 
 The ontology is stored with each memory store in `GraphMetadata`:
@@ -195,6 +197,11 @@ The effective project ontology is `compose(global ontology, overlay)`. Global
 types are inherited, so a project sees `contract`, `process_rule`, and any
 global domain additions without copying them. Project types stay local and never
 appear in the global store.
+
+A project with no overlay still inherits the global ontology when its stored
+snapshot is exactly the compiled default or only a same-definition subset of
+the global ontology. A snapshot that changes a core definition is treated as a
+possible legacy customization and kept until explicitly migrated.
 
 Overlay shape (see `jcode_memory_types::layered::OntologyLayer`):
 

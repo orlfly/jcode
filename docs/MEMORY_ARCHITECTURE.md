@@ -20,7 +20,7 @@ Three storage layers cooperate:
 
 ## The v2 ontology
 
-Types: `env_fact` (30-day TTL), `contract`, `process_rule`, `observation`
+Types: `env_fact` (14-day TTL), `contract`, `process_rule`, `observation`
 (90-day TTL, the residual bucket), `preference`, `entity`, `correction`,
 plus `goal:...` / `skill:...` **link nodes**, which are indexes of external
 artifacts, not memories: they skip write reconciliation, TTL GC and clustering,
@@ -150,6 +150,9 @@ not only compiled into the binary. A reflection pass can propose an
 `jcode memory ontology ...`), and applying it runs deterministic data
 migrations before installing the new definition. See
 [MEMORY_ONTOLOGY_RUNTIME.md](./MEMORY_ONTOLOGY_RUNTIME.md).
+Project overlays, layered composition, governance and failure modes are
+described in detail in
+[MEMORY_ONTOLOGY_DESIGN.zh.md](./MEMORY_ONTOLOGY_DESIGN.zh.md).
 
 ## Update governance (added 2026-11-08)
 

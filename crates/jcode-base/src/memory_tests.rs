@@ -3518,6 +3518,57 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
 }
 
 #[test]
+fn project_without_overlay_inherits_global_additions() {
+    use jcode_memory_types::OntologyType;
+    use jcode_memory_types::migration::{OntologyOp, OntologyPatch};
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+
+        // Create the project store while the global ontology is still default.
+        manager.load_project_graph().unwrap();
+        assert!(!overlay_path.exists());
+
+        let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let patch = OntologyPatch {
+            base_id: global_base.id.clone(),
+            base_version: global_base.version,
+            base_hash: global_base.content_hash(),
+            rationale: "add a shared cloud concept".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::AddType {
+                type_def: OntologyType::new("cloud.service", "Cloud service")
+                    .with_parent("entity")
+                    .with_description("A managed cloud service or deployment target"),
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Global, &patch, false)
+            .expect("global concept applies");
+
+        let project = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(
+            project.types.contains_key("cloud.service"),
+            "a project with no override must inherit global concepts"
+        );
+        assert!(
+            !overlay_path.exists(),
+            "inheritance must not require a project overlay file"
+        );
+        let global = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let (layers, parent_hash) = manager
+            .ontology_layer_status(OntologyScope::Project)
+            .unwrap();
+        assert!(layers.is_empty());
+        assert_eq!(parent_hash, global.content_hash());
+    });
+}
+
+#[test]
 fn project_field_patch_keeps_global_changes_flowing() {
     use jcode_memory_types::migration::{OntologyOp, OntologyPatch, TypePatch};
 
