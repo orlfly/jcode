@@ -12,6 +12,9 @@ Implemented surfaces:
 - `skill_manage` tool actions `validate`, `health`, `update`, `rollback`
 - Finalize-time automatic ontology reflection (proposal-only, low-risk
   `update_type` ops, 5-evidence minimum, one proposal per project per day)
+- Project ontology overlays: global types are inherited, project types stay
+  local, extraction uses the effective type catalog, and project patches write
+  field-level overlay diffs (`docs/plans/LAYERED_ONTOLOGY.md`)
 
 Remaining from the design: field-level G4 batch-diff refinement (extraction
 batches now force review when more than five rows or more than 20% of an

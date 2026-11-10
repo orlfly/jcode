@@ -183,6 +183,60 @@ recorded in `memory/ontology/.reflection-<project-store-key>.json` and still
 consumes that project's daily window. Applying an automatic proposal uses the
 same confirmed `ontology` tool call or CLI path as any other proposal.
 
+### Project overlay
+
+A project can carry a reviewable, repository-owned overlay:
+
+```
+<repo>/.jcode/memory/ontology.yaml
+```
+
+The effective project ontology is `compose(global ontology, overlay)`. Global
+types are inherited, so a project sees `contract`, `process_rule`, and any
+global domain additions without copying them. Project types stay local and never
+appear in the global store.
+
+Overlay shape (see `jcode_memory_types::layered::OntologyLayer`):
+
+```yaml
+id: project/acme-billing
+version: 4
+priority: 100
+namespace: acme.billing
+types:
+  acme.billing.invoice_flow:
+    display_name: Invoice flow
+    parent: contract
+    description: Invoice generation and settlement procedure.
+type_patches:
+  env_fact:
+    ttl_days: 45.0
+disabled_types:
+  - observation
+```
+
+Rules:
+
+- `types` adds or fully replaces a type. Prefer `parent` inheritance over
+  copying an existing definition.
+- `type_patches` is field-level: a project TTL override does not pin scoring,
+  decay, properties, or future global changes to those fields.
+- `disabled_types` removes a type from the project's effective ontology.
+- Overlay `rules` and `activities` are stripped on load. A cloned repository is
+  untrusted input and must not change memory side effects.
+
+Applying `jcode memory ontology apply ... --scope project --apply` writes the
+diff back to this file instead of copying a full snapshot. Rollback rewrites the
+overlay and removes it when the restored state equals the global ontology.
+Metadata records `ontology_parent_hash`, `ontology_layer_hash` and
+`ontology_layer_ids`; a changed global ontology or overlay invalidates the
+materialized copy on the next load.
+
+Extraction uses the effective type catalog. Project types are appended to the
+extractor prompt with their description and parent, and the returned id is
+stored as `MemoryCategory::Custom(id)`. Types with `present_in_prompt: false`
+are excluded.
+
 ## 6. Rollback
 
 Each apply pushes the previous ontology into `ontology_history` (bounded to 10
@@ -197,5 +251,12 @@ change itself must be undone.
 - `crates/jcode-base/src/memory_tests.rs`:
   `ontology_patch_persists_migrates_and_rolls_back` covers apply, persistence
   across manager instances, and rollback.
+  `project_overlay_inherits_global_and_stays_local`,
+  `project_patch_writes_overlay_diff_and_rolls_back`, and
+  `project_field_patch_keeps_global_changes_flowing` cover the layered path.
+- `crates/jcode-memory-types/src/layered.rs`: composition, priority, disable,
+  idempotence, diff round-trips, and layer stack hashing.
+- `crates/jcode-base/src/sidecar.rs`:
+  `extraction_catalog_includes_project_types` covers prompt catalog filtering.
 - `crates/jcode-base/src/memory/backend/sqlite_gvec.rs`:
   `ontology_metadata_round_trips_through_the_meta_table`.

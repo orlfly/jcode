@@ -349,8 +349,13 @@ impl Ontology {
 /// Definition of a memory instance type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OntologyType {
+    #[serde(default)]
     pub id: String,
     pub display_name: String,
+    /// Optional extraction/description hint shown in model prompts and
+    /// `memory ontology explain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     /// Legacy `MemoryCategory` name (e.g. "fact", "preference") that this
@@ -359,8 +364,11 @@ pub struct OntologyType {
     pub legacy_category: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<PropertyDef>,
+    #[serde(default)]
     pub lifecycle: LifecyclePolicy,
+    #[serde(default)]
     pub scoring: ScoringPolicy,
+    #[serde(default)]
     pub decay: DecayPolicy,
     /// Hard time-to-live in days for this type. Instances of a type with a
     /// `ttl_days` are archived by `activity.periodic_gc` once they have gone
@@ -403,6 +411,7 @@ impl OntologyType {
         Self {
             id: id.into(),
             display_name: display_name.into(),
+            description: None,
             parent: None,
             legacy_category: None,
             properties: Vec::new(),
@@ -420,6 +429,12 @@ impl OntologyType {
     /// Attach a hard TTL (days) for this type.
     pub fn with_ttl_days(mut self, days: f32) -> Self {
         self.ttl_days = Some(days);
+        self
+    }
+
+    /// Attach a human/model readable description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 

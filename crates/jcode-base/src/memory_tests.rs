@@ -3244,6 +3244,250 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
 }
 
 #[test]
+fn project_overlay_inherits_global_and_stays_local() {
+    use jcode_memory_types::{OntologyType, Rule};
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+
+        let mut layer = OntologyLayer::new("project/repo", 10);
+        layer.types.insert(
+            "acme.flow".to_string(),
+            OntologyType::new("acme.flow", "Invoice flow")
+                .with_parent("contract")
+                .with_description("Invoice generation and settlement"),
+        );
+        // Rules in a repository-owned overlay are untrusted and stripped.
+        layer
+            .rules
+            .push(Rule::new("overlay.evil", "event.remember"));
+        fs::write(&overlay_path, serde_yaml::to_string(&layer).unwrap()).unwrap();
+
+        let project = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(project.types.contains_key("acme.flow"));
+        assert!(project.types.contains_key("contract"));
+        let global = manager.stored_ontology(OntologyScope::Global).unwrap();
+        assert!(
+            !global.types.contains_key("acme.flow"),
+            "project concepts must not leak into the global store"
+        );
+        let loaded = manager
+            .load_project_ontology_layer()
+            .unwrap()
+            .expect("overlay");
+        assert!(loaded.rules.is_empty(), "project rules are stripped");
+
+        let id = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Custom("acme.flow".to_string()),
+                "Invoices settle at midnight and are retried once",
+            ))
+            .unwrap();
+        let graph = manager.load_project_graph().unwrap();
+        assert_eq!(
+            graph.get_memory(&id).unwrap().category,
+            MemoryCategory::Custom("acme.flow".to_string())
+        );
+
+        fs::remove_file(&overlay_path).unwrap();
+        let after = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(
+            !after.types.contains_key("acme.flow"),
+            "deleting the overlay must not leave a stale materialized type"
+        );
+        assert!(after.types.contains_key("contract"));
+    });
+}
+
+#[test]
+fn project_overlay_yaml_can_omit_default_policies_and_type_id() {
+    use jcode_memory_types::{DecayPolicy, ScoringPolicy};
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        fs::write(
+            &overlay_path,
+            r#"
+id: project/repo
+version: 7
+namespace: acme.billing
+types:
+  acme.billing.invoice_flow:
+    display_name: Invoice flow
+    parent: contract
+    description: Invoice generation and settlement.
+"#,
+        )
+        .unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+        let effective = manager.stored_ontology(OntologyScope::Project).unwrap();
+        let flow = &effective.types["acme.billing.invoice_flow"];
+        assert_eq!(flow.id, "acme.billing.invoice_flow");
+        assert_eq!(flow.parent.as_deref(), Some("contract"));
+        assert_eq!(flow.ttl_days, None);
+        assert_eq!(flow.scoring, ScoringPolicy::default());
+        assert_eq!(flow.decay, DecayPolicy::default());
+    });
+}
+
+#[test]
+fn project_patch_writes_overlay_diff_and_rolls_back() {
+    use jcode_memory_types::migration::{OntologyOp, OntologyPatch, TypePatch};
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+
+        let base = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(base.types["env_fact"].ttl_days, Some(14.0));
+        let rule_patch = OntologyPatch {
+            base_id: base.id.clone(),
+            base_version: base.version,
+            base_hash: base.content_hash(),
+            rationale: "untrusted project rule".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::AddRule {
+                rule: jcode_memory_types::Rule::new("project.rule", "event.remember"),
+            }],
+            migrations: Vec::new(),
+        };
+        assert!(
+            manager
+                .apply_ontology_patch(OntologyScope::Project, &rule_patch, false)
+                .is_err(),
+            "project patches must not add memory side effects"
+        );
+        let patch = OntologyPatch {
+            base_id: base.id.clone(),
+            base_version: base.version,
+            base_hash: base.content_hash(),
+            rationale: "env facts are re-created too often".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::UpdateType {
+                id: "env_fact".to_string(),
+                patch: TypePatch {
+                    ttl_days: Some(45.0),
+                    ..Default::default()
+                },
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Project, &patch, false)
+            .expect("project patch applies");
+
+        let overlay: OntologyLayer =
+            serde_yaml::from_str(&fs::read_to_string(&overlay_path).unwrap()).unwrap();
+        assert!(
+            overlay.types.is_empty(),
+            "a field change must not copy the full type"
+        );
+        assert_eq!(overlay.type_patches["env_fact"].ttl_days, Some(45.0));
+        assert_eq!(
+            manager
+                .stored_ontology(OntologyScope::Project)
+                .unwrap()
+                .types["env_fact"]
+                .ttl_days,
+            Some(45.0)
+        );
+        assert_eq!(
+            manager
+                .stored_ontology(OntologyScope::Global)
+                .unwrap()
+                .types["env_fact"]
+                .ttl_days,
+            Some(14.0),
+            "the project override must not change global memory"
+        );
+
+        manager
+            .rollback_ontology(OntologyScope::Project, base.version)
+            .expect("rollback");
+        assert!(
+            !overlay_path.exists(),
+            "an empty rolled-back overlay is removed"
+        );
+        assert_eq!(
+            manager
+                .stored_ontology(OntologyScope::Project)
+                .unwrap()
+                .types["env_fact"]
+                .ttl_days,
+            Some(14.0)
+        );
+    });
+}
+
+#[test]
+fn project_field_patch_keeps_global_changes_flowing() {
+    use jcode_memory_types::migration::{OntologyOp, OntologyPatch, TypePatch};
+
+    with_temp_home(|home| {
+        let repo = home.join("repo");
+        let overlay_path = repo.join(".jcode/memory/ontology.yaml");
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
+
+        let base = manager.stored_ontology(OntologyScope::Project).unwrap();
+        let mut layer = OntologyLayer::new("project/repo", base.version + 1);
+        layer.type_patches.insert(
+            "contract".to_string(),
+            TypePatch {
+                ttl_days: Some(730.0),
+                ..Default::default()
+            },
+        );
+        fs::write(&overlay_path, serde_yaml::to_string(&layer).unwrap()).unwrap();
+
+        let project = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(project.types["contract"].ttl_days, Some(730.0));
+        let previous_scoring = project.types["contract"].scoring.clone();
+
+        let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let mut new_scoring = global_base.types["contract"].scoring.clone();
+        new_scoring.base_score += 0.05;
+        let global_patch = OntologyPatch {
+            base_id: global_base.id.clone(),
+            base_version: global_base.version,
+            base_hash: global_base.content_hash(),
+            rationale: "raise contract production weight".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::UpdateType {
+                id: "contract".to_string(),
+                patch: TypePatch {
+                    scoring: Some(new_scoring.clone()),
+                    ..Default::default()
+                },
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Global, &global_patch, false)
+            .expect("global patch applies");
+
+        let refreshed = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(
+            refreshed.types["contract"].ttl_days,
+            Some(730.0),
+            "the project field override survives"
+        );
+        assert_eq!(
+            refreshed.types["contract"].scoring, new_scoring,
+            "unpatched global fields flow through"
+        );
+        assert_ne!(previous_scoring, new_scoring);
+    });
+}
+
+#[test]
 fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
     use jcode_memory_types::migration::{MigrationStep, OntologyOp, OntologyPatch, TypePatch};
 

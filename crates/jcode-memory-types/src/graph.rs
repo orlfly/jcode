@@ -254,6 +254,16 @@ pub struct GraphMetadata {
     /// optimistic-concurrency checks when applying a patch.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ontology_hash: String,
+    /// Content hash of the parent ontology a project store composes on top of.
+    /// Empty for global stores and stores without layered resolution.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ontology_parent_hash: String,
+    /// Deterministic hash of the project/domain layer stack.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ontology_layer_hash: String,
+    /// Human-readable layer ids that produced the materialized ontology.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ontology_layer_ids: Vec<String>,
     /// Bounded history of previously installed ontologies, newest last.
     /// Enables `memory ontology rollback` without external snapshot files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

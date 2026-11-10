@@ -10,7 +10,7 @@
 use crate::auth;
 use anyhow::{Context, Result};
 use jcode_memory_types::migration::OntologyPatch;
-use jcode_memory_types::{MemoryEntry, Ontology};
+use jcode_memory_types::{MemoryEntry, Ontology, OntologyType};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -1077,6 +1077,21 @@ Be conservative - only say "yes" if the memory would actually be useful for the 
         transcript: &str,
         existing: &[String],
     ) -> Result<Vec<ExtractedMemory>> {
+        self.extract_memories_with_ontology(transcript, existing, None)
+            .await
+    }
+
+    /// Extract using the effective ontology's additional type catalog.
+    ///
+    /// The seven core types keep their detailed static instructions. Domain
+    /// packs and project overlays contribute extra type ids, descriptions and
+    /// parent hints so project-specific concepts are actually extractable.
+    pub async fn extract_memories_with_ontology(
+        &self,
+        transcript: &str,
+        existing: &[String],
+        ontology: Option<&Ontology>,
+    ) -> Result<Vec<ExtractedMemory>> {
         let mut system = String::from(
             r#"You are a memory extraction assistant. Extract important NEW learnings from the conversation that should be remembered for future sessions.
 
@@ -1120,6 +1135,32 @@ Where:
 
 Output ONLY the JSONL lines, no other text. If no NEW memories worth extracting, output nothing."#,
         );
+
+        if let Some(ontology) = ontology {
+            let additional = additional_extraction_types(ontology);
+            if !additional.is_empty() {
+                system.push_str(
+                    "\n\nAdditional effective ontology types (also valid; prefer one of these when it fits):\n",
+                );
+                for type_def in additional {
+                    system.push_str("- ");
+                    system.push_str(&type_def.id);
+                    system.push_str(": ");
+                    system.push_str(&type_def.display_name);
+                    if let Some(description) = &type_def.description {
+                        system.push_str(". ");
+                        system.push_str(&single_line(description, 180));
+                    }
+                    if let Some(parent) = &type_def.parent {
+                        system.push_str(&format!(" (inherits from {parent})"));
+                    }
+                    system.push('\n');
+                }
+                system.push_str(
+                    "When one of these applies, return its exact id in the `type` field. Do not invent ids.",
+                );
+            }
+        }
 
         if !existing.is_empty() {
             system.push_str("\n\nAlready known (do NOT re-extract these or close paraphrases):\n");
@@ -1342,6 +1383,41 @@ impl OpenAiSidecarError {
             Self::Other(err) => err,
         }
     }
+}
+
+fn is_core_extraction_type(id: &str) -> bool {
+    matches!(
+        id,
+        "process_rule"
+            | "contract"
+            | "env_fact"
+            | "correction"
+            | "preference"
+            | "entity"
+            | "observation"
+    )
+}
+
+fn additional_extraction_types(ontology: &Ontology) -> Vec<&OntologyType> {
+    let mut types: Vec<&OntologyType> = ontology
+        .types
+        .values()
+        .filter(|type_def| {
+            type_def.persistent
+                && type_def.present_in_prompt
+                && !is_core_extraction_type(&type_def.id)
+        })
+        .collect();
+    // Domain/project ids are conventionally dotted; keep them ahead of any
+    // unrelated flat additions, then sort for a stable prompt.
+    types.sort_by_key(|type_def| (!type_def.id.contains('.'), type_def.id.clone()));
+    types.truncate(40);
+    types
+}
+
+fn single_line(text: &str, max_bytes: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::util::truncate_str(&collapsed, max_bytes).to_string()
 }
 
 fn parse_ontology_patch_response(response: &str) -> Option<OntologyPatch> {
@@ -3107,5 +3183,40 @@ mod tests {
         )
         .expect("wrapped patch");
         assert_eq!(wrapped.base_version, 3);
+    }
+
+    #[test]
+    fn extraction_catalog_includes_project_types() {
+        let mut ontology = jcode_memory_types::ontology::default_ontology();
+        ontology.types.insert(
+            "acme.flow".to_string(),
+            OntologyType::new("acme.flow", "Invoice flow")
+                .with_parent("contract")
+                .with_description("Invoice\ngeneration and settlement"),
+        );
+        ontology.types.insert(
+            "acme.hidden".to_string(),
+            OntologyType {
+                present_in_prompt: false,
+                ..OntologyType::new("acme.hidden", "Hidden")
+            },
+        );
+
+        let additional = additional_extraction_types(&ontology);
+        assert!(additional.iter().any(|type_def| type_def.id == "acme.flow"));
+        assert!(
+            !additional
+                .iter()
+                .any(|type_def| type_def.id == "acme.hidden"),
+            "prompt-hidden types stay out of extraction"
+        );
+        assert!(
+            !additional.iter().any(|type_def| type_def.id == "contract"),
+            "core types keep their static instructions"
+        );
+        assert_eq!(
+            single_line("Invoice\ngeneration and settlement", 80),
+            "Invoice generation and settlement"
+        );
     }
 }

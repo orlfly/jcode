@@ -10,6 +10,7 @@ pub use instance::{
 };
 
 pub mod ontology;
+pub mod layered;
 pub use ontology::{
     Activity, ActivityStep, ActivityTrigger, Condition, DEFAULT_ONTOLOGY_ID,
     DEFAULT_ONTOLOGY_VERSION, DecayPolicy, EVENT_CONTRADICT, EVENT_DEDUP, EVENT_FINALIZE,

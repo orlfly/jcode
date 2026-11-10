@@ -17,6 +17,9 @@ use crate::sidecar::Sidecar;
 use crate::storage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use jcode_memory_types::layered::{
+    OntologyLayer, compose_ontology_layers, diff_ontology_layer, layer_stack_hash,
+};
 use jcode_memory_types::{GraphBackend, StoreKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -498,6 +501,8 @@ const SKILL_DISTILL_MAX_PROPOSALS: usize = 20;
 const ONTOLOGY_REFLECTION_MIN_EVIDENCE: usize = 5;
 /// At most one automatic reflection proposal per project per day.
 const ONTOLOGY_REFLECTION_INTERVAL_HOURS: i64 = 24;
+/// Repository-owned project ontology overlay, relative to the project root.
+const PROJECT_ONTOLOGY_OVERLAY: &str = ".jcode/memory/ontology.yaml";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OntologyReflectionState {
@@ -509,6 +514,20 @@ fn ontology_reflection_enabled() -> bool {
         Ok(value) => !matches!(value.trim(), "0" | "false" | "off" | "no"),
         Err(_) => true,
     }
+}
+
+fn layer_is_empty(layer: &OntologyLayer) -> bool {
+    layer.types.is_empty()
+        && layer.type_patches.is_empty()
+        && layer.disabled_types.is_empty()
+        && layer.relationships.is_empty()
+        && layer.disabled_relationships.is_empty()
+        && layer.rules.is_empty()
+        && layer.disabled_rules.is_empty()
+        && layer.activities.is_empty()
+        && layer.disabled_activities.is_empty()
+        && layer.category_aliases.is_empty()
+        && layer.disabled_aliases.is_empty()
 }
 
 fn ontology_reflection_dir() -> Result<PathBuf> {
@@ -1360,6 +1379,149 @@ impl MemoryManager {
             Some(stored) => std::sync::Arc::new(stored.clone()),
             None => self.ontology_registry().default_ontology(),
         }
+    }
+
+    fn project_ontology_overlay_path(&self) -> Option<PathBuf> {
+        let dir = self.get_project_dir()?;
+        if dir.is_dir() {
+            return Some(dir.join(PROJECT_ONTOLOGY_OVERLAY));
+        }
+        // Synthetic/test project paths and deleted checkouts have no writable
+        // repository root. Keep the overlay beside the project's memory store.
+        let key = project_store_key(&dir).replace(':', "-");
+        storage::jcode_dir().ok().map(|base| {
+            base.join("memory")
+                .join("projects")
+                .join(format!("{key}.ontology.yaml"))
+        })
+    }
+
+    /// Read the global ontology without counting a retrieval or advancing
+    /// global graph metrics. Composition runs on every project load, so it must
+    /// not look like a user-facing global recall.
+    fn global_ontology_for_composition(
+        &self,
+    ) -> Result<std::sync::Arc<jcode_memory_types::Ontology>> {
+        if crate::memory::active_backend_name() == "sqlite-gvec" {
+            let backend = if self.test_mode {
+                crate::memory::test_backend()
+            } else {
+                crate::memory::graph_backend()
+            };
+            let key = StoreKey::new(crate::memory::global_store_key());
+            if let Ok(graph) = backend.load(&key) {
+                return Ok(self.ontology_for_graph(&graph));
+            }
+            return Ok(self.ontology_registry().default_ontology());
+        }
+        let path = self.global_memory_path()?;
+        if let Some(graph) = cached_graph(&path) {
+            return Ok(self.ontology_for_graph(&graph));
+        }
+        if path.exists()
+            && let Ok(graph) = storage::read_json::<MemoryGraph>(&path)
+            && graph.graph_version == GRAPH_VERSION
+        {
+            cache_graph(path, &graph);
+            return Ok(self.ontology_for_graph(&graph));
+        }
+        Ok(self.ontology_registry().default_ontology())
+    }
+
+    /// Load the repository-owned project overlay.
+    ///
+    /// A cloned repository is untrusted input, so rules and activities are
+    /// deliberately stripped. Only types, aliases and relationship definitions
+    /// can affect the effective ontology.
+    fn load_project_ontology_layer(&self) -> Result<Option<OntologyLayer>> {
+        let Some(path) = self.project_ontology_overlay_path() else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let mut layer: OntologyLayer = serde_yaml::from_str(&raw)
+            .map_err(|err| anyhow::anyhow!("invalid {}: {err}", path.display()))?;
+        layer.rules.clear();
+        layer.activities.clear();
+        layer.disabled_rules.clear();
+        layer.disabled_activities.clear();
+        layer.priority = layer.priority.max(100);
+        Ok(Some(layer))
+    }
+
+    /// Compose the project overlay onto the effective global ontology.
+    ///
+    /// The graph keeps a materialized copy for runtime use. The parent and layer
+    /// hashes make a changed global ontology or overlay invalidate that copy on
+    /// the next load, without treating recomposition as a data migration.
+    fn compose_project_ontology(&self, graph: &mut MemoryGraph) -> Result<()> {
+        let layer = self.load_project_ontology_layer()?;
+        let had_layer = !graph.metadata.ontology_layer_hash.is_empty()
+            || !graph.metadata.ontology_parent_hash.is_empty();
+        if layer.is_none() && !had_layer {
+            // A store that predates overlays keeps its own snapshot.
+            return Ok(());
+        }
+        let parent = self.global_ontology_for_composition()?;
+        let layers: Vec<OntologyLayer> = layer.into_iter().collect();
+        let layer_hash = layer_stack_hash(&layers);
+        let parent_hash = parent.content_hash();
+        if graph.metadata.ontology_parent_hash == parent_hash
+            && graph.metadata.ontology_layer_hash == layer_hash
+            && graph.metadata.ontology.is_some()
+        {
+            return Ok(());
+        }
+        let effective = if layers.is_empty() {
+            (*parent).clone()
+        } else {
+            compose_ontology_layers(&parent, &layers).map_err(|errors| {
+                anyhow::anyhow!(
+                    "project ontology layer rejected:\n- {}",
+                    errors.join("\n- ")
+                )
+            })?
+        };
+        graph.metadata.ontology_id = effective.id.clone();
+        graph.metadata.ontology_version = effective.version;
+        graph.metadata.ontology_hash = effective.content_hash();
+        graph.metadata.ontology_parent_hash = parent_hash;
+        graph.metadata.ontology_layer_hash = layer_hash;
+        graph.metadata.ontology_layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
+        graph.metadata.ontology = Some(effective);
+        Ok(())
+    }
+
+    fn write_project_ontology_layer(&self, layer: &OntologyLayer) -> Result<()> {
+        let Some(path) = self.project_ontology_overlay_path() else {
+            anyhow::bail!("project ontology overlay requires a project directory");
+        };
+        if layer_is_empty(layer) {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let yaml = serde_yaml::to_string(layer)?;
+        let temp = path.with_extension("yaml.tmp");
+        std::fs::write(&temp, yaml)?;
+        if let Err(first) = std::fs::rename(&temp, &path) {
+            // Windows cannot rename over an existing file.
+            let _ = std::fs::remove_file(&path);
+            if let Err(second) = std::fs::rename(&temp, &path) {
+                let _ = std::fs::remove_file(&temp);
+                anyhow::bail!(
+                    "write {} failed: {first}; retry failed: {second}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Store without embedding inference. Exact duplicates reinforce an
@@ -3820,6 +3982,9 @@ impl MemoryManager {
         patch: &jcode_memory_types::OntologyPatch,
         dry_run: bool,
     ) -> Result<jcode_memory_types::OntologyApplyReport> {
+        if scope == OntologyScope::Project {
+            return self.apply_project_ontology_patch(patch, dry_run);
+        }
         use jcode_memory_types::migration::{
             MigrationState, OntologyApplyReport, OntologySnapshot, apply_migrations, apply_patch,
         };
@@ -3879,6 +4044,111 @@ impl MemoryManager {
 
         Ok(OntologyApplyReport {
             store: format!("{}:{}", scope.label(), patch.base_id),
+            old_version: base.version,
+            new_version: next.version,
+            old_hash,
+            new_hash,
+            dry_run,
+            validation_ok,
+            migrations,
+            patch: patch.clone(),
+        })
+    }
+
+    /// Apply a project patch by rewriting the repository overlay.
+    ///
+    /// The effective ontology is the global ontology plus the overlay. Writing
+    /// the diff, rather than a full project snapshot, keeps future global changes
+    /// flowing for every field the project did not override.
+    fn apply_project_ontology_patch(
+        &self,
+        patch: &jcode_memory_types::OntologyPatch,
+        dry_run: bool,
+    ) -> Result<jcode_memory_types::OntologyApplyReport> {
+        use jcode_memory_types::migration::{
+            MigrationState, OntologyApplyReport, OntologySnapshot, apply_migrations, apply_patch,
+        };
+        use jcode_memory_types::migration::OntologyOp;
+
+        if patch.ops.iter().any(|op| {
+            matches!(
+                op,
+                OntologyOp::AddRule { .. }
+                    | OntologyOp::RemoveRule { .. }
+                    | OntologyOp::AddActivity { .. }
+                    | OntologyOp::RemoveActivity { .. }
+            )
+        }) {
+            anyhow::bail!(
+                "project ontology patches cannot change rules or activities; use global scope"
+            );
+        }
+
+        let parent = self.global_ontology_for_composition()?;
+        let overlay = self
+            .load_project_ontology_layer()?
+            .unwrap_or_else(|| OntologyLayer::new("project/overlay", parent.version));
+        let base =
+            compose_ontology_layers(&parent, std::slice::from_ref(&overlay)).map_err(|errors| {
+                anyhow::anyhow!(
+                    "current project ontology layer rejected:\n- {}",
+                    errors.join("\n- ")
+                )
+            })?;
+        let next = match apply_patch(&base, patch) {
+            Ok(next) => next,
+            Err(errors) => {
+                anyhow::bail!("ontology patch rejected:\n- {}", errors.join("\n- "));
+            }
+        };
+        let next_overlay = diff_ontology_layer(&parent, &next);
+        let old_hash = base.content_hash();
+        let new_hash = next.content_hash();
+        let validation_ok = jcode_memory_types::migration::validate_ontology(&next).is_empty();
+        let parent_hash = parent.content_hash();
+        let layer_hash = layer_stack_hash(std::slice::from_ref(&next_overlay));
+
+        let mut graph = self.load_project_graph_inner()?;
+        let migrations = if dry_run {
+            let mut probe = graph.clone();
+            apply_migrations(&mut probe, &patch.migrations, &next)
+        } else {
+            self.write_project_ontology_layer(&next_overlay)?;
+            graph
+                .metadata
+                .ontology_history
+                .push(OntologySnapshot::new(base.clone(), patch.rationale.clone()));
+            const MAX_HISTORY: usize = 10;
+            if graph.metadata.ontology_history.len() > MAX_HISTORY {
+                let drain = graph.metadata.ontology_history.len() - MAX_HISTORY;
+                graph.metadata.ontology_history.drain(..drain);
+            }
+            graph.metadata.migration_state = Some(MigrationState {
+                from_version: base.version,
+                to_version: next.version,
+                started_at: chrono::Utc::now(),
+                completed_steps: 0,
+                total_steps: patch.migrations.len(),
+            });
+            let report = apply_migrations(&mut graph, &patch.migrations, &next);
+            graph.metadata.migration_state = None;
+            graph.metadata.applied_migrations.push(format!(
+                "{}:{}->{}",
+                patch.base_id, base.version, next.version
+            ));
+            graph.metadata.ontology_id = next.id.clone();
+            graph.metadata.ontology_version = next.version;
+            graph.metadata.ontology_hash = new_hash.clone();
+            graph.metadata.ontology_parent_hash = parent_hash;
+            graph.metadata.ontology_layer_hash = layer_hash;
+            graph.metadata.ontology_layer_ids = vec![next_overlay.id.clone()];
+            graph.metadata.ontology = Some(next.clone());
+            self.save_project_graph(&graph)?;
+            report
+        };
+
+        Ok(OntologyApplyReport {
+            store: format!("{}:{}", OntologyScope::Project.label(), patch.base_id),
             old_version: base.version,
             new_version: next.version,
             old_hash,
@@ -3983,6 +4253,9 @@ impl MemoryManager {
         scope: OntologyScope,
         version: u32,
     ) -> Result<jcode_memory_types::OntologySnapshot> {
+        if scope == OntologyScope::Project {
+            return self.rollback_project_ontology(version);
+        }
         use jcode_memory_types::OntologySnapshot;
 
         let mut graph = self.load_scope_graph(scope)?;
@@ -4025,6 +4298,64 @@ impl MemoryManager {
         if scope == OntologyScope::Global {
             self.ontology_registry().install(restored);
         }
+        Ok(snapshot)
+    }
+
+    fn rollback_project_ontology(
+        &self,
+        version: u32,
+    ) -> Result<jcode_memory_types::OntologySnapshot> {
+        use jcode_memory_types::OntologySnapshot;
+
+        let mut graph = self.load_project_graph_inner()?;
+        let snapshot = graph
+            .metadata
+            .ontology_history
+            .iter()
+            .rev()
+            .find(|snapshot| snapshot.version == version)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no ontology version {version} in project history; available: {:?}",
+                    graph
+                        .metadata
+                        .ontology_history
+                        .iter()
+                        .map(|snapshot| snapshot.version)
+                        .collect::<Vec<_>>()
+                )
+            })?;
+
+        let parent = self.global_ontology_for_composition()?;
+        let overlay = diff_ontology_layer(&parent, &snapshot.ontology);
+        self.write_project_ontology_layer(&overlay)?;
+        let restored =
+            compose_ontology_layers(&parent, std::slice::from_ref(&overlay)).map_err(|errors| {
+                anyhow::anyhow!(
+                    "rolled-back project ontology rejected:\n- {}",
+                    errors.join("\n- ")
+                )
+            })?;
+
+        if let Some(current) = graph.metadata.ontology.clone() {
+            graph.metadata.ontology_history.push(OntologySnapshot::new(
+                current,
+                format!("before rollback to v{version}"),
+            ));
+        }
+        graph
+            .metadata
+            .ontology_history
+            .retain(|entry| entry.version != version);
+        graph.metadata.ontology_id = restored.id.clone();
+        graph.metadata.ontology_version = restored.version;
+        graph.metadata.ontology_hash = restored.content_hash();
+        graph.metadata.ontology_parent_hash = parent.content_hash();
+        graph.metadata.ontology_layer_hash = layer_stack_hash(std::slice::from_ref(&overlay));
+        graph.metadata.ontology_layer_ids = vec![overlay.id.clone()];
+        graph.metadata.ontology = Some(restored);
+        self.save_project_graph(&graph)?;
         Ok(snapshot)
     }
 
@@ -4094,16 +4425,13 @@ impl MemoryManager {
             crate::logging::info("Memory transcript extraction skipped: source health is paused");
             return Ok(Vec::new());
         }
-        let extracted = sidecar.extract_memories(transcript).await?;
-
-        let mut ids = Vec::new();
-        let candidates = extracted.len();
-        let candidate_categories: Vec<MemoryCategory> = extracted
-            .iter()
-            .map(|memory| memory.category.parse().unwrap_or(MemoryCategory::Fact))
-            .collect();
-        let existing_counts = self
-            .load_project_graph()
+        // The effective project ontology supplies the extra type catalog for
+        // the extractor. A load failure must not block extraction; fall back to
+        // the static core type list in that case.
+        let graph = self.load_project_graph().ok();
+        let ontology = graph.as_ref().map(|graph| self.ontology_for_graph(graph));
+        let existing_counts = graph
+            .as_ref()
             .map(|graph| {
                 let mut counts = std::collections::HashMap::new();
                 for entry in graph.active_memories() {
@@ -4112,6 +4440,16 @@ impl MemoryManager {
                 counts
             })
             .unwrap_or_default();
+        let extracted = sidecar
+            .extract_memories_with_ontology(transcript, &[], ontology.as_deref())
+            .await?;
+
+        let mut ids = Vec::new();
+        let candidates = extracted.len();
+        let candidate_categories: Vec<MemoryCategory> = extracted
+            .iter()
+            .map(|memory| memory.category.parse().unwrap_or(MemoryCategory::Fact))
+            .collect();
         let batch_gated_categories =
             batch_change_categories(&candidate_categories, &existing_counts);
         let mut unique_contents = std::collections::HashSet::new();
@@ -4581,7 +4919,19 @@ impl MemoryManager {
     }
 
     /// Load project memories as a MemoryGraph without generating embeddings.
+    ///
+    /// Applies the repository-owned ontology overlay before returning. A broken
+    /// overlay is logged and ignored so memory access never depends on a
+    /// project file being well formed.
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
+        let mut graph = self.load_project_graph_inner()?;
+        if let Err(err) = self.compose_project_ontology(&mut graph) {
+            crate::logging::warn(&format!("Project ontology overlay ignored: {err}"));
+        }
+        Ok(graph)
+    }
+
+    fn load_project_graph_inner(&self) -> Result<MemoryGraph> {
         // When the sqlite-gvec backend is active, route everything
         // through the trait. The legacy JSON path is preserved below
         // for users on the default backend or when the trait open
