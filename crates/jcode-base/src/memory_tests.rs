@@ -3352,6 +3352,11 @@ fn project_overlay_inherits_global_and_stays_local() {
         assert!(project.types.contains_key("acme.flow"));
         assert!(project.types.contains_key("contract"));
         let global = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let (layers, parent_hash) = manager
+            .ontology_layer_status(OntologyScope::Project)
+            .unwrap();
+        assert_eq!(layers, vec!["project/repo".to_string()]);
+        assert_eq!(parent_hash, global.content_hash());
         assert!(
             !global.types.contains_key("acme.flow"),
             "project concepts must not leak into the global store"
@@ -3376,6 +3381,10 @@ fn project_overlay_inherits_global_and_stays_local() {
 
         fs::remove_file(&overlay_path).unwrap();
         let after = manager.stored_ontology(OntologyScope::Project).unwrap();
+        let (layers, _) = manager
+            .ontology_layer_status(OntologyScope::Project)
+            .unwrap();
+        assert!(layers.is_empty());
         assert!(
             !after.types.contains_key("acme.flow"),
             "deleting the overlay must not leave a stale materialized type"
