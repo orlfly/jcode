@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::MemoryCategory;
 use crate::instance::{ExtractionMethod, MemoryStatus};
+use crate::memory_class;
 
 // ---------------------------------------------------------------------------
 // Type constants.  These are the canonical identifiers used by the default
@@ -49,7 +50,12 @@ use crate::instance::{ExtractionMethod, MemoryStatus};
 /// baselines, lower `preference` baseline, a stricter write-time `relate`
 /// threshold, provenance-preserving remember, mutually exclusive skill
 /// outcome tags, and aliases for legacy category spellings.
-pub const DEFAULT_ONTOLOGY_VERSION: u32 = 3;
+///
+/// v4 moves the memory-management classes out of the ontology payload and
+/// into [`crate::memory_class`]. The persisted ontology now carries only
+/// runtime-summarized business concepts. A v3 ontology is normalized on read:
+/// its core classes and core aliases are stripped and its version is bumped.
+pub const DEFAULT_ONTOLOGY_VERSION: u32 = 4;
 pub const DEFAULT_ONTOLOGY_ID: &str = "jcode/default/v1";
 
 // ---------------------------------------------------------------------------
@@ -240,6 +246,7 @@ pub const EVENT_ACTION_OUTCOME: &str = "event.action_outcome";
 /// A complete ontology definition.  An `Ontology` is a value object: it can
 /// be loaded from JSON, mutated in-memory, and serialized back out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "OntologyWire")]
 pub struct Ontology {
     pub id: String,
     pub version: u32,
@@ -257,6 +264,45 @@ pub struct Ontology {
     /// runtime consults the ontology for behavior.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub category_aliases: HashMap<String, String>,
+}
+
+/// Deserialization mirror used to normalize older persisted ontologies.
+///
+/// Keeping this separate from [`Ontology`] lets `serde` apply the same
+/// normalization on every read path (graph metadata, registry snapshots,
+/// project overlays) without relying on a store-specific migration step.
+#[derive(Deserialize)]
+struct OntologyWire {
+    id: String,
+    version: u32,
+    description: String,
+    #[serde(default)]
+    types: BTreeMap<String, OntologyType>,
+    #[serde(default)]
+    relationships: BTreeMap<String, RelationshipDef>,
+    #[serde(default)]
+    rules: Vec<Rule>,
+    #[serde(default)]
+    activities: Vec<Activity>,
+    #[serde(default)]
+    category_aliases: HashMap<String, String>,
+}
+
+impl From<OntologyWire> for Ontology {
+    fn from(wire: OntologyWire) -> Self {
+        let mut ontology = Ontology {
+            id: wire.id,
+            version: wire.version,
+            description: wire.description,
+            types: wire.types,
+            relationships: wire.relationships,
+            rules: wire.rules,
+            activities: wire.activities,
+            category_aliases: wire.category_aliases,
+        };
+        memory_class::strip_core_types(&mut ontology);
+        ontology
+    }
 }
 
 impl Ontology {
@@ -277,6 +323,27 @@ impl Ontology {
     /// legacy `MemoryCategory` name.
     pub fn with_type(mut self, type_def: OntologyType) -> Self {
         let type_id = type_def.id.clone();
+        // Core memory classes are code-defined and cannot be replaced by
+        // ontology data.
+        if memory_class::is_core_memory_class(&type_id) || memory_class::is_core_category(&type_id)
+        {
+            debug_assert!(
+                false,
+                "attempted to insert code-defined memory class '{type_id}' into an ontology"
+            );
+            return self;
+        }
+        if type_def
+            .legacy_category
+            .as_deref()
+            .is_some_and(memory_class::is_core_category)
+        {
+            debug_assert!(
+                false,
+                "attempted to claim a code-defined category in an ontology"
+            );
+            return self;
+        }
         if let Some(alias) = type_def.legacy_category.clone() {
             self.category_aliases.insert(alias, type_id.clone());
         }
@@ -301,11 +368,31 @@ impl Ontology {
 
     /// Look up a type by id.
     pub fn get_type(&self, id: &str) -> Option<&OntologyType> {
-        self.types.get(id)
+        // Code-defined memory classes take precedence over any stale copy
+        // that may still exist in a legacy persisted ontology.
+        memory_class::core_memory_class(id).or_else(|| self.types.get(id))
+    }
+
+    /// Iterate every type the runtime can resolve: code-defined memory classes
+    /// first, then persisted business concepts.
+    pub fn all_types(&self) -> impl Iterator<Item = &OntologyType> {
+        memory_class::core_memory_classes()
+            .values()
+            .chain(self.business_types())
+    }
+
+    /// Iterate persisted business concepts only.
+    pub fn business_types(&self) -> impl Iterator<Item = &OntologyType> {
+        self.types
+            .values()
+            .filter(|type_def| !memory_class::is_core_memory_class(&type_def.id))
     }
 
     /// Translate a legacy `MemoryCategory` into the canonical ontology type id.
     pub fn type_from_category(&self, category: &MemoryCategory) -> Option<&str> {
+        if let Some(type_def) = memory_class::core_class_for_category(category) {
+            return Some(type_def.id.as_str());
+        }
         let key = category.to_string();
         if let Some(s) = self.category_aliases.get(&key) {
             return Some(s.as_str());
@@ -1108,154 +1195,15 @@ pub fn default_ontology() -> Ontology {
     let mut onto = Ontology::new(
         DEFAULT_ONTOLOGY_ID,
         DEFAULT_ONTOLOGY_VERSION,
-        "Default memory ontology for jcode: environment facts, contracts, process rules, observations, preferences, entities and corrections. Goals and skills are external artifacts linked with `goal:` / `skill:` ids.",
+        "Default ontology for runtime-summarized business concepts. Memory-management classes (env_fact, contract, process_rule, observation, preference, entity, correction) are code-defined; goals and skills are external artifacts linked with `goal:` / `skill:` ids.",
     );
 
     // ---- Types -----------------------------------------------------------
     //
-    // Authority ordering (v2): correction > process_rule > contract >
-    // observation > env_fact. `env_fact` and `observation` carry hard TTLs so
-    // the store converges instead of growing monotonically.
-    let env_fact = OntologyType::new(TYPE_ENV_FACT, "Environment Fact")
-        .with_legacy_category("env_fact")
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_extraction_method(ExtractionMethod::RuleExtraction)
-        .with_scoring(ScoringPolicy {
-            base_score: 8.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 7.0,
-            access_boost: true,
-        })
-        .with_ttl_days(14.0);
-
-    let contract = OntologyType::new(TYPE_CONTRACT, "Contract")
-        .with_legacy_category("contract")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_scoring(ScoringPolicy {
-            base_score: 40.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 180.0,
-            access_boost: true,
-        });
-
-    let process_rule = OntologyType::new(TYPE_PROCESS_RULE, "Process Rule")
-        .with_legacy_category("process_rule")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_extraction_method(ExtractionMethod::RuleInference)
-        .with_scoring(ScoringPolicy {
-            base_score: 45.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 365.0,
-            access_boost: true,
-        });
-
-    let observation = OntologyType::new(TYPE_OBSERVATION, "Observation")
-        .with_legacy_category("observation")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_extraction_method(ExtractionMethod::RuleExtraction)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_extraction_method(ExtractionMethod::RuleInference)
-        .with_scoring(ScoringPolicy {
-            base_score: 20.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 45.0,
-            access_boost: true,
-        })
-        .with_ttl_days(90.0);
-
-    let preference = OntologyType::new(TYPE_PREFERENCE, "Preference")
-        .with_legacy_category("preference")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_scoring(ScoringPolicy {
-            base_score: 20.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 90.0,
-            access_boost: true,
-        });
-
-    let entity = OntologyType::new(TYPE_ENTITY, "Entity")
-        .with_legacy_category("entity")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::StructuredMapping)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_scoring(ScoringPolicy {
-            base_score: 35.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 180.0,
-            access_boost: true,
-        });
-
-    let correction = OntologyType::new(TYPE_CORRECTION, "Correction")
-        .with_legacy_category("correction")
-        .with_extraction_method(ExtractionMethod::UserStated)
-        .with_extraction_method(ExtractionMethod::LlmExtraction)
-        .with_scoring(ScoringPolicy {
-            base_score: 50.0,
-            ..Default::default()
-        })
-        .with_decay(DecayPolicy {
-            half_life_days: 365.0,
-            access_boost: true,
-        });
-
-    onto = onto
-        .with_type(env_fact)
-        .with_type(contract)
-        .with_type(process_rule)
-        .with_type(observation)
-        .with_type(preference)
-        .with_type(entity)
-        .with_type(correction);
-
-    // Legacy `MemoryCategory` names -> v2 type ids. Old graphs and any
-    // not-yet-migrated producer keep working: the overloaded `fact` bucket
-    // lands in `observation` (the residual type), `Skills` lands in
-    // `process_rule` (a skill is a distilled procedure), and `note` also lands
-    // in `observation`. `goal:` / `skill:` ids are link nodes, not types.
-    onto.category_aliases.insert("fact".to_string(), TYPE_OBSERVATION.to_string());
-    onto.category_aliases
-        .insert("note".to_string(), TYPE_OBSERVATION.to_string());
-    onto.category_aliases
-        .insert("Skills".to_string(), TYPE_PROCESS_RULE.to_string());
-    onto.category_aliases
-        .insert("skill".to_string(), TYPE_PROCESS_RULE.to_string());
-    for type_id in [
-        TYPE_ENV_FACT,
-        TYPE_CONTRACT,
-        TYPE_PROCESS_RULE,
-        TYPE_OBSERVATION,
-        TYPE_PREFERENCE,
-        TYPE_ENTITY,
-        TYPE_CORRECTION,
-    ] {
-        onto.category_aliases
-            .insert(type_id.to_string(), type_id.to_string());
-    }
-    // Spellings emitted by older extractors and the `MemoryCategory` serde
-    // representation. Keep them as aliases rather than renaming stored rows.
-    onto.category_aliases
-        .insert("medium".to_string(), TYPE_OBSERVATION.to_string());
-    onto.category_aliases
-        .insert("envfact".to_string(), TYPE_ENV_FACT.to_string());
-    onto.category_aliases
-        .insert("processrule".to_string(), TYPE_PROCESS_RULE.to_string());
+    // The memory-management classes (env_fact, contract, process_rule,
+    // observation, preference, entity, correction) are defined in code by
+    // `memory_class::core_memory_classes()`. The persisted ontology carries
+    // only runtime-summarized business concepts in `types`.
 
     // ---- Relationships ---------------------------------------------------
     let has_tag = RelationshipDef {
@@ -1556,7 +1504,7 @@ pub fn validate_default_ontology() -> Result<(), Vec<String>> {
         }
     }
 
-    for type_def in onto.types.values() {
+    for type_def in onto.all_types() {
         if type_def.lifecycle.initial_state != MemoryStatus::Active
             && !type_def
                 .lifecycle
@@ -1582,7 +1530,9 @@ mod tests {
         let onto = default_ontology();
         assert_eq!(onto.id, DEFAULT_ONTOLOGY_ID);
         assert_eq!(onto.version, DEFAULT_ONTOLOGY_VERSION);
-        assert_eq!(onto.version, 3);
+        assert_eq!(onto.version, 4);
+        // Core memory classes are code-defined, not persisted ontology data.
+        assert!(onto.types.is_empty());
         for type_id in [
             TYPE_ENV_FACT,
             TYPE_CONTRACT,
@@ -1592,8 +1542,13 @@ mod tests {
             TYPE_ENTITY,
             TYPE_CORRECTION,
         ] {
-            assert!(onto.types.contains_key(type_id), "missing type {type_id}");
+            assert!(onto.get_type(type_id).is_some(), "missing type {type_id}");
+            assert!(
+                crate::memory_class::core_memory_class(type_id).is_some(),
+                "{type_id} must be code-defined"
+            );
         }
+        assert_eq!(onto.all_types().count(), 7);
         assert!(onto.relationships.contains_key(REL_HAS_TAG));
         assert!(onto.relationships.contains_key(REL_RELATES_TO));
         assert!(onto.relationships.contains_key(REL_SUPERSEDES));
@@ -1604,22 +1559,61 @@ mod tests {
         // v2 rule: every declared type must carry a TTL or an explicit
         // retention justification, and the TTL-bearing types are the two
         // perishable ones.
-        assert_eq!(onto.types[TYPE_ENV_FACT].ttl_days, Some(14.0));
-        assert_eq!(onto.types[TYPE_OBSERVATION].ttl_days, Some(90.0));
-        assert_eq!(onto.types[TYPE_CONTRACT].ttl_days, None);
-        assert_eq!(onto.types[TYPE_PROCESS_RULE].ttl_days, None);
+        assert_eq!(onto.get_type(TYPE_ENV_FACT).unwrap().ttl_days, Some(14.0));
+        assert_eq!(
+            onto.get_type(TYPE_OBSERVATION).unwrap().ttl_days,
+            Some(90.0)
+        );
+        assert_eq!(onto.get_type(TYPE_CONTRACT).unwrap().ttl_days, None);
+        assert_eq!(onto.get_type(TYPE_PROCESS_RULE).unwrap().ttl_days, None);
         // Types with no producer/consumer were removed in v2.
         for removed in ["note", "skill", "goal", "fact"] {
-            assert!(!onto.types.contains_key(removed), "{removed} must not be a type");
+            assert!(
+                !onto.types.contains_key(removed),
+                "{removed} must not be a type"
+            );
         }
     }
 
     #[test]
-    fn default_ontology_v3_hash_is_canonical() {
-        // The compiled default must match the ontology that runtime v3 patches
-        // produced in existing stores. Changing declared semantics requires a
-        // version bump and an update to this hash.
-        assert_eq!(default_ontology().content_hash(), "97e4e5ba401d8927");
+    fn default_ontology_v4_hash_is_canonical() {
+        // The compiled default must match restored store snapshots. Changing
+        // declared semantics requires a version bump and an update to this hash.
+        assert_eq!(default_ontology().content_hash(), "9d3c2d392f197df7");
+    }
+
+    #[test]
+    fn legacy_core_types_are_stripped_on_deserialize() {
+        let mut legacy = default_ontology();
+        legacy.version = 3;
+        legacy.types.insert(
+            TYPE_ENV_FACT.to_string(),
+            OntologyType::new(TYPE_ENV_FACT, "Legacy env fact").with_ttl_days(99.0),
+        );
+        legacy.types.insert(
+            "fact".to_string(),
+            OntologyType::new("fact", "Legacy fact").with_legacy_category("fact"),
+        );
+        legacy
+            .category_aliases
+            .insert("fact".to_string(), TYPE_ENV_FACT.to_string());
+
+        let encoded = serde_json::to_vec(&legacy).expect("serialize legacy ontology");
+        let restored: Ontology = serde_json::from_slice(&encoded).expect("deserialize");
+
+        assert!(
+            restored.types.is_empty(),
+            "core types are not ontology data"
+        );
+        assert!(
+            restored.category_aliases.is_empty(),
+            "core category aliases live in code"
+        );
+        assert_eq!(restored.version, DEFAULT_ONTOLOGY_VERSION);
+        assert_eq!(
+            restored.get_type(TYPE_ENV_FACT).unwrap().ttl_days,
+            Some(14.0)
+        );
     }
 
     #[test]
@@ -1665,7 +1659,10 @@ mod tests {
         let onto = default_ontology();
         // The overloaded v1 `fact` bucket migrates to the residual type,
         // and `Skills` maps to the durable procedure type.
-        assert_eq!(onto.type_from_category(&MemoryCategory::Fact), Some(TYPE_OBSERVATION));
+        assert_eq!(
+            onto.type_from_category(&MemoryCategory::Fact),
+            Some(TYPE_OBSERVATION)
+        );
         assert_eq!(
             onto.type_from_category(&MemoryCategory::Custom("Skills".to_string())),
             Some(TYPE_PROCESS_RULE)
@@ -1674,7 +1671,10 @@ mod tests {
             onto.type_from_category(&MemoryCategory::Custom("env_fact".to_string())),
             Some(TYPE_ENV_FACT)
         );
-        assert_eq!(onto.type_from_category(&MemoryCategory::Correction), Some(TYPE_CORRECTION));
+        assert_eq!(
+            onto.type_from_category(&MemoryCategory::Correction),
+            Some(TYPE_CORRECTION)
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ types:
     parent: process_rule
     description: Operational steps for an incident, migration or recovery.
 type_patches:
-  contract:
+  cloud.service:
     ttl_days: 365
 ```
 
@@ -100,16 +100,15 @@ types:
     display_name: Settlement job
     parent: process_rule
 type_patches:
-  contract:
+  acme.billing.invoice_flow:
     ttl_days: 730
-  env_fact:
+  acme.billing.settlement_job:
     present_in_prompt: false
-disabled_types:
-  - observation
 ```
 
 The overlay is committed with the project, so changes are reviewed like code and
-can be reverted with git. It never contains global concepts.
+can be reverted with git. It never contains global concepts. Core memory
+classes are code-defined and cannot be patched, disabled or redefined here.
 
 ## 3. Effective ontology and scope resolution
 

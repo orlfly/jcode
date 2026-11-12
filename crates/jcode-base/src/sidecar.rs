@@ -1195,7 +1195,9 @@ Output ONLY the JSONL lines, no other text. If no NEW memories worth extracting,
         transcript: &str,
     ) -> Result<Option<OntologyPatch>> {
         let mut types = String::new();
-        for type_def in ontology.types.values() {
+        // Only persisted business concepts are patchable. Core memory
+        // classes live in code and are rejected by the patch validator.
+        for type_def in ontology.business_types() {
             types.push_str(&format!(
                 "- {} ({:?}): ttl={:?}, half_life={}, base_score={}, prompt={}, extraction={:?}\n",
                 type_def.id,
@@ -1207,6 +1209,13 @@ Output ONLY the JSONL lines, no other text. If no NEW memories worth extracting,
                 type_def.extraction_methods
             ));
         }
+        if types.is_empty() {
+            types.push_str("(no persisted business types yet)\n");
+        }
+        types.push_str(
+            "Core memory-management classes are code-defined and cannot be patched: \
+             env_fact, contract, process_rule, observation, preference, entity, correction.\n",
+        );
         let mut evidence_text = String::new();
         for entry in evidence.iter().take(40) {
             let provenance = entry.effective_provenance();
@@ -1389,28 +1398,10 @@ impl OpenAiSidecarError {
     }
 }
 
-fn is_core_extraction_type(id: &str) -> bool {
-    matches!(
-        id,
-        "process_rule"
-            | "contract"
-            | "env_fact"
-            | "correction"
-            | "preference"
-            | "entity"
-            | "observation"
-    )
-}
-
 fn additional_extraction_types(ontology: &Ontology) -> Vec<&OntologyType> {
     let mut types: Vec<&OntologyType> = ontology
-        .types
-        .values()
-        .filter(|type_def| {
-            type_def.persistent
-                && type_def.present_in_prompt
-                && !is_core_extraction_type(&type_def.id)
-        })
+        .business_types()
+        .filter(|type_def| type_def.persistent && type_def.present_in_prompt)
         .collect();
     // Domain/project ids are conventionally dotted; keep them ahead of any
     // unrelated flat additions, then sort for a stable prompt.

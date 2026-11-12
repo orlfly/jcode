@@ -123,6 +123,13 @@ pub fn compose_ontology_layers(
 
 fn apply_layer(ontology: &mut Ontology, layer: &OntologyLayer, errors: &mut Vec<String>) {
     for id in &layer.disabled_types {
+        if crate::memory_class::is_core_memory_class(id) {
+            errors.push(format!(
+                "layer '{}' cannot disable code-defined memory class '{id}'",
+                layer.id
+            ));
+            continue;
+        }
         if layer.types.contains_key(id) || layer.type_patches.contains_key(id) {
             errors.push(format!(
                 "layer '{}' both defines and disables type '{id}'",
@@ -135,6 +142,22 @@ fn apply_layer(ontology: &mut Ontology, layer: &OntologyLayer, errors: &mut Vec<
     }
 
     for (id, type_def) in &layer.types {
+        if crate::memory_class::is_core_memory_class(id) {
+            errors.push(format!(
+                "layer '{}' cannot define code-defined memory class '{id}'",
+                layer.id
+            ));
+            continue;
+        }
+        if let Some(legacy) = &type_def.legacy_category
+            && crate::memory_class::is_core_category(legacy)
+        {
+            errors.push(format!(
+                "layer '{}' type '{id}' cannot claim code-defined category '{legacy}'",
+                layer.id
+            ));
+            continue;
+        }
         let mut type_def = type_def.clone();
         if type_def.id.is_empty() {
             type_def.id = id.clone();
@@ -155,6 +178,22 @@ fn apply_layer(ontology: &mut Ontology, layer: &OntologyLayer, errors: &mut Vec<
     }
 
     for (id, patch) in &layer.type_patches {
+        if crate::memory_class::is_core_memory_class(id) {
+            errors.push(format!(
+                "layer '{}' cannot patch code-defined memory class '{id}'",
+                layer.id
+            ));
+            continue;
+        }
+        if let Some(legacy) = &patch.legacy_category
+            && crate::memory_class::is_core_category(legacy)
+        {
+            errors.push(format!(
+                "layer '{}' type '{id}' cannot claim code-defined category '{legacy}'",
+                layer.id
+            ));
+            continue;
+        }
         let Some(type_def) = ontology.types.get_mut(id) else {
             errors.push(format!("layer '{}' patches missing type '{id}'", layer.id));
             continue;
@@ -190,9 +229,30 @@ fn apply_layer(ontology: &mut Ontology, layer: &OntologyLayer, errors: &mut Vec<
     }
 
     for alias in &layer.disabled_aliases {
+        if crate::memory_class::is_core_category(alias) {
+            errors.push(format!(
+                "layer '{}' cannot remove code-defined category alias '{alias}'",
+                layer.id
+            ));
+            continue;
+        }
         ontology.category_aliases.remove(alias);
     }
     for (alias, target) in &layer.category_aliases {
+        if crate::memory_class::is_core_category(alias) {
+            errors.push(format!(
+                "layer '{}' cannot remap code-defined category '{alias}'",
+                layer.id
+            ));
+            continue;
+        }
+        if crate::memory_class::is_core_memory_class(target) {
+            errors.push(format!(
+                "layer '{}' alias '{alias}' cannot target code-defined memory class '{target}'",
+                layer.id
+            ));
+            continue;
+        }
         ontology
             .category_aliases
             .insert(alias.clone(), target.clone());
@@ -243,7 +303,8 @@ pub fn diff_ontology_layer(base: &Ontology, next: &Ontology) -> OntologyLayer {
     let mut layer = OntologyLayer::new("project/overlay", next.version);
     layer.priority = 100;
 
-    for (id, type_def) in &next.types {
+    for type_def in next.business_types() {
+        let id = &type_def.id;
         match base.types.get(id) {
             None => {
                 layer.types.insert(id.clone(), type_def.clone());
@@ -258,7 +319,7 @@ pub fn diff_ontology_layer(base: &Ontology, next: &Ontology) -> OntologyLayer {
             Some(_) => {}
         }
     }
-    for id in base.types.keys() {
+    for id in base.business_types().map(|type_def| &type_def.id) {
         if !next.types.contains_key(id) {
             layer.disabled_types.push(id.clone());
         }
@@ -285,11 +346,19 @@ pub fn diff_ontology_layer(base: &Ontology, next: &Ontology) -> OntologyLayer {
     diff_activities(&base.activities, &next.activities, &mut layer);
 
     for (alias, target) in &next.category_aliases {
+        if crate::memory_class::is_core_category(alias)
+            || crate::memory_class::is_core_memory_class(target)
+        {
+            continue;
+        }
         if base.category_aliases.get(alias) != Some(target) {
             layer.category_aliases.insert(alias.clone(), target.clone());
         }
     }
     for alias in base.category_aliases.keys() {
+        if crate::memory_class::is_core_category(alias) {
+            continue;
+        }
         if !next.category_aliases.contains_key(alias) {
             layer.disabled_aliases.push(alias.clone());
         }
@@ -452,8 +521,20 @@ mod tests {
     use super::*;
     use crate::ontology::{TYPE_CONTRACT, TYPE_ENV_FACT, default_ontology};
 
+    fn base_with_business_type(id: &str, ttl_days: f32) -> Ontology {
+        let mut base = default_ontology();
+        base.types.insert(
+            id.to_string(),
+            OntologyType::new(id, "Business concept")
+                .with_parent(TYPE_CONTRACT)
+                .with_ttl_days(ttl_days),
+        );
+        base.category_aliases.insert(id.to_string(), id.to_string());
+        base
+    }
+
     #[test]
-    fn project_layer_adds_namespaced_type_and_patches_core_field() {
+    fn project_layer_adds_namespaced_type_and_patches_it() {
         let base = default_ontology();
         let mut layer = OntologyLayer::new("project/acme", 4).with_priority(100);
         layer.types.insert(
@@ -463,7 +544,7 @@ mod tests {
                 .with_description("Invoice generation and settlement procedure"),
         );
         layer.type_patches.insert(
-            TYPE_ENV_FACT.to_string(),
+            "acme.billing.invoice_flow".to_string(),
             TypePatch {
                 ttl_days: Some(45.0),
                 ..Default::default()
@@ -478,31 +559,65 @@ mod tests {
                 .as_deref(),
             Some(TYPE_CONTRACT)
         );
-        assert_eq!(effective.types[TYPE_ENV_FACT].ttl_days, Some(45.0));
-        // Unpatched core fields survive.
         assert_eq!(
-            effective.types[TYPE_ENV_FACT].scoring,
-            base.types[TYPE_ENV_FACT].scoring
+            effective.types["acme.billing.invoice_flow"].ttl_days,
+            Some(45.0)
+        );
+        // Core memory classes are resolved from code and are unaffected by
+        // business-type patches.
+        assert_eq!(
+            effective.get_type(TYPE_ENV_FACT).unwrap().scoring,
+            crate::memory_class::core_memory_class(TYPE_ENV_FACT)
+                .unwrap()
+                .scoring
         );
     }
 
     #[test]
-    fn composition_is_idempotent_and_disable_removes_type() {
+    fn core_memory_classes_cannot_be_changed_by_layers() {
         let base = default_ontology();
+        let mut patch_core = OntologyLayer::new("project/acme", 1);
+        patch_core.type_patches.insert(
+            TYPE_ENV_FACT.to_string(),
+            TypePatch {
+                ttl_days: Some(45.0),
+                ..Default::default()
+            },
+        );
+        let errors = compose_ontology_layers(&base, &[patch_core]).expect_err("must reject");
+        assert!(errors.iter().any(|error| error.contains("code-defined")));
+
+        let mut disable_core = OntologyLayer::new("project/acme", 1);
+        disable_core.disabled_types.push(TYPE_CONTRACT.to_string());
+        let errors = compose_ontology_layers(&base, &[disable_core]).expect_err("must reject");
+        assert!(errors.iter().any(|error| error.contains("code-defined")));
+
+        let mut define_core = OntologyLayer::new("project/acme", 1);
+        define_core.types.insert(
+            TYPE_CONTRACT.to_string(),
+            OntologyType::new(TYPE_CONTRACT, "Fake contract"),
+        );
+        let errors = compose_ontology_layers(&base, &[define_core]).expect_err("must reject");
+        assert!(errors.iter().any(|error| error.contains("code-defined")));
+    }
+
+    #[test]
+    fn composition_is_idempotent_and_disable_removes_type() {
+        let base = base_with_business_type("acme.flow", 14.0);
         let mut layer = OntologyLayer::new("project/acme", 1);
-        layer.disabled_types.push(TYPE_ENV_FACT.to_string());
+        layer.disabled_types.push("acme.flow".to_string());
         let once = compose_ontology_layers(&base, std::slice::from_ref(&layer)).expect("compose");
-        assert!(!once.types.contains_key(TYPE_ENV_FACT));
+        assert!(!once.types.contains_key("acme.flow"));
         let twice = compose_ontology_layers(&once, &[layer]).expect("recompose");
         assert_eq!(once.content_hash(), twice.content_hash());
     }
 
     #[test]
     fn later_priority_wins_on_conflicting_patch() {
-        let base = default_ontology();
+        let base = base_with_business_type("acme.flow", 14.0);
         let mut low = OntologyLayer::new("pack/low", 1).with_priority(10);
         low.type_patches.insert(
-            TYPE_ENV_FACT.to_string(),
+            "acme.flow".to_string(),
             TypePatch {
                 ttl_days: Some(30.0),
                 ..Default::default()
@@ -510,7 +625,7 @@ mod tests {
         );
         let mut high = OntologyLayer::new("project/high", 1).with_priority(100);
         high.type_patches.insert(
-            TYPE_ENV_FACT.to_string(),
+            "acme.flow".to_string(),
             TypePatch {
                 ttl_days: Some(90.0),
                 ..Default::default()
@@ -518,38 +633,38 @@ mod tests {
         );
 
         let effective = compose_ontology_layers(&base, &[high, low]).expect("compose");
-        assert_eq!(effective.types[TYPE_ENV_FACT].ttl_days, Some(90.0));
+        assert_eq!(effective.types["acme.flow"].ttl_days, Some(90.0));
     }
 
     #[test]
     fn diff_writes_field_patch_not_full_type() {
-        let base = default_ontology();
+        let base = base_with_business_type("acme.flow", 14.0);
         let mut next = base.clone();
         next.version += 1;
-        next.types.get_mut(TYPE_ENV_FACT).unwrap().ttl_days = Some(120.0);
+        next.types.get_mut("acme.flow").unwrap().ttl_days = Some(120.0);
 
         let layer = diff_ontology_layer(&base, &next);
         assert!(layer.types.is_empty(), "field change must stay a patch");
-        assert_eq!(layer.type_patches[TYPE_ENV_FACT].ttl_days, Some(120.0));
+        assert_eq!(layer.type_patches["acme.flow"].ttl_days, Some(120.0));
         let recomposed = compose_ontology_layers(&base, &[layer]).expect("recompose");
         assert_eq!(recomposed.content_hash(), next.content_hash());
     }
 
     #[test]
     fn diff_round_trips_added_and_removed_types() {
-        let base = default_ontology();
+        let base = base_with_business_type("acme.old", 14.0);
         let mut next = base.clone();
         next.version += 1;
-        next.types.remove(TYPE_ENV_FACT);
+        next.types.remove("acme.old");
         next.category_aliases
-            .retain(|_, target| target != TYPE_ENV_FACT);
+            .retain(|_, target| target != "acme.old");
         next.types.insert(
             "acme.flow".to_string(),
             OntologyType::new("acme.flow", "Flow").with_parent(TYPE_CONTRACT),
         );
 
         let layer = diff_ontology_layer(&base, &next);
-        assert!(layer.disabled_types.contains(&TYPE_ENV_FACT.to_string()));
+        assert!(layer.disabled_types.contains(&"acme.old".to_string()));
         assert!(layer.types.contains_key("acme.flow"));
         let recomposed = compose_ontology_layers(&base, &[layer]).expect("recompose");
         assert_eq!(recomposed.content_hash(), next.content_hash());

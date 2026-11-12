@@ -3165,6 +3165,7 @@ fn explicit_distill_bypasses_the_daily_rate_limit() {
 
 #[test]
 fn ontology_patch_persists_migrates_and_rolls_back() {
+    use jcode_memory_types::OntologyType;
     use jcode_memory_types::migration::{MigrationStep, OntologyOp, OntologyPatch, TypePatch};
 
     with_temp_home(|_| {
@@ -3180,16 +3181,41 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
             .unwrap();
 
         let base = manager.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(base.types["env_fact"].ttl_days, Some(14.0));
+        assert_eq!(
+            base.get_type("env_fact").unwrap().ttl_days,
+            Some(14.0),
+            "core classes stay code-defined"
+        );
 
-        let patch = OntologyPatch {
+        // Business concepts are added through the ontology, then patched.
+        let add_patch = OntologyPatch {
             base_id: base.id.clone(),
             base_version: base.version,
             base_hash: base.content_hash(),
-            rationale: "env facts are re-created too often".to_string(),
+            rationale: "add a project business concept".to_string(),
+            evidence: vec![id.clone()],
+            ops: vec![OntologyOp::AddType {
+                type_def: OntologyType::new("acme.flow", "Invoice flow")
+                    .with_parent("contract")
+                    .with_ttl_days(10.0),
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Project, &add_patch, false)
+            .expect("add patch applies");
+        let with_flow = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(with_flow.version, base.version + 1);
+        assert_eq!(with_flow.types["acme.flow"].ttl_days, Some(10.0));
+
+        let patch = OntologyPatch {
+            base_id: with_flow.id.clone(),
+            base_version: with_flow.version,
+            base_hash: with_flow.content_hash(),
+            rationale: "invoice concepts need a longer lifetime".to_string(),
             evidence: vec![id.clone()],
             ops: vec![OntologyOp::UpdateType {
-                id: "env_fact".to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     ttl_days: Some(45.0),
                     ..Default::default()
@@ -3205,12 +3231,12 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
         let report = manager
             .apply_ontology_patch(OntologyScope::Project, &patch, false)
             .expect("patch applies");
-        assert_eq!(report.new_version, base.version + 1);
+        assert_eq!(report.new_version, with_flow.version + 1);
         assert!(!report.dry_run);
 
         let graph = manager.load_project_graph().unwrap();
         assert_eq!(
-            graph.metadata.ontology.as_ref().unwrap().types["env_fact"].ttl_days,
+            graph.metadata.ontology.as_ref().unwrap().types["acme.flow"].ttl_days,
             Some(45.0)
         );
         let entry = graph.get_memory(&id).unwrap();
@@ -3221,16 +3247,16 @@ fn ontology_patch_persists_migrates_and_rolls_back() {
         // A fresh manager reads the stored ontology, not the compiled default.
         let other = MemoryManager::new().with_project_dir("/ontology-runtime");
         let stored = other.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(stored.types["env_fact"].ttl_days, Some(45.0));
-        assert_eq!(stored.version, base.version + 1);
+        assert_eq!(stored.types["acme.flow"].ttl_days, Some(45.0));
+        assert_eq!(stored.version, with_flow.version + 1);
 
         // Rollback restores the previous definition and keeps the data.
         let snapshot = other
-            .rollback_ontology(OntologyScope::Project, base.version)
+            .rollback_ontology(OntologyScope::Project, with_flow.version)
             .expect("rollback");
-        assert_eq!(snapshot.version, base.version);
+        assert_eq!(snapshot.version, with_flow.version);
         let restored = other.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(restored.types["env_fact"].ttl_days, Some(14.0));
+        assert_eq!(restored.types["acme.flow"].ttl_days, Some(10.0));
         assert_eq!(
             other
                 .load_project_graph()
@@ -3259,6 +3285,9 @@ fn save_legacy_project_snapshot(
     graph.metadata.ontology_layer_ids.clear();
     graph.metadata.ontology = Some(ontology);
     manager.save_project_graph(&graph).unwrap();
+    if let Ok(Some(path)) = manager.project_memory_path() {
+        crate::memory::cache::forget_cached_graph(&path);
+    }
 }
 
 #[test]
@@ -3301,7 +3330,9 @@ fn additive_legacy_project_snapshot_is_adopted_as_overlay() {
 }
 
 #[test]
-fn stale_legacy_project_snapshot_is_not_adopted() {
+fn legacy_core_type_snapshot_is_normalized_not_adopted() {
+    use jcode_memory_types::OntologyType;
+
     with_temp_home(|home| {
         let repo = home.join("repo");
         fs::create_dir_all(&repo).unwrap();
@@ -3309,18 +3340,24 @@ fn stale_legacy_project_snapshot_is_not_adopted() {
         let overlay_path = repo.join(".jcode/memory/ontology.yaml");
 
         save_legacy_project_snapshot(&manager, |ontology| {
-            ontology.types.get_mut("env_fact").unwrap().ttl_days = Some(99.0);
+            // A v3 store persisted core classes. They must be stripped on
+            // read, so an old local TTL override cannot pin runtime behavior.
+            ontology.types.insert(
+                "env_fact".to_string(),
+                OntologyType::new("env_fact", "Legacy env fact").with_ttl_days(99.0),
+            );
         });
 
         let effective = manager.stored_ontology(OntologyScope::Project).unwrap();
         assert!(
             !overlay_path.exists(),
-            "a changed core type may be stale compiled data and is not adopted"
+            "a core-only legacy snapshot has no business concepts to adopt"
         );
+        assert!(!effective.types.contains_key("env_fact"));
         assert_eq!(
-            effective.types["env_fact"].ttl_days,
-            Some(99.0),
-            "the legacy store keeps its own snapshot until explicitly migrated"
+            effective.get_type("env_fact").unwrap().ttl_days,
+            Some(14.0),
+            "the code-defined class wins over the stale snapshot"
         );
     });
 }
@@ -3350,7 +3387,7 @@ fn project_overlay_inherits_global_and_stays_local() {
 
         let project = manager.stored_ontology(OntologyScope::Project).unwrap();
         assert!(project.types.contains_key("acme.flow"));
-        assert!(project.types.contains_key("contract"));
+        assert!(project.get_type("contract").is_some());
         let global = manager.stored_ontology(OntologyScope::Global).unwrap();
         let (layers, parent_hash) = manager
             .ontology_layer_status(OntologyScope::Project)
@@ -3389,7 +3426,7 @@ fn project_overlay_inherits_global_and_stays_local() {
             !after.types.contains_key("acme.flow"),
             "deleting the overlay must not leave a stale materialized type"
         );
-        assert!(after.types.contains_key("contract"));
+        assert!(after.get_type("contract").is_some());
     });
 }
 
@@ -3428,6 +3465,7 @@ types:
 
 #[test]
 fn project_patch_writes_overlay_diff_and_rolls_back() {
+    use jcode_memory_types::OntologyType;
     use jcode_memory_types::migration::{OntologyOp, OntologyPatch, TypePatch};
 
     with_temp_home(|home| {
@@ -3436,8 +3474,26 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
         let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
         let overlay_path = repo.join(".jcode/memory/ontology.yaml");
 
+        let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let add_patch = OntologyPatch {
+            base_id: global_base.id.clone(),
+            base_version: global_base.version,
+            base_hash: global_base.content_hash(),
+            rationale: "add a global business concept".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::AddType {
+                type_def: OntologyType::new("acme.flow", "Invoice flow")
+                    .with_parent("contract")
+                    .with_ttl_days(10.0),
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Global, &add_patch, false)
+            .expect("add patch applies");
         let base = manager.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(base.types["env_fact"].ttl_days, Some(14.0));
+        assert_eq!(base.get_type("env_fact").unwrap().ttl_days, Some(14.0));
+        assert_eq!(base.types["acme.flow"].ttl_days, Some(10.0));
         let rule_patch = OntologyPatch {
             base_id: base.id.clone(),
             base_version: base.version,
@@ -3459,10 +3515,10 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
             base_id: base.id.clone(),
             base_version: base.version,
             base_hash: base.content_hash(),
-            rationale: "env facts are re-created too often".to_string(),
+            rationale: "invoice concepts need a longer lifetime".to_string(),
             evidence: Vec::new(),
             ops: vec![OntologyOp::UpdateType {
-                id: "env_fact".to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     ttl_days: Some(45.0),
                     ..Default::default()
@@ -3480,12 +3536,12 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
             overlay.types.is_empty(),
             "a field change must not copy the full type"
         );
-        assert_eq!(overlay.type_patches["env_fact"].ttl_days, Some(45.0));
+        assert_eq!(overlay.type_patches["acme.flow"].ttl_days, Some(45.0));
         assert_eq!(
             manager
                 .stored_ontology(OntologyScope::Project)
                 .unwrap()
-                .types["env_fact"]
+                .types["acme.flow"]
                 .ttl_days,
             Some(45.0)
         );
@@ -3493,9 +3549,9 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
             manager
                 .stored_ontology(OntologyScope::Global)
                 .unwrap()
-                .types["env_fact"]
+                .types["acme.flow"]
                 .ttl_days,
-            Some(14.0),
+            Some(10.0),
             "the project override must not change global memory"
         );
 
@@ -3506,14 +3562,9 @@ fn project_patch_writes_overlay_diff_and_rolls_back() {
             !overlay_path.exists(),
             "an empty rolled-back overlay is removed"
         );
-        assert_eq!(
-            manager
-                .stored_ontology(OntologyScope::Project)
-                .unwrap()
-                .types["env_fact"]
-                .ttl_days,
-            Some(14.0)
-        );
+        let restored = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert_eq!(restored.types["acme.flow"].ttl_days, Some(10.0));
+        assert_eq!(restored.get_type("env_fact").unwrap().ttl_days, Some(14.0));
     });
 }
 
@@ -3570,6 +3621,7 @@ fn project_without_overlay_inherits_global_additions() {
 
 #[test]
 fn project_field_patch_keeps_global_changes_flowing() {
+    use jcode_memory_types::OntologyType;
     use jcode_memory_types::migration::{OntologyOp, OntologyPatch, TypePatch};
 
     with_temp_home(|home| {
@@ -3578,10 +3630,29 @@ fn project_field_patch_keeps_global_changes_flowing() {
         fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
         let manager = MemoryManager::new().with_project_dir(repo.to_str().unwrap());
 
+        let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let mut type_def = OntologyType::new("acme.flow", "Invoice flow")
+            .with_parent("contract")
+            .with_ttl_days(10.0);
+        type_def.scoring.base_score = 10.0;
+        let add_patch = OntologyPatch {
+            base_id: global_base.id.clone(),
+            base_version: global_base.version,
+            base_hash: global_base.content_hash(),
+            rationale: "add a global business concept".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::AddType { type_def }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Global, &add_patch, false)
+            .expect("global add applies");
+
         let base = manager.stored_ontology(OntologyScope::Project).unwrap();
+        assert!(base.types.contains_key("acme.flow"));
         let mut layer = OntologyLayer::new("project/repo", base.version + 1);
         layer.type_patches.insert(
-            "contract".to_string(),
+            "acme.flow".to_string(),
             TypePatch {
                 ttl_days: Some(730.0),
                 ..Default::default()
@@ -3590,20 +3661,20 @@ fn project_field_patch_keeps_global_changes_flowing() {
         fs::write(&overlay_path, serde_yaml::to_string(&layer).unwrap()).unwrap();
 
         let project = manager.stored_ontology(OntologyScope::Project).unwrap();
-        assert_eq!(project.types["contract"].ttl_days, Some(730.0));
-        let previous_scoring = project.types["contract"].scoring.clone();
+        assert_eq!(project.types["acme.flow"].ttl_days, Some(730.0));
+        let previous_scoring = project.types["acme.flow"].scoring.clone();
 
         let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
-        let mut new_scoring = global_base.types["contract"].scoring.clone();
+        let mut new_scoring = global_base.types["acme.flow"].scoring.clone();
         new_scoring.base_score += 0.05;
         let global_patch = OntologyPatch {
             base_id: global_base.id.clone(),
             base_version: global_base.version,
             base_hash: global_base.content_hash(),
-            rationale: "raise contract production weight".to_string(),
+            rationale: "raise invoice production weight".to_string(),
             evidence: Vec::new(),
             ops: vec![OntologyOp::UpdateType {
-                id: "contract".to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     scoring: Some(new_scoring.clone()),
                     ..Default::default()
@@ -3617,12 +3688,12 @@ fn project_field_patch_keeps_global_changes_flowing() {
 
         let refreshed = manager.stored_ontology(OntologyScope::Project).unwrap();
         assert_eq!(
-            refreshed.types["contract"].ttl_days,
+            refreshed.types["acme.flow"].ttl_days,
             Some(730.0),
             "the project field override survives"
         );
         assert_eq!(
-            refreshed.types["contract"].scoring, new_scoring,
+            refreshed.types["acme.flow"].scoring, new_scoring,
             "unpatched global fields flow through"
         );
         assert_ne!(previous_scoring, new_scoring);
@@ -3631,6 +3702,7 @@ fn project_field_patch_keeps_global_changes_flowing() {
 
 #[test]
 fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
+    use jcode_memory_types::OntologyType;
     use jcode_memory_types::migration::{MigrationStep, OntologyOp, OntologyPatch, TypePatch};
 
     with_temp_home(|home| {
@@ -3650,6 +3722,24 @@ fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
             );
         }
 
+        let global_base = manager.stored_ontology(OntologyScope::Global).unwrap();
+        let add_patch = OntologyPatch {
+            base_id: global_base.id.clone(),
+            base_version: global_base.version,
+            base_hash: global_base.content_hash(),
+            rationale: "add a business concept".to_string(),
+            evidence: Vec::new(),
+            ops: vec![OntologyOp::AddType {
+                type_def: OntologyType::new("acme.flow", "Invoice flow")
+                    .with_parent("contract")
+                    .with_ttl_days(10.0),
+            }],
+            migrations: Vec::new(),
+        };
+        manager
+            .apply_ontology_patch(OntologyScope::Global, &add_patch, false)
+            .expect("global add applies");
+
         let base = manager.stored_ontology(OntologyScope::Project).unwrap();
         let raw = OntologyPatch {
             base_id: "wrong-id".to_string(),
@@ -3659,7 +3749,7 @@ fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
             evidence: vec!["mem_not_in_session".to_string()],
             ops: vec![
                 OntologyOp::UpdateType {
-                    id: "env_fact".to_string(),
+                    id: "acme.flow".to_string(),
                     patch: TypePatch {
                         ttl_days: Some(45.0),
                         properties: Some(Vec::new()),

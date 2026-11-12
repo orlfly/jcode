@@ -20,7 +20,7 @@
 
 本体记忆管理不是“给记忆加一个标签”，而是让类型定义驱动记忆的写入、抽取、评分、生命周期和检索。当前实现遵循以下不变量：
 
-1. **类型是一等数据**。类型、属性、关系、规则、活动和生命周期策略都可以持久化、校验、版本化和迁移，不依赖散落的 `match MemoryCategory` 分支。
+1. **业务概念是一等数据，记忆管理类不是**。运行时总结出的业务概念，其类型、属性、关系、规则、活动和生命周期策略可以持久化、校验、版本化和迁移；`env_fact`、`contract`、`process_rule` 等记忆管理类由代码定义，不从本体数据加载，也不允许通过补丁改写。
 2. **实例与模式分离**。`MemoryEntry` 是实例，`Ontology` 是模式；实例存储自己的 `category`、属性、来源和状态，模式决定如何解释它们。
 3. **全局与项目隔离，但不割裂**。项目继承全局通用概念，只把项目专有概念写进项目覆盖层。项目本体不进入全局 store。
 4. **每次变更都可审计**。补丁带 base id/version/hash，应用前校验，应用后递增版本，破坏性操作必须声明数据迁移。
@@ -33,7 +33,7 @@
 
 ```mermaid
 flowchart TB
-    Core["core ontology<br/>编译内置类型与规则"]
+    Core["code memory classes<br/>代码定义的核心记忆类"]
     Global["global store<br/>全局有效本体"]
     Project["project overlay<br/><repo>/.jcode/memory/ontology.yaml"]
     Effective["effective project ontology<br/>materialized in graph metadata"]
@@ -60,7 +60,8 @@ flowchart TB
 
 | 对象 | 作用 | 代码位置 |
 |---|---|---|
-| `Ontology` | 完整模式：类型、关系、规则、活动、类别别名 | `crates/jcode-memory-types/src/ontology.rs` |
+| `Ontology` | 业务概念模式：持久化的业务类型、关系、规则、活动、类别别名 | `crates/jcode-memory-types/src/ontology.rs` |
+| `memory_class` | 代码定义的核心记忆类及其评分、TTL、抽取策略；不进入本体数据 | `crates/jcode-memory-types/src/memory_class.rs` |
 | `OntologyType` | 单个类型的属性、父类型、评分、衰减、TTL、抽取方法 | 同上 |
 | `OntologyLayer` | 部分本体：新增/覆盖类型、字段补丁、禁用项、关系/规则/活动 | `crates/jcode-memory-types/src/layered.rs` |
 | `MemoryGraph` | 一个 store 的实例、边、标签、统计和本体元数据 | `crates/jcode-memory-types/src/graph.rs` |
@@ -70,9 +71,22 @@ flowchart TB
 | `MemoryReviewItem` | 待人工确认的写入或变更 | `crates/jcode-memory-types/src/review.rs` |
 | `Effect` / `Rule` | 事件驱动的声明式行为 | `crates/jcode-memory-types/src/ontology.rs` |
 
+### 2.1 职责边界
+
+本体库只存“jcode 运行过程中总结出来的业务概念”，例如某个项目的发票流程、某个服务的部署约束、某组 API 的领域实体。它不存记忆管理自身的类定义。
+
+两类对象的边界：
+
+| 对象 | 存放位置 | 是否持久化 | 是否可通过本体补丁修改 |
+|---|---|---|---|
+| 核心记忆类：`env_fact`、`contract`、`process_rule`、`observation`、`preference`、`entity`、`correction` | `memory_class.rs` | 否，随二进制发布 | 否，必须改代码并发布新版本 |
+| 业务概念类型：`acme.billing.invoice_flow`、`cloud.service` 等 | `Ontology.types` | 是 | 是，受补丁、项目覆盖层和迁移校验约束 |
+
+运行时通过 `Ontology::get_type`、`Ontology::all_types` 和 `Ontology::type_from_category` 同时解析两类对象。旧 store 中残留的核心类型和核心类别别名在反序列化时剥离，默认本体版本因此升到 4。
+
 ## 3. 本体结构
 
-`Ontology` 的字段：
+`Ontology` 的字段（`types` 只表示持久化的业务概念）：
 
 ```rust
 pub struct Ontology {
@@ -108,7 +122,7 @@ pub struct Ontology {
 
 ### 3.1 默认类型
 
-默认本体 id 为 `jcode/default/v1`，版本为 3。当前七个核心类型：
+默认本体 id 为 `jcode/default/v1`，版本为 4。`Ontology.types` 默认为空；以下七个核心记忆类由 `memory_class::core_memory_classes()` 在代码中定义：
 
 | 类型 | TTL | base_score | half_life | 说明 |
 |---|---:|---:|---:|---|
@@ -121,6 +135,8 @@ pub struct Ontology {
 | `correction` | 无 | 50 | 365 天 | 被纠正的错误、错误假设、错误流程 |
 
 注意：旧架构文档曾把 `env_fact` 写成 30 天，当前实现是 14 天。
+
+这些类不是本体数据。`OntologyPatch` 的 `add_type`、`update_type`、`remove_type` 和 `set_category_alias` 一旦指向核心类或核心类别，都会被拒绝；项目覆盖层同样不能定义、禁用或补丁核心类。
 
 `goal:` 和 `skill:` 不是可抽取类型，而是外部工件的镜像链接节点。它们跳过写入调和、TTL GC 和聚类，只注入有界指针。
 
@@ -217,19 +233,17 @@ types:
     parent: contract
     description: Invoice generation and settlement procedure.
 type_patches:
-  env_fact:
+  acme.billing.invoice_flow:
     ttl_days: 45.0
-disabled_types:
-  - observation
 ```
 
 合并规则：
 
 1. 按 `priority` 升序合并，同优先级按文件/层顺序稳定排序。
 2. `types` 新增或完整替换类型；`parent` 继承应优先于复制父类型字段。
-3. `type_patches` 字段级覆盖。项目只改 `env_fact.ttl_days` 时，全局后续修改 `scoring` 仍会流入项目。
+3. `type_patches` 字段级覆盖。项目只改 `acme.billing.invoice_flow.ttl_days` 时，全局后续修改该类型的 `scoring` 仍会流入项目。核心记忆类不能被 `type_patches` 指向。
 4. `properties` 补丁是**整体替换**属性列表，不是逐属性合并。
-5. `disabled_types` 从有效本体移除类型；重复禁用是幂等的。
+5. `disabled_types` 从有效本体移除业务类型；重复禁用是幂等的。核心记忆类不能被禁用。
 6. 关系、规则、活动按 id 去重，后层覆盖前层。
 7. `category_aliases` 并集，冲突时后层优先。
 8. 有效本体版本取 `max(base.version, layer.version)`；内容哈希覆盖合并结果。
@@ -257,7 +271,7 @@ disabled_types:
 
 - 如果没有覆盖层，且快照等于编译默认本体，或快照中的类型/关系/规则/活动/别名都只是当前全局本体的同定义子集，则视为过期副本，直接使用全局有效本体；
 - 如果快照相对当前全局本体是**纯增量**：全局类型、关系、规则、活动、别名都不变，只多出项目类型，则写成一个 `project/legacy-adopted` 覆盖层；
-- 如果任何核心类型定义不同，视为可能包含过期编译默认值或离线核心升级，不自动迁移，保留旧快照，等待显式迁移。
+- 快照中的核心类型和核心类别别名在读取时被剥离；剥离后若只剩业务概念，按上面的纯增量规则处理。旧核心 TTL 等覆盖不会再生效，核心行为始终以当前代码为准。
 
 这样可以统一大多数“项目只新增概念”的旧 store，同时避免把旧核心定义永久钉进仓库。
 
@@ -383,7 +397,7 @@ sequenceDiagram
 
 抽取器先得到有效本体，再生成提示词：
 
-- 七个核心类型保留静态详细说明；
+- 七个核心记忆类保留静态详细说明（由代码定义，不依赖持久化类型表）；
 - `present_in_prompt=true` 且 `persistent=true` 的额外类型追加到提示词；
 - 带点的领域/项目类型优先，最多 40 个；
 - 每个额外类型包含 id、display_name、description、parent；
@@ -547,7 +561,7 @@ finalize 抽取成功后：
 - **L2**：向后兼容的 schema 或技能契约变更；
 - **L3**：结构性或破坏性变更，必须显式确认。
 
-本体的结构性变更、核心类型删除、关系删除、规则/活动变更属于高风险路径，默认需要人工确认。项目覆盖层通常属于 L2（新增类型、字段覆盖），删除核心类型等结构性调整仍应按 L3 处理，并受仓库审查和信任限制。
+本体的结构性变更、业务类型删除、关系删除、规则/活动变更属于高风险路径，默认需要人工确认。核心记忆类只能通过代码变更修改，不属于本体补丁的 L1/L2/L3 范围。项目覆盖层通常属于 L2（新增业务类型、字段覆盖），删除业务类型等结构性调整仍应按 L3 处理，并受仓库审查和信任限制。
 
 ### 10.2 安全边界
 
@@ -587,7 +601,7 @@ finalize 抽取成功后：
 | 全局本体缺失 | 回退到编译默认本体 |
 | 物化本体过期 | 父/层哈希不一致时重算 |
 | 旧快照仅新增类型 | 自动写覆盖层 |
-| 旧快照修改了核心类型 | 不自动迁移，保留旧快照 |
+| 旧快照包含核心类型 | 读取时剥离核心类型，按剩余业务概念判断是否采纳 |
 | 项目规则/活动 | 加载时剥离，补丁时拒绝 |
 
 ## 13. 已知边界
@@ -596,7 +610,7 @@ finalize 抽取成功后：
 2. **跨项目概念提升未实现**。没有 `promote` 工作流；项目类型可以被人工复制到全局，但不会自动提升。
 3. **项目不能改规则/活动**。这是信任边界，不是遗漏。
 4. **`properties` 补丁是整体替换**，不是逐属性 diff。
-5. **禁用核心类型不会从静态抽取提示中消失**。七个核心类型的静态说明仍在提示里；项目禁用后，模型仍可能输出该类型。后续需要完全动态的抽取目录。
+5. **核心记忆类不能通过本体配置调整**。修改核心类的 TTL、评分或抽取策略必须改 `memory_class.rs` 并发布新版本；这是有意的边界，不是遗漏。
 6. **自动反思只做 `update_type`**。项目新概念需要人工写覆盖层或提交补丁，自动反思不会自动 `add_type`。
 7. **实时 LLM 抽取未做端到端回归**。当前测试覆盖类型目录、解析和写入路径，真实模型输出仍依赖凭据和环境。
 8. **G4 是类别级 diff**。批量门按类别计数，不是逐属性比较。

@@ -213,11 +213,17 @@ pub fn validate_ontology(ontology: &Ontology) -> Vec<String> {
     if ontology.version == 0 {
         errors.push("ontology version must be > 0".to_string());
     }
-    if ontology.types.is_empty() {
-        errors.push("ontology declares no types".to_string());
-    }
+    // Business types may legitimately be empty: the core memory classes are
+    // code-defined and resolved separately from the persisted ontology.
 
     for (key, type_def) in &ontology.types {
+        if crate::memory_class::is_core_memory_class(key)
+            || crate::memory_class::is_core_category(key)
+        {
+            errors.push(format!(
+                "type '{key}' is a code-defined memory class and must not be persisted"
+            ));
+        }
         if key != &type_def.id {
             errors.push(format!(
                 "type map key '{key}' does not match type id '{}'",
@@ -230,6 +236,14 @@ pub fn validate_ontology(ontology: &Ontology) -> Vec<String> {
         if is_link_id(&type_def.id) {
             errors.push(format!(
                 "type '{}' uses a reserved link prefix; link nodes are not types",
+                type_def.id
+            ));
+        }
+        if let Some(legacy) = &type_def.legacy_category
+            && crate::memory_class::is_core_category(legacy)
+        {
+            errors.push(format!(
+                "type '{}' claims code-defined category '{legacy}'",
                 type_def.id
             ));
         }
@@ -248,7 +262,7 @@ pub fn validate_ontology(ontology: &Ontology) -> Vec<String> {
             errors.push(format!("type '{}' has non-finite base_score", type_def.id));
         }
         if let Some(parent) = &type_def.parent
-            && !ontology.types.contains_key(parent)
+            && ontology.get_type(parent).is_none()
         {
             errors.push(format!(
                 "type '{}' declares unknown parent '{parent}'",
@@ -258,9 +272,14 @@ pub fn validate_ontology(ontology: &Ontology) -> Vec<String> {
     }
 
     for (category, type_id) in &ontology.category_aliases {
-        if !ontology.types.contains_key(type_id) {
+        if ontology.get_type(type_id).is_none() {
             errors.push(format!(
                 "category alias '{category}' points at unknown type '{type_id}'"
+            ));
+        }
+        if crate::memory_class::is_core_category(category) {
+            errors.push(format!(
+                "category alias '{category}' is code-defined; core categories cannot be remapped by ontology data"
             ));
         }
     }
@@ -278,7 +297,7 @@ pub fn validate_ontology(ontology: &Ontology) -> Vec<String> {
             errors.push(format!("rule '{}' has no effects", rule.id));
         }
         for type_id in &rule.applies_to {
-            if !ontology.types.contains_key(type_id) {
+            if ontology.get_type(type_id).is_none() {
                 errors.push(format!(
                     "rule '{}' applies to unknown type '{type_id}'",
                     rule.id
@@ -376,6 +395,20 @@ pub fn apply_patch(base: &Ontology, patch: &OntologyPatch) -> Result<Ontology, V
 fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>> {
     match op {
         OntologyOp::AddType { type_def } => {
+            if crate::memory_class::is_core_memory_class(&type_def.id) {
+                return Err(vec![format!(
+                    "type '{}' is a code-defined memory class and cannot be added through ontology data",
+                    type_def.id
+                )]);
+            }
+            if let Some(legacy) = &type_def.legacy_category
+                && crate::memory_class::is_core_category(legacy)
+            {
+                return Err(vec![format!(
+                    "type '{}' cannot claim code-defined category '{legacy}'",
+                    type_def.id
+                )]);
+            }
             if ontology.types.contains_key(&type_def.id) {
                 return Err(vec![format!("type '{}' already exists", type_def.id)]);
             }
@@ -392,6 +425,11 @@ fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>>
             Ok(())
         }
         OntologyOp::UpdateType { id, patch } => {
+            if crate::memory_class::is_core_memory_class(id) {
+                return Err(vec![format!(
+                    "type '{id}' is a code-defined memory class and cannot be patched through ontology data"
+                )]);
+            }
             let Some(type_def) = ontology.types.get_mut(id) else {
                 return Err(vec![format!("type '{id}' does not exist")]);
             };
@@ -414,6 +452,11 @@ fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>>
                 type_def.extraction_methods = methods.clone();
             }
             if let Some(legacy) = &patch.legacy_category {
+                if crate::memory_class::is_core_category(legacy) {
+                    return Err(vec![format!(
+                        "type '{id}' cannot claim code-defined category '{legacy}'"
+                    )]);
+                }
                 type_def.legacy_category = Some(legacy.clone());
                 ontology.category_aliases.insert(legacy.clone(), id.clone());
             }
@@ -423,10 +466,15 @@ fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>>
             Ok(())
         }
         OntologyOp::RemoveType { id, fallback } => {
+            if crate::memory_class::is_core_memory_class(id) {
+                return Err(vec![format!(
+                    "type '{id}' is a code-defined memory class and cannot be removed through ontology data"
+                )]);
+            }
             if !ontology.types.contains_key(id) {
                 return Err(vec![format!("type '{id}' does not exist")]);
             }
-            if !ontology.types.contains_key(fallback) {
+            if ontology.get_type(fallback).is_none() {
                 return Err(vec![format!("fallback type '{fallback}' does not exist")]);
             }
             ontology.types.remove(id);
@@ -486,7 +534,12 @@ fn apply_op(ontology: &mut Ontology, op: &OntologyOp) -> Result<(), Vec<String>>
             Ok(())
         }
         OntologyOp::SetCategoryAlias { category, type_id } => {
-            if !ontology.types.contains_key(type_id) {
+            if crate::memory_class::is_core_category(category) {
+                return Err(vec![format!(
+                    "category '{category}' is code-defined and cannot be remapped through ontology data"
+                )]);
+            }
+            if ontology.get_type(type_id).is_none() {
                 return Err(vec![format!(
                     "category alias '{category}' points at unknown type '{type_id}'"
                 )]);
@@ -1210,11 +1263,20 @@ pub fn describe_ontology(ontology: &Ontology) -> String {
         ontology.version,
         ontology.content_hash()
     ));
-    out.push_str(&format!("types: {}\n", ontology.types.len()));
-    for type_def in ontology.types.values() {
+    out.push_str(&format!(
+        "business types: {} (persisted)\ncore memory classes: {} (code-defined)\n",
+        ontology.business_types().count(),
+        crate::memory_class::core_memory_classes().len()
+    ));
+    for type_def in ontology.all_types() {
         out.push_str(&format!(
-            "  - {:<14} ttl={:<6} base={:<5} half_life={:<5} methods={}\n",
+            "  - {:<14} {:<8} ttl={:<6} base={:<5} half_life={:<5} methods={}\n",
             type_def.id,
+            if crate::memory_class::is_core_memory_class(&type_def.id) {
+                "[core]"
+            } else {
+                "[business]"
+            },
             type_def
                 .ttl_days
                 .map(|days| format!("{days:.0}d"))
@@ -1237,7 +1299,9 @@ pub fn describe_ontology(ontology: &Ontology) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ontology::{DEFAULT_ONTOLOGY_VERSION, PropertyDef, PropertyKind, default_ontology};
+    use crate::ontology::{
+        DEFAULT_ONTOLOGY_VERSION, OntologyType, PropertyDef, PropertyKind, default_ontology,
+    };
 
     fn patch(
         base: &Ontology,
@@ -1255,6 +1319,19 @@ mod tests {
         }
     }
 
+    fn base_with_business_type(ttl_days: f32) -> Ontology {
+        let mut base = default_ontology();
+        base.types.insert(
+            "acme.flow".to_string(),
+            OntologyType::new("acme.flow", "Flow")
+                .with_parent(TYPE_CONTRACT)
+                .with_ttl_days(ttl_days),
+        );
+        base.category_aliases
+            .insert("acme.flow".to_string(), "acme.flow".to_string());
+        base
+    }
+
     #[test]
     fn hash_is_stable_and_sensitive() {
         let a = default_ontology();
@@ -1267,11 +1344,11 @@ mod tests {
 
     #[test]
     fn patch_updates_ttl_and_bumps_version() {
-        let base = default_ontology();
+        let base = base_with_business_type(14.0);
         let patch = patch(
             &base,
             vec![OntologyOp::UpdateType {
-                id: TYPE_ENV_FACT.to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     ttl_days: Some(45.0),
                     ..Default::default()
@@ -1281,14 +1358,14 @@ mod tests {
         );
         let next = apply_patch(&base, &patch).expect("patch applies");
         assert_eq!(next.version, DEFAULT_ONTOLOGY_VERSION + 1);
-        assert_eq!(next.types[TYPE_ENV_FACT].ttl_days, Some(45.0));
+        assert_eq!(next.types["acme.flow"].ttl_days, Some(45.0));
         // Base is untouched.
-        assert_eq!(base.types[TYPE_ENV_FACT].ttl_days, Some(14.0));
+        assert_eq!(base.types["acme.flow"].ttl_days, Some(14.0));
     }
 
     #[test]
     fn patch_replaces_type_properties() {
-        let base = default_ontology();
+        let base = base_with_business_type(14.0);
         let property = PropertyDef {
             id: "confidence".to_string(),
             kind: PropertyKind::Float,
@@ -1299,7 +1376,7 @@ mod tests {
         let patch = patch(
             &base,
             vec![OntologyOp::UpdateType {
-                id: TYPE_OBSERVATION.to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     properties: Some(vec![property.clone()]),
                     ..Default::default()
@@ -1308,20 +1385,20 @@ mod tests {
             Vec::new(),
         );
         let next = apply_patch(&base, &patch).expect("patch applies");
-        assert_eq!(next.types[TYPE_OBSERVATION].properties, vec![property]);
+        assert_eq!(next.types["acme.flow"].properties, vec![property]);
         assert!(
-            base.types[TYPE_OBSERVATION].properties.is_empty(),
+            base.types["acme.flow"].properties.is_empty(),
             "base ontology must stay untouched"
         );
     }
 
     #[test]
     fn destructive_patch_requires_migration() {
-        let base = default_ontology();
+        let base = base_with_business_type(14.0);
         let patch = patch(
             &base,
             vec![OntologyOp::RemoveType {
-                id: TYPE_OBSERVATION.to_string(),
+                id: "acme.flow".to_string(),
                 fallback: TYPE_ENV_FACT.to_string(),
             }],
             Vec::new(),
@@ -1336,12 +1413,50 @@ mod tests {
     }
 
     #[test]
-    fn stale_base_hash_is_rejected() {
+    fn core_memory_classes_cannot_be_changed_by_ontology_patches() {
         let base = default_ontology();
+        let cases = [
+            OntologyOp::AddType {
+                type_def: OntologyType::new(TYPE_ENV_FACT, "Fake env fact"),
+            },
+            OntologyOp::UpdateType {
+                id: TYPE_CONTRACT.to_string(),
+                patch: TypePatch {
+                    ttl_days: Some(1.0),
+                    ..Default::default()
+                },
+            },
+            OntologyOp::RemoveType {
+                id: TYPE_OBSERVATION.to_string(),
+                fallback: TYPE_ENV_FACT.to_string(),
+            },
+            OntologyOp::SetCategoryAlias {
+                category: "contract".to_string(),
+                type_id: TYPE_OBSERVATION.to_string(),
+            },
+        ];
+        for op in cases {
+            let errors = apply_patch(&base, &patch(&base, vec![op], Vec::new()))
+                .expect_err("core class changes must be rejected");
+            assert!(
+                errors.iter().any(|error| error.contains("code-defined")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_ontology_without_business_types_is_valid() {
+        assert!(validate_ontology(&default_ontology()).is_empty());
+    }
+
+    #[test]
+    fn stale_base_hash_is_rejected() {
+        let base = base_with_business_type(14.0);
         let mut patch = patch(
             &base,
             vec![OntologyOp::UpdateType {
-                id: TYPE_ENV_FACT.to_string(),
+                id: "acme.flow".to_string(),
                 patch: TypePatch {
                     ttl_days: Some(45.0),
                     ..Default::default()

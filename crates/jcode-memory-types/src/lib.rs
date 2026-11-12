@@ -9,8 +9,13 @@ pub use instance::{
     ProvenanceRecord, default_lifecycle_transition_table,
 };
 
+pub mod memory_class;
 pub mod ontology;
 pub mod layered;
+pub use memory_class::{
+    CORE_MEMORY_CLASS_IDS, core_class_for_category, core_memory_class, core_memory_classes,
+    is_core_category, is_core_memory_class, strip_core_types,
+};
 pub use ontology::{
     Activity, ActivityStep, ActivityTrigger, Condition, DEFAULT_ONTOLOGY_ID,
     DEFAULT_ONTOLOGY_VERSION, DecayPolicy, EVENT_CONTRADICT, EVENT_DEDUP, EVENT_FINALIZE,

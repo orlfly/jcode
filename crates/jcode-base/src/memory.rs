@@ -605,9 +605,12 @@ fn prepare_reflection_patch(
     patch.base_version = ontology.version;
     patch.base_hash = ontology.content_hash();
     patch.migrations.clear();
-    patch
-        .ops
-        .retain(|op| matches!(op, OntologyOp::UpdateType { .. }));
+    patch.ops.retain(|op| match op {
+        OntologyOp::UpdateType { id, .. } => {
+            !jcode_memory_types::is_core_memory_class(id) && ontology.get_type(id).is_some()
+        }
+        _ => false,
+    });
     for op in &mut patch.ops {
         if let OntologyOp::UpdateType { patch, .. } = op {
             // `properties` changes the type's schema, not a runtime parameter.
@@ -3467,7 +3470,7 @@ impl MemoryManager {
             .filter(|entry| !jcode_memory_types::is_link_node(entry))
             .filter_map(|entry| {
                 let type_id = ontology.type_from_category(&entry.category)?;
-                let ttl = ontology.types.get(type_id)?.ttl_days?;
+                let ttl = ontology.get_type(type_id)?.ttl_days?;
                 let age_days = (now - entry.updated_at).num_seconds().max(0) as f32 / 86_400.0;
                 (age_days > ttl).then(|| (entry.id.clone(), age_days, type_id.to_string()))
             })

@@ -216,10 +216,8 @@ types:
     parent: contract
     description: Invoice generation and settlement procedure.
 type_patches:
-  env_fact:
+  acme.billing.invoice_flow:
     ttl_days: 45.0
-disabled_types:
-  - observation
 ```
 
 Rules:
@@ -228,7 +226,9 @@ Rules:
   copying an existing definition.
 - `type_patches` is field-level: a project TTL override does not pin scoring,
   decay, properties, or future global changes to those fields.
-- `disabled_types` removes a type from the project's effective ontology.
+- `disabled_types` removes a business type from the project's effective
+  ontology. Core memory classes (`env_fact`, `contract`, ...) are code-defined
+  and cannot be patched, disabled or redefined by an overlay.
 - Overlay `rules` and `activities` are stripped on load. A cloned repository is
   untrusted input and must not change memory side effects.
 

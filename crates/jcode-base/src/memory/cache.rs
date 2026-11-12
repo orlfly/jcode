@@ -70,6 +70,14 @@ pub(super) fn cache_graph(path: PathBuf, graph: &MemoryGraph) {
     }
 }
 
+/// Drop the path-mode cache entry so the next load re-reads and re-normalizes
+/// the file. Used by tests that simulate a store written by an older version.
+pub(super) fn forget_cached_graph(path: &PathBuf) {
+    if let Ok(mut cache) = graph_cache().lock() {
+        cache.entries.remove(path);
+    }
+}
+
 /// Cache a graph loaded from a non-file backend (sqlite-gvec, etc.).
 /// `version` is bumped by the caller on every write; cache hits
 /// only while the backend reports the same version.

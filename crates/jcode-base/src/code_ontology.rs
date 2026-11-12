@@ -223,7 +223,7 @@ pub fn validate_code_ontology(
         };
         report.mapped += 1;
 
-        let Some(type_def) = ontology.types.get(type_id) else {
+        let Some(type_def) = ontology.get_type(type_id) else {
             report.error(
                 "C004",
                 Some(&concept.id),
