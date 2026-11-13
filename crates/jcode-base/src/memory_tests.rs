@@ -3363,6 +3363,73 @@ fn legacy_core_type_snapshot_is_normalized_not_adopted() {
 }
 
 #[test]
+fn migrate_canonicalizes_core_only_default_ontology() {
+    use jcode_memory_types::{DEFAULT_ONTOLOGY_VERSION, OntologyType, default_ontology};
+
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-canonicalize");
+        let id = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "You must call POST /api/task/claim with the team id",
+            ))
+            .unwrap();
+
+        save_legacy_project_snapshot(&manager, |ontology| {
+            ontology.version = 3;
+            ontology.description = "stale default description".to_string();
+            ontology.types.insert(
+                "env_fact".to_string(),
+                OntologyType::new("env_fact", "Legacy env fact").with_ttl_days(99.0),
+            );
+            ontology
+                .category_aliases
+                .insert("fact".to_string(), "env_fact".to_string());
+        });
+
+        let report = manager.apply_default_ontology_migrations(true).unwrap();
+        assert!(report.ontology_canonicalized >= 1);
+
+        let graph = manager.load_project_graph().unwrap();
+        let stored = graph.metadata.ontology.as_ref().expect("stored ontology");
+        assert_eq!(stored.version, DEFAULT_ONTOLOGY_VERSION);
+        assert!(stored.types.is_empty());
+        assert_eq!(stored.content_hash(), default_ontology().content_hash());
+        assert_eq!(
+            graph.metadata.ontology_hash,
+            default_ontology().content_hash()
+        );
+        assert!(graph.metadata.ontology_history.is_empty());
+        assert!(graph.get_memory(&id).is_some(), "memories must survive");
+    });
+}
+
+#[test]
+fn migrate_preserves_business_concepts_in_default_ontology() {
+    use jcode_memory_types::{OntologyType, default_ontology};
+
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/ontology-canonicalize-business");
+        save_legacy_project_snapshot(&manager, |ontology| {
+            ontology.types.insert(
+                "acme.flow".to_string(),
+                OntologyType::new("acme.flow", "Invoice flow").with_parent("contract"),
+            );
+        });
+
+        let report = manager.apply_default_ontology_migrations(true).unwrap();
+        let graph = manager.load_project_graph().unwrap();
+        let stored = graph.metadata.ontology.as_ref().expect("stored ontology");
+        assert!(
+            stored.types.contains_key("acme.flow"),
+            "business concepts must not be replaced by the compiled default"
+        );
+        assert_ne!(stored.content_hash(), default_ontology().content_hash());
+        assert_eq!(report.ontology_canonicalized, 0);
+    });
+}
+
+#[test]
 fn project_overlay_inherits_global_and_stays_local() {
     use jcode_memory_types::{OntologyType, Rule};
 

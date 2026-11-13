@@ -306,6 +306,10 @@ impl TtlGcReport {
 pub struct OntologyMigrationReport {
     /// Stores visited by the pass.
     pub stores: usize,
+    /// Stores whose core-only default ontology was rewritten to the compiled
+    /// default definition (description, hash and version included).
+    #[serde(default)]
+    pub ontology_canonicalized: usize,
     /// Whether this was a dry run.
     pub dry_run: bool,
     /// Aggregated per-step migration counts.
@@ -317,8 +321,9 @@ impl OntologyMigrationReport {
     pub fn summary(&self) -> String {
         let migrations = &self.migrations;
         format!(
-            "{} store(s), {} change(s): {} remapped, {} split, {} retired, {} archived, {} anchor(s), {} tag pass(es), {} lifecycle fix(es), {} entity demotion(s), {} dangling edge(s), {} rewired edge(s), {} reclassified",
+            "{} store(s), {} ontology canonicalized, {} change(s): {} remapped, {} split, {} retired, {} archived, {} anchor(s), {} tag pass(es), {} lifecycle fix(es), {} entity demotion(s), {} dangling edge(s), {} rewired edge(s), {} reclassified",
             self.stores,
+            self.ontology_canonicalized,
             migrations.changed(),
             migrations.remapped,
             migrations.split,
@@ -3734,20 +3739,88 @@ impl MemoryManager {
             ..Default::default()
         };
         report.stores = self.for_each_store(|_key, graph| {
-            let ontology = self.ontology_for_graph(graph);
             if apply {
+                let ontology_changed = self.canonicalize_default_ontology(graph);
+                if ontology_changed {
+                    report.ontology_canonicalized += 1;
+                }
+                let ontology = self.ontology_for_graph(graph);
                 let migrated = apply_migrations(graph, &steps, &ontology);
                 let changed = migrated.changed() > 0;
                 report.migrations.merge(migrated);
-                changed
+                ontology_changed || changed
             } else {
                 let mut probe = graph.clone();
+                let ontology_changed = self.canonicalize_default_ontology(&mut probe);
+                if ontology_changed {
+                    report.ontology_canonicalized += 1;
+                }
+                let ontology = self.ontology_for_graph(&probe);
                 let migrated = apply_migrations(&mut probe, &steps, &ontology);
                 report.migrations.merge(migrated);
                 false
             }
         })?;
         Ok(report)
+    }
+
+    /// Replace a store's core-only default ontology with the compiled default.
+    ///
+    /// Old stores persisted the memory classes directly in `ontology.types`
+    /// and may carry stale descriptions or hashes. Deserialization already
+    /// strips those classes, so the remaining value is a default ontology with
+    /// no business concepts. Rewriting it to the compiled default makes the
+    /// stored version, description and content hash match the running code.
+    ///
+    /// Stores with project business types, custom rules/relationships/activities
+    /// or layered overlays are left untouched.
+    fn canonicalize_default_ontology(&self, graph: &mut MemoryGraph) -> bool {
+        let default = self.ontology_registry().default_ontology();
+        let Some(stored) = graph.metadata.ontology.as_mut() else {
+            return false;
+        };
+        if stored.id != default.id
+            || !stored.types.is_empty()
+            || !stored.category_aliases.is_empty()
+            || stored.relationships != default.relationships
+            || stored.rules != default.rules
+            || stored.activities != default.activities
+        {
+            return false;
+        }
+
+        let default_hash = default.content_hash();
+        let history_is_core_only = graph.metadata.ontology_history.iter().all(|snapshot| {
+            snapshot.ontology.id == default.id
+                && snapshot.ontology.types.is_empty()
+                && snapshot.ontology.category_aliases.is_empty()
+                && snapshot.ontology.relationships == default.relationships
+                && snapshot.ontology.rules == default.rules
+                && snapshot.ontology.activities == default.activities
+        });
+        let changed = *stored != *default
+            || graph.metadata.ontology_id != default.id
+            || graph.metadata.ontology_version != default.version
+            || graph.metadata.ontology_hash != default_hash
+            || !graph.metadata.ontology_parent_hash.is_empty()
+            || !graph.metadata.ontology_layer_hash.is_empty()
+            || !graph.metadata.ontology_layer_ids.is_empty()
+            || (history_is_core_only && !graph.metadata.ontology_history.is_empty());
+        if !changed {
+            return false;
+        }
+
+        *stored = (*default).clone();
+        graph.metadata.ontology_id = default.id.clone();
+        graph.metadata.ontology_version = default.version;
+        graph.metadata.ontology_hash = default_hash;
+        graph.metadata.ontology_parent_hash.clear();
+        graph.metadata.ontology_layer_hash.clear();
+        graph.metadata.ontology_layer_ids.clear();
+        if history_is_core_only {
+            graph.metadata.ontology_history.clear();
+        }
+        true
     }
 
     /// Record that a skill was invoked, closing the skill -> memory loop.
