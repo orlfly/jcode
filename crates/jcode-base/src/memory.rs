@@ -1513,29 +1513,37 @@ impl MemoryManager {
         let layers: Vec<OntologyLayer> = layer.into_iter().collect();
         let layer_hash = layer_stack_hash(&layers);
         let parent_hash = parent.content_hash();
-        if graph.metadata.ontology_parent_hash == parent_hash
-            && graph.metadata.ontology_layer_hash == layer_hash
-            && graph.metadata.ontology.is_some()
-        {
+        if layers.is_empty() {
+            // No overlay: the effective ontology is exactly the global parent.
+            // Default parents are stored as a reference, not a snapshot.
+            let effective_is_default = *parent == *self.ontology_registry().default_ontology();
+            let metadata_matches = graph.metadata.ontology_parent_hash == parent_hash
+                && graph.metadata.ontology_layer_hash == layer_hash
+                && graph.metadata.ontology_id == parent.id
+                && graph.metadata.ontology_version == parent.version
+                && graph.metadata.ontology_hash == parent_hash
+                && graph.metadata.ontology.is_some() != effective_is_default;
+            if metadata_matches {
+                return Ok(());
+            }
+            self.set_effective_ontology_metadata(
+                graph,
+                &parent,
+                parent_hash,
+                layer_hash,
+                Vec::new(),
+            );
             return Ok(());
         }
-        let effective = if layers.is_empty() {
-            (*parent).clone()
-        } else {
-            compose_ontology_layers(&parent, &layers).map_err(|errors| {
-                anyhow::anyhow!(
-                    "project ontology layer rejected:\n- {}",
-                    errors.join("\n- ")
-                )
-            })?
-        };
-        graph.metadata.ontology_id = effective.id.clone();
-        graph.metadata.ontology_version = effective.version;
-        graph.metadata.ontology_hash = effective.content_hash();
-        graph.metadata.ontology_parent_hash = parent_hash;
-        graph.metadata.ontology_layer_hash = layer_hash;
-        graph.metadata.ontology_layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
-        graph.metadata.ontology = Some(effective);
+
+        let effective = compose_ontology_layers(&parent, &layers).map_err(|errors| {
+            anyhow::anyhow!(
+                "project ontology layer rejected:\n- {}",
+                errors.join("\n- ")
+            )
+        })?;
+        let layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
+        self.set_effective_ontology_metadata(graph, &effective, parent_hash, layer_hash, layer_ids);
         Ok(())
     }
 
@@ -3776,16 +3784,10 @@ impl MemoryManager {
     /// or layered overlays are left untouched.
     fn canonicalize_default_ontology(&self, graph: &mut MemoryGraph) -> bool {
         let default = self.ontology_registry().default_ontology();
-        let Some(stored) = graph.metadata.ontology.as_mut() else {
+        let Some(stored) = graph.metadata.ontology.as_ref() else {
             return false;
         };
-        if stored.id != default.id
-            || !stored.types.is_empty()
-            || !stored.category_aliases.is_empty()
-            || stored.relationships != default.relationships
-            || stored.rules != default.rules
-            || stored.activities != default.activities
-        {
+        if !self.is_core_only_default(stored) {
             return false;
         }
 
@@ -3798,19 +3800,7 @@ impl MemoryManager {
                 && snapshot.ontology.rules == default.rules
                 && snapshot.ontology.activities == default.activities
         });
-        let changed = *stored != *default
-            || graph.metadata.ontology_id != default.id
-            || graph.metadata.ontology_version != default.version
-            || graph.metadata.ontology_hash != default_hash
-            || !graph.metadata.ontology_parent_hash.is_empty()
-            || !graph.metadata.ontology_layer_hash.is_empty()
-            || !graph.metadata.ontology_layer_ids.is_empty()
-            || (history_is_core_only && !graph.metadata.ontology_history.is_empty());
-        if !changed {
-            return false;
-        }
-
-        *stored = (*default).clone();
+        graph.metadata.ontology = None;
         graph.metadata.ontology_id = default.id.clone();
         graph.metadata.ontology_version = default.version;
         graph.metadata.ontology_hash = default_hash;
@@ -4284,10 +4274,13 @@ impl MemoryManager {
                 "{}:{}->{}",
                 patch.base_id, base.version, next.version
             ));
-            graph.metadata.ontology_id = next.id.clone();
-            graph.metadata.ontology_version = next.version;
-            graph.metadata.ontology_hash = new_hash.clone();
-            graph.metadata.ontology = Some(next.clone());
+            self.set_effective_ontology_metadata(
+                &mut graph,
+                &next,
+                String::new(),
+                String::new(),
+                Vec::new(),
+            );
             self.save_scope_graph(scope, &graph)?;
             // Only the global ontology becomes the process-wide fallback for
             // stores that carry none. A project-specific patch must not leak
@@ -4392,13 +4385,13 @@ impl MemoryManager {
                 "{}:{}->{}",
                 patch.base_id, base.version, next.version
             ));
-            graph.metadata.ontology_id = next.id.clone();
-            graph.metadata.ontology_version = next.version;
-            graph.metadata.ontology_hash = new_hash.clone();
-            graph.metadata.ontology_parent_hash = parent_hash;
-            graph.metadata.ontology_layer_hash = layer_hash;
-            graph.metadata.ontology_layer_ids = vec![next_overlay.id.clone()];
-            graph.metadata.ontology = Some(next.clone());
+            self.set_effective_ontology_metadata(
+                &mut graph,
+                &next,
+                parent_hash,
+                layer_hash,
+                vec![next_overlay.id.clone()],
+            );
             self.save_project_graph(&graph)?;
             report
         };
@@ -4546,10 +4539,13 @@ impl MemoryManager {
             .ontology_history
             .retain(|entry| entry.version != version);
         let restored = snapshot.ontology.clone();
-        graph.metadata.ontology_id = restored.id.clone();
-        graph.metadata.ontology_version = restored.version;
-        graph.metadata.ontology_hash = restored.content_hash();
-        graph.metadata.ontology = Some(restored.clone());
+        self.set_effective_ontology_metadata(
+            &mut graph,
+            &restored,
+            String::new(),
+            String::new(),
+            Vec::new(),
+        );
         self.save_scope_graph(scope, &graph)?;
         if scope == OntologyScope::Global {
             self.ontology_registry().install(restored);
@@ -4586,13 +4582,24 @@ impl MemoryManager {
         let parent = self.global_ontology_for_composition()?;
         let overlay = diff_ontology_layer(&parent, &snapshot.ontology);
         self.write_project_ontology_layer(&overlay)?;
-        let restored =
-            compose_ontology_layers(&parent, std::slice::from_ref(&overlay)).map_err(|errors| {
+        let layers = if layer_is_empty(&overlay) {
+            Vec::new()
+        } else {
+            vec![overlay]
+        };
+        let restored = if layers.is_empty() {
+            (*parent).clone()
+        } else {
+            compose_ontology_layers(&parent, &layers).map_err(|errors| {
                 anyhow::anyhow!(
                     "rolled-back project ontology rejected:\n- {}",
                     errors.join("\n- ")
                 )
-            })?;
+            })?
+        };
+        let parent_hash = parent.content_hash();
+        let layer_hash = layer_stack_hash(&layers);
+        let layer_ids = layers.iter().map(|layer| layer.id.clone()).collect();
 
         if let Some(current) = graph.metadata.ontology.clone() {
             graph.metadata.ontology_history.push(OntologySnapshot::new(
@@ -4604,13 +4611,13 @@ impl MemoryManager {
             .metadata
             .ontology_history
             .retain(|entry| entry.version != version);
-        graph.metadata.ontology_id = restored.id.clone();
-        graph.metadata.ontology_version = restored.version;
-        graph.metadata.ontology_hash = restored.content_hash();
-        graph.metadata.ontology_parent_hash = parent.content_hash();
-        graph.metadata.ontology_layer_hash = layer_stack_hash(std::slice::from_ref(&overlay));
-        graph.metadata.ontology_layer_ids = vec![overlay.id.clone()];
-        graph.metadata.ontology = Some(restored);
+        self.set_effective_ontology_metadata(
+            &mut graph,
+            &restored,
+            parent_hash,
+            layer_hash,
+            layer_ids,
+        );
         self.save_project_graph(&graph)?;
         Ok(snapshot)
     }
@@ -5125,43 +5132,117 @@ impl MemoryManager {
     fn bind_ontology_metadata(&self, key: &str, graph: &mut MemoryGraph) -> bool {
         graph.metadata.retrieval_count = graph.metadata.retrieval_count.saturating_add(1);
         let mut changed = false;
+        let default = self.ontology_registry().default_ontology();
 
-        if graph.metadata.ontology.is_none() {
-            // First load of a store that predates runtime ontology storage:
-            // persist the compiled default so the store carries its own
-            // definition and can later be patched/rolled back.
-            let ontology = self.ontology_registry().default_ontology();
-            graph.metadata.ontology_id = ontology.id.clone();
-            graph.metadata.ontology_version = ontology.version;
-            graph.metadata.ontology_hash = ontology.content_hash();
-            graph.metadata.ontology = Some((*ontology).clone());
+        // A core-only default snapshot is redundant: the compiled definition
+        // is already the fallback. Drop it so stores do not carry a stale copy
+        // of descriptions, rules or core classes.
+        let stored_is_default = graph
+            .metadata
+            .ontology
+            .as_ref()
+            .is_some_and(|stored| self.is_core_only_default(stored));
+        if stored_is_default {
+            graph.metadata.ontology = None;
             changed = true;
-        } else {
-            let stored = graph
-                .metadata
-                .ontology
-                .as_ref()
-                .expect("checked above")
-                .clone();
-            let stored_hash = jcode_memory_types::migration::ontology_content_hash(&stored);
-            if graph.metadata.ontology_hash != stored_hash {
-                crate::logging::warn(&format!(
-                    "Memory ontology hash mismatch for {key}: metadata {} -> {stored_hash}",
-                    graph.metadata.ontology_hash
-                ));
-                graph.metadata.ontology_hash = stored_hash;
-                changed = true;
-            }
-            if graph.metadata.ontology_id != stored.id {
-                graph.metadata.ontology_id = stored.id.clone();
-                changed = true;
-            }
-            if graph.metadata.ontology_version != stored.version {
-                graph.metadata.ontology_version = stored.version;
-                changed = true;
-            }
         }
 
+        let (id, version, hash) = match graph.metadata.ontology.as_ref() {
+            Some(stored) => (
+                stored.id.clone(),
+                stored.version,
+                jcode_memory_types::migration::ontology_content_hash(stored),
+            ),
+            None => (
+                default.id.clone(),
+                default.version,
+                default.content_hash(),
+            ),
+        };
+        if graph.metadata.ontology_hash != hash {
+            if graph.metadata.ontology.is_some() {
+                crate::logging::warn(&format!(
+                    "Memory ontology hash mismatch for {key}: metadata {} -> {hash}",
+                    graph.metadata.ontology_hash
+                ));
+            }
+            graph.metadata.ontology_hash = hash;
+            changed = true;
+        }
+        if graph.metadata.ontology_id != id {
+            graph.metadata.ontology_id = id;
+            changed = true;
+        }
+        if graph.metadata.ontology_version != version {
+            graph.metadata.ontology_version = version;
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Whether `ontology` is semantically the compiled default, even when it
+    /// still carries an older description or a redundant default snapshot.
+    fn is_core_only_default(&self, ontology: &jcode_memory_types::Ontology) -> bool {
+        let default = self.ontology_registry().default_ontology();
+        ontology.id == default.id
+            && ontology.types.is_empty()
+            && ontology.category_aliases.is_empty()
+            && ontology.relationships == default.relationships
+            && ontology.rules == default.rules
+            && ontology.activities == default.activities
+    }
+
+    /// Store the effective ontology as a reference or a materialized snapshot.
+    ///
+    /// The compiled default is represented by `ontology = None` plus
+    /// id/version/hash metadata. Only non-default effective ontologies need a
+    /// full snapshot. Returns true when any metadata field changed.
+    fn set_effective_ontology_metadata(
+        &self,
+        graph: &mut MemoryGraph,
+        effective: &jcode_memory_types::Ontology,
+        parent_hash: String,
+        layer_hash: String,
+        layer_ids: Vec<String>,
+    ) -> bool {
+        let default = self.ontology_registry().default_ontology();
+        let is_default = effective == &*default;
+        let snapshot = if is_default {
+            None
+        } else {
+            Some(effective.clone())
+        };
+        let hash = effective.content_hash();
+        let mut changed = false;
+        if graph.metadata.ontology != snapshot {
+            graph.metadata.ontology = snapshot;
+            changed = true;
+        }
+        if graph.metadata.ontology_id != effective.id {
+            graph.metadata.ontology_id = effective.id.clone();
+            changed = true;
+        }
+        if graph.metadata.ontology_version != effective.version {
+            graph.metadata.ontology_version = effective.version;
+            changed = true;
+        }
+        if graph.metadata.ontology_hash != hash {
+            graph.metadata.ontology_hash = hash;
+            changed = true;
+        }
+        if graph.metadata.ontology_parent_hash != parent_hash {
+            graph.metadata.ontology_parent_hash = parent_hash;
+            changed = true;
+        }
+        if graph.metadata.ontology_layer_hash != layer_hash {
+            graph.metadata.ontology_layer_hash = layer_hash;
+            changed = true;
+        }
+        if graph.metadata.ontology_layer_ids != layer_ids {
+            graph.metadata.ontology_layer_ids = layer_ids;
+            changed = true;
+        }
         changed
     }
 

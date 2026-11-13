@@ -232,26 +232,28 @@ pub struct GraphMetadata {
     /// Total links discovered via co-relevance
     #[serde(default)]
     pub link_discovery_count: u64,
-    /// Ontology id the graph was authored against (e.g. `jcode/default/v1`).
-    /// Runtime rules/activities consult this id to look up the matching
-    /// `Ontology` from the registry.  Empty string means "no ontology bound"
-    /// — the runtime falls back to the hardcoded behavior.
+    /// Ontology id the graph is bound to (e.g. `jcode/default/v1`).
+    /// Runtime resolution combines this reference with [`Self::ontology`]:
+    /// when no snapshot is materialized, the compiled default for this id is
+    /// used. Empty string means the store predates ontology binding.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ontology_id: String,
     /// Ontology version that was bound.  Lets the runtime detect when the
     /// bound ontology has been upgraded and re-validate stored entries.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub ontology_version: u32,
-    /// Full serialized ontology this store is authored against.
+    /// Materialized ontology override for this store.
     ///
-    /// When present the runtime uses it instead of the compiled-in default.
-    /// When absent the store predates runtime ontology storage and falls back
-    /// to `default_ontology()`.
+    /// `None` means the store uses the compiled default selected by
+    /// `ontology_id` / `ontology_version` / `ontology_hash`. A full snapshot is
+    /// stored only when the effective ontology diverges from the compiled
+    /// default, such as business concepts, custom rules or project overlays.
+    /// This keeps default stores small and free of stale copies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology: Option<Ontology>,
-    /// Deterministic content hash of `ontology` (see
-    /// `migration::ontology_content_hash`). Used for drift detection and for
-    /// optimistic-concurrency checks when applying a patch.
+    /// Deterministic content hash of the effective ontology. When
+    /// [`Self::ontology`] is `None` this is the compiled default's hash.
+    /// Used for drift detection and optimistic-concurrency checks.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ontology_hash: String,
     /// Content hash of the parent ontology a project store composes on top of.

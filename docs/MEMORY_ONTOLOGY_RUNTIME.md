@@ -16,8 +16,8 @@ The ontology is stored with each memory store in `GraphMetadata`:
 pub struct GraphMetadata {
     pub ontology_id: String,
     pub ontology_version: u32,
-    pub ontology: Option<Ontology>,          // full serialized definition
-    pub ontology_hash: String,               // deterministic content hash
+    pub ontology: Option<Ontology>,          // None = compiled default; Some = non-default override
+    pub ontology_hash: String,               // effective ontology hash (default hash when None)
     pub ontology_history: Vec<OntologySnapshot>,
     pub applied_migrations: Vec<String>,
     pub migration_state: Option<MigrationState>,
@@ -28,13 +28,19 @@ pub struct GraphMetadata {
 Both backends persist it without extra schema work:
 
 - JSON: the whole `MemoryGraph` (including metadata) is one document.
-- SQLite/gvec: `jcode_graph_meta(store, json)` already stores the serialized
+- SQLite/gvec: `jcode_graph_meta(store, json)` stores the serialized
   metadata per named graph.
 
-On the first load of a store that predates this feature,
-`MemoryManager::bind_and_check_ontology` writes the compiled default ontology
-into the metadata. On later loads the stored ontology is authoritative; the
-compiled `default_ontology()` remains a fallback for stores that carry none.
+Default ontologies are stored by reference: `ontology = None` plus
+`ontology_id`, `ontology_version` and `ontology_hash`. A full snapshot is
+written only when the effective ontology differs from the compiled default.
+Loading a redundant default snapshot clears it, and `jcode memory migrate
+--apply` compacts existing stores.
+
+`MemoryManager::bind_and_check_ontology` records the effective id, version and
+hash on load and drops a redundant default snapshot. A store that predates
+runtime ontology storage therefore reads correctly without migration; the
+compiled `default_ontology()` is the fallback whenever `ontology` is `None`.
 
 ## 2. Runtime resolution
 
@@ -237,7 +243,7 @@ diff back to this file instead of copying a full snapshot. Rollback rewrites the
 overlay and removes it when the restored state equals the global ontology.
 Metadata records `ontology_parent_hash`, `ontology_layer_hash` and
 `ontology_layer_ids`; a changed global ontology or overlay invalidates the
-materialized copy on the next load.
+effective metadata on the next load.
 
 An older project store that persisted a full ontology snapshot is adopted
 automatically only when the snapshot is provably additive: every current global

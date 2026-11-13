@@ -3353,6 +3353,15 @@ fn legacy_core_type_snapshot_is_normalized_not_adopted() {
             !overlay_path.exists(),
             "a core-only legacy snapshot has no business concepts to adopt"
         );
+        assert!(
+            manager
+                .load_project_graph()
+                .unwrap()
+                .metadata
+                .ontology
+                .is_none(),
+            "loading must drop a redundant default snapshot"
+        );
         assert!(!effective.types.contains_key("env_fact"));
         assert_eq!(
             effective.get_type("env_fact").unwrap().ttl_days,
@@ -3391,13 +3400,29 @@ fn migrate_canonicalizes_core_only_default_ontology() {
         assert!(report.ontology_canonicalized >= 1);
 
         let graph = manager.load_project_graph().unwrap();
-        let stored = graph.metadata.ontology.as_ref().expect("stored ontology");
-        assert_eq!(stored.version, DEFAULT_ONTOLOGY_VERSION);
-        assert!(stored.types.is_empty());
-        assert_eq!(stored.content_hash(), default_ontology().content_hash());
+        assert!(
+            graph.metadata.ontology.is_none(),
+            "the compiled default is stored as a reference, not a snapshot"
+        );
+        assert_eq!(
+            graph.metadata.ontology_version,
+            DEFAULT_ONTOLOGY_VERSION
+        );
         assert_eq!(
             graph.metadata.ontology_hash,
             default_ontology().content_hash()
+        );
+        assert_eq!(
+            manager
+                .stored_ontology(OntologyScope::Project)
+                .unwrap()
+                .content_hash(),
+            default_ontology().content_hash()
+        );
+        let serialized = serde_json::to_value(&graph.metadata).unwrap();
+        assert!(
+            serialized.get("ontology").is_none(),
+            "default stores must not serialize a redundant ontology snapshot"
         );
         assert!(graph.metadata.ontology_history.is_empty());
         assert!(graph.get_memory(&id).is_some(), "memories must survive");
@@ -3870,15 +3895,15 @@ fn automatic_ontology_reflection_is_low_risk_and_proposal_only() {
 }
 
 #[test]
-fn json_store_persists_default_ontology_on_first_load() {
+fn json_store_binds_default_ontology_by_reference() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/ontology-json-bind");
         let graph = manager.load_project_graph().unwrap();
-        let ontology = graph
-            .metadata
-            .ontology
-            .as_ref()
-            .expect("JSON store must persist the ontology");
+        assert!(
+            graph.metadata.ontology.is_none(),
+            "the default ontology must not be materialized"
+        );
+        let ontology = manager.stored_ontology(OntologyScope::Project).unwrap();
         assert_eq!(graph.metadata.ontology_hash, ontology.content_hash());
         assert_eq!(
             graph.metadata.ontology_version,
@@ -3892,9 +3917,13 @@ fn json_store_persists_default_ontology_on_first_load() {
             reloaded.metadata.ontology_hash,
             graph.metadata.ontology_hash
         );
+        assert!(reloaded.metadata.ontology.is_none());
         assert_eq!(
-            reloaded.metadata.ontology.as_ref().unwrap().types.len(),
-            ontology.types.len()
+            other
+                .stored_ontology(OntologyScope::Project)
+                .unwrap()
+                .content_hash(),
+            ontology.content_hash()
         );
     });
 }

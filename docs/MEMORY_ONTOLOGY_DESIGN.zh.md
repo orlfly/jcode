@@ -290,7 +290,7 @@ type_patches:
 - 每个项目一个 graph，store key 为 `project:<hash>`；
 - 全局 graph 的 store key 为 `global`；
 - FTS5 表用于全文检索；
-- `jcode_graph_meta` 保存最近写入来源。
+- `jcode_graph_meta` 保存每个 store 的 `GraphMetadata` JSON，包括本体引用或非默认本体快照。
 
 JSON 回退：
 
@@ -316,8 +316,8 @@ JSON 回退：
 ```rust
 pub ontology_id: String,
 pub ontology_version: u32,
-pub ontology: Option<Ontology>,          // 物化的有效本体
-pub ontology_hash: String,               // 有效本体的内容哈希
+pub ontology: Option<Ontology>,          // None = 编译默认；Some = 非默认有效本体
+pub ontology_hash: String,               // 有效本体的内容哈希（默认时即编译默认哈希）
 pub ontology_parent_hash: String,        // 项目覆盖层的父本体哈希
 pub ontology_layer_hash: String,         // 项目覆盖层栈哈希
 pub ontology_layer_ids: Vec<String>,     // 层来源，供 show/诊断
@@ -326,8 +326,11 @@ pub applied_migrations: Vec<String>,
 pub migration_state: Option<MigrationState>,
 ```
 
-物化本体是**缓存/快照**，不是唯一事实来源：
+本体存储遵循“默认引用、非默认快照”：
 
+- `ontology = None` 表示使用 `ontology_id` / `ontology_version` / `ontology_hash` 指向的编译默认本体，不再为每个 store 复制一份默认定义；
+- `ontology = Some(..)` 只在有效本体偏离编译默认时出现，例如业务概念、自定义规则或项目覆盖层；
+- 默认快照在读取和 `memory migrate` 时会被清除，避免旧描述、旧哈希和核心类型残留。默认本体的事实来源始终是代码。
 - 项目 scope 的事实来源是全局有效本体 + 项目覆盖层；
 - 全局 scope 的事实来源是全局 store 中的本体；
 - 父哈希或层哈希变化时，下次加载重新合成。
@@ -341,7 +344,7 @@ pub migration_state: Option<MigrationState>,
 1. 读取全局有效本体；
 2. 读取项目覆盖层；
 3. 如果 `ontology_parent_hash` 和 `ontology_layer_hash` 与当前一致，复用物化本体；
-4. 否则重新合成、校验、替换 `metadata.ontology`；
+4. 否则重新合成、校验，并在默认本体时清空 `metadata.ontology`，在非默认本体时写入完整快照；
 5. 在下一次正常保存时持久化。
 
 加载合成路径使用 `global_ontology_for_composition()` 读取全局本体，不增加全局召回计数，避免把项目加载误计为用户召回。
