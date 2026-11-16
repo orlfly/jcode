@@ -728,7 +728,7 @@ fn render_memory_auto_disabled_line(info: &MemoryInfo, max_width: usize) -> Line
          Reload with `agents.memory_sidecar_enabled = false` to silence this badge."
             .to_string()
     };
-    let truncated = truncate_with_ellipsis(&detail, max_width.saturating_sub(2).max(20));
+    let truncated = clip(&detail, max_width.saturating_sub(2).max(20));
     Line::from(vec![
         Span::styled("⚠ ", Style::default().fg(rgb(255, 180, 80))),
         Span::styled(truncated, Style::default().fg(rgb(255, 200, 120))),
