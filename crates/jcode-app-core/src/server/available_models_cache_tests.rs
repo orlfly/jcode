@@ -105,7 +105,7 @@ async fn offloaded_catalog_releases_agent_and_validates_selection_before_metadat
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut release = Release(Some(release_tx));
         let provider = Arc::new(GatedProvider {
-            model: Arc::new(Mutex::new("model-a".into())),
+            model: Arc::new(Mutex::new("catalog-model-a".into())),
             revision: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(None)),
             builds: Arc::new(AtomicU64::new(0)),
@@ -138,10 +138,13 @@ async fn offloaded_catalog_releases_agent_and_validates_selection_before_metadat
             .try_lock()
             .expect("cold build must release the agent lock");
         match scenario {
-            "changed" => guard.provider_handle().set_model("model-b").unwrap(),
+            "changed" => guard
+                .provider_handle()
+                .set_model("catalog-model-b")
+                .unwrap(),
             "aba" => {
-                guard.set_model("model-b").unwrap();
-                guard.set_model("model-a").unwrap();
+                guard.set_model("catalog-model-b").unwrap();
+                guard.set_model("catalog-model-a").unwrap();
             }
             "catalog-revision" => {
                 provider.revision.fetch_add(1, Ordering::SeqCst);
@@ -163,16 +166,14 @@ async fn offloaded_catalog_releases_agent_and_validates_selection_before_metadat
         drop(busy);
         if scenario != "busy" {
             let (catalog, tier) = result.expect("stable live catalog");
-            let model = if scenario == "changed" {
-                "model-b"
-            } else {
-                "model-a"
-            };
+            // The agent may qualify a bare model with the session's provider
+            // route, so compare against the provider's resolved model.
+            let model = provider.model();
             assert_eq!(
                 catalog.snapshot().provider_model.as_deref(),
                 Some(format!("{model}@upstream").as_str())
             );
-            assert_eq!(tier.as_deref(), Some(model));
+            assert_eq!(tier.as_deref(), Some(model.as_str()));
             assert_eq!(
                 provider.builds.load(Ordering::SeqCst),
                 if scenario == "unchanged" { 1 } else { 2 }

@@ -314,8 +314,10 @@ fn model_definition_size_budget() {
     })
     .to_string();
     println!("BROWSER_DEFINITION={definition}");
+    // `mode` adds the headed/headless switch; keep the rest of the definition
+    // under the original budget.
     assert!(
-        definition.len() < 1_400,
+        definition.len() < 1_500,
         "browser definition: {} bytes",
         definition.len()
     );

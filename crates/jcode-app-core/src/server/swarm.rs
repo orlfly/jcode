@@ -8,7 +8,7 @@ use crate::session::Session;
 use anyhow::Result;
 use futures::future::try_join_all;
 use jcode_swarm_core::{
-    completion_notification_message, normalize_completion_report, truncate_detail,
+    completion_notification_with_lane_plan, normalize_completion_report, truncate_detail,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -766,7 +766,26 @@ async fn broadcast_swarm_status_now(
         return;
     }
 
-    let members_guard = swarm_members.read().await;
+    // Resolve recipients and publish under one guard. Besides avoiding a lock
+    // and full payload clone per session, this keeps an older snapshot from
+    // being queued after a concurrent newer snapshot on the same channel.
+    let mut members_guard = swarm_members.write().await;
+    let mut targets = Vec::new();
+    for sid in &session_ids {
+        let Some(member) = members_guard.get_mut(sid) else {
+            continue;
+        };
+        member.event_txs.retain(|_, tx| !tx.is_closed());
+        if let Some((_, tx)) = member.event_txs.iter().next() {
+            member.event_tx = tx.clone();
+            targets.extend(member.event_txs.values().cloned());
+        } else if !member.event_tx.is_closed() {
+            targets.push(member.event_tx.clone());
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
     let broadcast_terminal_retention = swarm_status_broadcast_terminal_retention();
     let members_list: Vec<crate::protocol::SwarmMemberStatus> = session_ids
         .iter()
@@ -839,13 +858,12 @@ async fn broadcast_swarm_status_now(
         })
         .collect();
 
-    drop(members_guard);
     let event = ServerEvent::SwarmStatus {
         members: members_list,
     };
-    for sid in session_ids {
-        let _ = fanout_session_event(swarm_members, &sid, event.clone()).await;
-    }
+    // Unbounded queue sends never await. Do not route through the generic
+    // event projector: SwarmStatus itself cannot change a live projection.
+    super::state::send_event_to_targets(&targets, event);
 }
 
 /// Publish wait transitions immediately and refresh elapsed wait ages while a
@@ -1700,7 +1718,7 @@ pub(super) async fn update_member_status_with_report_tldr(
     event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
     swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
 ) {
-    let mut completion_report = normalize_completion_report(completion_report);
+    let completion_report = normalize_completion_report(completion_report);
     let detail_present = detail.is_some();
     let (
         swarm_id,
@@ -1713,22 +1731,8 @@ pub(super) async fn update_member_status_with_report_tldr(
     ) = {
         let mut members = swarm_members.write().await;
         if let Some(member) = members.get_mut(session_id) {
-            // Forced stops and crashes may abort the turn before its transcript
-            // can be collected. Preserve the already streamed public tail before
-            // the terminal transition clears the gallery buffer.
-            if completion_report.is_none()
-                && matches!(
-                    status,
-                    "ready" | "completed" | "done" | "failed" | "crashed" | "stopped"
-                )
-            {
-                completion_report = member.output_tail.as_deref().and_then(|tail| {
-                    jcode_swarm_core::recent_output_tail(
-                        std::iter::once(tail),
-                        jcode_swarm_core::SWARM_OUTPUT_TAIL_TOKENS,
-                    )
-                });
-            }
+            // The live gallery buffer mixes tool activity and partial prose.
+            // Never promote it to the worker's final response on interruption.
             let previous_status = member.status.clone();
             let status_changed = member.status != status;
             let detail_changed = member.detail != detail;
@@ -1775,6 +1779,9 @@ pub(super) async fn update_member_status_with_report_tldr(
                 "ready" | "completed" | "done" | "failed" | "crashed" | "stopped"
             ) {
                 member.output_tail = None;
+                if status_changed {
+                    member.latest_completion_report = completion_report.clone();
+                }
             }
             if completion_report.is_some() {
                 member.latest_completion_report = completion_report.clone();
@@ -1877,8 +1884,14 @@ pub(super) async fn update_member_status_with_report_tldr(
                 let name = agent_name
                     .as_deref()
                     .unwrap_or(&session_id[..8.min(session_id.len())]);
-                let msg =
-                    completion_notification_message(name, status, completion_report.as_deref());
+                let todos = crate::todo::load_todos(session_id).unwrap_or_default();
+                let lane_plan = super::swarm_todo_link::completion_lane_plan(&todos);
+                let msg = completion_notification_with_lane_plan(
+                    name,
+                    status,
+                    completion_report.as_deref(),
+                    lane_plan.as_deref(),
+                );
                 // Display notifications alone never enter the owner's model
                 // context. Deliver reports through the reliable runtime bus,
                 // which wakes idle owners and queues reports for busy ones.

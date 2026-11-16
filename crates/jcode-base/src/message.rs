@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub use jcode_message_types::{
-    CacheControl, ConnectionPhase, ContentBlock, InputShellResult, Message, Role, StreamEvent,
-    TOOL_OUTPUT_MISSING_TEXT, ToolCall, ToolDefinition, cache_relevant_message_hashes,
+    CacheControl, ConnectionPhase, ContentBlock, InputShellResult, Message, Role, SharedContent,
+    StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall, ToolDefinition, cache_relevant_message_hashes,
     cache_relevant_message_value, cache_relevant_messages, ends_with_fresh_user_turn,
     extend_stable_hash, messages_with_dynamic_system_context, provider_native, replace_text_suffix,
     sanitize_tool_id, stable_message_hash,
@@ -61,6 +61,15 @@ fn compile_static_regexes(patterns: &[&str]) -> Vec<Regex> {
         .iter()
         .filter_map(|pattern| compile_static_regex(pattern))
         .collect()
+}
+
+fn replace_redaction_matches(text: &mut String, pattern: &Regex, replacement: &str) {
+    // Regex already returns a borrowed value when there are no matches. Keep
+    // the existing allocation instead of turning that borrow into a full copy
+    // for every pattern in the redaction pipeline.
+    if let std::borrow::Cow::Owned(replaced) = pattern.replace_all(text.as_str(), replacement) {
+        *text = replaced;
+    }
 }
 
 /// Redact likely secrets from persisted tool output.
@@ -200,13 +209,11 @@ pub fn redact_secrets(text: &str) -> String {
     .collect();
 
     for re in direct_patterns {
-        redacted = re.replace_all(&redacted, "[REDACTED_SECRET]").into_owned();
+        replace_redaction_matches(&mut redacted, re, "[REDACTED_SECRET]");
     }
 
     for re in assignment_patterns {
-        redacted = re
-            .replace_all(&redacted, "${1}[REDACTED_SECRET]")
-            .into_owned();
+        replace_redaction_matches(&mut redacted, re, "${1}[REDACTED_SECRET]");
     }
 
     // Also redact custom API key variable names configured at runtime.
@@ -240,9 +247,7 @@ pub fn redact_secrets(text: &str) -> String {
             logging::debug(&format!(
                 "adding custom secret redaction pattern for key={key_name}"
             ));
-            redacted = re
-                .replace_all(&redacted, "${1}[REDACTED_SECRET]")
-                .into_owned();
+            replace_redaction_matches(&mut redacted, &re, "${1}[REDACTED_SECRET]");
         }
     }
 

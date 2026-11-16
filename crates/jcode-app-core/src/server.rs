@@ -51,6 +51,7 @@ mod lane_dispatch;
 mod lifecycle;
 mod live_status;
 mod live_turn;
+mod mobile_local;
 mod provider_control;
 mod reload;
 mod reload_recovery;
@@ -501,8 +502,8 @@ pub use self::socket::{
 };
 use self::socket::{signal_ready_fd, socket_has_live_listener};
 
-pub use self::util::{MANAGED_CLOUD_LIVE_RELOAD_MARKER, ServerIdentity};
 pub(crate) use self::util::server_has_newer_binary;
+pub use self::util::{MANAGED_CLOUD_LIVE_RELOAD_MARKER, ServerIdentity};
 use self::util::{
     debug_control_allowed, embedding_idle_unload_secs, git_common_dir_for, reload_exec_target,
     startup_headless_recovery_test_delay, swarm_id_for_dir, swarm_id_for_session,
@@ -1410,6 +1411,19 @@ impl Server {
         crate::mobile_sync::spawn_background_sync();
         // On Jcode Cloud machines, run sessions the phone starts or continues.
         crate::mobile_runner::spawn_cloud_runner();
+        // On the user's own computer, take messages the phone sends to
+        // sessions running here (only while mobile sync is enabled).
+        mobile_local::spawn(mobile_local::DaemonSessions {
+            sessions: Arc::clone(&self.sessions),
+            soft_interrupt_queues: Arc::clone(&self.soft_interrupt_queues),
+            swarm: live_turn::LiveTurnSwarmContext::new(
+                &self.swarm_state.members,
+                &self.swarm_state.swarms_by_id,
+                &self.event_history,
+                &self.event_counter,
+                &self.swarm_event_tx,
+            ),
+        });
         Self::spawn_cloud_activity_keepalive(Arc::clone(&self.swarm_state.members));
 
         // Initialize the memory agent early so it's ready for all sessions

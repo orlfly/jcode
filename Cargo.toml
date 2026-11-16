@@ -124,7 +124,7 @@ thiserror = "1"
 # `workspace = true`; declare them at the jcode root so the inherited
 # resolution succeeds.
 gvec-core = { path = "third_party/sqlite-gvec/crates/gvec-core" }
-rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 
 [lib]
 name = "jcode"
@@ -177,7 +177,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
@@ -476,6 +476,17 @@ opt-level = 3
 [profile.selfdev.package.compact_str]
 opt-level = 3
 [profile.test.package.compact_str]
+opt-level = 3
+
+# The streaming markdown path re-renders every text delta in the focused TUI.
+# Live clients run selfdev builds, so keep it optimized there. Measured with
+# the ignored stream_cost_probe test (9k-char reply, per update late in the
+# reply): 0.219 ms at opt-level 0, 0.059 ms with these three at opt-level 3.
+[profile.selfdev.package.pulldown-cmark]
+opt-level = 3
+[profile.selfdev.package."jcode-tui-markdown"]
+opt-level = 3
+[profile.selfdev.package."jcode-render-core"]
 opt-level = 3
 
 # Keep the text-shaping stack optimized even in dev/selfdev/test builds.

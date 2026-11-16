@@ -1063,8 +1063,8 @@ mod tests {
         let ctx = || test_ctx(Some(project.path().to_path_buf()));
         let mut remembered_id = None;
         for (scope, content) in [
-            ("project", "local-probe project alpha"),
-            ("project", "local-probe project beta"),
+            ("project", "local-probe project alpha storage 4311"),
+            ("project", "local-probe project beta release 4312"),
             ("global", "local-probe global gamma"),
         ] {
             let output = tool
@@ -1074,7 +1074,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(output.output.contains(content));
+            assert!(
+                output.output.contains("Remembered") && output.output.contains(content),
+                "{}",
+                output.output
+            );
             if scope == "global" {
                 remembered_id = output
                     .output
@@ -1553,11 +1557,15 @@ mod tests {
             "base_id": "jcode/default/v1",
             "base_version": crate::memory_types::ontology::DEFAULT_ONTOLOGY_VERSION,
             "base_hash": "",
-            "rationale": "tool test: extend env_fact retention",
+            "rationale": "tool test: add a business concept",
             "ops": [{
-                "op": "update_type",
-                "id": "env_fact",
-                "patch": { "ttl_days": 45.0 }
+                "op": "add_type",
+                "type_def": {
+                    "id": "test.business_contract",
+                    "display_name": "Test Business Contract",
+                    "description": "Tool test business concept.",
+                    "ttl_days": 45.0
+                }
             }]
         });
 

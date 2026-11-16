@@ -39,8 +39,11 @@ pub(super) struct SearchRank {
     /// so a single typo cannot sink a session with strong, distinctive hits.
     source_weight: u32,
     literal: bool,
-    intent_terms: usize,
     exact_field: bool,
+    /// Bounded topical evidence from indexed user text, not titles or
+    /// agent/tool chatter. Repeated mentions beat a one-off incidental hit.
+    user_mentions: usize,
+    intent_terms: usize,
     metadata_terms: usize,
     whole_terms: usize,
     score: i64,
@@ -77,6 +80,7 @@ pub(super) fn literal_metadata_rank(index: &str, tokens: &[String]) -> SearchRan
         opening_prompt: 0,
         source_weight: 0,
         literal: metadata_terms == tokens.len(),
+        user_mentions: source::user_mentions(index, tokens),
         intent_terms: 0,
         exact_field: false,
         metadata_terms,
@@ -85,6 +89,7 @@ pub(super) fn literal_metadata_rank(index: &str, tokens: &[String]) -> SearchRan
     }
 }
 
+#[cfg(test)]
 pub(super) fn exact_metadata_field(session: &SessionInfo, query: &str) -> bool {
     [&session.title, &session.short_name, &session.id]
         .iter()
@@ -113,6 +118,7 @@ pub(super) fn lowercase_field(field: &str) -> std::borrow::Cow<'_, str> {
 }
 
 impl SearchRank {
+    #[cfg(test)]
     pub(super) fn with_intent_terms(mut self, terms: usize) -> Self {
         self.intent_terms = terms;
         self
@@ -295,6 +301,7 @@ fn build_candidates(
 
 /// Per-token metadata origins for the UI-thread ranking of sessions the worker
 /// has not ranked yet. Uses the already lowercased intent fields.
+#[cfg(test)]
 pub(super) fn metadata_source_weight(
     intent_fields: &[&str],
     index: &str,
@@ -485,8 +492,13 @@ fn stream_file<S: source::Sink>(path: &Path, sink: &mut S, cancel: &AtomicBool) 
             match reader.read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let _ = source::Walk::new(&mut *sink)
-                        .deserialize(&mut serde_json::Deserializer::from_slice(&line));
+                    if let Err(error) = source::Walk::new(&mut *sink)
+                        .deserialize(&mut serde_json::Deserializer::from_slice(&line))
+                    {
+                        crate::logging::debug(&format!(
+                            "Skipping invalid transcript search record: {error}"
+                        ));
+                    }
                 }
             }
         }
@@ -498,6 +510,8 @@ fn stream_file<S: source::Sink>(path: &Path, sink: &mut S, cancel: &AtomicBool) 
         .is_ok()
     {}
 }
+
+type IdentityRanks = HashMap<String, (bool, bool, bool)>;
 
 #[derive(Default)]
 pub(super) struct TranscriptSearch {
@@ -512,7 +526,7 @@ pub(super) struct TranscriptSearch {
     defer_metadata: bool,
     /// Per-token rarity weights, computed by the worker before any rank.
     idf: Arc<std::sync::OnceLock<Vec<u32>>>,
-    identities: Arc<std::sync::OnceLock<HashMap<String, (bool, bool, bool)>>>,
+    identities: Arc<std::sync::OnceLock<IdentityRanks>>,
 }
 
 impl Drop for TranscriptSearch {
@@ -572,10 +586,11 @@ impl TranscriptSearch {
         self.identities
             .get()
             .and_then(|identities| identities.get(id).copied())
-            .unwrap_or_default()
+            .unwrap_or((false, false, false))
     }
 
     /// Rarity weights for the current query, once the worker computed them.
+    #[cfg(test)]
     pub(super) fn idf(&self) -> &[u32] {
         self.idf.get().map_or(&[], Vec::as_slice)
     }
@@ -631,7 +646,9 @@ impl TranscriptSearch {
                         })
                         .collect();
                     let identity_ids: Vec<_> = identities.keys().cloned().collect();
-                    let _ = shared_identities.set(identities);
+                    if shared_identities.set(identities).is_err() {
+                        crate::logging::debug("Transcript search identities already initialized");
+                    }
                     for id in identity_ids {
                         if sender.send((id, SearchRank::default())).is_err() {
                             return;
@@ -645,7 +662,9 @@ impl TranscriptSearch {
                             .iter()
                             .map(|candidate| candidate.search_index.as_str()),
                     );
-                    let _ = shared_idf.set(idf.clone());
+                    if shared_idf.set(idf.clone()).is_err() {
+                        crate::logging::debug("Transcript search weights already initialized");
+                    }
                     // Transcript reads and fuzzy scans dominate. Shard sessions
                     // across workers round-robin so every shard sees the same
                     // mix of recent and old sessions and ranks arrive evenly.
@@ -759,7 +778,7 @@ fn search_shard(
         }
         if priority.opening_prompt > 0 {
             let mut rank =
-                fuzzy_metadata_rank_with_scores(&candidate.search_index, &tokens, &mut scores);
+                fuzzy_metadata_rank_with_scores(&candidate.search_index, tokens, &mut scores);
             rank.opening_prompt = priority.opening_prompt;
             rank.intent_terms = priority.intent_terms;
             rank.source_weight = priority.source_weight;
@@ -771,7 +790,7 @@ fn search_shard(
             .missing_tokens
             .retain(|token| !candidate.entry.search_index.contains(token.as_str()));
         if candidate.missing_tokens.is_empty() {
-            let mut rank = literal_metadata_rank(&candidate.search_index, &tokens)
+            let mut rank = literal_metadata_rank(&candidate.search_index, tokens)
                 .with_exact_field(candidate.exact_field)
                 .with_source_weight(priority.source_weight);
             rank.opening_prompt = priority.opening_prompt;
@@ -792,13 +811,13 @@ fn search_shard(
         fuzzy_candidates.push((candidate, priority));
     }
     let mut transcripts = Vec::new();
-    for (mut candidate, priority) in fuzzy_candidates {
+    for (candidate, priority) in fuzzy_candidates {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
         let mut fuzzy_missing = candidate.missing_tokens.clone();
         let mut rank =
-            fuzzy_metadata_rank_with_scores(&candidate.search_index, &tokens, &mut scores)
+            fuzzy_metadata_rank_with_scores(&candidate.search_index, tokens, &mut scores)
                 .with_exact_field(candidate.exact_field);
         rank.opening_prompt = priority.opening_prompt;
         rank.intent_terms = priority.intent_terms;
@@ -824,9 +843,9 @@ fn search_shard(
         }
         match cached_paths_scan_with_scores(
             &candidate.paths,
-            &tokens,
+            tokens,
             &candidate.prior,
-            &cancel,
+            cancel,
             false,
             &mut scores,
         ) {
@@ -836,7 +855,7 @@ fn search_shard(
                         candidate.id.clone(),
                         SearchRank {
                             literal: true,
-                            source_weight: source::weighted_source_weight(&evidence.sources, &idf),
+                            source_weight: source::weighted_source_weight(&evidence.sources, idf),
                             ..rank
                         },
                     ))
@@ -851,12 +870,12 @@ fn search_shard(
         }
     }
     for (candidate, missing, rank) in warm_fuzzy {
-        let prior = fuzzy_prior(&tokens, &candidate.prior, &missing);
+        let prior = fuzzy_prior(tokens, &candidate.prior, &missing);
         match cached_paths_scan_with_scores(
             &candidate.paths,
-            &tokens,
+            tokens,
             &prior,
-            &cancel,
+            cancel,
             true,
             &mut scores,
         ) {
@@ -866,7 +885,7 @@ fn search_shard(
                         candidate.id.clone(),
                         SearchRank {
                             score: rank.score + evidence.score,
-                            source_weight: source::weighted_source_weight(&evidence.sources, &idf),
+                            source_weight: source::weighted_source_weight(&evidence.sources, idf),
                             ..rank
                         },
                     ))
@@ -886,9 +905,9 @@ fn search_shard(
         }
         if let Some(evidence) = scan_paths_with_scores(
             &candidate.paths,
-            &tokens,
+            tokens,
             &candidate.prior,
-            &cancel,
+            cancel,
             ScanMode::Literal,
             &mut scores,
         ) {
@@ -897,7 +916,7 @@ fn search_shard(
                     candidate.id.clone(),
                     SearchRank {
                         literal: true,
-                        source_weight: source::weighted_source_weight(&evidence.sources, &idf),
+                        source_weight: source::weighted_source_weight(&evidence.sources, idf),
                         ..rank
                     },
                 ))
@@ -918,13 +937,13 @@ fn search_shard(
         }
         if let Some(evidence) = scan_paths_with_scores(
             &candidate.paths,
-            &tokens,
+            tokens,
             &candidate.prior,
-            &cancel,
+            cancel,
             ScanMode::Classify,
             &mut scores,
         ) {
-            let weight = source::weighted_source_weight(&evidence.sources, &idf);
+            let weight = source::weighted_source_weight(&evidence.sources, idf);
             if weight > rank.source_weight
                 && sender
                     .send((candidate.id.clone(), rank.with_source_weight(weight)))
@@ -940,18 +959,18 @@ fn search_shard(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        let prior = fuzzy_prior(&tokens, &candidate.prior, &missing);
+        let prior = fuzzy_prior(tokens, &candidate.prior, &missing);
         if let Some(evidence) = scan_paths_with_scores(
             &candidate.paths,
-            &tokens,
+            tokens,
             &prior,
-            &cancel,
+            cancel,
             ScanMode::Fuzzy,
             &mut scores,
         ) {
             let rank = SearchRank {
                 score: rank.score + evidence.score,
-                source_weight: source::weighted_source_weight(&evidence.sources, &idf),
+                source_weight: source::weighted_source_weight(&evidence.sources, idf),
                 ..rank
             };
             if sender.send((candidate.id.clone(), rank)).is_err() {
@@ -966,7 +985,7 @@ fn search_shard(
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let matched = user_prompt_phrase_rank(&paths, phrase, &cancel);
+            let matched = user_prompt_phrase_rank(&paths, phrase, cancel);
             if matched > priority.opening_prompt
                 && sender
                     .send((
@@ -976,7 +995,7 @@ fn search_shard(
                             source_weight: priority.source_weight.max(
                                 source::weighted_source_weight(
                                     &vec![Some(Source::User); tokens.len()],
-                                    &idf,
+                                    idf,
                                 ),
                             ),
                             ..priority
@@ -1149,7 +1168,7 @@ impl<'a> Scan<'a> {
                 // metadata. Bound DP work for URLs and minified output.
                 // Transcript evidence prefers the closest word length
                 // over an incidental longer prefix or suffix match.
-                if let Some(score) = self.scores.best_score(token, lower, true) {
+                if let Some(score) = self.scores.best_search_score(token, lower) {
                     *found = true;
                     *best = Some(source);
                     self.score += i64::from(score);

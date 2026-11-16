@@ -1,7 +1,7 @@
 # Memory Regression Budget
 
 Status: active guardrail
-Updated: 2026-04-18
+Updated: 2026-11-15
 
 This document defines the current memory regression budget for jcode.
 
@@ -50,6 +50,196 @@ We use two kinds of budgets:
 2. Ratchet expectations
 - These are expected relationships between memory counters.
 - Regressions here are allowed only with explanation and updated docs/tests.
+
+## Efficiency investigations and stopping criteria
+
+Prefer eliminating redundant ownership over reducing useful retained state.
+Preserve conversation history, exact persistence/replay, snapshot isolation,
+rendered output, responsiveness, and cache utility. Cache eviction, compression
+with extra decoding work, and delayed delivery are tradeoffs, not automatic wins.
+
+For an optimization round:
+
+1. Rank attributed owners before editing, but do not use a minimum size cutoff
+   to dismiss identifiable redundant ownership. Pursue small obvious waste as
+   well as material owners when exact behavior and acceptable CPU/latency can
+   be preserved. An unattributed heap gap is not itself evidence of waste.
+2. Pin and identify both binaries. Repeat the same workload against isolated
+   sockets and homes, with settled samples at equal session/turn counts. Do not
+   infer savings from restarting the production server.
+3. Distinguish live allocator bytes, process PSS/private pages, unique backing
+   allocations, string capacities, and serialized JSON sizes. JSON size is an
+   attribution proxy, not a guaranteed heap bound. Exclude busy profiles explicitly.
+4. Test exact equality, legacy serialization, replay, and mutation isolation.
+   Verify the installed binary and live diagnostic schema after activation.
+5. Continue automatically through concrete safe candidates, including small
+   ones, without requiring repeated user prompts. Two ranked follow-up passes
+   finding no further actionable candidate establish a practical stopping point,
+   not a theorem that no optimization can exist. Record each remaining owner's
+   disposition and any missing attribution or behavior/latency tradeoff. A wider
+   redesign alone is not evidence that an opportunity is impossible. Do not
+   reopen an unchanged inventory merely because theoretical potential exists.
+
+### Native response-wait ownership acceptance (2026-11-15)
+
+The native OpenAI runtime previously held its separately built input array after
+the persistent-continuation attempt, even though the complete retry request
+already owned the input. It now releases that redundant array before fresh
+HTTPS/WebSocket attempts. Continuation-only diagnostic payload and incremental
+input copies are also released after fingerprinting, before response waits.
+
+Two matched, pinned, local-only native HTTPS workloads resumed sixteen sessions
+with 1 MiB of tool output each. Each receiver asserted the `/v1/responses` path,
+native input shape, and fixture model. Live allocator growth was
+**73.3776/73.3663 MiB before versus 57.2281/57.1410 MiB after**, a paired reduction
+of **16.1495/16.2254 MiB**. This is not a fixed process-RSS or production-workload
+savings claim. Earlier attempts accidentally restored an OpenAI-compatible
+route, and a subsequent attempt exposed a fixture catalog mismatch. Those runs
+were discarded rather than used as native evidence.
+
+The full native runtime suite passed **232 tests, 3 ignored**, serially. Parallel
+execution exposed an environment-sensitive catalog endpoint test failure, so
+that run is not reported as passing. Four retry regressions then passed,
+including a new real HTTP test asserting the complete 1 MiB prompt on every
+attempt after a provider overload. Retry, cancellation, fallback, and delivery
+policies remain unchanged. Anthropic/OpenRouter diagnostic borrowing separately
+passed 317 tests, 2 ignored, with exact schema/hash/null/count checks.
+
+Gemini and Antigravity diagnostic JSON now lives entirely in a synchronous
+logging helper, with serialized fields moved into one payload and borrowed for
+fingerprinting. The helper returns before HTTP response waits. All 74 runtime
+tests passed, including exact legacy JSON/hash/optional-field equivalence.
+This establishes shorter ownership lifetimes, not a measured RSS reduction.
+
+A 4 KiB bounded hashing writer was rejected: optimized paired measurements
+increased CPU by 26% for small requests, 31% for many tiny fields, and 16% for
+large escaped Unicode. Production hashing remains unchanged. Removing a
+serialization allocation does not qualify as a no-tradeoff gain when it adds
+that CPU cost. Reproduction artifacts are retained separately from ordinary
+tests, without installing a test-wide allocation interceptor.
+
+The next ownership pass removed duplicate Cursor prompt/system diagnostic
+values (54 runtime tests passed) and moved Copilot input/messages/tools into
+the actual request tree, borrowing diagnostics from it (38 tests passed).
+Four Responses stream dequeue paths now move queued events instead of cloning
+and discarding the original. Nine parser tests passed, including a large
+payload allocation-identity and ordering check. Browser result and parsed tool
+input extraction similarly move JSON out of discarded envelopes, with fourteen
+web tests passing, including large nested payloads and missing-versus-null
+behavior. These are copy-elimination guarantees, not measured production RSS
+savings or changes to history, retry, cache, or delivery policies.
+
+### Isolated allocation-stack follow-up (2026-11-15)
+
+Two private jemalloc-prof workloads were run after activating the ownership
+fixes. This instrumented allocator was never installed in production. Each
+workload used a private home/socket, `JCODE_TEST_SESSION=1`, fake credentials,
+and a route-asserted localhost Responses server with sixteen 1 MiB transcripts.
+The first zero-session heap-dump attempt failed because allocator commands
+require a session. It was discarded and both corrected runs completed.
+
+Sampled live-heap reports were **62.6/62.7 MiB active** and **24.9/24.7 MiB**
+five seconds after local responses completed. Allocation-origin stacks showed
+about **20.0 MiB** in wire JSON serialization, **16.2/16.6 MiB** in persisted
+message parsing, and roughly **16 MiB** in request JSON construction. Cumulative
+frames overlap and must not be summed indiscriminately. These figures are
+sampled heap estimates, not exact allocator counters, production RSS, or a
+comparison between allocators. History and retry payloads remain necessary;
+wire shrinking and bounded hashing have already failed no-tradeoff acceptance.
+
+A smaller **1.2–1.6 MiB** sampled pricing-cache publication origin exposed
+another avoidable transient deep clone: the fresh cache was cloned into an Arc
+before the original was dropped. The cache is now consumed and published in an
+Arc without cloning its backing storage. Ten serial pricing tests passed,
+including allocation identity, byte-identical disk JSON, lookup/reload, and
+failed-write publication. Retention, refresh frequency, and pricing are
+unchanged. This avoids a transient copy, not two permanently retained caches.
+
+Artifacts and reproduction notes are in `~/.jcode/scratch/ram-fork/HEAP_STACKS.md`,
+`heap-stack-probe.py`, and `heap-stacks-2` / `heap-stacks-3`. Both private daemons
+and fixture sockets were cleaned up. The production allocator, history, and
+API bridge were unchanged. This synthetic workload does not explain the entire
+production heap or prove that all theoretical optimization is exhausted.
+
+### Export and redaction ownership acceptance (2026-11-15)
+
+Unchanged export redaction now retains shared message payloads. Changed fields
+are computed once before a single copy-on-write detach, preserving the previous
+redaction output, opaque fields, and original-session isolation. An independent
+eager-redaction oracle covers every content variant and nested JSON values.
+
+An isolated allocator probe retained eight export snapshots of sixteen
+106,496-byte text messages and one 2 MiB opaque image. Live allocated-byte growth
+was **30,505,008 before versus 39,104 after** for safe content, and
+**30,480,416 versus 13,701,392** when every text message needed redaction.
+These are retained allocator measurements for this fixture, not production RSS.
+Single-run elapsed times were 176,158/166,226 microseconds for safe exports and
+693,024/687,604 for changed exports. They do not establish a general speedup.
+Reproduce serially with
+`justrust test -p jcode-base --lib export_sharing_cpu_allocator_probe -- --ignored --nocapture --test-threads=1`.
+
+Separately, regex no-match replacements now reuse the existing string instead
+of converting a borrowed `Cow` into another full copy. A 1,107,000-byte helper
+probe performed fifty no-match replacements with **50 allocation replacements
+before and zero after**, preserving exact output. Existing cache breakpoints
+also no longer detach shared message payloads just to retain the same marker.
+These are allocation/copy reductions, not measured process-RSS reductions.
+
+### Rejected wire shrinking candidate (2026-11-15)
+
+The tested candidate shrank wire buffers only when spare capacity was at least
+1 MiB and at least half their length. Real localhost uploads covered off/gzip/
+zstd, repeated and varied input, 1/8/16 MiB fixtures, slow readers, cancellation,
+and response waits. All 216 transport runs and 36 exact receiver-byte checks
+passed. Fifteen of eighteen fixtures saved 1–16 MiB of allocation capacity, but
+there was **no meaningful peak-memory or consistent RSS benefit demonstrated**.
+Timing noise also left latency neutrality unproven. The shrinking policy was
+therefore rejected rather than deployed to improve capacity counters alone.
+
+Only the simpler early release of the no-longer-needed raw serialization buffer
+after compression was retained, with off/gzip/zstd HTTP byte/header equivalence
+coverage. This shortens a local allocation lifetime, not a demonstrated
+steady-state or peak-RSS gain. No compression, retry, cache, or history policy
+was changed. The remaining live-heap attribution gap still requires allocation
+stack evidence before it can be classified as redundant ownership.
+
+### Shared compaction acceptance example (2026-11-15)
+
+Sixteen resumed sessions, each with a 1 MiB encrypted compaction payload, grew
+live allocator usage by **52.358–52.729 MiB before** and **36.578–36.702 MiB after**
+sharing immutable session/persistence snapshots, over two pinned runs per binary.
+The pinned revisions also include concurrent changes, so this is a workload
+comparison rather than a one-patch benchmark. Ownership tests and payload
+counters independently verify the eliminated metadata copy.
+Process-private growth varied more, so this is not a fixed RSS savings claim.
+Both candidate runs retained 16,777,744 bytes of canonical payload capacity and
+zero additional persistence-metadata payload capacity. The independent compaction manager summary was initially a separate owner.
+A subsequent narrower change shares only the immutable encrypted body between
+manager summaries and stored states, retaining independently mutable summary text.
+
+Borrowed exact comparison also avoids constructing an owned exported payload
+solely to detect unchanged state. An optional probe of 128 comparisons with a
+9 MiB payload took 67,228 microseconds for export-and-compare and 21,172 for the
+borrowed comparison in one hosted test run. This measures that operation, not
+application-wide latency or retained RSS. Run the focused probe with
+`justrust test -p jcode-base --lib persisted_state_comparison_probe -- --ignored --nocapture`.
+
+The follow-up owner pass found about 0.57 MiB combined AGENTS/skill snapshot
+string capacity across 41 ready live sessions. A local completed-turn fixture
+retained 26 default tools with 32,697 serialized JSON bytes, not a heap bound or
+a measurement of custom MCP catalogs. Immediately post-reload, locked tool
+snapshots are cold, so their zero count is not representative of warmed turns.
+The approximately 10.3 MiB search index already shares incremental Bloom-filter
+backing storage. No cache reduction was made to manufacture further savings.
+The encrypted-body follow-up (`fe1773bb6`, sharing regressions in `63bf3a240`)
+repeated the isolated sixteen-session workload with two runs per pinned binary.
+Live-allocator growth fell from **36.261–36.400 MiB to 20.163–20.309 MiB**.
+Private-page growth was also lower but noisier, so this is not a guaranteed
+production PSS reduction. The pinned builds contain concurrent changes, while
+pointer-sharing, copy-on-write and byte-identical JSON tests independently
+verify the removed encrypted-body allocation. No history or cache was discarded.
+Custom tool catalogs and transcript/provider-cache payload duplication remain
+separate candidates requiring their own ownership and mutation analysis.
 
 ## Hard caps
 
@@ -157,3 +347,102 @@ These are the concrete enforced limits today:
 - Mermaid on-disk PNG cache: 50 MiB, max age 3 days
 
 Any intentional change to those limits must update this document in the same PR.
+
+## November 15, 2026 ownership follow-up
+
+- Message and stored-message payloads now share immutable backing storage and
+  detach on mutation. Legacy JSON arrays and independent snapshot mutation are
+  preserved. An isolated 32-snapshot allocator probe over a 720,896-byte body
+  measured 23,080,144 bytes of growth for owned-vector copies versus 3,440 bytes
+  for shared snapshots. This is an ownership probe, not production RSS savings.
+- Pinned 16-session local-provider workloads did not establish a steady-state
+  streaming RAM reduction from transcript sharing alone. Provider transports
+  already release request-preparation transcript snapshots before network waits.
+- The OpenAI-compatible/OpenRouter retry transport separately retained a full
+  JSON request and a deep per-attempt clone. The attempt now borrows the retry
+  owner's immutable request, preserving serialization and retry behavior.
+  Two private 16-session runs with 1 MiB of tool results per session measured
+  allocator-live growth of 74,415,664 and 74,265,760 bytes before, versus
+  57,186,656 and 57,134,672 bytes after. The second pair reversed run order.
+  These are isolated real transport measurements, not a claim about current
+  production totals or a fixed RSS reduction.
+- The retry-body change passed 12 wire tests, 11 retry-filter tests and four
+  Azure retry tests on hosted builds. No cache limits, history retention,
+  batching, timers or output quality were reduced.
+- The same borrowing rule now applies to Anthropic attempts and native OpenAI
+  HTTPS/opaque-recovery attempts. Hosted validation passed 118 Anthropic runtime
+  tests (one ignored), four native HTTP idle tests and ten opaque recovery tests.
+  These provider equivalents have structural copy-removal evidence, not their
+  own measured production RAM delta. The integrated session suite additionally
+  passed 143 tests (six ignored).
+- Follow-up ownership review found that transformed websocket wire trees have
+  no uses after send and timeout-policy derivation. Releasing these temporary
+  values before response reception preserves the caller's retry request and
+  persistent response state. This is a lifetime improvement, not a measured RSS
+  claim. The original retry request, canonical transcript and useful caches
+  remain deliberately retained. Eliminating those owners requires additional
+  attribution or a wider serialization/ownership redesign, not arbitrary caps.
+  The early-release change passed the full native OpenAI runtime suite:
+  232 tests passed, three ignored, including wire, cancellation and recovery.
+
+## November 15, 2026 deeper attribution
+
+A read-only production pass at 13:03 UTC profiled 52 of 53 sessions without
+forcing busy-agent locks. Three subsequent samples reported allocator-live
+713,265,168–715,795,920 bytes and anonymous PSS 946,536,448–949,792,768 bytes.
+The existing resident-retention estimate was 230,740,528–236,527,600 bytes.
+This is not proof that those bytes are immediately reclaimable. GNU malloc's
+free-chunk counter includes address space whose physical pages may already have
+been returned. Concurrent activity and diagnostic allocations also prevent a
+controlled production savings claim. No production purge was performed.
+
+Two isolated, no-inference 16-session lifecycle runs used the installed binary,
+dedicated session storage and private sockets. After request completion, an
+explicit private-only allocator purge reduced private resident memory by
+18,169,856 and 18,489,344 bytes, with nearly unchanged live allocation counts.
+Active-request reductions were only 3,194,880 and 3,350,528 bytes. Existing
+completion trimming may already have run before the manual purge. These results
+do not justify increasing production trimming frequency without latency and
+power measurements.
+
+A separate copied-source request-compression probe ran 36 isolated processes:
+1/8/16 MiB payloads, repeated and deterministic-hex content, raw/gzip/zstd,
+twice each. Paired requested-allocation and capacity counters matched exactly.
+For a 16 MiB payload, raw JSON length 16,777,259 bytes occupied a Vec capacity
+of 33,554,482 bytes. Repeated-content gzip produced 76,586 wire bytes while
+retaining capacity 8,388,629 bytes. Compressed paths released the raw allocation
+before `json_body` returned, but the wire allocation persisted until request
+drop. Thus wire length substantially understates retained buffer capacity.
+These are Rust allocation counts, not RSS or real upload-completion measurements.
+Native codec allocations, malloc overhead and realloc transient overlap are
+excluded. Buffer compaction is a candidate, not an accepted latency-free gain.
+
+Reproduction artifacts are under `~/.jcode/scratch/ram-fork/` (production
+`deep-measure`, isolated `allocator-lifecycle-3` and `allocator-lifecycle-4`)
+and `~/.jcode/scratch/request-buffer-lifetimes/` (README, full measurements,
+validation and locked scratch build). Serialized content lengths still do not
+explain all production live heap. Capacity accounting must deduplicate shared
+payload backing and explicitly exclude unmeasured map-node/allocator overhead.
+
+Additive retained-capacity diagnostics passed 31 message-type tests and three
+session profile tests, then were activated as `7d05ba673`. A subsequent read-only
+pass profiled 46 of 50 sessions. The sum of known transcript backing capacity
+was 82,889,738 bytes: 70,010,226 string bytes plus 12,879,512 Vec bytes. This
+sum deduplicates within each session, not across sessions, and excludes four
+busy/unavailable sessions, JSON map nodes, Arc/allocator overhead and other
+owners. The sampled strings had no spare capacity after reload. Production
+allocator-live remained 553,280,576–567,569,856 bytes. These unmatched scopes
+cannot explain the entire heap or establish that the difference is waste.
+Do not attribute the lower post-reload process totals to the diagnostics.
+The API bridge retained PID 310062 throughout activation.
+
+A scratch-only wire-buffer `shrink_to_fit` comparison checked 18 case pairs and
+matched wire checksums, lengths and requested-allocation reductions. For a
+16 MiB payload it removed 16,777,223 spare raw-buffer bytes, or 8,312,043 bytes
+for repeated-content gzip. Ten alternating timing pairs per case measured
+shrink-call medians ranging from 105 ns to 32,058 ns, with noisy overall timing
+deltas, including positive paired deltas. This demonstrates allocation savings,
+not a universally free optimization, physical-page savings, or unchanged real
+upload latency. No wire-buffer compaction or allocator policy change was
+installed in this measurement round. Raw result matrices are retained in the
+scratch `compaction-results.json` and `compaction-summary.txt`.

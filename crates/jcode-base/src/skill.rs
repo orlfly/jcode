@@ -131,7 +131,8 @@ enum AllowedTools {
 /// Registry of available skills
 #[derive(Debug, Default, Clone)]
 pub struct SkillRegistry {
-    skills: HashMap<String, Skill>,
+    // Snapshots keep independent maps but share immutable skill definitions.
+    skills: HashMap<String, Arc<Skill>>,
 }
 
 /// Maximum directory depth scanned under a Claude Code plugin root when
@@ -393,7 +394,7 @@ impl SkillRegistry {
     /// (project dirs loaded last).
     pub fn merge_overlay(&mut self, overlay: Self) {
         for skill in overlay.skills.into_values() {
-            self.insert_loaded_skill(skill);
+            self.insert_shared_skill(skill);
         }
     }
 
@@ -678,7 +679,7 @@ impl SkillRegistry {
 
     /// Get a skill by name
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.get(name)
+        self.skills.get(name).map(Arc::as_ref)
     }
 
     /// List all available skills.
@@ -691,7 +692,7 @@ impl SkillRegistry {
     /// system prompt with identical length but different bytes, silently busting
     /// the Anthropic strict-prefix KV cache mid-conversation.
     pub fn list(&self) -> Vec<&Skill> {
-        let mut skills: Vec<&Skill> = self.skills.values().collect();
+        let mut skills: Vec<&Skill> = self.skills.values().map(Arc::as_ref).collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
     }
@@ -704,7 +705,7 @@ impl SkillRegistry {
         if let Some(path) = path {
             if path.exists() {
                 let skill = Self::parse_skill(&path)?;
-                self.skills.insert(skill.name.clone(), skill);
+                self.skills.insert(skill.name.clone(), Arc::new(skill));
                 Ok(true)
             } else {
                 // Skill file was deleted
@@ -791,6 +792,10 @@ impl SkillRegistry {
     }
 
     fn insert_loaded_skill(&mut self, skill: Skill) {
+        self.insert_shared_skill(Arc::new(skill));
+    }
+
+    fn insert_shared_skill(&mut self, skill: Arc<Skill>) {
         if let Some(shadowed) = self.skills.get(&skill.name)
             && shadowed.path != skill.path
         {
@@ -2078,7 +2083,12 @@ fn reconcile_skill_memory_links_inner(
         // into this workspace's skill health.
         let global_resolution = manager
             .load_global_graph()
-            .map(|global| resolve_skill_evidence_in_graph(&global, local.skills.values()))
+            .map(|global| {
+                resolve_skill_evidence_in_graph(
+                    &global,
+                    local.skills.values().map(|skill| skill.as_ref()),
+                )
+            })
             .unwrap_or_default();
         if let Ok(mut graph) = manager.load_project_graph()
             // Global skills may already have a project mirror created when
@@ -2121,7 +2131,11 @@ fn reconcile_skill_graph(
     let mut changed = false;
     let mut names = std::collections::HashSet::new();
 
-    let mut skills: Vec<&Skill> = registry.skills.values().collect();
+    let mut skills: Vec<&Skill> = registry
+        .skills
+        .values()
+        .map(|skill| skill.as_ref())
+        .collect();
     if let Some(global) = existing_global {
         for skill in global.skills.values() {
             if !registry.skills.contains_key(&skill.name)
@@ -2129,7 +2143,7 @@ fn reconcile_skill_graph(
                     .memories
                     .contains_key(&format!("skill:{}", skill.name))
             {
-                skills.push(skill);
+                skills.push(skill.as_ref());
             }
         }
     }
