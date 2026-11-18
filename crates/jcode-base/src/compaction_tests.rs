@@ -1460,6 +1460,41 @@ impl Provider for RefusingSummaryProvider {
 }
 
 #[tokio::test]
+async fn text_summary_appends_graph_memory_state() {
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-compact".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "cargo test -p jcode"}),
+                thought_signature: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-compact".into(),
+                content: "error[E0425]: cannot find function".into(),
+                is_error: Some(true),
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+    let result = generate_compaction_artifact(Arc::new(MockSummaryProvider), messages, None)
+        .await
+        .expect("summary");
+    assert!(result.summary_text.contains("## Graph Memory State"));
+    assert!(result.summary_text.contains("command:"));
+    assert!(result.summary_text.contains("error:"));
+}
+
+#[tokio::test]
 async fn refused_compaction_keeps_original_messages_issue_2089() {
     let messages: Vec<Message> = (0..28)
         .map(|i| {

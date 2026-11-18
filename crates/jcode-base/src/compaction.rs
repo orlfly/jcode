@@ -1833,8 +1833,15 @@ async fn generate_compaction_artifact(
         usage,
     );
 
+    let mut summary_text = validate_compaction_summary(summary)?;
+    let graph_state = crate::engineering_episode::render_graph_memory_state(&messages, 24);
+    if !graph_state.is_empty() && !summary_text.contains("## Graph Memory State") {
+        summary_text.push_str("\n\n## Graph Memory State\n\n");
+        summary_text.push_str(&graph_state);
+    }
+
     Ok(CompactionResult {
-        summary_text: validate_compaction_summary(summary)?,
+        summary_text,
         openai_encrypted_content: None,
         covers_up_to_turn: messages.len(),
         duration_ms: start.elapsed().as_millis() as u64,

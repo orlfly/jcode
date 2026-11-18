@@ -464,6 +464,38 @@ fn stable_id(prefix: &str, input: &str) -> String {
     format!("{prefix}:{hash:016x}")
 }
 
+/// Render a deterministic `Graph Memory State` block for a compaction summary.
+///
+/// The block contains only stable anchors that a later `shortest_path` or
+/// `memory recall` call can resolve. Session, turn and observation nodes are
+/// omitted because they are already represented by the summary itself.
+pub fn render_graph_memory_state(messages: &[Message], max_anchors: usize) -> String {
+    if max_anchors == 0 {
+        return String::new();
+    }
+    let extraction = extract_engineering_episode("compaction", messages, None);
+    let mut lines = Vec::new();
+    for entity in extraction.graph.entities.values() {
+        if matches!(
+            entity.class.as_str(),
+            CLASS_SESSION | CLASS_TURN | CLASS_OBSERVATION
+        ) {
+            continue;
+        }
+        let summary = entity.name.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(format!(
+            "- `{}` | {} | {}",
+            entity.id,
+            entity.class,
+            truncate(&summary, 120)
+        ));
+        if lines.len() >= max_anchors {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +613,26 @@ mod tests {
         assert_eq!(extraction.graph.find_by_class(CLASS_ACTION).len(), 1);
         assert!(extraction.graph.find_by_class(CLASS_FILE).is_empty());
         assert!(extraction.graph.find_by_class(CLASS_COMMAND).is_empty());
+    }
+
+    #[test]
+    fn renders_graph_memory_state_anchors() {
+        let messages = vec![
+            tool_use(
+                "call-6",
+                "edit",
+                json!({"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+            ),
+            tool_result("call-6", "ok", false),
+            tool_use("call-7", "bash", json!({"command": "cargo test -p jcode"})),
+            tool_result("call-7", "error[E0425]: boom", true),
+        ];
+        let rendered = render_graph_memory_state(&messages, 24);
+        assert!(rendered.contains("file:src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("command:"), "{rendered}");
+        assert!(rendered.contains("error:"), "{rendered}");
+        assert!(!rendered.contains("session:"), "{rendered}");
+        assert!(!rendered.contains("turn:"), "{rendered}");
     }
 
     #[test]

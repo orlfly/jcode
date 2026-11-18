@@ -146,6 +146,20 @@ let warnings = extraction.warnings;
 
 该抽取器不使用 LLM，未知工具只生成 `Action`，不生成猜测性的文件或命令边。
 
+### 5.2 压缩摘要锚点
+
+`render_graph_memory_state(messages, max_anchors)` 会从同一批消息生成确定性锚点，并在文本摘要末尾追加：
+
+```text
+## Graph Memory State
+
+- `file:src/lib.rs` | file | src/lib.rs
+- `command:...` | command | cargo test -p jcode
+- `error:...` | error | error[E0425]: cannot find function
+```
+
+该块只包含稳定 id，后续 `shortest_path` 或 `memory recall` 可以直接解析。Session、Turn、Observation 不进入锚点段，因为它们已由摘要正文表达。
+
 ## 6. 非目标
 
 - 不实现 OWL DL 推理。
