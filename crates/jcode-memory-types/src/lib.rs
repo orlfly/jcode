@@ -1,3 +1,11 @@
+pub mod engineering_ontology;
+pub use engineering_ontology::{
+    AlphaDef, AlphaStateDef, BfoCategory, ConcernDef, EngineeringClassDef, EngineeringEntity,
+    EngineeringGraph, EngineeringOntology, EngineeringPropertyDef, EngineeringProvenance,
+    EngineeringRelation, EngineeringRelationDef, EngineeringValidationIssue,
+    EngineeringValidationReport, EntityStatus, PropertyValueKind, default_engineering_ontology,
+};
+
 pub mod graph;
 pub use graph::{
     ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, TagEntry,
