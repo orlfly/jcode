@@ -121,6 +121,31 @@ let path = graph.shortest_path("task:#157", "error:EO11", 3, &[REL_BLOCKED_BY]);
 - **计划生成**：todo DAG 映射到 `Task` / `WorkUnit`，关系映射到 `depends_on`、`blocked_by`、`implements`、`verifies`。
 - **记忆层**：现有 `MemoryGraph` 保留事实、偏好、约定，不强行改造成领域实例图。
 
+### 5.1 Episode 抽取器
+
+`jcode-base::engineering_episode::extract_engineering_episode` 是第一个生产方：
+
+```rust
+use jcode_base::engineering_episode::extract_engineering_episode;
+
+let extraction = extract_engineering_episode(session_id, &messages, Some(working_dir));
+let graph = extraction.graph;
+let warnings = extraction.warnings;
+```
+
+当前确定性映射：
+
+| 工具 | 产物 |
+|---|---|
+| `bash` | `Action -> calls -> Command`，错误结果生成 `Error` |
+| `edit` / `replace` / `write` / `apply_patch` | `File`、`Change`，`Action -> modifies -> File` |
+| `read` | `Action -> uses -> File` |
+| `todo` | `Task`，`Action -> implements -> Task` |
+| 任意工具结果 | `Observation`，`Action -> produces -> Observation` |
+| 错误结果 | `Action -> causes -> Error`，错误签名做稳定 id |
+
+该抽取器不使用 LLM，未知工具只生成 `Action`，不生成猜测性的文件或命令边。
+
 ## 6. 非目标
 
 - 不实现 OWL DL 推理。
