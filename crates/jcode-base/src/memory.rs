@@ -191,6 +191,8 @@ pub fn l1_recall_enabled() -> bool {
 pub const L1_MIN_SCORE: f32 = 0.34;
 /// Maximum instances L1 injects into one turn.
 pub const L1_MAX_RESULTS: usize = 3;
+/// Minimum `relates_to` weight used to expand an L1 hit to a neighbour.
+pub const L1_LINK_MIN_WEIGHT: f32 = 0.65;
 
 /// Local relevance scoring (L1): deterministic, no network, no embedder.
 ///
@@ -3373,7 +3375,61 @@ impl MemoryManager {
             }
         }
         let entries = by_id.into_iter().map(|(_, entry)| entry).collect();
+        let entries = self.expand_l1_links(entries, limit);
         Ok(self.expand_skill_parts(entries, limit))
+    }
+
+    /// Fill unused L1 slots with high-weight semantic neighbours.
+    ///
+    /// Link discovery only creates edges between memories that already share a
+    /// subject key or enough tags. Reusing those edges here lets a strongly
+    /// matching memory pull in a directly related one without widening the
+    /// injection budget or traversing tag edges.
+    fn expand_l1_links(&self, mut entries: Vec<MemoryEntry>, limit: usize) -> Vec<MemoryEntry> {
+        let max_total = limit.min(L1_MAX_RESULTS);
+        if entries.is_empty() || entries.len() >= max_total {
+            return entries;
+        }
+        let graphs: Vec<MemoryGraph> = [self.load_project_graph(), self.load_global_graph()]
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
+        let mut seen: std::collections::HashSet<String> =
+            entries.iter().map(|entry| entry.id.clone()).collect();
+        let mut candidates: Vec<(f32, MemoryEntry)> = Vec::new();
+        for seed in &entries {
+            for graph in &graphs {
+                for edge in graph.get_edges(&seed.id) {
+                    let jcode_memory_types::EdgeKind::RelatesTo { weight } = &edge.kind else {
+                        continue;
+                    };
+                    if *weight < L1_LINK_MIN_WEIGHT {
+                        continue;
+                    }
+                    let Some(target) = graph.get_memory(&edge.target) else {
+                        continue;
+                    };
+                    if !target.is_retrievable_now() || seen.contains(&target.id) {
+                        continue;
+                    }
+                    seen.insert(target.id.clone());
+                    candidates.push((*weight, target.clone()));
+                }
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.id.cmp(&right.1.id))
+        });
+        for (_, entry) in candidates {
+            if entries.len() >= max_total {
+                break;
+            }
+            entries.push(entry);
+        }
+        entries
     }
 
     /// Add the root pointer of any selected skill part before the part itself.

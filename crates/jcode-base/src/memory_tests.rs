@@ -4469,6 +4469,41 @@ fn legacy_json_audit_quarantines_only_stale_snapshots() {
 }
 
 #[test]
+fn l1_recall_expands_only_high_weight_semantic_neighbours() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/l1-link-expansion");
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "seed body")
+                .with_id("mem_seed")
+                .with_tags(vec!["alpha".to_string()]),
+        );
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Observation, "high related body")
+                .with_id("mem_high"),
+        );
+        graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Observation, "weak related body")
+                .with_id("mem_low"),
+        );
+        graph.link_memories("mem_seed", "mem_high", 0.9);
+        graph.link_memories("mem_seed", "mem_low", 0.3);
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let ids: Vec<String> = manager
+            .l1_relevant("alpha", 3)
+            .expect("recall")
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert!(ids.contains(&"mem_seed".to_string()), "{ids:?}");
+        assert!(ids.contains(&"mem_high".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"mem_low".to_string()), "{ids:?}");
+        assert!(ids.len() <= L1_MAX_RESULTS, "{ids:?}");
+    });
+}
+
+#[test]
 fn legacy_json_merge_adds_only_missing_memories_and_edges() {
     with_temp_home(|_| {
         let project = Path::new("/legacy-merge-project");

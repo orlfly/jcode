@@ -59,6 +59,11 @@ retrieval gate, so a superseded memory can keep `lifecycle.status = active`
 while `active = false`; that combination is intentional and is not lifecycle
 drift.
 
+L1 fills unused result slots with direct `relates_to` neighbours whose weight is
+at least `L1_LINK_MIN_WEIGHT = 0.65`. This reuses the conservative edges created
+by link discovery, never traverses tag edges, and never exceeds
+`L1_MAX_RESULTS`, so expansion cannot widen the injection budget.
+
 **Tier 2 (Jev-judged)**: scoped candidates (BM25 prefilter to
 `MAX_JEV_RECALL_CANDIDATES = 72` when the store exceeds it) are sent to Jev's
 typed Decisions API as `noul` questions; answers above
