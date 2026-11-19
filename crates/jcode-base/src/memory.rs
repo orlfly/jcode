@@ -4439,11 +4439,18 @@ impl MemoryManager {
             seen_keys.insert(key.as_str().to_string());
             visited += 1;
             if visit(key.as_str(), &mut graph) {
-                if let Err(e) = backend.save(&key, &graph) {
-                    crate::logging::warn(&format!(
-                        "store save after maintenance failed for {}: {e}",
-                        key.as_str()
-                    ));
+                match backend.save(&key, &graph) {
+                    Ok(()) => {
+                        if !self.test_mode {
+                            cache_graph_for_backend(backend.name(), &key, &graph, 0);
+                        }
+                    }
+                    Err(e) => {
+                        crate::logging::warn(&format!(
+                            "store save after maintenance failed for {}: {e}",
+                            key.as_str()
+                        ));
+                    }
                 }
             }
         }
@@ -4471,6 +4478,9 @@ impl MemoryManager {
                     visited += 1;
                     if visit(&legacy_key, &mut graph) {
                         crate::storage::write_json(&path, &graph)?;
+                        if !self.test_mode {
+                            cache_graph(path.clone(), &graph);
+                        }
                     }
                 }
             }
