@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use jcode_memory_types::engineering_ontology::{
-    EngineeringEntity, EngineeringGraph, EngineeringRelation, default_engineering_ontology,
+    CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringRelation,
+    default_engineering_ontology,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -125,6 +126,14 @@ impl EngineeringStore {
         graph: &EngineeringGraph,
     ) -> Result<()> {
         anyhow::ensure!(!session_id.trim().is_empty(), "session_id is empty");
+        if graph.relations.is_empty()
+            && graph
+                .entities
+                .values()
+                .all(|entity| entity.class == CLASS_SESSION)
+        {
+            return Ok(());
+        }
         let ontology = default_engineering_ontology();
         let graph_json = serde_json::to_string(graph).context("serialize engineering graph")?;
         let now = Utc::now().to_rfc3339();
@@ -433,5 +442,20 @@ mod tests {
         assert!(store.delete_graph("session-1").expect("delete"));
         assert!(store.load_graph("session-1").expect("load").is_none());
         assert!(!store.delete_graph("session-1").expect("delete again"));
+    }
+
+    #[test]
+    fn skips_session_only_graph() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(
+            CLASS_SESSION,
+            "session-1",
+            "session-1",
+        ));
+        store
+            .save_graph("session-1", None, &graph)
+            .expect("empty save");
+        assert!(store.load_graph("session-1").expect("load").is_none());
     }
 }
