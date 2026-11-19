@@ -2235,7 +2235,7 @@ async fn run_memory_command_for_dir(
                     Err(error) => {
                         errors.push(serde_json::json!({
                             "session_id": session_id,
-                            "error": error.to_string(),
+                            "error": format!("{error:#}"),
                         }));
                         continue;
                     }
@@ -2252,7 +2252,7 @@ async fn run_memory_command_for_dir(
                     Ok(report) => reports.push(report),
                     Err(error) => errors.push(serde_json::json!({
                         "session_id": session_id,
-                        "error": error.to_string(),
+                        "error": format!("{error:#}"),
                     })),
                 }
             }
