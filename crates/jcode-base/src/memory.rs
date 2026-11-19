@@ -1022,6 +1022,19 @@ pub struct ReviewTriageReport {
     pub by_project: Vec<(String, usize)>,
 }
 
+/// Result of accepting a filtered slice of the pending review queue.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReviewBatchReport {
+    pub pending: usize,
+    pub selected: usize,
+    pub accepted: usize,
+    pub skipped_missing_target: usize,
+    pub skipped_existing: usize,
+    pub failed: usize,
+    pub by_action: std::collections::BTreeMap<String, usize>,
+    pub applied: bool,
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -2114,6 +2127,125 @@ impl MemoryManager {
         Ok(updated)
     }
 
+    /// Accept pending items matching `actions`, in queue order, up to `max`.
+    /// Dry run unless `apply` is true. Items whose target disappeared or whose
+    /// new id is already present are skipped rather than overwriting anything.
+    pub fn accept_reviews_batch(
+        &self,
+        actions: &[String],
+        max: usize,
+        apply: bool,
+    ) -> Result<ReviewBatchReport> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut all_items = review::load_items(&path)?;
+        let pending = all_items
+            .iter()
+            .filter(|item| item.status == ReviewStatus::Pending)
+            .count();
+        let wanted: std::collections::HashSet<&str> =
+            actions.iter().map(String::as_str).collect();
+        let selected: Vec<MemoryReviewItem> = all_items
+            .iter()
+            .filter(|item| {
+                item.status == ReviewStatus::Pending
+                    && (wanted.is_empty() || wanted.contains(item.action.as_str()))
+            })
+            .take(max)
+            .cloned()
+            .collect();
+        let mut report = ReviewBatchReport {
+            pending,
+            selected: selected.len(),
+            applied: apply,
+            ..ReviewBatchReport::default()
+        };
+        let mut groups: std::collections::BTreeMap<
+            (String, Option<String>),
+            Vec<MemoryReviewItem>,
+        > = std::collections::BTreeMap::new();
+        for item in selected {
+            groups
+                .entry((item.scope.clone(), item.project_dir.clone()))
+                .or_default()
+                .push(item);
+        }
+        let now = Utc::now();
+        for items in groups.values() {
+            let Some(first) = items.first() else {
+                continue;
+            };
+            let manager = match self.manager_for_review(first) {
+                Ok(manager) => manager,
+                Err(_) => {
+                    report.failed += items.len();
+                    continue;
+                }
+            };
+            let mut graph = match manager.load_review_graph(first) {
+                Ok(graph) => graph,
+                Err(_) => {
+                    report.failed += items.len();
+                    continue;
+                }
+            };
+            let mut accepted_ids = Vec::new();
+            for item in items {
+                if graph.memories.contains_key(&item.new.id) {
+                    report.skipped_existing += 1;
+                    continue;
+                }
+                if matches!(
+                    item.action.as_str(),
+                    "relate" | "supersede" | "contradict" | "reinforce"
+                ) && item
+                    .old
+                    .as_ref()
+                    .is_none_or(|old| !graph.memories.contains_key(&old.id))
+                {
+                    report.skipped_missing_target += 1;
+                    continue;
+                }
+                let provenance = item
+                    .new
+                    .effective_provenance()
+                    .into_owned()
+                    .with_confirmation("batch-review", now)
+                    .with_confidence(item.new.effective_provenance().confidence.max(0.95));
+                let mut entry = item.new.clone();
+                entry.provenance = Some(provenance);
+                entry.review = MemoryReviewState::confirmed(now);
+                entry.updated_at = now;
+                if Self::apply_reviewed_change_to_graph(&mut graph, item, entry).is_err() {
+                    report.failed += 1;
+                    continue;
+                }
+                report.accepted += 1;
+                *report.by_action.entry(item.action.clone()).or_default() += 1;
+                accepted_ids.push(item.id.clone());
+            }
+            if apply && !accepted_ids.is_empty() {
+                if manager.save_review_graph(first, &graph).is_err() {
+                    report.failed += accepted_ids.len();
+                    report.accepted = report.accepted.saturating_sub(accepted_ids.len());
+                    continue;
+                }
+                for id in accepted_ids {
+                    let _ = review::update_status(
+                        &mut all_items,
+                        &id,
+                        ReviewStatus::Accepted,
+                        Some("batch-review"),
+                        Some("batch accepted"),
+                    );
+                }
+            }
+        }
+        if apply {
+            review::save_items(&path, &all_items)?;
+        }
+        Ok(report)
+    }
+
     pub fn reject_review(
         &self,
         id: &str,
@@ -2164,17 +2296,37 @@ impl MemoryManager {
         }
     }
 
-    fn apply_reviewed_change(&self, item: &MemoryReviewItem, entry: MemoryEntry) -> Result<()> {
-        let mut graph = if item.scope == "global" {
-            self.load_global_graph()?
+    fn load_review_graph(&self, item: &MemoryReviewItem) -> Result<MemoryGraph> {
+        if item.scope == "global" {
+            self.load_global_graph()
         } else {
             anyhow::ensure!(
                 self.project_memory_path()?.is_some(),
                 "project memory requires a working directory"
             );
-            self.load_project_graph()?
-        };
+            self.load_project_graph()
+        }
+    }
 
+    fn save_review_graph(&self, item: &MemoryReviewItem, graph: &MemoryGraph) -> Result<()> {
+        if item.scope == "global" {
+            self.save_global_graph(graph)
+        } else {
+            self.save_project_graph(graph)
+        }
+    }
+
+    fn apply_reviewed_change(&self, item: &MemoryReviewItem, entry: MemoryEntry) -> Result<()> {
+        let mut graph = self.load_review_graph(item)?;
+        Self::apply_reviewed_change_to_graph(&mut graph, item, entry)?;
+        self.save_review_graph(item, &graph)
+    }
+
+    fn apply_reviewed_change_to_graph(
+        graph: &mut MemoryGraph,
+        item: &MemoryReviewItem,
+        entry: MemoryEntry,
+    ) -> Result<()> {
         match item.action.as_str() {
             "reinforce" => {
                 let target_id = item
@@ -2237,12 +2389,7 @@ impl MemoryManager {
                 graph.add_memory(entry);
             }
         }
-
-        if item.scope == "global" {
-            self.save_global_graph(&graph)
-        } else {
-            self.save_project_graph(&graph)
-        }
+        Ok(())
     }
 
     /// Aggregate memory and review-queue health across every persisted store.

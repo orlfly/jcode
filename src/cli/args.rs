@@ -1372,7 +1372,7 @@ pub(crate) enum MemoryCommand {
 
     /// Inspect and resolve the memory review queue
     Review {
-        /// list, triage, accept, reject, or defer
+        /// list, triage, accept, accept-batch, reject, or defer
         #[arg(default_value = "list")]
         action: String,
 
@@ -1390,6 +1390,18 @@ pub(crate) enum MemoryCommand {
         /// Optional note
         #[arg(long)]
         note: Option<String>,
+
+        /// Comma-separated actions for accept-batch (empty means all)
+        #[arg(long)]
+        actions: Option<String>,
+
+        /// Maximum items for accept-batch
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+
+        /// Write accepted items instead of only reporting them
+        #[arg(long)]
+        apply: bool,
 
         /// Emit JSON instead of plain text
         #[arg(long)]

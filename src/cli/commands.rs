@@ -1634,6 +1634,9 @@ pub enum MemorySubcommand {
         status: String,
         reviewer: String,
         note: Option<String>,
+        actions: Option<String>,
+        max: usize,
+        apply: bool,
         json: bool,
     },
     Health {
@@ -2190,6 +2193,9 @@ async fn run_memory_command_for_dir(
             status,
             reviewer,
             note,
+            actions,
+            max,
+            apply,
             json,
         } => match action.as_str() {
             "list" => {
@@ -2242,6 +2248,37 @@ async fn run_memory_command_for_dir(
                     println!("  top projects:");
                     for (project, count) in &report.by_project {
                         println!("    {project}: {count}");
+                    }
+                }
+            }
+            "accept-batch" => {
+                let actions: Vec<String> = actions
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|action| !action.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                let report = manager.accept_reviews_batch(&actions, max, apply)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Review batch accept: {} pending, {} selected, {} accepted, {} missing target, {} already present, {} failed{}",
+                        report.pending,
+                        report.selected,
+                        report.accepted,
+                        report.skipped_missing_target,
+                        report.skipped_existing,
+                        report.failed,
+                        if apply { "" } else { " (dry run)" }
+                    );
+                    for (action, count) in &report.by_action {
+                        println!("  {action}: {count}");
+                    }
+                    if !apply {
+                        println!("Dry run. Re-run with --apply to accept these items.");
                     }
                 }
             }

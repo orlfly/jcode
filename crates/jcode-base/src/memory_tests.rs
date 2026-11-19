@@ -3989,6 +3989,50 @@ fn review_triage_groups_pending_items() {
 }
 
 #[test]
+fn review_batch_accept_is_dry_by_default_and_respects_limit() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-batch");
+        for content in ["first batch fact", "second batch fact"] {
+            let entry = MemoryEntry::new(MemoryCategory::Observation, content).with_provenance(
+                ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                    .with_confidence(0.4),
+            );
+            assert!(manager.remember_project_governed(entry).unwrap().is_pending_review());
+        }
+        let actions = vec!["insert".to_string()];
+        let dry = manager
+            .accept_reviews_batch(&actions, 10, false)
+            .expect("dry run");
+        assert_eq!(dry.pending, 2);
+        assert_eq!(dry.selected, 2);
+        assert_eq!(dry.accepted, 2);
+        assert!(!dry.applied);
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 0);
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let applied = manager
+            .accept_reviews_batch(&actions, 1, true)
+            .expect("apply one");
+        assert_eq!(applied.accepted, 1);
+        assert_eq!(applied.by_action.get("insert"), Some(&1));
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 1);
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
+#[test]
 fn batch_change_gate_uses_absolute_and_share_thresholds() {
     let existing = std::collections::HashMap::from([
         (MemoryCategory::Observation, 100usize),
