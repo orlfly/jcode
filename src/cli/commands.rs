@@ -1628,6 +1628,15 @@ pub enum MemorySubcommand {
         overwrite: bool,
     },
     Stats,
+    ReExtract {
+        sessions: Vec<String>,
+        manifest: Option<String>,
+        tier: Option<String>,
+        limit: usize,
+        apply: bool,
+        force: bool,
+        json: bool,
+    },
     Review {
         action: String,
         id: Option<String>,
@@ -2186,6 +2195,93 @@ async fn run_memory_command_for_dir(
             println!("\nBy category:");
             for (cat, count) in &categories {
                 println!("  {}: {}", cat, count);
+            }
+        }
+
+        MemorySubcommand::ReExtract {
+            sessions,
+            manifest,
+            tier,
+            limit,
+            apply,
+            force,
+            json,
+        } => {
+            let manifest_path = manifest.as_deref().map(Path::new);
+            let session_ids = memory::resolve_reextract_sessions(
+                &sessions,
+                manifest_path,
+                tier.as_deref(),
+                limit,
+            )?;
+            let mut reports = Vec::new();
+            let mut errors = Vec::new();
+
+            for session_id in &session_ids {
+                let loaded = match session::Session::load(session_id) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        errors.push(serde_json::json!({
+                            "session_id": session_id,
+                            "error": error.to_string(),
+                        }));
+                        continue;
+                    }
+                };
+                let project_manager = loaded
+                    .working_dir
+                    .as_deref()
+                    .map(|dir| memory::MemoryManager::new().with_project_dir(dir))
+                    .unwrap_or_default();
+                match project_manager
+                    .reextract_session(&loaded, apply, force)
+                    .await
+                {
+                    Ok(report) => reports.push(report),
+                    Err(error) => errors.push(serde_json::json!({
+                        "session_id": session_id,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "applied": apply,
+                        "sessions": reports,
+                        "errors": errors,
+                    }))?
+                );
+            } else {
+                for report in &reports {
+                    println!(
+                        "{}: messages={} chars={} candidates={} duplicates={} admitted={} queued={} failed={}",
+                        report.session_id,
+                        report.messages,
+                        report.transcript_chars,
+                        report.candidates,
+                        report.duplicates,
+                        report.admitted,
+                        report.queued,
+                        report.failed
+                    );
+                    for item in &report.items {
+                        println!(
+                            "  [{}] {} {}",
+                            item.status,
+                            item.category,
+                            item.content.chars().take(120).collect::<String>()
+                        );
+                    }
+                }
+                for error in &errors {
+                    eprintln!("re-extract error: {error}");
+                }
+                if !apply {
+                    println!("Dry run. Re-run with --apply to write admitted memories.");
+                }
             }
         }
 

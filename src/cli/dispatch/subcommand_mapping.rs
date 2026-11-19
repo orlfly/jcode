@@ -22,6 +22,23 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             overwrite,
         },
         MemoryCommand::Stats => commands::MemorySubcommand::Stats,
+        MemoryCommand::ReExtract {
+            sessions,
+            manifest,
+            tier,
+            limit,
+            apply,
+            force,
+            json,
+        } => commands::MemorySubcommand::ReExtract {
+            sessions,
+            manifest,
+            tier,
+            limit,
+            apply,
+            force,
+            json,
+        },
         MemoryCommand::Review {
             action,
             id,

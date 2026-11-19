@@ -1370,6 +1370,40 @@ pub(crate) enum MemoryCommand {
     /// Show memory statistics
     Stats,
 
+    /// Re-extract memories from historical session transcripts
+    ///
+    /// Dry run unless --apply. Select sessions with repeated --session flags or
+    /// a soft-delete/recovery manifest whose rows carry a session source.
+    ReExtract {
+        /// Session id to replay (repeatable)
+        #[arg(long = "session")]
+        sessions: Vec<String>,
+
+        /// Manifest JSON containing rows with `source` session ids
+        #[arg(long)]
+        manifest: Option<String>,
+
+        /// Only include manifest rows carrying this tier name
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Maximum number of sessions to process
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Write extracted memories through the governed admission pipeline
+        #[arg(long)]
+        apply: bool,
+
+        /// Ignore the automatic extraction source-health pause
+        #[arg(long)]
+        force: bool,
+
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Inspect and resolve the memory review queue
     Review {
         /// list, triage, accept, accept-batch, prune-stale, reject, or defer

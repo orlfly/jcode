@@ -36,6 +36,8 @@ mod ontology_registry;
 mod pending;
 #[path = "memory_prompt.rs"]
 mod prompt_support;
+#[path = "memory/reextract.rs"]
+mod reextract;
 #[path = "memory/review.rs"]
 mod review;
 #[path = "memory/source_health.rs"]
@@ -75,6 +77,7 @@ pub(crate) use prompt_support::format_context_for_extraction;
 pub use prompt_support::{
     focus_query_text, format_context_for_relevance, format_focused_query_for_relevance,
 };
+pub use reextract::{ReextractItem, ReextractReport, resolve_reextract_sessions};
 pub use review::{MemoryHealthReport, ReviewHealth};
 pub use source_health::{ExtractionBatch, ExtractionHealth};
 
