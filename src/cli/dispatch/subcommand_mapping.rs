@@ -3,7 +3,11 @@
 use super::*;
 use crate::cli::args::OntologyCommand;
 
-pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySubcommand {
+pub(super) fn map_memory_subcommand(
+    subcmd: MemoryCommand,
+    provider: super::super::provider_init::ProviderChoice,
+    model: Option<String>,
+) -> commands::MemorySubcommand {
     match subcmd {
         MemoryCommand::List { scope, tag } => commands::MemorySubcommand::List { scope, tag },
         MemoryCommand::Search { query, semantic } => {
@@ -38,6 +42,8 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             apply,
             force,
             json,
+            provider,
+            model,
         },
         MemoryCommand::Review {
             action,

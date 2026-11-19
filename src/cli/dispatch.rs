@@ -459,7 +459,12 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             }
         },
         Some(Command::Memory(subcmd)) => {
-            commands::run_memory_command(map_memory_subcommand(subcmd)).await?;
+            commands::run_memory_command(map_memory_subcommand(
+                subcmd,
+                args.provider,
+                args.model.clone(),
+            ))
+            .await?;
         }
         Some(Command::Skill(subcmd)) => {
             commands::run_skill_command(subcmd).await?;

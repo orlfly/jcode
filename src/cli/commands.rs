@@ -1636,6 +1636,8 @@ pub enum MemorySubcommand {
         apply: bool,
         force: bool,
         json: bool,
+        provider: super::provider_init::ProviderChoice,
+        model: Option<String>,
     },
     Review {
         action: String,
@@ -2206,6 +2208,8 @@ async fn run_memory_command_for_dir(
             apply,
             force,
             json,
+            provider,
+            model,
         } => {
             let manifest_path = manifest.as_deref().map(Path::new);
             let session_ids = memory::resolve_reextract_sessions(
@@ -2214,6 +2218,14 @@ async fn run_memory_command_for_dir(
                 tier.as_deref(),
                 limit,
             )?;
+            if crate::provider::active_provider_fork().is_none() {
+                let initialized = super::provider_init::init_provider_quiet(
+                    &provider,
+                    model.as_deref(),
+                )
+                .await?;
+                crate::provider::set_active_provider(initialized);
+            }
             let mut reports = Vec::new();
             let mut errors = Vec::new();
 
