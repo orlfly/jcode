@@ -8,7 +8,7 @@
 
 use super::{
     ExtractionMethod, MemoryCategory, MemoryEntry, MemoryManager, MemoryWriteOutcome,
-    ProvenanceRecord, TrustLevel, batch_change_categories, memory_llm_judge_available,
+    ProvenanceRecord, TrustLevel, batch_change_categories, memory_sidecar_enabled,
 };
 use crate::memory_agent::build_transcript_for_extraction;
 use crate::session::Session;
@@ -131,7 +131,12 @@ impl MemoryManager {
         apply: bool,
         force: bool,
     ) -> Result<ReextractReport> {
-        if !memory_llm_judge_available() {
+        if !memory_sidecar_enabled() {
+            anyhow::bail!(
+                "memory extraction sidecar is disabled; set agents.memory_sidecar_enabled = true"
+            );
+        }
+        if !Sidecar::llm_backend_available() {
             anyhow::bail!(
                 "memory extraction model is unavailable; configure the memory extraction model or provider"
             );
