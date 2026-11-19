@@ -325,6 +325,22 @@ impl MemoryManager {
 mod tests {
     use super::*;
 
+    fn with_temp_home<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var("JCODE_HOME").ok();
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn extracted(content: &str, category: &str) -> crate::sidecar::ExtractedMemory {
         crate::sidecar::ExtractedMemory {
             category: category.to_string(),
@@ -396,5 +412,34 @@ mod tests {
         )
         .expect("resolve limited");
         assert_eq!(limited, vec!["session_c"]);
+    }
+
+    #[test]
+    fn apply_writes_non_duplicate_candidates_through_governed_path() {
+        with_temp_home(|| {
+            let manager = MemoryManager::new_test();
+            let report = manager.process_extracted_candidates(
+                "session_test",
+                vec![extracted("a durable observation", "observation")],
+                &[],
+                &HashMap::new(),
+                true,
+            );
+            assert_eq!(report.candidates, 1);
+            assert_eq!(report.duplicates, 0);
+            assert_eq!(report.admitted, 1);
+            assert_eq!(report.queued, 0);
+            assert_eq!(report.failed, 0);
+            assert_eq!(report.items[0].status, "stored");
+            assert!(report.items[0].stored_id.is_some());
+
+            let stored = manager.list_all().expect("list");
+            assert!(
+                stored
+                    .iter()
+                    .any(|entry| entry.content == "a durable observation"),
+                "re-extracted memory must be retrievable"
+            );
+        });
     }
 }
