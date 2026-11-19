@@ -203,7 +203,7 @@ pub fn score_l1_relevance(
     query_terms: &[String],
     normalized_query: &str,
 ) -> f32 {
-    if !entry.active {
+    if !entry.is_retrievable_now() {
         return 0.0;
     }
     if let Some(subject) = entry.subject_key.as_deref() {
@@ -5306,7 +5306,9 @@ impl MemoryManager {
         };
         let entries: Vec<_> = entries
             .into_iter()
-            .filter(|entry| entry.active && !is_memory_injected(session_id, &entry.id))
+            .filter(|entry| {
+                entry.is_retrievable_now() && !is_memory_injected(session_id, &entry.id)
+            })
             .collect();
         let entries = prefilter_for_jev(entries, query);
         pipeline_update(|p| {

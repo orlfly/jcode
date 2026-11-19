@@ -218,7 +218,7 @@ pub async fn select_with_transport<T: RelevanceTransport + ?Sized>(
         // Canonical tie order independent of graph HashMap iteration and recency.
         let mut keyed = entries
             .into_iter()
-            .filter(|entry| entry.active)
+            .filter(|entry| entry.is_retrievable_now())
             .map(|entry| Ok((serde_json::to_string(&entry)?, entry)))
             .collect::<Result<Vec<_>>>()?;
         keyed.sort_by(|a, b| a.1.id.cmp(&b.1.id).then_with(|| a.0.cmp(&b.0)));

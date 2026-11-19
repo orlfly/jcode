@@ -158,7 +158,7 @@ fn collect_candidates_from_graph(
     candidates: &mut Vec<GlobalPromotionCandidate>,
 ) {
     for memory in graph.memories.values() {
-        if !memory.active {
+        if !memory.is_retrievable_now() {
             continue;
         }
         // Promotion requires cross-context reinforcement: a memory that
@@ -240,7 +240,7 @@ pub fn gather_feedback_memories(memory_manager: &crate::memory::MemoryManager) -
     .flatten()
     {
         for memory in graph.memories.values() {
-            if !memory.active {
+            if !memory.is_retrievable_now() {
                 continue;
             }
             let has_ambient_tag = memory.tags.iter().any(|t| t == "ambient" || t == "system");

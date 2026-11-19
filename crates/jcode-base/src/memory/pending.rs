@@ -234,7 +234,7 @@ fn snapshot_selected_memories(
             "selected memory ID does not match its storage key"
         );
         anyhow::ensure!(
-            entry.active && entry.superseded_by.is_none(),
+            entry.is_retrievable_now() && entry.superseded_by.is_none(),
             "selected memory is inactive"
         );
         // Compare semantic/rendered metadata exactly, not a collision-prone hash.

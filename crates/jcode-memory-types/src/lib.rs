@@ -961,7 +961,7 @@ impl MemoryStore {
         ranking::top_k_by_score(
             self.entries
                 .iter()
-                .filter(|entry| entry.active)
+                .filter(|entry| entry.is_retrievable_now())
                 .map(|entry| (entry, memory_score(entry) as f32)),
             limit,
         )
@@ -977,7 +977,7 @@ impl MemoryStore {
 }
 
 pub fn memory_score(entry: &MemoryEntry) -> f64 {
-    if !entry.active {
+    if !entry.is_retrievable_now() {
         return 0.0;
     }
 
@@ -1009,7 +1009,7 @@ fn selected_entries_for_prompt(entries: &[MemoryEntry], limit: usize) -> Vec<&Me
     let mut selected = Vec::new();
     let mut seen_content = HashSet::new();
 
-    for entry in entries.iter().filter(|entry| entry.active) {
+    for entry in entries.iter().filter(|entry| entry.is_retrievable_now()) {
         if selected.len() >= limit {
             break;
         }
@@ -1437,6 +1437,50 @@ pub mod ranking {
             let restored: MemoryEntry =
                 serde_json::from_value(json).expect("legacy entry without properties");
             assert!(restored.properties.is_empty());
+        }
+
+        #[test]
+        fn retrieval_uses_lifecycle_status_not_only_active_flag() {
+            use crate::{
+                LifecycleMetadata, MemoryCategory, MemoryEntry, MemoryStore, memory_score,
+            };
+
+            let mut store = MemoryStore::new();
+            let active = store.add(MemoryEntry::new(MemoryCategory::Fact, "active memory"));
+            store.add(
+                MemoryEntry::new(MemoryCategory::Fact, "expired memory")
+                    .with_lifecycle(LifecycleMetadata::expired()),
+            );
+            store.add(
+                MemoryEntry::new(MemoryCategory::Fact, "deprecated memory")
+                    .with_lifecycle(LifecycleMetadata::deprecated("old")),
+            );
+            store.add(
+                MemoryEntry::new(MemoryCategory::Fact, "future memory").with_lifecycle(
+                    LifecycleMetadata::active()
+                        .with_effective_from(chrono::Utc::now() + chrono::Duration::days(1)),
+                ),
+            );
+            let superseded = store.add(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "superseded memory",
+            ));
+            store.entries.iter_mut().for_each(|entry| {
+                if entry.id == superseded {
+                    entry.active = false;
+                    entry.superseded_by = Some(active.clone());
+                }
+            });
+
+            let relevant = store.get_relevant(10);
+            assert_eq!(relevant.len(), 1);
+            assert_eq!(relevant[0].id, active);
+            assert!(store.format_for_prompt(10).is_some());
+            for memory in &store.entries {
+                if memory.id != active {
+                    assert_eq!(memory_score(memory), 0.0, "{}", memory.id);
+                }
+            }
         }
     }
 }
