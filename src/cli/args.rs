@@ -1414,6 +1414,25 @@ pub(crate) enum MemoryCommand {
         json: bool,
     },
 
+    /// Discover conservative relates_to edges from subject keys and shared tags
+    Links {
+        /// discover
+        #[arg(default_value = "discover")]
+        action: String,
+
+        /// Write the discovered edges instead of only reporting them
+        #[arg(long)]
+        apply: bool,
+
+        /// Maximum suggestions to print (the report always includes totals)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Clear test memory storage (used by debug sessions)
     ClearTest,
 

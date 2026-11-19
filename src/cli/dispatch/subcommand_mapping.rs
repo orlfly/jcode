@@ -41,6 +41,17 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
         MemoryCommand::Source { action, json } => {
             commands::MemorySubcommand::Source { action, json }
         }
+        MemoryCommand::Links {
+            action,
+            apply,
+            limit,
+            json,
+        } => commands::MemorySubcommand::Links {
+            action,
+            apply,
+            limit,
+            json,
+        },
         MemoryCommand::Distill { dry_run } => commands::MemorySubcommand::Distill { dry_run },
         MemoryCommand::SkillAccept { draft } => commands::MemorySubcommand::SkillAccept { draft },
         MemoryCommand::Forget { id } => commands::MemorySubcommand::Forget { id },

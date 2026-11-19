@@ -1643,6 +1643,12 @@ pub enum MemorySubcommand {
         action: String,
         json: bool,
     },
+    Links {
+        action: String,
+        apply: bool,
+        limit: usize,
+        json: bool,
+    },
     Distill {
         dry_run: bool,
     },
@@ -2321,6 +2327,46 @@ async fn run_memory_command_for_dir(
                 }
                 if action == "resume" {
                     println!("Automatic extraction resumed.");
+                }
+            }
+        }
+
+        MemorySubcommand::Links {
+            action,
+            apply,
+            limit,
+            json,
+        } => {
+            if action != "discover" {
+                anyhow::bail!("unknown links action '{}'; use discover", action);
+            }
+            let report = manager.discover_links(apply)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Link discovery: {} store(s), {} active memories, {} candidate(s), {} existing, {} applied{}",
+                    report.stores,
+                    report.memories,
+                    report.candidates,
+                    report.existing,
+                    report.applied,
+                    if report.capped { ", capped" } else { "" }
+                );
+                for suggestion in report.suggestions.iter().take(limit) {
+                    println!(
+                        "  {} -> {} weight={:.2} ({})",
+                        suggestion.from, suggestion.to, suggestion.weight, suggestion.reason
+                    );
+                }
+                if report.suggestions.len() > limit {
+                    println!(
+                        "  ... {} more suggestion(s); use --json or --limit",
+                        report.suggestions.len() - limit
+                    );
+                }
+                if !apply {
+                    println!("Dry run. Re-run with --apply to write these relates_to edges.");
                 }
             }
         }

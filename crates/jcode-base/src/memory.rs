@@ -928,6 +928,27 @@ pub fn ensure_artifact_kind_config() {
     LOADED.get_or_init(load_artifact_kind_config);
 }
 
+/// One deterministic link-discovery candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkSuggestion {
+    pub from: String,
+    pub to: String,
+    pub weight: f32,
+    pub reason: String,
+}
+
+/// Result of a link-discovery pass over every memory store.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkDiscoveryReport {
+    pub stores: usize,
+    pub memories: usize,
+    pub candidates: usize,
+    pub existing: usize,
+    pub applied: usize,
+    pub capped: bool,
+    pub suggestions: Vec<LinkSuggestion>,
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -3552,6 +3573,180 @@ impl MemoryManager {
         Ok(report)
     }
 
+    /// Discover conservative `relates_to` edges from shared `subject_key`
+    /// values and shared tags.
+    ///
+    /// This is intentionally deterministic and proposal-first: `apply=false`
+    /// only reports candidates, while `apply=true` writes `RelatesTo` edges and
+    /// bumps `link_discovery_count`. No LLM or embedding call is involved.
+    pub fn discover_links(&self, apply: bool) -> Result<LinkDiscoveryReport> {
+        use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+        const MAX_TOTAL: usize = 200;
+        const MAX_PER_MEMORY: usize = 3;
+
+        let mut report = LinkDiscoveryReport::default();
+        report.stores = self.for_each_store(|_store, graph| {
+            let active: Vec<(String, Option<String>, Vec<String>)> = graph
+                .all_memories()
+                .filter(|entry| {
+                    entry.is_retrievable_now() && !jcode_memory_types::is_link_id(&entry.id)
+                })
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        entry.subject_key.clone(),
+                        entry.tags.clone(),
+                    )
+                })
+                .collect();
+            report.memories += active.len();
+            if active.len() < 2 {
+                return false;
+            }
+
+            let active_ids: HashSet<String> = active.iter().map(|(id, _, _)| id.clone()).collect();
+            let mut existing_pairs: HashSet<(String, String)> = HashSet::new();
+            for id in &active_ids {
+                for edge in graph.get_edges(id) {
+                    if active_ids.contains(&edge.target) {
+                        existing_pairs.insert(link_pair(id, &edge.target));
+                    }
+                }
+            }
+
+            let mut candidates: BTreeMap<(String, String), LinkSuggestion> = BTreeMap::new();
+
+            // High precision: the same normalized subject key.
+            let mut subject_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (id, subject_key, _) in &active {
+                if let Some(subject_key) = subject_key.as_deref()
+                    && !subject_key.trim().is_empty()
+                {
+                    subject_groups
+                        .entry(subject_key.to_string())
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
+            for ids in subject_groups.values() {
+                for left in 0..ids.len() {
+                    for right in left + 1..ids.len() {
+                        insert_link_suggestion(
+                            &mut candidates,
+                            &ids[left],
+                            &ids[right],
+                            0.9,
+                            "same subject_key",
+                        );
+                    }
+                }
+            }
+
+            // Medium precision: at least two shared tags and Jaccard >= 0.5.
+            let tags_by_id: BTreeMap<String, BTreeSet<String>> = active
+                .iter()
+                .filter_map(|(id, _, tags)| {
+                    let tags: BTreeSet<String> = tags
+                        .iter()
+                        .map(|tag| tag.trim().to_lowercase())
+                        .filter(|tag| !tag.is_empty())
+                        .collect();
+                    (!tags.is_empty()).then(|| (id.clone(), tags))
+                })
+                .collect();
+            let mut tag_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (id, tags) in &tags_by_id {
+                for tag in tags {
+                    tag_index.entry(tag.clone()).or_default().push(id.clone());
+                }
+            }
+            let mut shared_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+            for ids in tag_index.values() {
+                for left in 0..ids.len() {
+                    for right in left + 1..ids.len() {
+                        *shared_counts
+                            .entry(link_pair(&ids[left], &ids[right]))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            for ((from, to), shared) in shared_counts {
+                if shared < 2 {
+                    continue;
+                }
+                let (Some(from_tags), Some(to_tags)) = (tags_by_id.get(&from), tags_by_id.get(&to))
+                else {
+                    continue;
+                };
+                let union = from_tags.union(to_tags).count();
+                if union == 0 {
+                    continue;
+                }
+                let jaccard = shared as f32 / union as f32;
+                if jaccard < 0.5 {
+                    continue;
+                }
+                insert_link_suggestion(
+                    &mut candidates,
+                    &from,
+                    &to,
+                    0.5 + 0.3 * jaccard,
+                    &format!(
+                        "shared tags ({shared} shared, {:.0}% Jaccard)",
+                        jaccard * 100.0
+                    ),
+                );
+            }
+
+            let mut suggestions: Vec<LinkSuggestion> = candidates
+                .into_values()
+                .filter(|suggestion| {
+                    let key = link_pair(&suggestion.from, &suggestion.to);
+                    if existing_pairs.contains(&key) {
+                        report.existing += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            report.candidates += suggestions.len();
+            suggestions.sort_by(|left, right| {
+                right
+                    .weight
+                    .partial_cmp(&left.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.from.cmp(&right.from))
+                    .then_with(|| left.to.cmp(&right.to))
+            });
+
+            let mut per_memory: HashMap<String, usize> = HashMap::new();
+            let mut changed = false;
+            for suggestion in suggestions {
+                if report.suggestions.len() >= MAX_TOTAL {
+                    report.capped = true;
+                    break;
+                }
+                if per_memory.get(&suggestion.from).copied().unwrap_or(0) >= MAX_PER_MEMORY
+                    || per_memory.get(&suggestion.to).copied().unwrap_or(0) >= MAX_PER_MEMORY
+                {
+                    continue;
+                }
+                *per_memory.entry(suggestion.from.clone()).or_default() += 1;
+                *per_memory.entry(suggestion.to.clone()).or_default() += 1;
+                if apply {
+                    graph.link_memories(&suggestion.from, &suggestion.to, suggestion.weight);
+                    report.applied += 1;
+                    changed = true;
+                }
+                report.suggestions.push(suggestion);
+            }
+            changed
+        })?;
+        Ok(report)
+    }
+
     /// Visit every persisted store graph, saving the ones the visitor changed.
     ///
     /// Two layouts have to be covered: the trait backend's own store root
@@ -5984,6 +6179,38 @@ pub fn test_backend() -> Arc<dyn GraphBackend> {
     let root =
         crate::memory::backend::JsonBackend::default_root().unwrap_or_else(|_| PathBuf::from("."));
     Arc::new(crate::memory::backend::JsonBackend::new(root))
+}
+
+fn link_pair(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
+}
+
+fn insert_link_suggestion(
+    candidates: &mut std::collections::BTreeMap<(String, String), LinkSuggestion>,
+    left: &str,
+    right: &str,
+    weight: f32,
+    reason: &str,
+) {
+    let key = link_pair(left, right);
+    match candidates.get(&key) {
+        Some(existing) if existing.weight >= weight => {}
+        _ => {
+            candidates.insert(
+                key.clone(),
+                LinkSuggestion {
+                    from: key.0,
+                    to: key.1,
+                    weight,
+                    reason: reason.to_string(),
+                },
+            );
+        }
+    }
 }
 
 /// Convenience: derive a `StoreKey` from a project's directory hash

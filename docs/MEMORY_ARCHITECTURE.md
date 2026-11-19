@@ -178,6 +178,10 @@ policy before mutating a graph:
   A confidence pause requires two consecutive degraded batches, so one
   low-confidence transcript does not stop extraction. The `memory` tool exposes
   the same recovery as `{"action":"health","extraction_action":"resume"}`.
+- `jcode memory links discover` reports conservative `relates_to` candidates
+  from exact `subject_key` matches and shared-tag Jaccard. It is dry-run by
+  default and writes only with `--apply`, capped at three new links per memory
+  and 200 per pass.
 - Skills have a v2 manifest contract (version, status, triggers, inputs,
   allowed tools, preconditions, effects, validation, changelog, provenance)
   while remaining backward compatible with legacy `SKILL.md` files.

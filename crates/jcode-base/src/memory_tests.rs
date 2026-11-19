@@ -4295,6 +4295,60 @@ fn extraction_source_pauses_on_confidence_drop() {
 }
 
 #[test]
+fn link_discovery_is_proposal_first_and_idempotent() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/link-discovery");
+        let mut graph = MemoryGraph::new();
+        let mut first = MemoryEntry::new(MemoryCategory::Fact, "first memory body");
+        first.subject_key = Some("api:/api/task/claim".to_string());
+        first.tags = vec!["alpha".to_string(), "beta".to_string()];
+        let mut second = MemoryEntry::new(MemoryCategory::Fact, "second memory body");
+        second.subject_key = Some("api:/api/task/claim".to_string());
+        second.tags = vec!["alpha".to_string(), "beta".to_string()];
+        let mut third = MemoryEntry::new(MemoryCategory::Observation, "third memory body");
+        third.tags = vec!["alpha".to_string(), "beta".to_string()];
+        let first_id = graph.add_memory(first);
+        let second_id = graph.add_memory(second);
+        let third_id = graph.add_memory(third);
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let dry = manager.discover_links(false).expect("dry-run");
+        assert!(dry.suggestions.len() >= 2, "{dry:?}");
+        assert!(dry.candidates >= 2);
+        assert_eq!(dry.applied, 0);
+        assert!(
+            dry.suggestions
+                .iter()
+                .any(|suggestion| suggestion.reason == "same subject_key")
+        );
+        let stored = manager.load_project_graph().expect("load");
+        assert!(
+            stored
+                .get_edges(&first_id)
+                .iter()
+                .all(|edge| !matches!(edge.kind, jcode_memory_types::EdgeKind::RelatesTo { .. }))
+        );
+
+        let applied = manager.discover_links(true).expect("apply");
+        assert!(applied.applied >= 2, "{applied:?}");
+        let stored = manager.load_project_graph().expect("load");
+        assert!(
+            stored
+                .get_edges(&first_id)
+                .iter()
+                .any(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::RelatesTo { .. }))
+        );
+        for id in [&first_id, &second_id, &third_id] {
+            assert!(stored.get_memory(id).is_some());
+        }
+
+        let again = manager.discover_links(true).expect("second apply");
+        assert_eq!(again.applied, 0);
+        assert!(again.existing >= 2, "{again:?}");
+    });
+}
+
+#[test]
 fn extraction_source_ignores_single_confidence_outlier() {
     with_temp_home(|_| {
         let manager = MemoryManager::new_test();
