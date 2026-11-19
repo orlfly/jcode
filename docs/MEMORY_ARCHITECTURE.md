@@ -43,12 +43,21 @@ not be treated as user-memory semantics by validation or traversal.
 
 ## Recall: two tiers
 
-**Tier 1 (L1, local, default-on)**: `score_l1_relevance` scores every active
-instance from the query: anchor match (`subject_key` contained in the
-normalized query) → 1.0, tag hit → 0.6, two-plus term overlap → ≤0.5.
+**Tier 1 (L1, local, default-on)**: `score_l1_relevance` scores every
+lifecycle-retrievable instance from the query: anchor match (`subject_key`
+contained in the normalized query) → 1.0, tag hit → 0.6, two-plus term overlap
+→ ≤0.5.
 Threshold `L1_MIN_SCORE = 0.34`, top `L1_MAX_RESULTS = 3`.
 Used when the judged path is unavailable (`agents.memory_l1_recall`, default
 true). It needs no credentials, no LLM and no embedder.
+
+Retrieval eligibility is defined by `MemoryEntry::is_retrievable_now()`:
+`active == true`, `lifecycle.status == active`, not `deprecated`, and inside the
+effective window. L1, graph ranking, JEV candidate collection, injection and
+ambient promotion all use this predicate. `active` remains an independent
+retrieval gate, so a superseded memory can keep `lifecycle.status = active`
+while `active = false`; that combination is intentional and is not lifecycle
+drift.
 
 **Tier 2 (Jev-judged)**: scoped candidates (BM25 prefilter to
 `MAX_JEV_RECALL_CANDIDATES = 72` when the store exceeds it) are sent to Jev's
