@@ -3965,6 +3965,30 @@ fn low_confidence_write_is_parked_in_review_queue() {
 }
 
 #[test]
+fn review_triage_groups_pending_items() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-triage");
+        for content in ["first parked fact", "second parked fact"] {
+            let entry = MemoryEntry::new(MemoryCategory::Observation, content).with_provenance(
+                ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                    .with_confidence(0.4),
+            );
+            assert!(manager.remember_project_governed(entry).unwrap().is_pending_review());
+        }
+        let report = manager.review_triage().expect("triage");
+        assert_eq!(report.pending, 2);
+        assert_eq!(report.by_action.get("insert"), Some(&2));
+        assert_eq!(report.by_gate.get("<none>"), Some(&2));
+        assert!(
+            report
+                .by_project
+                .iter()
+                .any(|(project, count)| project == "/review-triage" && *count == 2)
+        );
+    });
+}
+
+#[test]
 fn batch_change_gate_uses_absolute_and_share_thresholds() {
     let existing = std::collections::HashMap::from([
         (MemoryCategory::Observation, 100usize),

@@ -1372,7 +1372,7 @@ pub(crate) enum MemoryCommand {
 
     /// Inspect and resolve the memory review queue
     Review {
-        /// list, accept, reject, or defer
+        /// list, triage, accept, reject, or defer
         #[arg(default_value = "list")]
         action: String,
 

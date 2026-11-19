@@ -199,6 +199,8 @@ policy before mutating a graph:
   `relate` item now stores the new memory and adds `relates_to` edges to the
   old target and to the reconcile neighbours, using the originally computed
   similarity as the edge weight instead of inserting an unlinked duplicate.
+  `jcode memory review triage [--json]` groups the pending queue by action,
+  gate and project without dumping every item.
 - `jcode memory health` reports type distribution, contradictions, duplicate
   subjects, missing provenance/locators, review backlog and extraction source
   health. `jcode memory source status|resume` controls the extraction pause.

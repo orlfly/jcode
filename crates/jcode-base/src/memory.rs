@@ -1012,6 +1012,16 @@ pub struct LegacyJsonMergeReport {
     pub applied: usize,
 }
 
+/// Grouped view of the pending review queue.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReviewTriageReport {
+    pub pending: usize,
+    pub oldest_pending_days: i64,
+    pub by_action: std::collections::BTreeMap<String, usize>,
+    pub by_gate: std::collections::BTreeMap<String, usize>,
+    pub by_project: Vec<(String, usize)>,
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -2028,6 +2038,45 @@ impl MemoryManager {
         let path = review::queue_path(self.test_mode)?;
         let items = review::load_items(&path)?;
         Ok(review::find_item(&items, id).cloned())
+    }
+
+    /// Summarize the pending queue by action, gate and project so a large
+    /// backlog can be triaged without loading every item into the terminal.
+    pub fn review_triage(&self) -> Result<ReviewTriageReport> {
+        let items = self.list_reviews(Some(ReviewStatus::Pending))?;
+        let now = Utc::now();
+        let mut report = ReviewTriageReport {
+            pending: items.len(),
+            ..ReviewTriageReport::default()
+        };
+        let mut projects: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for item in &items {
+            *report.by_action.entry(item.action.clone()).or_default() += 1;
+            if item.gates.is_empty() {
+                *report.by_gate.entry("<none>".to_string()).or_default() += 1;
+            } else {
+                for gate in &item.gates {
+                    *report
+                        .by_gate
+                        .entry(format!("{gate:?}").to_lowercase())
+                        .or_default() += 1;
+                }
+            }
+            let project = item
+                .project_dir
+                .clone()
+                .unwrap_or_else(|| format!("<{}>", item.scope));
+            *projects.entry(project).or_default() += 1;
+            let days = now.signed_duration_since(item.created_at).num_days().max(0);
+            report.oldest_pending_days = report.oldest_pending_days.max(days);
+        }
+        report.by_project = projects.into_iter().collect();
+        report
+            .by_project
+            .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        report.by_project.truncate(10);
+        Ok(report)
     }
 
     /// Accept a pending review and apply its proposed change.

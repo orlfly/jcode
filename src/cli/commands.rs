@@ -2222,6 +2222,29 @@ async fn run_memory_command_for_dir(
                     }
                 }
             }
+            "triage" => {
+                let report = manager.review_triage()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Review triage: {} pending, oldest {} day(s)",
+                        report.pending, report.oldest_pending_days
+                    );
+                    println!("  by action:");
+                    for (action, count) in &report.by_action {
+                        println!("    {action}: {count}");
+                    }
+                    println!("  by gate:");
+                    for (gate, count) in &report.by_gate {
+                        println!("    {gate}: {count}");
+                    }
+                    println!("  top projects:");
+                    for (project, count) in &report.by_project {
+                        println!("    {project}: {count}");
+                    }
+                }
+            }
             "accept" | "reject" | "defer" => {
                 let id = id
                     .as_deref()
