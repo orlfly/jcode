@@ -193,6 +193,17 @@ let recalls = store.recall_anchor("error:0123abcd", 2, 10)?;
 
 当前索引是 `graph_json LIKE '%anchor%'` 加内存精确过滤。它适合几千个 session 以内的本地库；超过这个量级时应增加 `engineering_entities(session_id, entity_id)` 与 `engineering_relations(session_id, from_id, to_id)` 索引表。
 
+### 5.4 带权路径与 k-best
+
+`shortest_path` 保留原来的无权 BFS 语义，用于只需要连通性的调用。需要排序或解释时使用：
+
+```rust
+let path = graph.weighted_shortest_path("file:src/lib.rs", "error:0123", 4, &[]);
+let alternatives = graph.k_shortest_paths("file:src/lib.rs", "error:0123", 4, &[], 3);
+```
+
+边权为 `(1 + 2 * (1 - confidence)) * property["weight"]`，`weight` 缺省 1.0。`paths[i].cost` 是边权和，`confidence` 是路径上最弱边的置信度，`provenance` 按边顺序返回 PROV-O 形状记录。`k_shortest_paths` 使用 Yen 算法，结果按 cost、节点序列稳定排序。
+
 ## 6. 非目标
 
 - 不实现 OWL DL 推理。

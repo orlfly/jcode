@@ -1,8 +1,8 @@
 pub mod engineering_ontology;
 pub use engineering_ontology::{
     AlphaDef, AlphaStateDef, BfoCategory, ConcernDef, EngineeringClassDef, EngineeringEntity,
-    EngineeringGraph, EngineeringOntology, EngineeringPropertyDef, EngineeringProvenance,
-    EngineeringRelation, EngineeringRelationDef, EngineeringValidationIssue,
+    EngineeringGraph, EngineeringOntology, EngineeringPath, EngineeringPropertyDef,
+    EngineeringProvenance, EngineeringRelation, EngineeringRelationDef, EngineeringValidationIssue,
     EngineeringValidationReport, EntityStatus, PropertyValueKind, default_engineering_ontology,
 };
 

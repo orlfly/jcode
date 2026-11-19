@@ -766,6 +766,46 @@ pub struct EngineeringGraph {
     pub relations: BTreeMap<String, EngineeringRelation>,
 }
 
+/// A scored path through an [`EngineeringGraph`].
+///
+/// `nodes` and `relations` are parallel: `relations[i]` is the relation id that
+/// connects `nodes[i]` to `nodes[i + 1]`. `cost` is the sum of edge costs;
+/// lower is better. `confidence` is the weakest edge confidence on the path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineeringPath {
+    pub nodes: Vec<String>,
+    pub relations: Vec<String>,
+    pub cost: f64,
+    pub confidence: f32,
+    pub provenance: Vec<EngineeringProvenance>,
+}
+
+impl EngineeringPath {
+    pub fn hop_count(&self) -> usize {
+        self.relations.len()
+    }
+}
+
+fn relation_cost(relation: &EngineeringRelation) -> f64 {
+    let confidence = if relation.confidence.is_finite() {
+        f64::from(relation.confidence.clamp(0.0, 1.0))
+    } else {
+        0.5
+    };
+    let confidence_penalty = 1.0 + 2.0 * (1.0 - confidence);
+    let weight = relation
+        .properties
+        .get("weight")
+        .and_then(Value::as_f64)
+        .filter(|weight| weight.is_finite() && *weight > 0.0)
+        .unwrap_or(1.0);
+    confidence_penalty * weight
+}
+
+fn scaled_cost(cost: f64) -> u64 {
+    (cost * 1_000_000.0).round().clamp(1.0, u64::MAX as f64) as u64
+}
+
 impl EngineeringGraph {
     pub fn new() -> Self {
         Self::default()
@@ -854,6 +894,192 @@ impl EngineeringGraph {
             }
         }
         None
+    }
+
+    /// Best path under the graph's edge weights.
+    ///
+    /// Edge cost is `(1 + 2 * (1 - confidence)) * property["weight"]`, where
+    /// `weight` defaults to 1.0. Low-confidence and explicitly expensive
+    /// relations are therefore avoided without requiring a separate weight
+    /// table. This is Dijkstra over effective, non-negative edges.
+    pub fn weighted_shortest_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        allowed_relations: &[&str],
+    ) -> Option<EngineeringPath> {
+        self.dijkstra(
+            from,
+            to,
+            max_depth,
+            allowed_relations,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Yen's k-best loop-free paths under the same edge weights as
+    /// [`Self::weighted_shortest_path`].
+    ///
+    /// The first path is the weighted shortest path; each subsequent path is
+    /// the cheapest deviation from the previously accepted paths. Results are
+    /// sorted by cost and then by node sequence for deterministic ties. This is
+    /// the primitive for "show me alternative explanations" queries without
+    /// switching to an external graph database.
+    pub fn k_shortest_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        allowed_relations: &[&str],
+        k: usize,
+    ) -> Vec<EngineeringPath> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let Some(first) = self.weighted_shortest_path(from, to, max_depth, allowed_relations)
+        else {
+            return Vec::new();
+        };
+        let mut accepted = vec![first];
+        let mut candidates: Vec<EngineeringPath> = Vec::new();
+
+        while accepted.len() < k {
+            let previous = accepted.last().expect("accepted path").clone();
+            for spur_index in 0..previous.nodes.len().saturating_sub(1) {
+                let spur_node = previous.nodes[spur_index].clone();
+                let root_nodes = previous.nodes[..=spur_index].to_vec();
+                let root_relations = previous.relations[..spur_index].to_vec();
+
+                let mut removed_relations = BTreeSet::new();
+                for path in &accepted {
+                    if path.nodes.len() > spur_index
+                        && path.nodes[..=spur_index] == root_nodes
+                        && let Some(relation) = path.relations.get(spur_index)
+                    {
+                        removed_relations.insert(relation.clone());
+                    }
+                }
+                let blocked_nodes: BTreeSet<String> =
+                    root_nodes[..spur_index].iter().cloned().collect();
+
+                let Some(spur) = self.dijkstra(
+                    &spur_node,
+                    to,
+                    max_depth.saturating_sub(spur_index),
+                    allowed_relations,
+                    &removed_relations,
+                    &blocked_nodes,
+                ) else {
+                    continue;
+                };
+
+                let mut nodes = root_nodes;
+                nodes.extend(spur.nodes.into_iter().skip(1));
+                let mut relations = root_relations;
+                relations.extend(spur.relations);
+                if accepted.iter().any(|path| path.nodes == nodes)
+                    || candidates.iter().any(|path| path.nodes == nodes)
+                {
+                    continue;
+                }
+                candidates.push(self.path_from(nodes, relations));
+            }
+
+            if candidates.is_empty() {
+                break;
+            }
+            candidates.sort_by(|left, right| {
+                left.cost
+                    .partial_cmp(&right.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.nodes.cmp(&right.nodes))
+            });
+            accepted.push(candidates.remove(0));
+        }
+        accepted
+    }
+
+    fn dijkstra(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        allowed_relations: &[&str],
+        removed_relations: &BTreeSet<String>,
+        blocked_nodes: &BTreeSet<String>,
+    ) -> Option<EngineeringPath> {
+        if from == to {
+            return Some(self.path_from(vec![from.to_string()], Vec::new()));
+        }
+        let mut queue: BTreeSet<(u64, String, usize, Vec<String>, Vec<String>)> = BTreeSet::new();
+        queue.insert((0, from.to_string(), 0, vec![from.to_string()], Vec::new()));
+        let mut best: HashMap<(String, usize), u64> = HashMap::new();
+        best.insert((from.to_string(), 0), 0);
+
+        while let Some((cost, node, depth, nodes, relations)) = queue.pop_first() {
+            if node == to {
+                return Some(self.path_from(nodes, relations));
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for relation in self.outgoing(&node) {
+                if !allowed_relations.is_empty()
+                    && !allowed_relations.contains(&relation.relation.as_str())
+                {
+                    continue;
+                }
+                if removed_relations.contains(&relation.id) || blocked_nodes.contains(&relation.to)
+                {
+                    continue;
+                }
+                let next_depth = depth + 1;
+                let next_cost = cost.saturating_add(scaled_cost(relation_cost(relation)));
+                let key = (relation.to.clone(), next_depth);
+                if best
+                    .get(&key)
+                    .is_some_and(|existing| *existing <= next_cost)
+                {
+                    continue;
+                }
+                best.insert(key, next_cost);
+                let mut next_nodes = nodes.clone();
+                next_nodes.push(relation.to.clone());
+                let mut next_relations = relations.clone();
+                next_relations.push(relation.id.clone());
+                queue.insert((
+                    next_cost,
+                    relation.to.clone(),
+                    next_depth,
+                    next_nodes,
+                    next_relations,
+                ));
+            }
+        }
+        None
+    }
+
+    fn path_from(&self, nodes: Vec<String>, relations: Vec<String>) -> EngineeringPath {
+        let mut cost = 0.0;
+        let mut confidence = 1.0f32;
+        let mut provenance = Vec::with_capacity(relations.len());
+        for relation_id in &relations {
+            let Some(relation) = self.relations.get(relation_id) else {
+                continue;
+            };
+            cost += relation_cost(relation);
+            confidence = confidence.min(relation.confidence.clamp(0.0, 1.0));
+            provenance.push(relation.provenance.clone());
+        }
+        EngineeringPath {
+            nodes,
+            relations,
+            cost,
+            confidence,
+            provenance,
+        }
     }
 
     /// Validate every entity and relation against the ontology.
@@ -1981,6 +2207,45 @@ mod tests {
             .shortest_path("t1", "e1", 3, &[REL_DEPENDS_ON, REL_BLOCKED_BY])
             .expect("path");
         assert_eq!(path, vec!["t1", "t2", "e1"]);
+    }
+
+    #[test]
+    fn weighted_paths_honor_weights_and_return_provenance() {
+        let mut graph = EngineeringGraph::new();
+        for id in ["t0", "t1", "t2", "t3"] {
+            graph.insert_entity(task(id));
+        }
+        graph.insert_relation(
+            EngineeringRelation::new("t0", REL_DEPENDS_ON, "t1")
+                .with_confidence(0.95)
+                .with_provenance(EngineeringProvenance::new("trace:high-confidence")),
+        );
+        graph.insert_relation(
+            EngineeringRelation::new("t1", REL_DEPENDS_ON, "t3")
+                .with_confidence(0.95)
+                .with_provenance(EngineeringProvenance::new("trace:high-confidence")),
+        );
+        graph.insert_relation(
+            EngineeringRelation::new("t0", REL_DEPENDS_ON, "t2")
+                .with_confidence(0.5)
+                .with_property("weight", json!(0.2))
+                .with_provenance(EngineeringProvenance::new("trace:cheap")),
+        );
+        graph.insert_relation(
+            EngineeringRelation::new("t2", REL_DEPENDS_ON, "t3")
+                .with_confidence(0.5)
+                .with_property("weight", json!(0.2))
+                .with_provenance(EngineeringProvenance::new("trace:cheap")),
+        );
+
+        let paths = graph.k_shortest_paths("t0", "t3", 3, &[REL_DEPENDS_ON], 2);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].nodes, vec!["t0", "t2", "t3"]);
+        assert_eq!(paths[1].nodes, vec!["t0", "t1", "t3"]);
+        assert!(paths[0].cost < paths[1].cost);
+        assert_eq!(paths[0].hop_count(), 2);
+        assert_eq!(paths[0].provenance[0].source, "trace:cheap");
+        assert!(paths[0].confidence < paths[1].confidence);
     }
 
     #[test]
