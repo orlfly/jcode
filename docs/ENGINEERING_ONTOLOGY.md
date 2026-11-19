@@ -193,6 +193,15 @@ let recalls = store.recall_anchor("error:0123abcd", 2, 10)?;
 
 当前索引是 `graph_json LIKE '%anchor%'` 加内存精确过滤。它适合几千个 session 以内的本地库；超过这个量级时应增加 `engineering_entities(session_id, entity_id)` 与 `engineering_relations(session_id, from_id, to_id)` 索引表。
 
+保留策略默认保留最新两个非空 session、任何 30 天内的 session，并始终把只有 Session 节点的空图标为候选：
+
+```bash
+jcode memory storage engineering-audit
+jcode memory storage engineering-prune --apply
+```
+
+`engineering-audit` 只读；`engineering-prune` 默认 dry-run，只有 `--apply` 才删除候选行。当前策略不会裁剪大型活跃 session，只清理空图和超过 30 天且不在最新两个之内的历史图。
+
 ### 5.4 带权路径与 k-best
 
 `shortest_path` 保留原来的无权 BFS 语义，用于只需要连通性的调用。需要排序或解释时使用：

@@ -10,12 +10,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use jcode_memory_types::engineering_ontology::{
     CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringRelation,
     default_engineering_ontology,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::storage;
 
@@ -38,6 +39,34 @@ pub struct EngineeringAnchorRecall {
     pub working_dir: Option<String>,
     pub graph: EngineeringGraph,
 }
+
+/// One session selected by the engineering retention policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineeringRetentionCandidate {
+    pub session_id: String,
+    pub working_dir: Option<String>,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub updated_at: String,
+    pub reason: String,
+}
+
+/// Retention summary for the engineering episode store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineeringRetentionReport {
+    pub sessions: usize,
+    pub entities: usize,
+    pub relations: usize,
+    pub storage_bytes: u64,
+    pub empty_sessions: usize,
+    pub candidates: Vec<EngineeringRetentionCandidate>,
+    pub pruned: usize,
+}
+
+/// Keep the newest two non-empty sessions and any session younger than 30 days.
+/// Empty session-only graphs are always candidates for pruning.
+pub const ENGINEERING_KEEP_LATEST: usize = 2;
+pub const ENGINEERING_MAX_AGE_DAYS: i64 = 30;
 
 /// SQLite-backed store for engineering episode graphs.
 pub struct EngineeringStore {
@@ -230,6 +259,93 @@ impl EngineeringStore {
             )
             .context("delete engineering graph")?;
         Ok(removed > 0)
+    }
+
+    /// Report which sessions fall outside the default retention policy.
+    pub fn retention_report(&self) -> Result<EngineeringRetentionReport> {
+        self.retention_pass(false)
+    }
+
+    /// Apply the default retention policy. `apply=false` is a dry run.
+    pub fn prune_sessions(&self, apply: bool) -> Result<EngineeringRetentionReport> {
+        self.retention_pass(apply)
+    }
+
+    fn retention_pass(&self, apply: bool) -> Result<EngineeringRetentionReport> {
+        let sessions = self.list_sessions(10_000)?;
+        let now = Utc::now();
+        let non_empty: Vec<&EngineeringSessionRecord> = sessions
+            .iter()
+            .filter(|session| session.entity_count > 1 || session.relation_count > 0)
+            .collect();
+        let newest_non_empty: std::collections::BTreeSet<&str> = non_empty
+            .iter()
+            .take(ENGINEERING_KEEP_LATEST)
+            .map(|session| session.session_id.as_str())
+            .collect();
+
+        let mut candidates = Vec::new();
+        for session in &sessions {
+            let empty = session.entity_count <= 1 && session.relation_count == 0;
+            let old = !newest_non_empty.contains(session.session_id.as_str())
+                && session
+                    .updated_at
+                    .parse::<DateTime<Utc>>()
+                    .ok()
+                    .is_some_and(|updated| {
+                        now.signed_duration_since(updated).num_days() > ENGINEERING_MAX_AGE_DAYS
+                    });
+            let reason = if empty {
+                "empty session graph"
+            } else if old {
+                "older than 30 days and outside newest two sessions"
+            } else {
+                continue;
+            };
+            candidates.push(EngineeringRetentionCandidate {
+                session_id: session.session_id.clone(),
+                working_dir: session.working_dir.clone(),
+                entity_count: session.entity_count,
+                relation_count: session.relation_count,
+                updated_at: session.updated_at.clone(),
+                reason: reason.to_string(),
+            });
+        }
+
+        let mut pruned = 0;
+        if apply {
+            for candidate in &candidates {
+                let removed = self
+                    .connection
+                    .execute(
+                        "DELETE FROM engineering_graphs WHERE session_id = ?1",
+                        params![candidate.session_id],
+                    )
+                    .context("prune engineering session")?;
+                pruned += removed;
+            }
+        }
+        let storage_bytes = [
+            &self.path,
+            &self.path.with_extension("sqlite-wal"),
+            &self.path.with_extension("sqlite-shm"),
+        ]
+        .into_iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+        Ok(EngineeringRetentionReport {
+            sessions: sessions.len(),
+            entities: sessions.iter().map(|session| session.entity_count).sum(),
+            relations: sessions.iter().map(|session| session.relation_count).sum(),
+            storage_bytes,
+            empty_sessions: sessions
+                .iter()
+                .filter(|session| session.entity_count <= 1 && session.relation_count == 0)
+                .count(),
+            candidates,
+            pruned,
+        })
     }
 
     /// Find sessions whose graph contains `anchor_id`, then return the subgraph
@@ -457,5 +573,78 @@ mod tests {
             .save_graph("session-1", None, &graph)
             .expect("empty save");
         assert!(store.load_graph("session-1").expect("load").is_none());
+    }
+
+    #[test]
+    fn retention_report_and_prune_are_safe_by_default() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let graph = sample_graph();
+        store.save_graph("new-a", None, &graph).expect("save a");
+        store.save_graph("new-b", None, &graph).expect("save b");
+        store.save_graph("old", None, &graph).expect("save old");
+        let old_time = (Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        store
+            .connection
+            .execute(
+                "UPDATE engineering_graphs SET updated_at = ?1 WHERE session_id = 'old'",
+                params![old_time],
+            )
+            .expect("age old session");
+        store
+            .connection
+            .execute(
+                r#"
+                INSERT INTO engineering_graphs (
+                    session_id, working_dir, ontology_id, ontology_hash,
+                    entity_count, relation_count, graph_json, created_at, updated_at
+                ) VALUES (?1, NULL, ?2, ?3, 1, 0, ?4, ?5, ?5)
+                "#,
+                params![
+                    "empty",
+                    default_engineering_ontology().id,
+                    default_engineering_ontology().content_hash(),
+                    serde_json::to_string(&EngineeringGraph::new()).expect("empty graph"),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("insert empty session");
+
+        let report = store.retention_report().expect("retention report");
+        assert_eq!(report.sessions, 4);
+        assert_eq!(report.empty_sessions, 1);
+        assert!(
+            report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.session_id == "empty")
+        );
+        assert!(
+            report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.session_id == "old")
+        );
+        assert!(
+            !report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.session_id == "new-a")
+        );
+        assert!(
+            !report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.session_id == "new-b")
+        );
+
+        let dry = store.prune_sessions(false).expect("dry run");
+        assert_eq!(dry.pruned, 0);
+        assert!(store.load_graph("empty").expect("load empty").is_some());
+
+        let applied = store.prune_sessions(true).expect("prune");
+        assert_eq!(applied.pruned, 2);
+        assert!(store.load_graph("empty").expect("load empty").is_none());
+        assert!(store.load_graph("old").expect("load old").is_none());
+        assert!(store.load_graph("new-a").expect("load new").is_some());
     }
 }

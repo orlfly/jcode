@@ -2381,6 +2381,42 @@ async fn run_memory_command_for_dir(
             apply,
             json,
         } => {
+            if matches!(action.as_str(), "engineering-audit" | "engineering-prune") {
+                let store = crate::engineering_store::EngineeringStore::open_default()?;
+                let report = if action == "engineering-audit" {
+                    store.retention_report()?
+                } else {
+                    store.prune_sessions(apply)?
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Engineering retention: {} session(s), {} entities, {} relations, {} bytes, {} empty, {} candidate(s), {} pruned",
+                        report.sessions,
+                        report.entities,
+                        report.relations,
+                        report.storage_bytes,
+                        report.empty_sessions,
+                        report.candidates.len(),
+                        report.pruned
+                    );
+                    for candidate in &report.candidates {
+                        println!(
+                            "  {} entities={} relations={} updated={} ({})",
+                            candidate.session_id,
+                            candidate.entity_count,
+                            candidate.relation_count,
+                            candidate.updated_at,
+                            candidate.reason
+                        );
+                    }
+                    if action == "engineering-prune" && !apply {
+                        println!("Dry run. Re-run with --apply to prune these sessions.");
+                    }
+                }
+                return Ok(());
+            }
             let quarantine = match action.as_str() {
                 "audit" => false,
                 "quarantine-legacy" => apply,

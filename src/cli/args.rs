@@ -1435,7 +1435,7 @@ pub(crate) enum MemoryCommand {
 
     /// Audit legacy JSON snapshots against the active SQLite backend
     Storage {
-        /// audit or quarantine-legacy
+        /// audit, quarantine-legacy, engineering-audit, or engineering-prune
         #[arg(default_value = "audit")]
         action: String,
 
