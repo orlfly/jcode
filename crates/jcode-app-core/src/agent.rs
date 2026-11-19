@@ -802,6 +802,42 @@ impl Agent {
         }
     }
 
+    /// Persist the deterministic engineering episode graph after a compaction
+    /// boundary. Compaction is infrequent and already touches the full history,
+    /// so it is the natural checkpoint for the graph store.
+    fn persist_engineering_episode_best_effort(&self, messages: &[Message]) {
+        let extraction = jcode_base::engineering_episode::extract_engineering_episode(
+            &self.session.id,
+            messages,
+            self.session.working_dir.as_deref(),
+        );
+        if !extraction.warnings.is_empty() {
+            logging::warn(&format!(
+                "Engineering episode extraction for session {} produced {} warning(s)",
+                self.session.id,
+                extraction.warnings.len()
+            ));
+        }
+        match jcode_base::engineering_store::EngineeringStore::open_default() {
+            Ok(store) => {
+                if let Err(err) = store.save_graph(
+                    &self.session.id,
+                    self.session.working_dir.as_deref(),
+                    &extraction.graph,
+                ) {
+                    logging::warn(&format!(
+                        "Failed to persist engineering episode for session {}: {}",
+                        self.session.id, err
+                    ));
+                }
+            }
+            Err(err) => logging::warn(&format!(
+                "Failed to open engineering graph store for session {}: {}",
+                self.session.id, err
+            )),
+        }
+    }
+
     fn reset_runtime_state_for_session_change(&mut self) {
         self.active_skill = None;
         self.last_upstream_provider = None;
@@ -980,6 +1016,8 @@ impl Agent {
                         self.sync_session_compaction_state_from_manager(&manager);
                     }
                     if event.is_some() {
+                        let messages = self.session.provider_messages().to_vec();
+                        self.persist_engineering_episode_best_effort(&messages);
                         self.note_compaction_applied();
                         self.persist_session_best_effort("compaction completion");
                     }

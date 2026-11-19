@@ -160,6 +160,39 @@ let warnings = extraction.warnings;
 
 该块只包含稳定 id，后续 `shortest_path` 或 `memory recall` 可以直接解析。Session、Turn、Observation 不进入锚点段，因为它们已由摘要正文表达。
 
+追加前会做 shrink proof：如果模型返回的摘要本身已经不小于被压缩消息的总字符数，或者加上锚点后会不再变小，就跳过锚点段并记录 warning。锚点段自身上限为 4096 字符，超出时按整行截断。这样锚点不会让一次本来失败的压缩变得更差。
+
+### 5.3 持久化与锚点回读
+
+`jcode-base::engineering_store::EngineeringStore` 把每个 session 的属性图作为一个 JSON 图保存到：
+
+```text
+<JCODE_HOME>/engineering/graphs.sqlite
+```
+
+默认路径是 `~/.jcode/engineering/graphs.sqlite`。表 `engineering_graphs` 以 `session_id` 为主键，同时保存 ontology id/hash、实体数、关系数、`created_at` 与 `updated_at`。当前版本使用 JSON 图而不是规范化三元组表，原因是 Episode 图规模小，路径查询在内存中完成；后续需要跨 session 图查询时再拆表。
+
+压缩完成、摘要正式生效时，Agent 会重新抽取该 session 的图并 upsert：
+
+```rust
+let extraction = extract_engineering_episode(session_id, &messages, working_dir);
+store.save_graph(session_id, working_dir, &extraction.graph)?;
+```
+
+回读通过 `memory` 工具：
+
+```json
+{"action":"recall","anchor":"file:src/lib.rs","depth":2,"limit":10}
+```
+
+返回所有包含该锚点的 session 子图，包含 `depth` 跳内的实体和两端都在子图内的关系。`limit` 是扫描的 session 数上限，`depth` 默认 2。`file:`、`error:`、`command:`、`task:` 都使用同一套稳定 id。
+
+```rust
+let recalls = store.recall_anchor("error:0123abcd", 2, 10)?;
+```
+
+当前索引是 `graph_json LIKE '%anchor%'` 加内存精确过滤。它适合几千个 session 以内的本地库；超过这个量级时应增加 `engineering_entities(session_id, entity_id)` 与 `engineering_relations(session_id, from_id, to_id)` 索引表。
+
 ## 6. 非目标
 
 - 不实现 OWL DL 推理。

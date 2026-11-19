@@ -1431,6 +1431,44 @@ fn compaction_summary_rejects_refusals_and_empty_text_issue_2089() {
 
 struct RefusingSummaryProvider;
 
+struct OversizedSummaryProvider;
+
+#[async_trait::async_trait]
+impl Provider for OversizedSummaryProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn name(&self) -> &str {
+        "oversized-summary"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(OversizedSummaryProvider)
+    }
+
+    async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
+        Ok("x".repeat(5000))
+    }
+
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        system: &str,
+    ) -> Result<(String, jcode_provider_core::SimpleCompletionUsage)> {
+        Ok((
+            self.complete_simple(prompt, system).await?,
+            jcode_provider_core::SimpleCompletionUsage::default(),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for RefusingSummaryProvider {
     async fn complete(
@@ -1462,6 +1500,7 @@ impl Provider for RefusingSummaryProvider {
 #[tokio::test]
 async fn text_summary_appends_graph_memory_state() {
     let messages = vec![
+        make_text_message(Role::User, &"context ".repeat(300)),
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
@@ -1492,6 +1531,19 @@ async fn text_summary_appends_graph_memory_state() {
     assert!(result.summary_text.contains("## Graph Memory State"));
     assert!(result.summary_text.contains("command:"));
     assert!(result.summary_text.contains("error:"));
+}
+
+#[tokio::test]
+async fn oversized_summary_skips_graph_memory_state() {
+    let messages = vec![
+        make_text_message(Role::User, "short request"),
+        make_text_message(Role::Assistant, "short answer"),
+    ];
+    let result = generate_compaction_artifact(Arc::new(OversizedSummaryProvider), messages, None)
+        .await
+        .expect("summary");
+    assert_eq!(result.summary_text.chars().count(), 5000);
+    assert!(!result.summary_text.contains("## Graph Memory State"));
 }
 
 #[tokio::test]

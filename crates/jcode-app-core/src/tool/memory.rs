@@ -5,6 +5,7 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, MemoryScope};
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_base::engineering_store::EngineeringStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -87,6 +88,9 @@ struct MemoryInput {
     /// For recall action: retrieval mode
     #[serde(default)]
     mode: Option<String>,
+    /// For recall action: engineering graph anchor such as `file:src/lib.rs`.
+    #[serde(default)]
+    anchor: Option<String>,
     /// For ontology action: show | propose | apply | history | rollback
     #[serde(default)]
     ontology_action: Option<String>,
@@ -158,6 +162,10 @@ impl Tool for MemoryTool {
                 "from_id": { "type": "string" },
                 "to_id": { "type": "string" },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, or list. Zero returns no results. Recall defaults to 10." },
+                "anchor": {
+                    "type": "string",
+                    "description": "For action=recall: engineering graph anchor (file:, error:, command:, task:). Returns the stored subgraph around it."
+                },
                 "ontology_action": {
                     "type": "string",
                     "enum": ["show", "propose", "validate", "apply", "history", "rollback"],
@@ -316,6 +324,15 @@ impl Tool for MemoryTool {
             }
             "recall" => {
                 let limit = input.limit.unwrap_or(10);
+                if let Some(anchor) = input
+                    .anchor
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|anchor| !anchor.is_empty())
+                {
+                    let depth = input.depth.unwrap_or(2);
+                    return Self::recall_engineering_anchor(anchor, depth, limit);
+                }
                 let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
                 let mode = input.mode.as_deref().unwrap_or_else(|| {
                     if input.query.is_some() {
@@ -847,6 +864,53 @@ impl Tool for MemoryTool {
     }
 }
 
+impl MemoryTool {
+    /// Read back persisted episode subgraphs around a stable graph id.
+    fn recall_engineering_anchor(anchor: &str, depth: usize, limit: usize) -> Result<ToolOutput> {
+        if limit == 0 {
+            return Ok(ToolOutput::new("No graph anchors requested."));
+        }
+        let store = EngineeringStore::open_default()
+            .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+        let recalls = store
+            .recall_anchor(anchor, depth, limit)
+            .map_err(|error| anyhow::anyhow!("recall engineering anchor: {error}"))?;
+        if recalls.is_empty() {
+            return Ok(ToolOutput::new(format!(
+                "No stored engineering graph contains anchor `{anchor}`."
+            )));
+        }
+
+        let mut out = format!(
+            "Found {} stored session graph(s) for anchor `{anchor}` (depth {depth}):\n",
+            recalls.len()
+        );
+        for recall in recalls {
+            out.push_str(&format!("\n## session {}\n", recall.session_id));
+            if let Some(working_dir) = recall.working_dir.as_deref() {
+                out.push_str(&format!("working_dir: {working_dir}\n"));
+            }
+            out.push_str("entities:\n");
+            for entity in recall.graph.entities.values() {
+                out.push_str(&format!(
+                    "- `{}` | {} | {}\n",
+                    entity.id, entity.class, entity.name
+                ));
+            }
+            if !recall.graph.relations.is_empty() {
+                out.push_str("relations:\n");
+                for relation in recall.graph.relations.values() {
+                    out.push_str(&format!(
+                        "- `{}` -{}-> `{}`\n",
+                        relation.from, relation.relation, relation.to
+                    ));
+                }
+            }
+        }
+        Ok(ToolOutput::new(out))
+    }
+}
+
 /// Review/autoreview/judge sessions are analysis-only. They may propose an
 /// ontology patch (which writes to the memory proposal directory, not the
 /// repo) but must never apply or roll one back.
@@ -941,6 +1005,7 @@ mod tests {
         assert!(props.contains_key("from_id"));
         assert!(props.contains_key("to_id"));
         assert!(props.contains_key("limit"));
+        assert!(props.contains_key("anchor"));
         assert!(!props.contains_key("weight"));
         assert!(!props.contains_key("depth"));
         assert!(!props.contains_key("mode"));
@@ -994,6 +1059,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn recall_anchor_reads_persisted_engineering_graph() {
+        use crate::message::{ContentBlock, Message, Role};
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "edit".to_string(),
+                    input: json!({
+                        "file_path": "src/lib.rs",
+                        "old_string": "a",
+                        "new_string": "b",
+                    }),
+                    thought_signature: None,
+                }]
+                .into(),
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }]
+                .into(),
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+        ];
+        let extraction = jcode_base::engineering_episode::extract_engineering_episode(
+            "session-anchor",
+            &messages,
+            Some("/repo"),
+        );
+        EngineeringStore::open_default()
+            .expect("store")
+            .save_graph("session-anchor", Some("/repo"), &extraction.graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({"action":"recall", "anchor":"file:src/lib.rs", "depth":1}),
+                test_ctx(None),
+            )
+            .await
+            .expect("anchor recall");
+        assert!(
+            output.output.contains("session-anchor"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("file:src/lib.rs"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("modifies"), "{}", output.output);
     }
 
     #[tokio::test]

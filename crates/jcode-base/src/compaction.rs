@@ -1833,12 +1833,8 @@ async fn generate_compaction_artifact(
         usage,
     );
 
-    let mut summary_text = validate_compaction_summary(summary)?;
-    let graph_state = crate::engineering_episode::render_graph_memory_state(&messages, 24);
-    if !graph_state.is_empty() && !summary_text.contains("## Graph Memory State") {
-        summary_text.push_str("\n\n## Graph Memory State\n\n");
-        summary_text.push_str(&graph_state);
-    }
+    let summary_text = validate_compaction_summary(summary)?;
+    let summary_text = attach_graph_memory_state(summary_text, &messages);
 
     Ok(CompactionResult {
         summary_text,
@@ -1847,6 +1843,58 @@ async fn generate_compaction_artifact(
         duration_ms: start.elapsed().as_millis() as u64,
         summarized_messages: messages.len(),
     })
+}
+
+/// Maximum chars reserved for the deterministic graph anchor block.
+const MAX_GRAPH_MEMORY_STATE_CHARS: usize = 4096;
+
+/// Append graph anchors only when the resulting summary still shrinks the
+/// source messages. A provider can return a verbatim or oversized summary; in
+/// that case adding anchors makes compaction strictly worse, so skip them.
+fn attach_graph_memory_state(mut summary_text: String, messages: &[Message]) -> String {
+    if summary_text.contains("## Graph Memory State") {
+        return summary_text;
+    }
+    let source_chars: usize = messages.iter().map(message_char_count).sum();
+    if source_chars == 0 || summary_text.chars().count() >= source_chars {
+        crate::logging::warn(&format!(
+            "[compaction] skipped graph memory state: summary ({}) is not smaller than source ({})",
+            summary_text.chars().count(),
+            source_chars
+        ));
+        return summary_text;
+    }
+
+    let graph_state = crate::engineering_episode::render_graph_memory_state(messages, 24);
+    let graph_state = truncate_graph_state(&graph_state, MAX_GRAPH_MEMORY_STATE_CHARS);
+    if graph_state.is_empty() {
+        return summary_text;
+    }
+
+    let candidate_chars = summary_text.chars().count()
+        + "\n\n## Graph Memory State\n\n".len()
+        + graph_state.chars().count();
+    if candidate_chars >= source_chars {
+        crate::logging::warn(&format!(
+            "[compaction] skipped graph memory state: summary with anchors ({candidate_chars}) would not shrink source ({source_chars})"
+        ));
+        return summary_text;
+    }
+
+    summary_text.push_str("\n\n## Graph Memory State\n\n");
+    summary_text.push_str(&graph_state);
+    summary_text
+}
+
+fn truncate_graph_state(graph_state: &str, max_chars: usize) -> String {
+    if graph_state.chars().count() <= max_chars {
+        return graph_state.to_string();
+    }
+    let mut out: String = graph_state.chars().take(max_chars).collect();
+    if let Some(last_newline) = out.rfind('\n') {
+        out.truncate(last_newline);
+    }
+    out
 }
 
 /// Reject summaries that cannot stand in for the messages they replace, such
