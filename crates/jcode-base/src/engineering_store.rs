@@ -1,16 +1,20 @@
 //! Persistent storage for deterministic engineering episode graphs.
 //!
-//! Each session is stored as one JSON graph keyed by `session_id`. The schema
-//! keeps the ontology identity alongside the graph so a later replay can detect
-//! schema drift. This is deliberately a small, append/update store rather than a
-//! graph database: the current episode graphs are small and the path engine runs
-//! in memory.
+//! Each session is stored as one gzip-compressed JSON graph keyed by
+//! `session_id`, with a separate entity index for anchor lookup. The schema keeps
+//! the ontology identity alongside the graph so a later replay can detect schema
+//! drift. This is deliberately a small, append/update store rather than a graph
+//! database: the path engine runs in memory.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use jcode_memory_types::engineering_ontology::{
     CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringRelation,
     default_engineering_ontology,
@@ -63,10 +67,21 @@ pub struct EngineeringRetentionReport {
     pub pruned: usize,
 }
 
+/// Result of rewriting the engineering store into compressed blobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineeringCompactionReport {
+    pub sessions: usize,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub compacted: usize,
+}
+
 /// Keep the newest two non-empty sessions and any session younger than 30 days.
 /// Empty session-only graphs are always candidates for pruning.
 pub const ENGINEERING_KEEP_LATEST: usize = 2;
 pub const ENGINEERING_MAX_AGE_DAYS: i64 = 30;
+
+const GRAPH_BLOB_MAGIC: &[u8] = b"JCEG1";
 
 /// SQLite-backed store for engineering episode graphs.
 pub struct EngineeringStore {
@@ -103,6 +118,7 @@ impl EngineeringStore {
         configure_connection(&connection)?;
         let store = Self { path, connection };
         store.ensure_schema()?;
+        store.ensure_entity_index()?;
         Ok(store)
     }
 
@@ -136,14 +152,98 @@ impl EngineeringStore {
                     entity_count INTEGER NOT NULL,
                     relation_count INTEGER NOT NULL,
                     graph_json TEXT NOT NULL,
+                    graph_blob BLOB,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS engineering_graphs_updated
                     ON engineering_graphs(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS engineering_entity_index (
+                    session_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    class TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    PRIMARY KEY(session_id, entity_id)
+                );
+                CREATE INDEX IF NOT EXISTS engineering_entity_index_entity
+                    ON engineering_entity_index(entity_id);
                 "#,
             )
             .context("create engineering_graphs schema")?;
+        let has_blob = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('engineering_graphs') WHERE name = 'graph_blob'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("inspect engineering_graphs columns")?
+            > 0;
+        if !has_blob {
+            self.connection
+                .execute("ALTER TABLE engineering_graphs ADD COLUMN graph_blob BLOB", [])
+                .context("add engineering_graphs.graph_blob")?;
+        }
+        Ok(())
+    }
+
+    /// Backfill the entity index for rows written before the index existed.
+    fn ensure_entity_index(&self) -> Result<()> {
+        let missing: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    r#"
+                    SELECT session_id FROM engineering_graphs
+                    WHERE session_id NOT IN (
+                        SELECT DISTINCT session_id FROM engineering_entity_index
+                    )
+                    "#,
+                )
+                .context("prepare entity index backfill")?;
+            let rows = statement
+                .query_map([], |row| row.get(0))
+                .context("query entity index backfill")?;
+            let mut missing = Vec::new();
+            for row in rows {
+                missing.push(row.context("read entity index backfill row")?);
+            }
+            missing
+        };
+        for session_id in missing {
+            let Some(graph) = self.load_graph(&session_id)? else {
+                continue;
+            };
+            self.write_entity_index(&session_id, &graph)?;
+        }
+        Ok(())
+    }
+
+    fn write_entity_index(&self, session_id: &str, graph: &EngineeringGraph) -> Result<()> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .context("begin entity index transaction")?;
+        transaction
+            .execute(
+                "DELETE FROM engineering_entity_index WHERE session_id = ?1",
+                params![session_id],
+            )
+            .context("clear entity index")?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT OR REPLACE INTO engineering_entity_index \
+                     (session_id, entity_id, class, name) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .context("prepare entity index insert")?;
+            for entity in graph.entities.values() {
+                statement
+                    .execute(params![session_id, entity.id, entity.class, entity.name])
+                    .context("insert entity index row")?;
+            }
+        }
+        transaction.commit().context("commit entity index")?;
         Ok(())
     }
 
@@ -164,15 +264,19 @@ impl EngineeringStore {
             return Ok(());
         }
         let ontology = default_engineering_ontology();
-        let graph_json = serde_json::to_string(graph).context("serialize engineering graph")?;
+        let graph_blob = encode_graph(graph)?;
         let now = Utc::now().to_rfc3339();
-        self.connection
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .context("begin engineering graph transaction")?;
+        transaction
             .execute(
                 r#"
                 INSERT INTO engineering_graphs (
                     session_id, working_dir, ontology_id, ontology_hash,
-                    entity_count, relation_count, graph_json, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                    entity_count, relation_count, graph_json, graph_blob, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
                 ON CONFLICT(session_id) DO UPDATE SET
                     working_dir = excluded.working_dir,
                     ontology_id = excluded.ontology_id,
@@ -180,6 +284,7 @@ impl EngineeringStore {
                     entity_count = excluded.entity_count,
                     relation_count = excluded.relation_count,
                     graph_json = excluded.graph_json,
+                    graph_blob = excluded.graph_blob,
                     updated_at = excluded.updated_at
                 "#,
                 params![
@@ -189,30 +294,50 @@ impl EngineeringStore {
                     ontology.content_hash(),
                     graph.entities.len() as i64,
                     graph.relations.len() as i64,
-                    graph_json,
+                    "",
+                    graph_blob,
                     now,
                 ],
             )
             .context("upsert engineering graph")?;
+        transaction
+            .execute(
+                "DELETE FROM engineering_entity_index WHERE session_id = ?1",
+                params![session_id],
+            )
+            .context("clear engineering entity index")?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT OR REPLACE INTO engineering_entity_index \
+                     (session_id, entity_id, class, name) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .context("prepare engineering entity index")?;
+            for entity in graph.entities.values() {
+                statement
+                    .execute(params![session_id, entity.id, entity.class, entity.name])
+                    .context("insert engineering entity index row")?;
+            }
+        }
+        transaction
+            .commit()
+            .context("commit engineering graph transaction")?;
         Ok(())
     }
 
     /// Load one session graph, or `None` if it has not been persisted.
     pub fn load_graph(&self, session_id: &str) -> Result<Option<EngineeringGraph>> {
-        let json: Option<String> = self
+        let row: Option<(String, Option<Vec<u8>>)> = self
             .connection
             .query_row(
-                "SELECT graph_json FROM engineering_graphs WHERE session_id = ?1",
+                "SELECT graph_json, graph_blob FROM engineering_graphs WHERE session_id = ?1",
                 params![session_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .context("load engineering graph")?;
-        json.map(|json| {
-            serde_json::from_str(&json)
-                .with_context(|| format!("parse engineering graph for session {session_id}"))
-        })
-        .transpose()
+        row.map(|(json, blob)| decode_graph(&json, blob.as_deref()))
+            .transpose()
     }
 
     /// List stored sessions, newest first.
@@ -251,13 +376,23 @@ impl EngineeringStore {
 
     /// Delete one session graph. Returns whether a row existed.
     pub fn delete_graph(&self, session_id: &str) -> Result<bool> {
-        let removed = self
+        let transaction = self
             .connection
+            .unchecked_transaction()
+            .context("begin delete engineering graph")?;
+        let removed = transaction
             .execute(
                 "DELETE FROM engineering_graphs WHERE session_id = ?1",
                 params![session_id],
             )
             .context("delete engineering graph")?;
+        transaction
+            .execute(
+                "DELETE FROM engineering_entity_index WHERE session_id = ?1",
+                params![session_id],
+            )
+            .context("delete engineering entity index")?;
+        transaction.commit().context("commit delete engineering graph")?;
         Ok(removed > 0)
     }
 
@@ -269,6 +404,64 @@ impl EngineeringStore {
     /// Apply the default retention policy. `apply=false` is a dry run.
     pub fn prune_sessions(&self, apply: bool) -> Result<EngineeringRetentionReport> {
         self.retention_pass(apply)
+    }
+
+    /// Rewrite stored JSON graphs as compressed blobs. Existing blobs are only
+    /// rewritten when the new blob is smaller.
+    pub fn compact_storage(&self, apply: bool) -> Result<EngineeringCompactionReport> {
+        let rows: Vec<(String, i64, i64)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT session_id, length(graph_json), coalesce(length(graph_blob), 0) \
+                     FROM engineering_graphs",
+                )
+                .context("prepare engineering compaction")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .context("query engineering compaction")?;
+            let mut rows_out = Vec::new();
+            for row in rows {
+                rows_out.push(row.context("read engineering compaction row")?);
+            }
+            rows_out
+        };
+        let mut report = EngineeringCompactionReport {
+            sessions: rows.len(),
+            before_bytes: 0,
+            after_bytes: 0,
+            compacted: 0,
+        };
+        for (session_id, json_bytes, blob_bytes) in rows {
+            let before = json_bytes.max(0) as u64 + blob_bytes.max(0) as u64;
+            report.before_bytes += before;
+            let Some(graph) = self.load_graph(&session_id)? else {
+                report.after_bytes += before;
+                continue;
+            };
+            let blob = encode_graph(&graph)?;
+            let after = blob.len() as u64;
+            let target = after.min(before);
+            report.after_bytes += target;
+            if apply && after < before {
+                self.connection
+                    .execute(
+                        "UPDATE engineering_graphs SET graph_json = '', graph_blob = ?1 \
+                         WHERE session_id = ?2",
+                        params![blob, session_id],
+                    )
+                    .context("compact engineering graph")?;
+                self.write_entity_index(&session_id, &graph)?;
+                report.compacted += 1;
+            }
+        }
+        Ok(report)
     }
 
     fn retention_pass(&self, apply: bool) -> Result<EngineeringRetentionReport> {
@@ -322,6 +515,12 @@ impl EngineeringStore {
                         params![candidate.session_id],
                     )
                     .context("prune engineering session")?;
+                self.connection
+                    .execute(
+                        "DELETE FROM engineering_entity_index WHERE session_id = ?1",
+                        params![candidate.session_id],
+                    )
+                    .context("prune engineering entity index")?;
                 pruned += removed;
             }
         }
@@ -364,10 +563,14 @@ impl EngineeringStore {
             .connection
             .prepare(
                 r#"
-                SELECT session_id, working_dir, graph_json
-                FROM engineering_graphs
-                WHERE graph_json LIKE ?1 ESCAPE '\'
-                ORDER BY updated_at DESC
+                SELECT e.session_id, e.working_dir, e.graph_json, e.graph_blob
+                FROM engineering_graphs e
+                WHERE EXISTS (
+                    SELECT 1 FROM engineering_entity_index i
+                    WHERE i.session_id = e.session_id
+                      AND i.entity_id LIKE ?1 ESCAPE '\'
+                )
+                ORDER BY e.updated_at DESC
                 "#,
             )
             .context("prepare anchor recall")?;
@@ -377,14 +580,15 @@ impl EngineeringStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })
             .context("query anchor recall")?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, working_dir, json) = row.context("read anchor row")?;
-            let graph: EngineeringGraph = match serde_json::from_str(&json) {
+            let (session_id, working_dir, json, blob) = row.context("read anchor row")?;
+            let graph = match decode_graph(&json, blob.as_deref()) {
                 Ok(graph) => graph,
                 Err(error) => {
                     crate::logging::warn(&format!(
@@ -419,6 +623,35 @@ fn configure_connection(connection: &Connection) -> Result<()> {
         )
         .context("configure engineering store connection")?;
     Ok(())
+}
+
+fn encode_graph(graph: &EngineeringGraph) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(graph).context("serialize engineering graph")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&json)
+        .context("compress engineering graph")?;
+    let body = encoder.finish().context("finish engineering graph gzip")?;
+    let mut blob = Vec::with_capacity(GRAPH_BLOB_MAGIC.len() + body.len());
+    blob.extend_from_slice(GRAPH_BLOB_MAGIC);
+    blob.extend_from_slice(&body);
+    Ok(blob)
+}
+
+fn decode_graph(json: &str, blob: Option<&[u8]>) -> Result<EngineeringGraph> {
+    if let Some(blob) = blob {
+        anyhow::ensure!(
+            blob.starts_with(GRAPH_BLOB_MAGIC),
+            "unknown engineering graph blob encoding"
+        );
+        let mut decoder = GzDecoder::new(&blob[GRAPH_BLOB_MAGIC.len()..]);
+        let mut json = Vec::new();
+        decoder
+            .read_to_end(&mut json)
+            .context("decompress engineering graph")?;
+        return serde_json::from_slice(&json).context("parse compressed engineering graph");
+    }
+    serde_json::from_str(json).context("parse engineering graph")
 }
 
 fn like_escape(value: &str) -> String {
@@ -558,6 +791,98 @@ mod tests {
         assert!(store.delete_graph("session-1").expect("delete"));
         assert!(store.load_graph("session-1").expect("load").is_none());
         assert!(!store.delete_graph("session-1").expect("delete again"));
+        let indexed: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM engineering_entity_index WHERE session_id = 'session-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count index");
+        assert_eq!(indexed, 0);
+    }
+
+    #[test]
+    fn save_writes_compressed_blob_and_index() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let graph = sample_graph();
+        store
+            .save_graph("session-1", None, &graph)
+            .expect("save");
+        let (json, blob_len, indexed): (String, i64, i64) = store
+            .connection
+            .query_row(
+                r#"
+                SELECT g.graph_json, coalesce(length(g.graph_blob), 0),
+                       (SELECT COUNT(*) FROM engineering_entity_index i
+                        WHERE i.session_id = g.session_id)
+                FROM engineering_graphs g WHERE g.session_id = 'session-1'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read stored row");
+        assert!(json.is_empty());
+        assert!(blob_len > 4);
+        assert_eq!(indexed, 3);
+        let loaded = store.load_graph("session-1").expect("load").expect("graph");
+        assert_eq!(loaded, graph);
+    }
+
+    #[test]
+    fn compact_storage_rewrites_legacy_json() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let graph = sample_graph();
+        let json = serde_json::to_string(&graph).expect("json");
+        store
+            .connection
+            .execute(
+                r#"
+                INSERT INTO engineering_graphs (
+                    session_id, working_dir, ontology_id, ontology_hash,
+                    entity_count, relation_count, graph_json, created_at, updated_at
+                ) VALUES ('legacy', NULL, ?1, ?2, 3, 2, ?3, ?4, ?4)
+                "#,
+                params![
+                    default_engineering_ontology().id,
+                    default_engineering_ontology().content_hash(),
+                    json,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("insert legacy row");
+        let dry = store.compact_storage(false).expect("dry run");
+        assert_eq!(dry.sessions, 1);
+        assert_eq!(dry.compacted, 0);
+        let (json_before, blob_before): (String, Option<Vec<u8>>) = store
+            .connection
+            .query_row(
+                "SELECT graph_json, graph_blob FROM engineering_graphs WHERE session_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read legacy row");
+        assert!(!json_before.is_empty());
+        assert!(blob_before.is_none());
+        let applied = store.compact_storage(true).expect("compact");
+        assert_eq!(applied.compacted, 1);
+        let (json_after, blob_after): (String, Option<Vec<u8>>) = store
+            .connection
+            .query_row(
+                "SELECT graph_json, graph_blob FROM engineering_graphs WHERE session_id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read compacted row");
+        assert!(json_after.is_empty());
+        assert!(blob_after.is_some());
+        let loaded = store.load_graph("legacy").expect("load").expect("graph");
+        assert_eq!(loaded, graph);
+        let recalls = store
+            .recall_anchor("file:src/lib.rs", 2, 10)
+            .expect("recall after compaction");
+        assert_eq!(recalls.len(), 1);
+        assert_eq!(recalls[0].graph, graph);
     }
 
     #[test]

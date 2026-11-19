@@ -2381,8 +2381,27 @@ async fn run_memory_command_for_dir(
             apply,
             json,
         } => {
-            if matches!(action.as_str(), "engineering-audit" | "engineering-prune") {
+            if matches!(
+                action.as_str(),
+                "engineering-audit" | "engineering-prune" | "engineering-compact"
+            ) {
                 let store = crate::engineering_store::EngineeringStore::open_default()?;
+                if action == "engineering-compact" {
+                    let report = store.compact_storage(apply)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "Engineering compaction: {} session(s), {} -> {} bytes, {} rewritten{}",
+                            report.sessions,
+                            report.before_bytes,
+                            report.after_bytes,
+                            report.compacted,
+                            if apply { "" } else { " (dry run)" }
+                        );
+                    }
+                    return Ok(());
+                }
                 let report = if action == "engineering-audit" {
                     store.retention_report()?
                 } else {

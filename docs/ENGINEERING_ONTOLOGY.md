@@ -191,7 +191,7 @@ store.save_graph(session_id, working_dir, &extraction.graph)?;
 let recalls = store.recall_anchor("error:0123abcd", 2, 10)?;
 ```
 
-当前索引是 `graph_json LIKE '%anchor%'` 加内存精确过滤。它适合几千个 session 以内的本地库；超过这个量级时应增加 `engineering_entities(session_id, entity_id)` 与 `engineering_relations(session_id, from_id, to_id)` 索引表。
+锚点查询先走 `engineering_entity_index(session_id, entity_id)` 定位候选 session，再在内存中精确过滤并做 BFS。索引在每次保存时随图同步写入，旧库打开时会自动回填。关系仍只在内存中遍历；如果需要跨 session 的关系级检索，再增加 `engineering_relations(session_id, from_id, to_id)` 索引表。
 
 保留策略默认保留最新两个非空 session、任何 30 天内的 session，并始终把只有 Session 节点的空图标为候选：
 
@@ -201,6 +201,15 @@ jcode memory storage engineering-prune --apply
 ```
 
 `engineering-audit` 只读；`engineering-prune` 默认 dry-run，只有 `--apply` 才删除候选行。当前策略不会裁剪大型活跃 session，只清理空图和超过 30 天且不在最新两个之内的历史图。
+
+工程图默认以 gzip 压缩 BLOB 保存，并维护 `engineering_entity_index` 供锚点回读。存量 JSON 行可用：
+
+```bash
+jcode memory storage engineering-compact
+jcode memory storage engineering-compact --apply
+```
+
+压缩只替换更大的旧 JSON，不会改变实体、关系或锚点语义。
 
 ### 5.4 带权路径与 k-best
 
