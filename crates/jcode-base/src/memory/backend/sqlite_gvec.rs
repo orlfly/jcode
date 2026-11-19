@@ -37,6 +37,7 @@ use jcode_memory_types::{
     apply_mutations_in_place,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -488,6 +489,9 @@ impl GraphBackend for SqliteGvecBackend {
         // a couple of graphs had FTS5 tables). Running it here guarantees
         // every store that is written also gets a live keyword index.
         ensure_text_index(&g)?;
+        // Capture semantic edges added by another process after this snapshot
+        // was loaded; they are re-applied after the replace-all below.
+        let concurrent_relates = concurrent_relates_to_edges(&g, graph)?;
         // Reset everything: for this PoC, the SQL backend treats save
         // as a replace-all. The mutation log API on the trait is the
         // efficient path; save() is the slow path.
@@ -510,6 +514,9 @@ impl GraphBackend for SqliteGvecBackend {
             for edge in edges {
                 upsert_edge(&g, from, &edge.target, &edge.kind)?;
             }
+        }
+        for (from, to, kind) in concurrent_relates {
+            upsert_edge(&g, &from, &to, &kind)?;
         }
         save_metadata(&g, &graph.metadata)?;
         Ok(())
@@ -904,6 +911,79 @@ fn drop_all_edges(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// `save()` replaces the whole graph. A caller that loaded before another
+/// process added a semantic edge would otherwise silently drop it on its next
+/// write (last-writer-wins). Preserve `relates_to` edges that still connect
+/// live memory nodes but are absent from the incoming snapshot.
+///
+/// Only `relates_to` is merged: it is written by discovery/review flows rather
+/// than by whole-graph edits, and there is no user-facing "unlink" operation
+/// that would depend on omission from a snapshot to delete it. Other kinds stay
+/// authoritative in the snapshot, so tag/cluster rebuilds can still replace
+/// them.
+fn concurrent_relates_to_edges(
+    graph: &Graph,
+    incoming: &MemoryGraph,
+) -> Result<Vec<(String, String, EdgeKind)>> {
+    let mut present: HashSet<(String, String)> = HashSet::new();
+    for (from, edges) in &incoming.edges {
+        for edge in edges {
+            if matches!(edge.kind, EdgeKind::RelatesTo { .. }) {
+                present.insert(if from <= &edge.target {
+                    (from.clone(), edge.target.clone())
+                } else {
+                    (edge.target.clone(), from.clone())
+                });
+            }
+        }
+    }
+
+    let mut preserved = Vec::new();
+    for edge in graph
+        .storage
+        .list_edges(None, None)
+        .map_err(|e| anyhow::anyhow!("preserve relates_to: list: {e}"))?
+    {
+        if edge.edge_type.as_deref() != Some("relates_to") {
+            continue;
+        }
+        let (Ok(src), Ok(tgt)) = (
+            node_props(graph, edge.source),
+            node_props(graph, edge.target),
+        ) else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (read_node_id_from_props(&src), read_node_id_from_props(&tgt))
+        else {
+            continue;
+        };
+        if !incoming.memories.contains_key(&from) || !incoming.memories.contains_key(&to) {
+            continue;
+        }
+        let pair = if from <= to {
+            (from.clone(), to.clone())
+        } else {
+            (to.clone(), from.clone())
+        };
+        if !present.insert(pair) {
+            continue;
+        }
+        let kind = serde_json::from_value(
+            edge.properties
+                .get("kind_payload")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .unwrap_or(EdgeKind::RelatesTo { weight: 1.0 });
+        let kind = match kind {
+            EdgeKind::RelatesTo { weight } => EdgeKind::RelatesTo { weight },
+            _ => EdgeKind::RelatesTo { weight: 1.0 },
+        };
+        preserved.push((from, to, kind));
+    }
+    Ok(preserved)
+}
+
 fn node_props(graph: &Graph, rowid: gvec_core::ids::NodeId) -> Result<Value> {
     match graph.storage.get_node(rowid) {
         Ok(n) => Ok(n.properties),
@@ -1020,6 +1100,75 @@ mod tests {
         // The save path also creates the Tag node, so reload should
         // have a Tag entry.
         assert_eq!(loaded.tags.len(), 1);
+    }
+
+    #[test]
+    fn save_preserves_relates_edges_added_after_load() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("concurrent-relates-test");
+
+        let mut graph = MemoryGraph::new();
+        for (id, content) in [
+            ("mem_1", "first"),
+            ("mem_2", "second"),
+            ("mem_3", "third"),
+        ] {
+            let mut entry = MemoryEntry::new(MemoryCategory::Fact, content);
+            entry.id = id.into();
+            graph.add_memory(entry);
+        }
+        graph.add_edge("mem_1", "mem_2", EdgeKind::RelatesTo { weight: 0.8 });
+        backend.save(&key, &graph).unwrap();
+
+        // A second process loads, links mem_1 -> mem_3, and saves.
+        let mut concurrent = backend.load(&key).unwrap();
+        concurrent.add_edge("mem_1", "mem_3", EdgeKind::RelatesTo { weight: 0.7 });
+        backend.save(&key, &concurrent).unwrap();
+
+        // The first process still holds the pre-link snapshot. Its next
+        // whole-graph save must not erase the concurrently added edge.
+        backend.save(&key, &graph).unwrap();
+
+        let loaded = backend.load(&key).unwrap();
+        let rel = |from: &str, to: &str| {
+            loaded.edges.get(from).is_some_and(|edges| {
+                edges.iter().any(|edge| {
+                    edge.target == to && matches!(edge.kind, EdgeKind::RelatesTo { .. })
+                })
+            })
+        };
+        assert!(rel("mem_1", "mem_2"), "snapshot edge must survive");
+        assert!(rel("mem_1", "mem_3"), "concurrently added edge must survive");
+    }
+
+    #[test]
+    fn save_drops_relates_edges_to_removed_memories() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("removed-endpoint-test");
+
+        let mut graph = MemoryGraph::new();
+        for (id, content) in [("mem_1", "first"), ("mem_2", "second")] {
+            let mut entry = MemoryEntry::new(MemoryCategory::Fact, content);
+            entry.id = id.into();
+            graph.add_memory(entry);
+        }
+        graph.add_edge("mem_1", "mem_2", EdgeKind::RelatesTo { weight: 0.8 });
+        backend.save(&key, &graph).unwrap();
+
+        // Removing the endpoint is authoritative: the edge must not be
+        // resurrected by the concurrency merge.
+        graph.memories.remove("mem_2");
+        backend.save(&key, &graph).unwrap();
+
+        let loaded = backend.load(&key).unwrap();
+        assert!(loaded.memories.get("mem_2").is_none());
+        assert!(
+            loaded
+                .edges
+                .get("mem_1")
+                .is_none_or(|edges| edges.iter().all(|edge| edge.target != "mem_2")),
+            "edge to a removed memory must be dropped"
+        );
     }
 
     #[test]
