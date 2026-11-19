@@ -1433,6 +1433,21 @@ pub(crate) enum MemoryCommand {
         json: bool,
     },
 
+    /// Audit legacy JSON snapshots against the active SQLite backend
+    Storage {
+        /// audit or quarantine-legacy
+        #[arg(default_value = "audit")]
+        action: String,
+
+        /// Rename stale legacy JSON files aside (quarantine-legacy only)
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Clear test memory storage (used by debug sessions)
     ClearTest,
 

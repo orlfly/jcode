@@ -192,6 +192,11 @@ policy before mutating a graph:
   from exact `subject_key` matches and shared-tag Jaccard. It is dry-run by
   default and writes only with `--apply`, capped at three new links per memory
   and 200 per pass.
+- `jcode memory storage audit` compares the legacy
+  `memory/projects/*.json` snapshots with the active backend graph.
+  `jcode memory storage quarantine-legacy --apply` renames only snapshots that
+  are strictly smaller than an existing backend graph; JSON files that are the
+  only surviving copy are never touched.
 - Skills have a v2 manifest contract (version, status, triggers, inputs,
   allowed tools, preconditions, effects, validation, changelog, provenance)
   while remaining backward compatible with legacy `SKILL.md` files.

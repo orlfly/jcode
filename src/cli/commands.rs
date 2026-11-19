@@ -1649,6 +1649,11 @@ pub enum MemorySubcommand {
         limit: usize,
         json: bool,
     },
+    Storage {
+        action: String,
+        apply: bool,
+        json: bool,
+    },
     Distill {
         dry_run: bool,
     },
@@ -2367,6 +2372,58 @@ async fn run_memory_command_for_dir(
                 }
                 if !apply {
                     println!("Dry run. Re-run with --apply to write these relates_to edges.");
+                }
+            }
+        }
+
+        MemorySubcommand::Storage {
+            action,
+            apply,
+            json,
+        } => {
+            let quarantine = match action.as_str() {
+                "audit" => false,
+                "quarantine-legacy" => apply,
+                other => anyhow::bail!(
+                    "unknown storage action '{}'; use audit or quarantine-legacy --apply",
+                    other
+                ),
+            };
+            if action == "quarantine-legacy" && !apply {
+                anyhow::bail!("quarantine-legacy requires --apply");
+            }
+            let report = manager.audit_legacy_json(quarantine)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Legacy JSON audit: {} file(s), {} stale, {} only-copy, {} quarantined",
+                    report.files.len(),
+                    report.stale,
+                    report.only_copy,
+                    report.quarantined
+                );
+                for file in &report.files {
+                    println!(
+                        "  {}{} json={}m/{}e backend={}m/{}e common={} json-only={} backend-only={}{}",
+                        file.path,
+                        if file.stale { " [stale]" } else { "" },
+                        file.json_memories,
+                        file.json_edges,
+                        file.backend_memories
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_string()),
+                        file.backend_edges
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".to_string()),
+                        file.common_memories,
+                        file.json_only_memories,
+                        file.backend_only_memories,
+                        file.quarantined_to
+                            .as_deref()
+                            .map(|target| format!(" -> {target}"))
+                            .unwrap_or_default()
+                    );
                 }
             }
         }

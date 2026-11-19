@@ -4349,6 +4349,75 @@ fn link_discovery_is_proposal_first_and_idempotent() {
 }
 
 #[test]
+fn legacy_json_audit_quarantines_only_stale_snapshots() {
+    with_temp_home(|_| {
+        let project = Path::new("/legacy-audit-project");
+        let manager = MemoryManager::new().with_project_dir(project);
+        let mut backend_graph = MemoryGraph::new();
+        backend_graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "backend one"));
+        backend_graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "backend two"));
+
+        let key = project_store_key(project);
+        let backend = super::backend::JsonBackend::new(
+            crate::storage::jcode_dir()
+                .expect("home")
+                .join("memory")
+                .join("test-backend"),
+        );
+        backend
+            .save(&StoreKey::new(&key), &backend_graph)
+            .expect("save backend graph");
+        let stem = key.strip_prefix("project:").expect("project key");
+        let projects = crate::storage::jcode_dir()
+            .expect("home")
+            .join("memory")
+            .join("projects");
+        fs::create_dir_all(&projects).expect("projects dir");
+        let legacy_path = projects.join(format!("{stem}.json"));
+        let mut legacy_graph = MemoryGraph::new();
+        legacy_graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "legacy one"));
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&legacy_graph).expect("serialize"),
+        )
+        .expect("write legacy");
+
+        let audit = manager
+            .audit_legacy_json_with_backend(false, &backend)
+            .expect("audit");
+        let entry = audit
+            .files
+            .iter()
+            .find(|entry| entry.store_key == key)
+            .expect("audited entry");
+        assert!(entry.stale);
+        assert!(!entry.only_copy);
+        assert_eq!(entry.json_memories, 1);
+        assert_eq!(entry.backend_memories, Some(2));
+        assert_eq!(entry.json_only_memories, 1);
+        assert_eq!(entry.backend_only_memories, 2);
+        assert_eq!(entry.common_memories, 0);
+
+        let quarantined = manager
+            .audit_legacy_json_with_backend(true, &backend)
+            .expect("quarantine");
+        assert_eq!(quarantined.quarantined, 1);
+        assert!(!legacy_path.exists());
+        let entry = quarantined
+            .files
+            .iter()
+            .find(|entry| entry.store_key == key)
+            .expect("quarantined entry");
+        assert!(
+            entry
+                .quarantined_to
+                .as_deref()
+                .is_some_and(|path| path.contains("json.legacy."))
+        );
+    });
+}
+
+#[test]
 fn extraction_source_ignores_single_confidence_outlier() {
     with_temp_home(|_| {
         let manager = MemoryManager::new_test();

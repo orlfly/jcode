@@ -949,6 +949,32 @@ pub struct LinkDiscoveryReport {
     pub suggestions: Vec<LinkSuggestion>,
 }
 
+/// One legacy `projects/<hash>.json` snapshot compared with its SQLite graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyJsonAudit {
+    pub path: String,
+    pub store_key: String,
+    pub json_memories: usize,
+    pub json_edges: usize,
+    pub backend_memories: Option<usize>,
+    pub backend_edges: Option<usize>,
+    pub json_only_memories: usize,
+    pub backend_only_memories: usize,
+    pub common_memories: usize,
+    pub stale: bool,
+    pub only_copy: bool,
+    pub quarantined_to: Option<String>,
+}
+
+/// Result of auditing legacy JSON snapshots against the active backend.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LegacyJsonAuditReport {
+    pub files: Vec<LegacyJsonAudit>,
+    pub stale: usize,
+    pub only_copy: usize,
+    pub quarantined: usize,
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -3744,6 +3770,101 @@ impl MemoryManager {
             }
             changed
         })?;
+        Ok(report)
+    }
+
+    /// Audit legacy `memory/projects/*.json` snapshots against the active
+    /// backend. With `quarantine=true`, only snapshots that are strictly
+    /// smaller than an existing backend graph are renamed aside; JSON files
+    /// that are the only surviving copy are never touched.
+    pub fn audit_legacy_json(&self, quarantine: bool) -> Result<LegacyJsonAuditReport> {
+        let backend = if self.test_mode {
+            test_backend()
+        } else {
+            graph_backend()
+        };
+        self.audit_legacy_json_with_backend(quarantine, backend.as_ref())
+    }
+
+    fn audit_legacy_json_with_backend(
+        &self,
+        quarantine: bool,
+        backend: &dyn GraphBackend,
+    ) -> Result<LegacyJsonAuditReport> {
+        let dir = storage::jcode_dir()?.join("memory").join("projects");
+        let mut report = LegacyJsonAuditReport::default();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(report);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Ok(json_graph) = storage::read_json::<MemoryGraph>(&path) else {
+                continue;
+            };
+            let store_key = format!("project:{stem}");
+            let backend_graph = backend.load(&StoreKey::new(&store_key)).ok();
+            let backend_memories = backend_graph.as_ref().map(MemoryGraph::memory_count);
+            let backend_edges = backend_graph.as_ref().map(MemoryGraph::edge_count);
+            let json_ids: std::collections::BTreeSet<&str> =
+                json_graph.memories.keys().map(String::as_str).collect();
+            let backend_ids: std::collections::BTreeSet<&str> = backend_graph
+                .as_ref()
+                .map(|graph| graph.memories.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            let common_memories = json_ids.intersection(&backend_ids).count();
+            let json_only_memories = json_ids.len().saturating_sub(common_memories);
+            let backend_only_memories = backend_ids.len().saturating_sub(common_memories);
+            let only_copy = match backend_graph.as_ref() {
+                None => true,
+                Some(graph) => {
+                    graph.memory_count() == 0
+                        && graph.edge_count() == 0
+                        && (json_graph.memory_count() > 0 || json_graph.edge_count() > 0)
+                }
+            };
+            let stale = backend_graph.as_ref().is_some_and(|graph| {
+                graph.memory_count() >= json_graph.memory_count()
+                    && graph.edge_count() >= json_graph.edge_count()
+                    && (graph.memory_count() > json_graph.memory_count()
+                        || graph.edge_count() > json_graph.edge_count())
+            });
+            let mut quarantined_to = None;
+            if quarantine && stale {
+                let target = path
+                    .with_extension(format!("json.legacy.{}", Utc::now().format("%Y%m%d%H%M%S")));
+                if !target.exists() {
+                    std::fs::rename(&path, &target)?;
+                    report.quarantined += 1;
+                    quarantined_to = Some(target.display().to_string());
+                }
+            }
+            if stale {
+                report.stale += 1;
+            }
+            if only_copy {
+                report.only_copy += 1;
+            }
+            report.files.push(LegacyJsonAudit {
+                path: path.display().to_string(),
+                store_key,
+                json_memories: json_graph.memory_count(),
+                json_edges: json_graph.edge_count(),
+                backend_memories,
+                backend_edges,
+                json_only_memories,
+                backend_only_memories,
+                common_memories,
+                stale,
+                only_copy,
+                quarantined_to,
+            });
+        }
         Ok(report)
     }
 
