@@ -79,6 +79,54 @@ pub fn resolve_reextract_sessions(
     Ok(ids)
 }
 
+/// Split messages into roughly `max_chars` transcript chunks.
+///
+/// Tool results are already truncated by
+/// [`build_transcript_for_extraction`], so the estimate uses the same formatter
+/// per message. `max_chunks == 0` means unlimited. Returns `(chunks, truncated)`
+/// where `truncated` means more chunks existed than the limit allowed.
+fn split_message_chunks(
+    messages: &[crate::message::Message],
+    max_chars: usize,
+    max_chunks: usize,
+) -> (Vec<Vec<crate::message::Message>>, bool) {
+    if messages.is_empty() {
+        return (Vec::new(), false);
+    }
+    if max_chars == 0 {
+        return (vec![messages.to_vec()], false);
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0usize;
+    for message in messages {
+        let message_chars = build_transcript_for_extraction(std::slice::from_ref(message))
+            .chars()
+            .count();
+        if !current.is_empty() && current_chars + message_chars > max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(message.clone());
+        current_chars += message_chars;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    let limit = if max_chunks == 0 {
+        usize::MAX
+    } else {
+        max_chunks
+    };
+    let truncated = chunks.len() > limit;
+    if truncated {
+        chunks.truncate(limit);
+    }
+    (chunks, truncated)
+}
+
 /// One candidate produced while replaying a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReextractItem {
@@ -110,6 +158,9 @@ pub struct ReextractReport {
     pub working_dir: Option<String>,
     pub messages: usize,
     pub transcript_chars: usize,
+    pub chunks_processed: usize,
+    pub chunks_total: usize,
+    pub truncated: bool,
     pub candidates: usize,
     pub duplicates: usize,
     pub admitted: usize,
@@ -130,6 +181,8 @@ impl MemoryManager {
         session: &Session,
         apply: bool,
         force: bool,
+        chunk_chars: usize,
+        max_chunks: usize,
     ) -> Result<ReextractReport> {
         if !memory_sidecar_enabled() {
             anyhow::bail!(
@@ -177,10 +230,35 @@ impl MemoryManager {
             .collect();
 
         let sidecar = Sidecar::for_session(session);
-        let extracted = sidecar
-            .extract_memories_with_ontology(&transcript, &existing_contents, ontology.as_deref())
-            .await
-            .with_context(|| format!("extract session {}", session.id))?;
+        let (chunks, truncated) = split_message_chunks(&messages, chunk_chars, max_chunks);
+        let chunks_total = chunks.len();
+        let mut extracted = Vec::new();
+        let mut transcript_chars = 0usize;
+        let mut chunks_processed = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_transcript = build_transcript_for_extraction(chunk);
+            if chunk_transcript.trim().is_empty() {
+                continue;
+            }
+            transcript_chars += chunk_transcript.chars().count();
+            let candidates = sidecar
+                .extract_memories_with_ontology(
+                    &chunk_transcript,
+                    &existing_contents,
+                    ontology.as_deref(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "extract session {} chunk {}/{}",
+                        session.id,
+                        index + 1,
+                        chunks_total
+                    )
+                })?;
+            chunks_processed += 1;
+            extracted.extend(candidates);
+        }
 
         let mut report = self.process_extracted_candidates(
             &session.id,
@@ -191,7 +269,10 @@ impl MemoryManager {
         );
         report.working_dir = session.working_dir.clone();
         report.messages = messages.len();
-        report.transcript_chars = transcript.chars().count();
+        report.transcript_chars = transcript_chars;
+        report.chunks_processed = chunks_processed;
+        report.chunks_total = chunks_total;
+        report.truncated = truncated;
         Ok(report)
     }
 
@@ -315,6 +396,9 @@ impl MemoryManager {
             working_dir: None,
             messages: 0,
             transcript_chars: 0,
+            chunks_processed: 0,
+            chunks_total: 0,
+            truncated: false,
             candidates,
             duplicates,
             admitted,
@@ -446,5 +530,25 @@ mod tests {
                 "re-extracted memory must be retrievable"
             );
         });
+    }
+
+    #[test]
+    fn chunking_respects_budget_and_max_chunks() {
+        let messages: Vec<crate::message::Message> = (0..8)
+            .map(|index| crate::message::Message::user(&format!("message {index} with some text")))
+            .collect();
+
+        let (chunks, truncated) = split_message_chunks(&messages, 80, 0);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        assert!(!truncated);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), messages.len());
+
+        let (limited, truncated) = split_message_chunks(&messages, 80, 2);
+        assert_eq!(limited.len(), 2);
+        assert!(truncated);
+
+        let (single, truncated) = split_message_chunks(&messages, 0, 2);
+        assert_eq!(single.len(), 1);
+        assert!(!truncated);
     }
 }

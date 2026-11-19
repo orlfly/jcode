@@ -1391,6 +1391,14 @@ pub(crate) enum MemoryCommand {
         #[arg(long, default_value_t = 10)]
         limit: usize,
 
+        /// Approximate transcript characters per extraction chunk (0 disables chunking)
+        #[arg(long, default_value_t = 12_000)]
+        chunk_chars: usize,
+
+        /// Maximum chunks to process per session
+        #[arg(long, default_value_t = 20)]
+        max_chunks: usize,
+
         /// Write extracted memories through the governed admission pipeline
         #[arg(long)]
         apply: bool,

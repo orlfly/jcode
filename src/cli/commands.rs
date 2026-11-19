@@ -1633,6 +1633,8 @@ pub enum MemorySubcommand {
         manifest: Option<String>,
         tier: Option<String>,
         limit: usize,
+        chunk_chars: usize,
+        max_chunks: usize,
         apply: bool,
         force: bool,
         json: bool,
@@ -2205,6 +2207,8 @@ async fn run_memory_command_for_dir(
             manifest,
             tier,
             limit,
+            chunk_chars,
+            max_chunks,
             apply,
             force,
             json,
@@ -2246,7 +2250,7 @@ async fn run_memory_command_for_dir(
                     .map(|dir| memory::MemoryManager::new().with_project_dir(dir))
                     .unwrap_or_default();
                 match project_manager
-                    .reextract_session(&loaded, apply, force)
+                    .reextract_session(&loaded, apply, force, chunk_chars, max_chunks)
                     .await
                 {
                     Ok(report) => reports.push(report),
@@ -2269,10 +2273,13 @@ async fn run_memory_command_for_dir(
             } else {
                 for report in &reports {
                     println!(
-                        "{}: messages={} chars={} candidates={} duplicates={} admitted={} queued={} failed={}",
+                        "{}: messages={} chars={} chunks={}/{} truncated={} candidates={} duplicates={} admitted={} queued={} failed={}",
                         report.session_id,
                         report.messages,
                         report.transcript_chars,
+                        report.chunks_processed,
+                        report.chunks_total,
+                        report.truncated,
                         report.candidates,
                         report.duplicates,
                         report.admitted,
