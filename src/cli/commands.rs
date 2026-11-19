@@ -1645,6 +1645,7 @@ pub enum MemorySubcommand {
     },
     Links {
         action: String,
+        path: Option<String>,
         apply: bool,
         limit: usize,
         json: bool,
@@ -2338,12 +2339,40 @@ async fn run_memory_command_for_dir(
 
         MemorySubcommand::Links {
             action,
+            path,
             apply,
             limit,
             json,
         } => {
+            if action == "apply" {
+                let path = path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("links apply requires --path <proposal.json>")
+                })?;
+                let content = std::fs::read_to_string(path)?;
+                let suggestions =
+                    match serde_json::from_str::<memory::LinkDiscoveryReport>(&content) {
+                        Ok(report) => report.suggestions,
+                        Err(_) => serde_json::from_str::<Vec<memory::LinkSuggestion>>(&content)?,
+                    };
+                let report = manager.apply_link_proposals(&suggestions, apply)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Link proposals: {} suggestion(s), {} matched, {} existing, {} applicable, {} applied, {} missing{}",
+                        report.suggestions,
+                        report.matched,
+                        report.existing,
+                        report.applicable,
+                        report.applied,
+                        report.missing,
+                        if apply { "" } else { " (dry run)" }
+                    );
+                }
+                return Ok(());
+            }
             if action != "discover" {
-                anyhow::bail!("unknown links action '{}'; use discover", action);
+                anyhow::bail!("unknown links action '{}'; use discover or apply", action);
             }
             let report = manager.discover_links(apply)?;
             if json {
@@ -2436,11 +2465,43 @@ async fn run_memory_command_for_dir(
                 }
                 return Ok(());
             }
+            if action == "legacy-merge" {
+                let report = manager.merge_legacy_json(apply)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Legacy JSON merge: {} file(s), +{} memories, +{} edges, {} store(s) written{}",
+                        report.files.len(),
+                        report.added_memories,
+                        report.added_edges,
+                        report.applied,
+                        if apply { "" } else { " (dry run)" }
+                    );
+                    for file in &report.files {
+                        println!(
+                            "  {} json-only={} added_memories={} added_edges={} added_tags={} backend={}->{}{}",
+                            file.path,
+                            file.json_only_memories,
+                            file.added_memories,
+                            file.added_edges,
+                            file.added_tags,
+                            file.backend_memories_before,
+                            file.backend_memories_after,
+                            if file.applied { " [written]" } else { "" }
+                        );
+                    }
+                    if !apply {
+                        println!("Dry run. Re-run with --apply to merge these memories.");
+                    }
+                }
+                return Ok(());
+            }
             let quarantine = match action.as_str() {
                 "audit" => false,
                 "quarantine-legacy" => apply,
                 other => anyhow::bail!(
-                    "unknown storage action '{}'; use audit or quarantine-legacy --apply",
+                    "unknown storage action '{}'; use audit, legacy-merge, or quarantine-legacy --apply",
                     other
                 ),
             };

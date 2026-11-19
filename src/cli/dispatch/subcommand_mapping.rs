@@ -43,11 +43,13 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
         }
         MemoryCommand::Links {
             action,
+            path,
             apply,
             limit,
             json,
         } => commands::MemorySubcommand::Links {
             action,
+            path,
             apply,
             limit,
             json,

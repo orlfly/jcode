@@ -4349,6 +4349,57 @@ fn link_discovery_is_proposal_first_and_idempotent() {
 }
 
 #[test]
+fn reviewed_link_proposals_apply_exactly_and_idempotently() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/link-proposals");
+        let mut graph = MemoryGraph::new();
+        let first_id = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "first body"));
+        let second_id = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "second body"));
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let suggestions = vec![
+            LinkSuggestion {
+                from: first_id.clone(),
+                to: second_id.clone(),
+                weight: 0.9,
+                reason: "same subject_key".to_string(),
+            },
+            LinkSuggestion {
+                from: first_id.clone(),
+                to: "mem_missing".to_string(),
+                weight: 0.5,
+                reason: "shared tags".to_string(),
+            },
+        ];
+
+        let dry = manager
+            .apply_link_proposals(&suggestions, false)
+            .expect("dry run");
+        assert_eq!(dry.matched, 1);
+        assert_eq!(dry.applicable, 1);
+        assert_eq!(dry.applied, 0);
+        assert_eq!(dry.missing, 1);
+
+        let applied = manager
+            .apply_link_proposals(&suggestions, true)
+            .expect("apply");
+        assert_eq!(applied.applied, 1);
+        assert_eq!(applied.stores_changed, 1);
+        let stored = manager.load_project_graph().expect("load");
+        assert!(stored.get_edges(&first_id).iter().any(|edge| {
+            edge.target == second_id
+                && matches!(edge.kind, jcode_memory_types::EdgeKind::RelatesTo { .. })
+        }));
+
+        let again = manager
+            .apply_link_proposals(&suggestions, true)
+            .expect("second apply");
+        assert_eq!(again.applied, 0);
+        assert_eq!(again.existing, 1);
+    });
+}
+
+#[test]
 fn legacy_json_audit_quarantines_only_stale_snapshots() {
     with_temp_home(|_| {
         let project = Path::new("/legacy-audit-project");
@@ -4414,6 +4465,90 @@ fn legacy_json_audit_quarantines_only_stale_snapshots() {
                 .as_deref()
                 .is_some_and(|path| path.contains("json.legacy."))
         );
+    });
+}
+
+#[test]
+fn legacy_json_merge_adds_only_missing_memories_and_edges() {
+    with_temp_home(|_| {
+        let project = Path::new("/legacy-merge-project");
+        let manager = MemoryManager::new().with_project_dir(project);
+        let mut backend_graph = MemoryGraph::new();
+        backend_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "backend body").with_id("mem_common"),
+        );
+        let key = project_store_key(project);
+        let backend = super::backend::JsonBackend::new(
+            crate::storage::jcode_dir()
+                .expect("home")
+                .join("memory")
+                .join("test-backend"),
+        );
+        backend
+            .save(&StoreKey::new(&key), &backend_graph)
+            .expect("save backend graph");
+
+        let stem = key.strip_prefix("project:").expect("project key");
+        let projects = crate::storage::jcode_dir()
+            .expect("home")
+            .join("memory")
+            .join("projects");
+        fs::create_dir_all(&projects).expect("projects dir");
+        let legacy_path = projects.join(format!("{stem}.json"));
+        let mut legacy_graph = MemoryGraph::new();
+        legacy_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "stale copy").with_id("mem_common"),
+        );
+        legacy_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Observation, "only in json")
+                .with_id("mem_json_only")
+                .with_tags(vec!["legacy-tag".to_string()]),
+        );
+        legacy_graph.link_memories("mem_json_only", "mem_common", 0.7);
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&legacy_graph).expect("serialize"),
+        )
+        .expect("write legacy");
+
+        let dry = manager
+            .merge_legacy_json_with_backend(false, &backend)
+            .expect("dry run");
+        assert_eq!(dry.added_memories, 0);
+        let entry = dry
+            .files
+            .iter()
+            .find(|entry| entry.store_key == key)
+            .expect("dry entry");
+        assert_eq!(entry.json_only_memories, 1);
+        assert_eq!(entry.added_memories, 1);
+        assert_eq!(entry.added_edges, 2);
+
+        let applied = manager
+            .merge_legacy_json_with_backend(true, &backend)
+            .expect("apply");
+        assert_eq!(applied.added_memories, 1);
+        assert_eq!(applied.applied, 1);
+        let stored = backend.load(&StoreKey::new(&key)).expect("load");
+        assert_eq!(stored.memory_count(), 2);
+        assert_eq!(
+            stored
+                .get_memory("mem_common")
+                .expect("common")
+                .content,
+            "backend body"
+        );
+        assert!(stored.get_memory("mem_json_only").is_some());
+        assert!(stored.get_edges("mem_json_only").iter().any(|edge| {
+            edge.target == "mem_common"
+                && matches!(edge.kind, jcode_memory_types::EdgeKind::RelatesTo { .. })
+        }));
+
+        let again = manager
+            .merge_legacy_json_with_backend(true, &backend)
+            .expect("second apply");
+        assert_eq!(again.added_memories, 0);
+        assert_eq!(again.applied, 0);
     });
 }
 

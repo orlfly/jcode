@@ -200,9 +200,14 @@ policy before mutating a graph:
 - `jcode memory links discover` reports conservative `relates_to` candidates
   from exact `subject_key` matches and shared-tag Jaccard. It is dry-run by
   default and writes only with `--apply`, capped at three new links per memory
-  and 200 per pass.
+  and 200 per pass. A reviewed report can be replayed exactly with
+  `jcode memory links apply --path <report.json> [--apply]`; suggestions whose
+  endpoints no longer exist are counted as missing instead of guessed.
 - `jcode memory storage audit` compares the legacy
   `memory/projects/*.json` snapshots with the active backend graph.
+  `jcode memory storage legacy-merge [--apply]` adds memories and incident
+  edges that exist only in those snapshots; existing backend memories are never
+  overwritten. After a successful merge, `json_only_memories` is zero.
   `jcode memory storage quarantine-legacy --apply` renames only snapshots that
   are strictly smaller than an existing backend graph; JSON files that are the
   only surviving copy are never touched.

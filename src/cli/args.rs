@@ -1416,11 +1416,15 @@ pub(crate) enum MemoryCommand {
 
     /// Discover conservative relates_to edges from subject keys and shared tags
     Links {
-        /// discover
+        /// discover or apply
         #[arg(default_value = "discover")]
         action: String,
 
-        /// Write the discovered edges instead of only reporting them
+        /// Proposal JSON file (required for apply)
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Write the discovered/applied edges instead of only reporting them
         #[arg(long)]
         apply: bool,
 
@@ -1435,7 +1439,7 @@ pub(crate) enum MemoryCommand {
 
     /// Audit legacy JSON snapshots against the active SQLite backend
     Storage {
-        /// audit, quarantine-legacy, engineering-audit, engineering-prune, or engineering-compact
+        /// audit, legacy-merge, quarantine-legacy, engineering-audit, engineering-prune, or engineering-compact
         #[arg(default_value = "audit")]
         action: String,
 

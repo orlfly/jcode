@@ -949,6 +949,18 @@ pub struct LinkDiscoveryReport {
     pub suggestions: Vec<LinkSuggestion>,
 }
 
+/// Result of applying an already-reviewed list of link suggestions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkApplyReport {
+    pub suggestions: usize,
+    pub matched: usize,
+    pub existing: usize,
+    pub applicable: usize,
+    pub applied: usize,
+    pub missing: usize,
+    pub stores_changed: usize,
+}
+
 /// One legacy `projects/<hash>.json` snapshot compared with its SQLite graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegacyJsonAudit {
@@ -973,6 +985,29 @@ pub struct LegacyJsonAuditReport {
     pub stale: usize,
     pub only_copy: usize,
     pub quarantined: usize,
+}
+
+/// One legacy JSON snapshot merged into its backend graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyJsonMerge {
+    pub path: String,
+    pub store_key: String,
+    pub json_only_memories: usize,
+    pub added_memories: usize,
+    pub added_edges: usize,
+    pub added_tags: usize,
+    pub backend_memories_before: usize,
+    pub backend_memories_after: usize,
+    pub applied: bool,
+}
+
+/// Result of merging legacy JSON snapshots into the active backend.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LegacyJsonMergeReport {
+    pub files: Vec<LegacyJsonMerge>,
+    pub added_memories: usize,
+    pub added_edges: usize,
+    pub applied: usize,
 }
 
 pub struct MemoryManager {
@@ -3773,6 +3808,56 @@ impl MemoryManager {
         Ok(report)
     }
 
+    /// Apply an already-reviewed list of link suggestions instead of
+    /// recomputing them. A suggestion is applied to the first store that
+    /// contains both endpoints; missing endpoints are counted, not guessed at.
+    pub fn apply_link_proposals(
+        &self,
+        suggestions: &[LinkSuggestion],
+        apply: bool,
+    ) -> Result<LinkApplyReport> {
+        use std::collections::HashSet;
+
+        let mut report = LinkApplyReport {
+            suggestions: suggestions.len(),
+            ..LinkApplyReport::default()
+        };
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        report.stores_changed = self.for_each_store(|_store, graph| {
+            let mut changed = false;
+            for suggestion in suggestions {
+                let key = link_pair(&suggestion.from, &suggestion.to);
+                if seen.contains(&key) {
+                    continue;
+                }
+                if !graph.memories.contains_key(&suggestion.from)
+                    || !graph.memories.contains_key(&suggestion.to)
+                {
+                    continue;
+                }
+                seen.insert(key);
+                report.matched += 1;
+                if graph
+                    .get_edges(&suggestion.from)
+                    .iter()
+                    .any(|edge| edge.target == suggestion.to)
+                {
+                    report.existing += 1;
+                    continue;
+                }
+                report.applicable += 1;
+                if apply {
+                    graph.link_memories(&suggestion.from, &suggestion.to, suggestion.weight);
+                    report.applied += 1;
+                    changed = true;
+                }
+            }
+            changed
+        })?;
+        report.missing = suggestions.len().saturating_sub(report.matched);
+        Ok(report)
+    }
+
     /// Audit legacy `memory/projects/*.json` snapshots against the active
     /// backend. With `quarantine=true`, only snapshots that are strictly
     /// smaller than an existing backend graph are renamed aside; JSON files
@@ -3863,6 +3948,75 @@ impl MemoryManager {
                 stale,
                 only_copy,
                 quarantined_to,
+            });
+        }
+        Ok(report)
+    }
+
+    /// Merge memories that exist only in legacy `projects/<hash>.json`
+    /// snapshots into the active backend. Existing backend memories are never
+    /// overwritten; only missing memories and their incident edges are added.
+    pub fn merge_legacy_json(&self, apply: bool) -> Result<LegacyJsonMergeReport> {
+        let backend = if self.test_mode {
+            test_backend()
+        } else {
+            graph_backend()
+        };
+        self.merge_legacy_json_with_backend(apply, backend.as_ref())
+    }
+
+    fn merge_legacy_json_with_backend(
+        &self,
+        apply: bool,
+        backend: &dyn GraphBackend,
+    ) -> Result<LegacyJsonMergeReport> {
+        let dir = storage::jcode_dir()?.join("memory").join("projects");
+        let mut report = LegacyJsonMergeReport::default();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(report);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Ok(json_graph) = storage::read_json::<MemoryGraph>(&path) else {
+                continue;
+            };
+            let store_key = format!("project:{stem}");
+            let mut backend_graph = backend
+                .load(&StoreKey::new(&store_key))
+                .unwrap_or_else(|_| MemoryGraph::new());
+            let backend_memories_before = backend_graph.memory_count();
+            let json_only_memories = json_graph
+                .memories
+                .keys()
+                .filter(|id| !backend_graph.memories.contains_key(*id))
+                .count();
+            let (added_memories, added_edges, added_tags) =
+                merge_json_graph(&mut backend_graph, &json_graph);
+            let backend_memories_after = backend_graph.memory_count();
+            let mut applied = false;
+            if apply && added_memories > 0 {
+                backend.save(&StoreKey::new(&store_key), &backend_graph)?;
+                applied = true;
+                report.added_memories += added_memories;
+                report.added_edges += added_edges;
+                report.applied += 1;
+            }
+            report.files.push(LegacyJsonMerge {
+                path: path.display().to_string(),
+                store_key,
+                json_only_memories,
+                added_memories,
+                added_edges,
+                added_tags,
+                backend_memories_before,
+                backend_memories_after,
+                applied,
             });
         }
         Ok(report)
@@ -6310,6 +6464,52 @@ fn link_pair(left: &str, right: &str) -> (String, String) {
     } else {
         (right.to_string(), left.to_string())
     }
+}
+
+fn merge_json_graph(
+    backend: &mut MemoryGraph,
+    json: &MemoryGraph,
+) -> (usize, usize, usize) {
+    use std::collections::HashSet;
+
+    let edges_before = backend.edge_count();
+    let tags_before = backend.tags.len();
+    let mut added = HashSet::new();
+    for (id, entry) in &json.memories {
+        if backend.memories.contains_key(id) {
+            continue;
+        }
+        added.insert(backend.add_memory(entry.clone()));
+    }
+    for (from, edges) in &json.edges {
+        for edge in edges {
+            if !added.contains(from) && !added.contains(&edge.target) {
+                continue;
+            }
+            if matches!(edge.kind, jcode_memory_types::EdgeKind::HasTag) {
+                continue;
+            }
+            if matches!(edge.kind, jcode_memory_types::EdgeKind::InCluster)
+                && !backend.clusters.contains_key(&edge.target)
+                && let Some(cluster) = json.clusters.get(&edge.target)
+            {
+                backend.clusters.insert(edge.target.clone(), cluster.clone());
+            }
+            if !node_exists(backend, from) || !node_exists(backend, &edge.target) {
+                continue;
+            }
+            backend.add_edge(from, &edge.target, edge.kind.clone());
+        }
+    }
+    (
+        added.len(),
+        backend.edge_count().saturating_sub(edges_before),
+        backend.tags.len().saturating_sub(tags_before),
+    )
+}
+
+fn node_exists(graph: &MemoryGraph, id: &str) -> bool {
+    graph.memories.contains_key(id) || graph.tags.contains_key(id) || graph.clusters.contains_key(id)
 }
 
 fn insert_link_suggestion(
