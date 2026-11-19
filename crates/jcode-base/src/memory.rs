@@ -1988,6 +1988,8 @@ impl MemoryManager {
             };
             let mut item = MemoryReviewItem::new(scope, old.clone(), entry.clone(), gates, reason)
                 .with_action(outcome.action.label());
+            item.similarity = outcome.similarity;
+            item.related = outcome.related.clone();
             if let Some(dir) = project_dir {
                 item = item.with_project_dir(dir.to_string_lossy().to_string());
             }
@@ -2160,7 +2162,26 @@ impl MemoryManager {
                 let new_id = graph.add_memory(entry);
                 graph.mark_contradiction(&new_id, &old_id);
             }
-            "insert" | "relate" => {
+            "relate" => {
+                let new_id = graph.add_memory(entry);
+                let mut linked = std::collections::HashSet::new();
+                if let Some(old_id) = item.old.as_ref().map(|old| old.id.clone()) {
+                    let weight = if item.similarity > 0.0 {
+                        item.similarity.clamp(0.5, 0.95)
+                    } else {
+                        0.7
+                    };
+                    if graph.memories.contains_key(&old_id) && linked.insert(old_id.clone()) {
+                        graph.link_memories(&new_id, &old_id, weight);
+                    }
+                }
+                for (target, weight) in &item.related {
+                    if graph.memories.contains_key(target) && linked.insert(target.clone()) {
+                        graph.link_memories(&new_id, target, *weight);
+                    }
+                }
+            }
+            "insert" => {
                 graph.add_memory(entry);
             }
             _ => {

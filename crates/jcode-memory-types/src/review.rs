@@ -104,6 +104,13 @@ pub struct MemoryReviewItem {
     pub diff: Vec<String>,
     /// Why the item needs review.
     pub reason: String,
+    /// Similarity of the deciding match, retained so accepting a `relate`
+    /// item can use the original edge weight.
+    #[serde(default)]
+    pub similarity: f32,
+    /// Related memories and weights proposed by reconcile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<(String, f32)>,
     #[serde(default)]
     pub recommendation: ReviewRecommendation,
     #[serde(default)]
@@ -138,6 +145,8 @@ impl MemoryReviewItem {
             new,
             action: default_action(),
             reason: reason.into(),
+            similarity: 0.0,
+            related: Vec::new(),
             recommendation: ReviewRecommendation::NeedsHuman,
             status: ReviewStatus::Pending,
             note: None,

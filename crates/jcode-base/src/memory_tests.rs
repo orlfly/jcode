@@ -4118,6 +4118,40 @@ fn reject_review_leaves_graph_unchanged() {
 }
 
 #[test]
+fn accepting_relate_review_links_new_memory_to_old() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-relate");
+        let old = MemoryEntry::new(MemoryCategory::Fact, "old api endpoint")
+            .with_id("mem_review_old");
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(old.clone());
+        manager.save_project_graph(&graph).expect("save old");
+
+        let new = MemoryEntry::new(MemoryCategory::Fact, "new api endpoint detail")
+            .with_id("mem_review_new");
+        let mut item = MemoryReviewItem::new(
+            "project",
+            Some(old),
+            new.clone(),
+            Vec::new(),
+            "related update",
+        )
+        .with_action("relate");
+        item.similarity = 0.8;
+        manager
+            .apply_reviewed_change(&item, new.clone())
+            .expect("apply relate");
+
+        let stored = manager.load_project_graph().expect("load");
+        assert!(stored.get_memory("mem_review_new").is_some());
+        assert!(stored.get_edges("mem_review_new").iter().any(|edge| {
+            edge.target == "mem_review_old"
+                && matches!(edge.kind, jcode_memory_types::EdgeKind::RelatesTo { weight } if (weight - 0.8).abs() < 1e-6)
+        }));
+    });
+}
+
+#[test]
 fn health_report_counts_reviews_and_provenance_gaps() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/review-health");

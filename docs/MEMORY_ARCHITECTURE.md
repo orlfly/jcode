@@ -195,7 +195,10 @@ policy before mutating a graph:
   of an active category, are parked with a G4 `BatchChange` gate. This is a
   category-level diff today, not a per-property comparison.
 - Review items live in `<jcode_dir>/memory/reviews/pending.jsonl`; resolve
-  them with `jcode memory review list|accept|reject|defer`.
+  them with `jcode memory review list|accept|reject|defer`. Accepting a
+  `relate` item now stores the new memory and adds `relates_to` edges to the
+  old target and to the reconcile neighbours, using the originally computed
+  similarity as the edge weight instead of inserting an unlinked duplicate.
 - `jcode memory health` reports type distribution, contradictions, duplicate
   subjects, missing provenance/locators, review backlog and extraction source
   health. `jcode memory source status|resume` controls the extraction pause.
