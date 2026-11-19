@@ -1657,6 +1657,7 @@ pub enum MemorySubcommand {
     Storage {
         action: String,
         apply: bool,
+        repair_edges: bool,
         json: bool,
     },
     Distill {
@@ -2493,6 +2494,7 @@ async fn run_memory_command_for_dir(
         MemorySubcommand::Storage {
             action,
             apply,
+            repair_edges,
             json,
         } => {
             if matches!(
@@ -2551,7 +2553,7 @@ async fn run_memory_command_for_dir(
                 return Ok(());
             }
             if action == "legacy-merge" {
-                let report = manager.merge_legacy_json(apply)?;
+                let report = manager.merge_legacy_json_with_options(apply, repair_edges)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {

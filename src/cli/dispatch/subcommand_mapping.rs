@@ -65,10 +65,12 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
         MemoryCommand::Storage {
             action,
             apply,
+            repair_edges,
             json,
         } => commands::MemorySubcommand::Storage {
             action,
             apply,
+            repair_edges,
             json,
         },
         MemoryCommand::Distill { dry_run } => commands::MemorySubcommand::Distill { dry_run },

@@ -4315,17 +4315,28 @@ impl MemoryManager {
     /// snapshots into the active backend. Existing backend memories are never
     /// overwritten; only missing memories and their incident edges are added.
     pub fn merge_legacy_json(&self, apply: bool) -> Result<LegacyJsonMergeReport> {
+        self.merge_legacy_json_with_options(apply, false)
+    }
+
+    /// Merge legacy snapshots. With `repair_edges`, also backfill missing
+    /// non-tag edges and tags for memories that already exist in the backend.
+    pub fn merge_legacy_json_with_options(
+        &self,
+        apply: bool,
+        repair_edges: bool,
+    ) -> Result<LegacyJsonMergeReport> {
         let backend = if self.test_mode {
             test_backend()
         } else {
             graph_backend()
         };
-        self.merge_legacy_json_with_backend(apply, backend.as_ref())
+        self.merge_legacy_json_with_backend(apply, repair_edges, backend.as_ref())
     }
 
     fn merge_legacy_json_with_backend(
         &self,
         apply: bool,
+        repair_edges: bool,
         backend: &dyn GraphBackend,
     ) -> Result<LegacyJsonMergeReport> {
         let dir = storage::jcode_dir()?.join("memory").join("projects");
@@ -4355,10 +4366,10 @@ impl MemoryManager {
                 .filter(|id| !backend_graph.memories.contains_key(*id))
                 .count();
             let (added_memories, added_edges, added_tags) =
-                merge_json_graph(&mut backend_graph, &json_graph);
+                merge_json_graph(&mut backend_graph, &json_graph, repair_edges);
             let backend_memories_after = backend_graph.memory_count();
             let mut applied = false;
-            if apply && added_memories > 0 {
+            if apply && (added_memories > 0 || added_edges > 0 || added_tags > 0) {
                 backend.save(&StoreKey::new(&store_key), &backend_graph)?;
                 applied = true;
                 report.added_memories += added_memories;
@@ -6827,6 +6838,7 @@ fn link_pair(left: &str, right: &str) -> (String, String) {
 fn merge_json_graph(
     backend: &mut MemoryGraph,
     json: &MemoryGraph,
+    repair_edges: bool,
 ) -> (usize, usize, usize) {
     use std::collections::HashSet;
 
@@ -6841,10 +6853,15 @@ fn merge_json_graph(
     }
     for (from, edges) in &json.edges {
         for edge in edges {
-            if !added.contains(from) && !added.contains(&edge.target) {
+            if !repair_edges && !added.contains(from) && !added.contains(&edge.target) {
                 continue;
             }
             if matches!(edge.kind, jcode_memory_types::EdgeKind::HasTag) {
+                if repair_edges
+                    && let Some(tag) = edge.target.strip_prefix("tag:")
+                {
+                    backend.tag_memory(from, tag);
+                }
                 continue;
             }
             if matches!(edge.kind, jcode_memory_types::EdgeKind::InCluster)
@@ -6857,6 +6874,16 @@ fn merge_json_graph(
                 continue;
             }
             backend.add_edge(from, &edge.target, edge.kind.clone());
+        }
+    }
+    if repair_edges {
+        for (id, entry) in &json.memories {
+            if !backend.memories.contains_key(id) {
+                continue;
+            }
+            for tag in &entry.tags {
+                backend.tag_memory(id, tag);
+            }
         }
     }
     (

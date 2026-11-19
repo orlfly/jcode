@@ -1463,6 +1463,10 @@ pub(crate) enum MemoryCommand {
         #[arg(long)]
         apply: bool,
 
+        /// Backfill missing edges for common memories (legacy-merge only)
+        #[arg(long)]
+        repair_edges: bool,
+
         /// Emit JSON instead of plain text
         #[arg(long)]
         json: bool,

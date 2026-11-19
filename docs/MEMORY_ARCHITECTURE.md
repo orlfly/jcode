@@ -222,7 +222,9 @@ policy before mutating a graph:
   `memory/projects/*.json` snapshots with the active backend graph.
   `jcode memory storage legacy-merge [--apply]` adds memories and incident
   edges that exist only in those snapshots; existing backend memories are never
-  overwritten. After a successful merge, `json_only_memories` is zero.
+  overwritten. `--repair-edges` additionally backfills missing tags and
+  non-tag edges for memories that already exist in both graphs. After a
+  successful merge, `json_only_memories` is zero.
   `jcode memory storage quarantine-legacy --apply` renames only snapshots that
   are strictly smaller than an existing backend graph; JSON files that are the
   only surviving copy are never touched.

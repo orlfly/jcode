@@ -4691,7 +4691,7 @@ fn legacy_json_merge_adds_only_missing_memories_and_edges() {
         .expect("write legacy");
 
         let dry = manager
-            .merge_legacy_json_with_backend(false, &backend)
+            .merge_legacy_json_with_backend(false, false, &backend)
             .expect("dry run");
         assert_eq!(dry.added_memories, 0);
         let entry = dry
@@ -4704,7 +4704,7 @@ fn legacy_json_merge_adds_only_missing_memories_and_edges() {
         assert_eq!(entry.added_edges, 2);
 
         let applied = manager
-            .merge_legacy_json_with_backend(true, &backend)
+            .merge_legacy_json_with_backend(true, false, &backend)
             .expect("apply");
         assert_eq!(applied.added_memories, 1);
         assert_eq!(applied.applied, 1);
@@ -4724,10 +4724,80 @@ fn legacy_json_merge_adds_only_missing_memories_and_edges() {
         }));
 
         let again = manager
-            .merge_legacy_json_with_backend(true, &backend)
+            .merge_legacy_json_with_backend(true, false, &backend)
             .expect("second apply");
         assert_eq!(again.added_memories, 0);
         assert_eq!(again.applied, 0);
+    });
+}
+
+#[test]
+fn legacy_json_merge_can_repair_missing_edges_for_common_memories() {
+    with_temp_home(|_| {
+        let project = Path::new("/legacy-edge-repair");
+        let manager = MemoryManager::new().with_project_dir(project);
+        let mut backend_graph = MemoryGraph::new();
+        backend_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "left body").with_id("mem_left"),
+        );
+        backend_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "right body").with_id("mem_right"),
+        );
+        let key = project_store_key(project);
+        let backend = super::backend::JsonBackend::new(
+            crate::storage::jcode_dir()
+                .expect("home")
+                .join("memory")
+                .join("test-backend"),
+        );
+        backend
+            .save(&StoreKey::new(&key), &backend_graph)
+            .expect("save backend");
+
+        let stem = key.strip_prefix("project:").expect("project key");
+        let projects = crate::storage::jcode_dir()
+            .expect("home")
+            .join("memory")
+            .join("projects");
+        fs::create_dir_all(&projects).expect("projects dir");
+        let mut legacy_graph = MemoryGraph::new();
+        legacy_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "left body").with_id("mem_left"),
+        );
+        legacy_graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "right body").with_id("mem_right"),
+        );
+        legacy_graph.link_memories("mem_left", "mem_right", 0.8);
+        fs::write(
+            projects.join(format!("{stem}.json")),
+            serde_json::to_vec_pretty(&legacy_graph).expect("serialize"),
+        )
+        .expect("write legacy");
+
+        let without = manager
+            .merge_legacy_json_with_backend(true, false, &backend)
+            .expect("without repair");
+        assert_eq!(without.added_edges, 0);
+        assert!(
+            backend
+                .load(&StoreKey::new(&key))
+                .expect("load")
+                .get_edges("mem_left")
+                .is_empty()
+        );
+
+        let repaired = manager
+            .merge_legacy_json_with_backend(true, true, &backend)
+            .expect("repair");
+        assert!(repaired.added_edges >= 1, "{repaired:?}");
+        assert!(
+            backend
+                .load(&StoreKey::new(&key))
+                .expect("load")
+                .get_edges("mem_left")
+                .iter()
+                .any(|edge| edge.target == "mem_right")
+        );
     });
 }
 
