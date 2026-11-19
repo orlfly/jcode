@@ -31,6 +31,16 @@ and only inject their bounded pointer line.
 (`Custom("env_fact")`) are canonicalized into variants by
 `prepare_for_write` on load/write, so stores converge without a migration.
 
+### Edge kinds and ontology ownership
+
+The memory ontology declares the six semantic relationships: `has_tag`,
+`in_cluster` (deprecated, no producer), `relates_to`, `supersedes`,
+`contradicts`, `derived_from`. Two additional `EdgeKind` variants,
+`contains` and `next_step`, are **structural skill-index edges** produced by
+`crates/jcode-base/src/skill/skill_index.rs` for `skill:` artifact mirrors.
+They are intentionally outside the memory ontology relationship table and must
+not be treated as user-memory semantics by validation or traversal.
+
 ## Recall: two tiers
 
 **Tier 1 (L1, local, default-on)**: `score_l1_relevance` scores every active
