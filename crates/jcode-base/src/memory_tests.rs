@@ -3407,10 +3407,7 @@ fn migrate_canonicalizes_core_only_default_ontology() {
             graph.metadata.ontology.is_none(),
             "the compiled default is stored as a reference, not a snapshot"
         );
-        assert_eq!(
-            graph.metadata.ontology_version,
-            DEFAULT_ONTOLOGY_VERSION
-        );
+        assert_eq!(graph.metadata.ontology_version, DEFAULT_ONTOLOGY_VERSION);
         assert_eq!(
             graph.metadata.ontology_hash,
             default_ontology().content_hash()
@@ -4283,6 +4280,9 @@ fn extraction_source_pauses_on_confidence_drop() {
         manager
             .record_extraction_batch("session", 5, 5, 0, 0, 0.5, 0.0)
             .expect("batch 3");
+        manager
+            .record_extraction_batch("session", 5, 5, 0, 0, 0.5, 0.0)
+            .expect("batch 4");
         let health = manager.extraction_health().expect("health");
         assert!(health.paused);
         assert!(
@@ -4291,6 +4291,20 @@ fn extraction_source_pauses_on_confidence_drop() {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("confidence"))
         );
+    });
+}
+
+#[test]
+fn extraction_source_ignores_single_confidence_outlier() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new_test();
+        for confidence in [0.95, 0.95, 0.5, 0.95] {
+            manager
+                .record_extraction_batch("session", 5, 5, 0, 0, confidence, 0.0)
+                .expect("batch");
+        }
+        let health = manager.extraction_health().expect("health");
+        assert!(!health.paused, "{:?}", health.pause_reason);
     });
 }
 

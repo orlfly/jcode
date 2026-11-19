@@ -115,6 +115,9 @@ struct MemoryInput {
     /// For review list: pending | accepted | rejected | deferred | all
     #[serde(default)]
     status: Option<String>,
+    /// For health action: resume automatic extraction after a health pause.
+    #[serde(default)]
+    extraction_action: Option<String>,
     /// Optional reviewer note
     #[serde(default)]
     note: Option<String>,
@@ -199,6 +202,11 @@ impl Tool for MemoryTool {
                 "status": {
                     "type": "string",
                     "description": "For review listing: pending, accepted, rejected, deferred, all."
+                },
+                "extraction_action": {
+                    "type": "string",
+                    "enum": ["resume"],
+                    "description": "For action=health: resume automatic memory extraction after a source-health pause."
                 },
                 "note": {
                     "type": "string",
@@ -656,6 +664,22 @@ impl Tool for MemoryTool {
                 }
             }
             "health" => {
+                if let Some(extraction_action) = input.extraction_action.as_deref() {
+                    match extraction_action {
+                        "resume" => {
+                            let source = manager.resume_extraction()?;
+                            return Ok(ToolOutput::new(format!(
+                                "Extraction resumed.\n{}",
+                                source.summary()
+                            )));
+                        }
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "Unknown extraction_action: {other}. Use resume"
+                            ));
+                        }
+                    }
+                }
                 let report = manager.health_report()?;
                 let source = manager.extraction_health()?;
                 Ok(ToolOutput::new(format!(
@@ -1006,6 +1030,7 @@ mod tests {
         assert!(props.contains_key("to_id"));
         assert!(props.contains_key("limit"));
         assert!(props.contains_key("anchor"));
+        assert!(props.contains_key("extraction_action"));
         assert!(!props.contains_key("weight"));
         assert!(!props.contains_key("depth"));
         assert!(!props.contains_key("mode"));
@@ -1126,6 +1151,40 @@ mod tests {
             output.output
         );
         assert!(output.output.contains("modifies"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn health_action_resumes_paused_extraction() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let memory_dir = home.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let health_path = memory_dir.join("extraction_health.json");
+        std::fs::write(
+            &health_path,
+            r#"{"paused":true,"pause_reason":"test pause","batches":[]}"#,
+        )
+        .unwrap();
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({"action":"health", "extraction_action":"resume"}),
+                test_ctx(None),
+            )
+            .await
+            .expect("resume extraction");
+        assert!(
+            output.output.contains("Extraction resumed"),
+            "{}",
+            output.output
+        );
+
+        let health: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&health_path).unwrap()).unwrap();
+        assert_eq!(health["paused"], false);
+        assert!(health["pause_reason"].is_null());
     }
 
     #[tokio::test]

@@ -2230,18 +2230,25 @@ impl MemoryManager {
                     source_health::MAX_FAILURE_RATE * 100.0
                 ));
             }
-            if recent.len() >= 2 {
-                let baseline = recent[..recent.len() - 1]
+            // A single low-confidence batch is often an extraction outlier, not
+            // a degraded source. Require two consecutive degraded batches
+            // before pausing so one bad transcript cannot stop the pipeline.
+            if recent.len() >= 3 {
+                let baseline = recent[..recent.len() - 2]
                     .iter()
                     .map(|batch| batch.avg_confidence)
                     .sum::<f32>()
-                    / (recent.len() - 1) as f32;
-                let current = recent
-                    .last()
+                    / (recent.len() - 2) as f32;
+                let recent_two = &recent[recent.len() - 2..];
+                let current = recent_two
+                    .iter()
                     .map(|batch| batch.avg_confidence)
-                    .unwrap_or(0.0);
+                    .sum::<f32>()
+                    / recent_two.len() as f32;
                 if baseline > 0.0
-                    && baseline - current > source_health::MAX_CONFIDENCE_DROP
+                    && recent_two.iter().all(|batch| {
+                        baseline - batch.avg_confidence > source_health::MAX_CONFIDENCE_DROP
+                    })
                     && !health.paused
                 {
                     health.paused = true;
@@ -5153,11 +5160,7 @@ impl MemoryManager {
                 stored.version,
                 jcode_memory_types::migration::ontology_content_hash(stored),
             ),
-            None => (
-                default.id.clone(),
-                default.version,
-                default.content_hash(),
-            ),
+            None => (default.id.clone(), default.version, default.content_hash()),
         };
         if graph.metadata.ontology_hash != hash {
             if graph.metadata.ontology.is_some() {

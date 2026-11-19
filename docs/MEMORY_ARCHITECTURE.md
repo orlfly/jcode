@@ -175,6 +175,9 @@ policy before mutating a graph:
 - `jcode memory health` reports type distribution, contradictions, duplicate
   subjects, missing provenance/locators, review backlog and extraction source
   health. `jcode memory source status|resume` controls the extraction pause.
+  A confidence pause requires two consecutive degraded batches, so one
+  low-confidence transcript does not stop extraction. The `memory` tool exposes
+  the same recovery as `{"action":"health","extraction_action":"resume"}`.
 - Skills have a v2 manifest contract (version, status, triggers, inputs,
   allowed tools, preconditions, effects, validation, changelog, provenance)
   while remaining backward compatible with legacy `SKILL.md` files.
