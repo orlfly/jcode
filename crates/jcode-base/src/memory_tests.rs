@@ -4,6 +4,23 @@ use super::*;
 fn manager_without_project_dir_does_not_use_process_cwd() {
     assert!(MemoryManager::new().get_project_dir().is_none());
 }
+
+#[test]
+fn failed_backend_save_recovery_snapshot_stays_out_of_legacy_projects_dir() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/recovery-snapshot");
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "recovery body"));
+        let path = manager
+            .write_recovery_graph(&graph, true)
+            .expect("write recovery")
+            .expect("project recovery path");
+        assert!(path.to_string_lossy().contains("memory/recovery/projects"));
+        assert!(!path.to_string_lossy().contains("memory/projects/"));
+        let stored: MemoryGraph = crate::storage::read_json(&path).expect("read recovery");
+        assert_eq!(stored.memory_count(), 1);
+    });
+}
 use crate::message::{ContentBlock, Message, Role};
 use serde_json::json;
 use std::fs;

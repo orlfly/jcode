@@ -895,6 +895,22 @@ pub fn project_memory_file(project_dir: &std::path::Path) -> Result<PathBuf> {
     Ok(memory_dir.join(format!("{}.json", project_hash)))
 }
 
+/// Recovery snapshot used only when the active backend cannot save. It lives
+/// outside `memory/projects/` so the canonical legacy audit never mistakes a
+/// failed write for a real JSON-mode store.
+pub fn project_recovery_file(project_dir: &std::path::Path) -> Result<PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    project_dir.hash(&mut hasher);
+    let project_hash = format!("{:016x}", hasher.finish());
+    let recovery_dir = storage::jcode_dir()?
+        .join("memory")
+        .join("recovery")
+        .join("projects");
+    Ok(recovery_dir.join(format!("{}.json", project_hash)))
+}
+
 /// Optional `<jcode_dir>/memory/artifact-kinds.json` override.
 ///
 /// The file adds or overrides artifact kinds without a rebuild:
@@ -6370,9 +6386,6 @@ impl MemoryManager {
                 None => "project:none".to_string(),
             });
             if let Err(e) = backend.save(&key, graph) {
-                crate::logging::warn(&format!(
-                    "save_project_graph via {e}; falling back to JSON path"
-                ));
                 // Same suppression as the load fallback: a manager that served
                 // its graph from the staler JSON snapshot must not persist it.
                 if self
@@ -6384,7 +6397,13 @@ impl MemoryManager {
                     );
                     return Ok(());
                 }
-                return self.save_project_graph_json(graph);
+                let recovery = self.write_recovery_graph(graph, true)?;
+                anyhow::bail!(
+                    "save_project_graph failed: {e}; recovery snapshot saved to {}",
+                    recovery
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                );
             }
             if !self.test_mode {
                 cache_graph_for_backend(backend.name(), &key, graph, 0);
@@ -6417,6 +6436,49 @@ impl MemoryManager {
         Ok(())
     }
 
+    fn project_recovery_path(&self) -> Result<Option<PathBuf>> {
+        if self.test_mode {
+            let dir = storage::jcode_dir()?.join("memory").join("test").join("recovery");
+            return Ok(Some(dir.join("test_project.json")));
+        }
+        let Some(project_dir) = self.get_project_dir() else {
+            return Ok(None);
+        };
+        project_recovery_file(&project_dir).map(Some)
+    }
+
+    fn global_recovery_path(&self) -> Result<PathBuf> {
+        Ok(storage::jcode_dir()?
+            .join("memory")
+            .join("recovery")
+            .join("global.json"))
+    }
+
+    /// Persist a failed backend write outside the canonical JSON store.
+    fn write_recovery_graph(
+        &self,
+        graph: &MemoryGraph,
+        project: bool,
+    ) -> Result<Option<PathBuf>> {
+        let path = if project {
+            self.project_recovery_path()?
+        } else {
+            Some(self.global_recovery_path()?)
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        storage::write_json(&path, graph)?;
+        crate::logging::warn(&format!(
+            "memory backend save failed; recovery snapshot written to {}",
+            path.display()
+        ));
+        Ok(Some(path))
+    }
+
     /// Save global memories as a MemoryGraph
     pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
         if crate::memory::active_backend_name() == "sqlite-gvec" {
@@ -6427,9 +6489,6 @@ impl MemoryManager {
             };
             let key = StoreKey::new(crate::memory::global_store_key());
             if let Err(e) = backend.save(&key, graph) {
-                crate::logging::warn(&format!(
-                    "save_global_graph via {e}; falling back to JSON path"
-                ));
                 // Same suppression as the load fallback (see
                 // `save_project_graph`).
                 if self
@@ -6441,7 +6500,13 @@ impl MemoryManager {
                     );
                     return Ok(());
                 }
-                return self.save_global_graph_json(graph);
+                let recovery = self.write_recovery_graph(graph, false)?;
+                anyhow::bail!(
+                    "save_global_graph failed: {e}; recovery snapshot saved to {}",
+                    recovery
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                );
             }
             if !self.test_mode {
                 cache_graph_for_backend(backend.name(), &key, graph, 0);

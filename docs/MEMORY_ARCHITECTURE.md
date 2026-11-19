@@ -228,6 +228,10 @@ policy before mutating a graph:
   `jcode memory storage quarantine-legacy --apply` renames only snapshots that
   are strictly smaller than an existing backend graph; JSON files that are the
   only surviving copy are never touched.
+  If a backend save fails, the graph is written to
+  `memory/recovery/projects/<hash>.json` (or `memory/recovery/global.json`) and
+  the save returns an error; failed writes no longer masquerade as canonical
+  legacy JSON stores.
 - Skills have a v2 manifest contract (version, status, triggers, inputs,
   allowed tools, preconditions, effects, validation, changelog, provenance)
   while remaining backward compatible with legacy `SKILL.md` files.
