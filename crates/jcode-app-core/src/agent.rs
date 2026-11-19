@@ -1279,6 +1279,8 @@ impl Agent {
         self.session.mark_closed();
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
+            let messages = self.session.provider_messages().to_vec();
+            self.persist_engineering_episode_best_effort(&messages);
         }
         self.upload_transcript_telemetry(end_reason);
         // A deferred (never begun) session has nothing to end. Ending anyway
@@ -1315,6 +1317,8 @@ impl Agent {
         self.session.mark_crashed(message);
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session crash state");
+            let messages = self.session.provider_messages().to_vec();
+            self.persist_engineering_episode_best_effort(&messages);
         }
         self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::Unknown);
         crate::telemetry::record_crash(

@@ -172,7 +172,7 @@ let warnings = extraction.warnings;
 
 默认路径是 `~/.jcode/engineering/graphs.sqlite`。表 `engineering_graphs` 以 `session_id` 为主键，同时保存 ontology id/hash、实体数、关系数、`created_at` 与 `updated_at`。当前版本使用 JSON 图而不是规范化三元组表，原因是 Episode 图规模小，路径查询在内存中完成；后续需要跨 session 图查询时再拆表。
 
-压缩完成、摘要正式生效时，Agent 会重新抽取该 session 的图并 upsert：
+压缩完成、摘要正式生效时，以及会话正常关闭或崩溃落盘时，Agent 会重新抽取该 session 的图并 upsert：
 
 ```rust
 let extraction = extract_engineering_episode(session_id, &messages, working_dir);
