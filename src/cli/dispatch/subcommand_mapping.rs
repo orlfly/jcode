@@ -31,6 +31,7 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             json,
             actions,
             max,
+            project,
             apply,
         } => commands::MemorySubcommand::Review {
             action,
@@ -41,6 +42,7 @@ pub(super) fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySu
             json,
             actions,
             max,
+            project,
             apply,
         },
         MemoryCommand::Health { json } => commands::MemorySubcommand::Health { json },

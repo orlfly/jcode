@@ -4001,7 +4001,7 @@ fn review_batch_accept_is_dry_by_default_and_respects_limit() {
         }
         let actions = vec!["insert".to_string()];
         let dry = manager
-            .accept_reviews_batch(&actions, 10, false)
+            .accept_reviews_batch(&actions, None, 10, false)
             .expect("dry run");
         assert_eq!(dry.pending, 2);
         assert_eq!(dry.selected, 2);
@@ -4017,7 +4017,7 @@ fn review_batch_accept_is_dry_by_default_and_respects_limit() {
         );
 
         let applied = manager
-            .accept_reviews_batch(&actions, 1, true)
+            .accept_reviews_batch(&actions, None, 1, true)
             .expect("apply one");
         assert_eq!(applied.accepted, 1);
         assert_eq!(applied.by_action.get("insert"), Some(&1));
@@ -4025,6 +4025,48 @@ fn review_batch_accept_is_dry_by_default_and_respects_limit() {
         assert_eq!(
             manager
                 .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
+#[test]
+fn prune_stale_reviews_rejects_missing_targets_only_on_apply() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-prune");
+        let old = MemoryEntry::new(MemoryCategory::Fact, "deleted target").with_id("mem_gone");
+        let new = MemoryEntry::new(MemoryCategory::Fact, "new detail").with_id("mem_new_detail");
+        let item =
+            MemoryReviewItem::new("project", Some(old), new, Vec::new(), "related detail")
+                .with_action("relate")
+                .with_project_dir("/review-prune");
+        manager.enqueue_review_item(&item).expect("enqueue");
+
+        let dry = manager.prune_stale_reviews(false).expect("dry run");
+        assert_eq!(dry.pending, 1);
+        assert_eq!(dry.stale_missing_target, 1);
+        assert_eq!(dry.rejected, 1);
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let applied = manager.prune_stale_reviews(true).expect("apply");
+        assert_eq!(applied.rejected, 1);
+        assert!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Rejected))
                 .unwrap()
                 .len(),
             1

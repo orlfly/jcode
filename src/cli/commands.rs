@@ -1636,6 +1636,7 @@ pub enum MemorySubcommand {
         note: Option<String>,
         actions: Option<String>,
         max: usize,
+        project: Option<String>,
         apply: bool,
         json: bool,
     },
@@ -2195,6 +2196,7 @@ async fn run_memory_command_for_dir(
             note,
             actions,
             max,
+            project,
             apply,
             json,
         } => match action.as_str() {
@@ -2260,7 +2262,12 @@ async fn run_memory_command_for_dir(
                     .filter(|action| !action.is_empty())
                     .map(ToString::to_string)
                     .collect();
-                let report = manager.accept_reviews_batch(&actions, max, apply)?;
+                let report = manager.accept_reviews_batch(
+                    &actions,
+                    project.as_deref(),
+                    max,
+                    apply,
+                )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
@@ -2279,6 +2286,24 @@ async fn run_memory_command_for_dir(
                     }
                     if !apply {
                         println!("Dry run. Re-run with --apply to accept these items.");
+                    }
+                }
+            }
+            "prune-stale" => {
+                let report = manager.prune_stale_reviews(apply)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Review stale prune: {} pending, {} already present, {} missing target, {} rejected{}",
+                        report.pending,
+                        report.stale_existing,
+                        report.stale_missing_target,
+                        report.rejected,
+                        if apply { "" } else { " (dry run)" }
+                    );
+                    if !apply {
+                        println!("Dry run. Re-run with --apply to reject these items.");
                     }
                 }
             }

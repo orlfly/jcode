@@ -1035,6 +1035,16 @@ pub struct ReviewBatchReport {
     pub applied: bool,
 }
 
+/// Result of rejecting review items that can no longer be applied.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReviewPruneReport {
+    pub pending: usize,
+    pub stale_existing: usize,
+    pub stale_missing_target: usize,
+    pub rejected: usize,
+    pub applied: bool,
+}
+
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
     /// When true, use isolated test storage instead of real memory
@@ -2133,6 +2143,7 @@ impl MemoryManager {
     pub fn accept_reviews_batch(
         &self,
         actions: &[String],
+        project: Option<&str>,
         max: usize,
         apply: bool,
     ) -> Result<ReviewBatchReport> {
@@ -2149,6 +2160,9 @@ impl MemoryManager {
             .filter(|item| {
                 item.status == ReviewStatus::Pending
                     && (wanted.is_empty() || wanted.contains(item.action.as_str()))
+                    && project.is_none_or(|project| {
+                        item.project_dir.as_deref() == Some(project)
+                    })
             })
             .take(max)
             .cloned()
@@ -2241,6 +2255,77 @@ impl MemoryManager {
             }
         }
         if apply {
+            review::save_items(&path, &all_items)?;
+        }
+        Ok(report)
+    }
+
+    /// Reject pending items whose new id already exists or whose required old
+    /// target disappeared. No memory graph is changed; only queue statuses.
+    pub fn prune_stale_reviews(&self, apply: bool) -> Result<ReviewPruneReport> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut all_items = review::load_items(&path)?;
+        let pending: Vec<MemoryReviewItem> = all_items
+            .iter()
+            .filter(|item| item.status == ReviewStatus::Pending)
+            .cloned()
+            .collect();
+        let mut report = ReviewPruneReport {
+            pending: pending.len(),
+            applied: apply,
+            ..ReviewPruneReport::default()
+        };
+        let mut groups: std::collections::BTreeMap<
+            (String, Option<String>),
+            Vec<MemoryReviewItem>,
+        > = std::collections::BTreeMap::new();
+        for item in pending {
+            groups
+                .entry((item.scope.clone(), item.project_dir.clone()))
+                .or_default()
+                .push(item);
+        }
+        let mut stale_ids = Vec::new();
+        for items in groups.values() {
+            let Some(first) = items.first() else {
+                continue;
+            };
+            let Ok(manager) = self.manager_for_review(first) else {
+                continue;
+            };
+            let Ok(graph) = manager.load_review_graph(first) else {
+                continue;
+            };
+            for item in items {
+                if graph.memories.contains_key(&item.new.id) {
+                    report.stale_existing += 1;
+                    stale_ids.push(item.id.clone());
+                    continue;
+                }
+                if matches!(
+                    item.action.as_str(),
+                    "relate" | "supersede" | "contradict" | "reinforce"
+                ) && item
+                    .old
+                    .as_ref()
+                    .is_none_or(|old| !graph.memories.contains_key(&old.id))
+                {
+                    report.stale_missing_target += 1;
+                    stale_ids.push(item.id.clone());
+                }
+            }
+        }
+        report.rejected = stale_ids.len();
+        if apply && !stale_ids.is_empty() {
+            for id in stale_ids {
+                let _ = review::update_status(
+                    &mut all_items,
+                    &id,
+                    ReviewStatus::Rejected,
+                    Some("stale-prune"),
+                    Some("target missing or already applied"),
+                );
+            }
             review::save_items(&path, &all_items)?;
         }
         Ok(report)

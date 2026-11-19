@@ -1372,7 +1372,7 @@ pub(crate) enum MemoryCommand {
 
     /// Inspect and resolve the memory review queue
     Review {
-        /// list, triage, accept, accept-batch, reject, or defer
+        /// list, triage, accept, accept-batch, prune-stale, reject, or defer
         #[arg(default_value = "list")]
         action: String,
 
@@ -1398,6 +1398,10 @@ pub(crate) enum MemoryCommand {
         /// Maximum items for accept-batch
         #[arg(long, default_value_t = 100)]
         max: usize,
+
+        /// Exact project directory filter for accept-batch/prune-stale
+        #[arg(long)]
+        project: Option<String>,
 
         /// Write accepted items instead of only reporting them
         #[arg(long)]

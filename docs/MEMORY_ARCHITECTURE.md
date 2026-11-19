@@ -202,8 +202,10 @@ policy before mutating a graph:
   `jcode memory review triage [--json]` groups the pending queue by action,
   gate and project without dumping every item.
   `jcode memory review accept-batch --actions reinforce,relate --max N
-  [--apply]` dry-runs by default and skips items whose target disappeared or
-  whose new id already exists; it never overwrites an existing memory.
+  [--project PATH] [--apply]` dry-runs by default and skips items whose target
+  disappeared or whose new id already exists; it never overwrites an existing
+  memory. `jcode memory review prune-stale [--apply]` rejects only those
+  already-applied or missing-target items and changes no memory graph.
 - `jcode memory health` reports type distribution, contradictions, duplicate
   subjects, missing provenance/locators, review backlog and extraction source
   health. `jcode memory source status|resume` controls the extraction pause.
