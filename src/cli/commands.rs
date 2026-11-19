@@ -2219,7 +2219,7 @@ async fn run_memory_command_for_dir(
                 limit,
             )?;
             if crate::provider::active_provider_fork().is_none() {
-                let initialized = super::provider_init::init_provider_quiet(
+                let initialized = super::provider_init::init_provider_for_validation(
                     &provider,
                     model.as_deref(),
                 )
