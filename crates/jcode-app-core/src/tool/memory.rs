@@ -76,6 +76,15 @@ struct MemoryInput {
     /// For link action: target memory ID
     #[serde(default)]
     to_id: Option<String>,
+    /// For path action: additional start anchors.
+    #[serde(default)]
+    from_anchors: Option<Vec<String>>,
+    /// For path action: additional goal anchors.
+    #[serde(default)]
+    to_anchors: Option<Vec<String>>,
+    /// For path action: canonical EdgeKind names to allow. Empty means all.
+    #[serde(default)]
+    relation_allow: Option<Vec<String>>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -170,6 +179,24 @@ impl Tool for MemoryTool {
                 "to_id": {
                     "type": "string",
                     "description": "For action=link: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
+                },
+                "from_anchors": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For action=path: additional start anchors. Every source-target pair is solved."
+                },
+                "to_anchors": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For action=path: additional goal anchors. Every source-target pair is solved."
+                },
+                "relation_allow": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["has_tag", "in_cluster", "relates_to", "supersedes", "contradicts", "derived_from", "contains", "next_step"]
+                    },
+                    "description": "For action=path: restrict traversal to these relation types. Omit to allow all."
                 },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
                 "mode": {
@@ -625,47 +652,97 @@ impl Tool for MemoryTool {
                 }
             }
             "path" => {
-                let from = input
-                    .from_id
-                    .ok_or_else(|| anyhow::anyhow!("from_id required for path"))?;
-                let to = input
-                    .to_id
-                    .ok_or_else(|| anyhow::anyhow!("to_id required for path"))?;
                 let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
                 let depth = input.depth.unwrap_or(4);
                 let limit = input.limit.unwrap_or(3);
+                let mut froms = input.from_anchors.unwrap_or_default();
+                if let Some(from) = input.from_id {
+                    froms.insert(0, from);
+                }
+                let mut tos = input.to_anchors.unwrap_or_default();
+                if let Some(to) = input.to_id {
+                    tos.insert(0, to);
+                }
+                if froms.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "from_id or from_anchors required for path"
+                    ));
+                }
+                if tos.is_empty() {
+                    return Err(anyhow::anyhow!("to_id or to_anchors required for path"));
+                }
+                let relations = input.relation_allow.unwrap_or_default();
 
                 memory::set_state(MemoryState::ToolAction {
                     action: "path".into(),
                     detail: format!(
                         "{} -> {}",
-                        truncate_for_widget(&from, 15),
-                        truncate_for_widget(&to, 15)
+                        truncate_for_widget(&froms.join(","), 15),
+                        truncate_for_widget(&tos.join(","), 15)
                     ),
                 });
-                let paths = manager.path_between(&from, &to, depth, limit, scope)?;
+                let outcome = manager.paths_between_anchors(
+                    &froms, &tos, depth, limit, scope, &relations,
+                )?;
+                let paths = &outcome.paths;
                 memory::add_event(MemoryEventKind::ToolRecalled {
                     query: format!(
                         "path:{}->{}",
-                        truncate_for_widget(&from, 15),
-                        truncate_for_widget(&to, 15)
+                        truncate_for_widget(&froms.join(","), 15),
+                        truncate_for_widget(&tos.join(","), 15)
                     ),
                     count: paths.len(),
                 });
                 memory::set_state(MemoryState::Idle);
 
+                let mut diagnostics = Vec::new();
+                if !outcome.unresolved_from.is_empty() {
+                    diagnostics.push(format!(
+                        "unresolved start anchor(s): {}",
+                        outcome.unresolved_from.join(", ")
+                    ));
+                }
+                if !outcome.unresolved_to.is_empty() {
+                    diagnostics.push(format!(
+                        "unresolved goal anchor(s): {}",
+                        outcome.unresolved_to.join(", ")
+                    ));
+                }
+                if !outcome.unknown_relations.is_empty() {
+                    diagnostics.push(format!(
+                        "unknown relation(s) ignored: {}",
+                        outcome.unknown_relations.join(", ")
+                    ));
+                }
+
                 if paths.is_empty() {
-                    Ok(ToolOutput::new(format!(
-                        "No memory path found from '{}' to '{}' within depth {} (scope {:?}). Try different anchors or a larger depth.",
-                        from, to, depth, scope
-                    )))
+                    let mut out = format!(
+                        "No memory path found from [{}] to [{}] within depth {} (scope {:?}, stores searched: {}).",
+                        froms.join(", "),
+                        tos.join(", "),
+                        outcome.depth,
+                        scope,
+                        outcome.stores_searched
+                    );
+                    for diagnostic in &diagnostics {
+                        out.push_str(&format!("\n- {diagnostic}"));
+                    }
+                    out.push_str(
+                        "\nTry different anchors, a larger depth (capped at 8), or a wider scope.",
+                    );
+                    Ok(ToolOutput::new(out))
                 } else {
                     let mut out = format!(
-                        "Found {} memory path(s) from '{}' to '{}':\n",
+                        "Found {} memory path(s) from [{}] to [{}] (depth {}, stores searched: {}):\n",
                         paths.len(),
-                        from,
-                        to
+                        froms.join(", "),
+                        tos.join(", "),
+                        outcome.depth,
+                        outcome.stores_searched
                     );
+                    for diagnostic in &diagnostics {
+                        out.push_str(&format!("\n- {diagnostic}"));
+                    }
                     for (index, path) in paths.iter().enumerate() {
                         out.push_str(&format!(
                             "\nPath {}: cost {:.2}, confidence {:.0}%, {} node(s)\n",

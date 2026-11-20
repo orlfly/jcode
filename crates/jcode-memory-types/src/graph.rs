@@ -151,7 +151,44 @@ fn memory_edge_key(edge: &MemoryPathEdge) -> (String, String, String) {
     )
 }
 
+fn relation_allowed(kind: &EdgeKind, allowed_relations: &[&str]) -> bool {
+    allowed_relations.is_empty()
+        || allowed_relations
+            .iter()
+            .any(|allowed| kind.as_str().eq_ignore_ascii_case(allowed.trim()))
+}
+
 impl EdgeKind {
+    /// Canonical wire name used by relation filters and provenance.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeKind::HasTag => "has_tag",
+            EdgeKind::InCluster => "in_cluster",
+            EdgeKind::RelatesTo { .. } => "relates_to",
+            EdgeKind::Supersedes => "supersedes",
+            EdgeKind::Contradicts => "contradicts",
+            EdgeKind::DerivedFrom => "derived_from",
+            EdgeKind::Contains => "contains",
+            EdgeKind::NextStep => "next_step",
+        }
+    }
+
+    /// Parse a canonical relation name. Unknown names are rejected rather than
+    /// silently widening a path query.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "has_tag" => EdgeKind::HasTag,
+            "in_cluster" => EdgeKind::InCluster,
+            "relates_to" => EdgeKind::RelatesTo { weight: 1.0 },
+            "supersedes" => EdgeKind::Supersedes,
+            "contradicts" => EdgeKind::Contradicts,
+            "derived_from" => EdgeKind::DerivedFrom,
+            "contains" => EdgeKind::Contains,
+            "next_step" => EdgeKind::NextStep,
+            _ => return None,
+        })
+    }
+
     /// Get the traversal weight for BFS scoring
     pub fn traversal_weight(&self) -> f32 {
         match self {
@@ -822,7 +859,29 @@ impl MemoryGraph {
         to: &str,
         max_depth: usize,
     ) -> Option<MemoryPath> {
-        self.memory_dijkstra(from, to, max_depth, &BTreeSet::new(), &BTreeSet::new())
+        self.weighted_shortest_path_with_relations(from, to, max_depth, &[])
+    }
+
+    /// Cheapest loop-free path restricted to `allowed_relations`.
+    ///
+    /// An empty allow-list means "any relation", matching
+    /// [`Self::weighted_shortest_path`]. Names use canonical `EdgeKind` wire
+    /// names such as `relates_to`, `derived_from`, `contains`, `next_step`.
+    pub fn weighted_shortest_path_with_relations(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        allowed_relations: &[&str],
+    ) -> Option<MemoryPath> {
+        self.memory_dijkstra(
+            from,
+            to,
+            max_depth,
+            allowed_relations,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
     }
 
     /// Yen's k-best loop-free paths under [`Self::weighted_shortest_path`]'s
@@ -835,10 +894,24 @@ impl MemoryGraph {
         max_depth: usize,
         k: usize,
     ) -> Vec<MemoryPath> {
+        self.k_shortest_paths_with_relations(from, to, max_depth, k, &[])
+    }
+
+    /// Yen's k-best paths restricted to `allowed_relations`.
+    pub fn k_shortest_paths_with_relations(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        k: usize,
+        allowed_relations: &[&str],
+    ) -> Vec<MemoryPath> {
         if k == 0 {
             return Vec::new();
         }
-        let Some(first) = self.weighted_shortest_path(from, to, max_depth) else {
+        let Some(first) =
+            self.weighted_shortest_path_with_relations(from, to, max_depth, allowed_relations)
+        else {
             return Vec::new();
         };
         let mut accepted = vec![first];
@@ -867,6 +940,7 @@ impl MemoryGraph {
                     &spur_node,
                     to,
                     max_depth.saturating_sub(spur_index),
+                    allowed_relations,
                     &removed_edges,
                     &blocked_nodes,
                 ) else {
@@ -903,6 +977,7 @@ impl MemoryGraph {
         from: &str,
         to: &str,
         max_depth: usize,
+        allowed_relations: &[&str],
         removed_edges: &BTreeSet<(String, String, String)>,
         blocked_nodes: &BTreeSet<String>,
     ) -> Option<MemoryPath> {
@@ -919,12 +994,12 @@ impl MemoryGraph {
 
         while let Some(Reverse((cost, node, depth, nodes))) = queue.pop() {
             if node == to {
-                return self.memory_path_from_nodes(nodes);
+                return self.memory_path_from_nodes(nodes, allowed_relations);
             }
             if depth >= max_depth {
                 continue;
             }
-            for (next, edge) in self.memory_neighbors(&node) {
+            for (next, edge) in self.memory_neighbors(&node, allowed_relations) {
                 if removed_edges.contains(&memory_edge_key(&edge))
                     || blocked_nodes.contains(&next)
                     || nodes.contains(&next)
@@ -948,9 +1023,16 @@ impl MemoryGraph {
         None
     }
 
-    fn memory_neighbors(&self, node_id: &str) -> Vec<(String, MemoryPathEdge)> {
+    fn memory_neighbors(
+        &self,
+        node_id: &str,
+        allowed_relations: &[&str],
+    ) -> Vec<(String, MemoryPathEdge)> {
         let mut out = Vec::new();
         for edge in self.get_edges(node_id) {
+            if !relation_allowed(&edge.kind, allowed_relations) {
+                continue;
+            }
             out.push((
                 edge.target.clone(),
                 MemoryPathEdge {
@@ -975,7 +1057,8 @@ impl MemoryGraph {
                     | EdgeKind::InCluster
                     | EdgeKind::RelatesTo { .. }
                     | EdgeKind::Contradicts
-            ) {
+            ) && relation_allowed(&edge.kind, allowed_relations)
+            {
                 out.push((
                     source.to_string(),
                     MemoryPathEdge {
@@ -1020,13 +1103,17 @@ impl MemoryGraph {
         (base + hub_penalty + 0.5 * (1.0 - confidence)).max(0.01)
     }
 
-    fn memory_path_from_nodes(&self, nodes: Vec<String>) -> Option<MemoryPath> {
+    fn memory_path_from_nodes(
+        &self,
+        nodes: Vec<String>,
+        allowed_relations: &[&str],
+    ) -> Option<MemoryPath> {
         let mut edges = Vec::with_capacity(nodes.len().saturating_sub(1));
         for pair in nodes.windows(2) {
             let from = &pair[0];
             let to = &pair[1];
             let edge = self
-                .memory_neighbors(from)
+                .memory_neighbors(from, allowed_relations)
                 .into_iter()
                 .filter(|(next, _)| next == to)
                 .min_by(|left, right| left.1.cost.total_cmp(&right.1.cost))

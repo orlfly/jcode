@@ -251,6 +251,38 @@ pub fn score_l1_relevance(
     if hits < 2 { 0.0 } else { ratio.min(0.5) }
 }
 
+/// Result of a multi-source/multi-target memory path query.
+///
+/// `paths` contains only successfully resolved routes. The diagnostic fields
+/// let the caller distinguish "anchor does not exist" from "anchors exist but
+/// the graph is disconnected" or "relation name is unknown" without retrying
+/// with a wider search.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPathQueryOutcome {
+    pub paths: Vec<jcode_memory_types::MemoryPath>,
+    pub unresolved_from: Vec<String>,
+    pub unresolved_to: Vec<String>,
+    pub unknown_relations: Vec<String>,
+    pub stores_searched: usize,
+    pub depth: usize,
+}
+
+fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for anchor in anchors {
+        let anchor = anchor.trim();
+        if anchor.is_empty() || !seen.insert(anchor.to_string()) {
+            continue;
+        }
+        out.push(anchor.to_string());
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    out
+}
+
 /// Resolve a path endpoint without requiring the caller to know an internal id.
 fn resolve_path_anchor(graph: &MemoryGraph, anchor: &str) -> Option<String> {
     let anchor = anchor.trim();
@@ -7025,12 +7057,75 @@ impl MemoryManager {
         limit: usize,
         scope: MemoryScope,
     ) -> Result<Vec<jcode_memory_types::MemoryPath>> {
-        if from_anchor.trim().is_empty() || to_anchor.trim().is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
+        Ok(self
+            .paths_between_anchors(
+                &[from_anchor.to_string()],
+                &[to_anchor.to_string()],
+                depth,
+                limit,
+                scope,
+                &[],
+            )?
+            .paths)
+    }
+
+    /// Cheapest k memory-graph paths between two anchor sets.
+    ///
+    /// This is the deterministic half of the design document's constrained
+    /// multi-source/multi-target path query: anchors are resolved per store,
+    /// every source-target pair is solved, and an optional relation allow-list
+    /// restricts traversal to canonical `EdgeKind` names. Unknown relation
+    /// names are reported instead of silently widening the search.
+    ///
+    /// Paths still never cross project/global stores, because no persisted
+    /// bridge edges exist between them.
+    pub fn paths_between_anchors(
+        &self,
+        from_anchors: &[String],
+        to_anchors: &[String],
+        depth: usize,
+        limit: usize,
+        scope: MemoryScope,
+        relations: &[String],
+    ) -> Result<MemoryPathQueryOutcome> {
+        let froms = normalize_path_anchors(from_anchors);
+        let tos = normalize_path_anchors(to_anchors);
         let depth = depth.clamp(1, 8);
         let limit = limit.min(20);
-        let mut paths = Vec::new();
+        let mut outcome = MemoryPathQueryOutcome {
+            depth,
+            ..MemoryPathQueryOutcome::default()
+        };
+
+        let mut allowed_owned = Vec::new();
+        for relation in relations {
+            let relation = relation.trim();
+            if relation.is_empty() {
+                continue;
+            }
+            if jcode_memory_types::EdgeKind::parse(relation).is_some() {
+                allowed_owned.push(relation.to_string());
+            } else {
+                outcome.unknown_relations.push(relation.to_string());
+            }
+        }
+        outcome.unknown_relations.sort();
+        outcome.unknown_relations.dedup();
+        let allowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
+
+        if froms.is_empty() || tos.is_empty() || limit == 0 {
+            outcome.unresolved_from = froms;
+            outcome.unresolved_to = tos;
+            return Ok(outcome);
+        }
+        // A filter made only of unknown names must match nothing. Treating it
+        // as an empty filter would turn a typo into an unrestricted query.
+        if !relations.is_empty() && allowed.is_empty() {
+            outcome.unresolved_from = froms;
+            outcome.unresolved_to = tos;
+            return Ok(outcome);
+        }
+
         let mut graphs = Vec::new();
         if scope.includes_project() {
             graphs.push(self.load_project_graph()?);
@@ -7038,22 +7133,61 @@ impl MemoryManager {
         if scope.includes_global() {
             graphs.push(self.load_global_graph()?);
         }
-        for graph in graphs {
-            let Some(from) = resolve_path_anchor(&graph, from_anchor) else {
-                continue;
-            };
-            let Some(to) = resolve_path_anchor(&graph, to_anchor) else {
-                continue;
-            };
-            paths.extend(graph.k_shortest_paths(&from, &to, depth, limit));
+        outcome.stores_searched = graphs.len();
+
+        let mut resolved_from = std::collections::HashSet::new();
+        let mut resolved_to = std::collections::HashSet::new();
+        for graph in &graphs {
+            for anchor in &froms {
+                if resolve_path_anchor(graph, anchor).is_some() {
+                    resolved_from.insert(anchor.clone());
+                }
+            }
+            for anchor in &tos {
+                if resolve_path_anchor(graph, anchor).is_some() {
+                    resolved_to.insert(anchor.clone());
+                }
+            }
+        }
+        outcome.unresolved_from = froms
+            .iter()
+            .filter(|anchor| !resolved_from.contains(*anchor))
+            .cloned()
+            .collect();
+        outcome.unresolved_to = tos
+            .iter()
+            .filter(|anchor| !resolved_to.contains(*anchor))
+            .cloned()
+            .collect();
+
+        let mut paths = Vec::new();
+        for graph in &graphs {
+            let from_nodes: Vec<String> = froms
+                .iter()
+                .filter_map(|anchor| resolve_path_anchor(graph, anchor))
+                .collect();
+            let to_nodes: Vec<String> = tos
+                .iter()
+                .filter_map(|anchor| resolve_path_anchor(graph, anchor))
+                .collect();
+            for from in &from_nodes {
+                for to in &to_nodes {
+                    paths.extend(graph.k_shortest_paths_with_relations(
+                        from, to, depth, limit, &allowed,
+                    ));
+                }
+            }
         }
         paths.sort_by(|left, right| {
             left.cost
                 .total_cmp(&right.cost)
                 .then_with(|| left.nodes.cmp(&right.nodes))
         });
+        let mut seen = std::collections::HashSet::new();
+        paths.retain(|path| seen.insert(path.nodes.clone()));
         paths.truncate(limit);
-        Ok(paths)
+        outcome.paths = paths;
+        Ok(outcome)
     }
 
     /// Fetch one memory by id from the requested scope.

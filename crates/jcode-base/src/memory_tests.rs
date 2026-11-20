@@ -4942,3 +4942,65 @@ fn needs_review_badge_is_visible_in_prompt() {
     let prompt = crate::memory_types::format_entries_for_prompt(&[entry], 5).expect("prompt");
     assert!(prompt.contains("[needs review]"), "{prompt}");
 }
+
+#[test]
+fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-anchor-sets");
+        let a = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "alpha path anchor"))
+            .expect("alpha");
+        let b = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "beta path anchor"))
+            .expect("beta");
+        let c = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "gamma path anchor"))
+            .expect("gamma");
+        manager.link_memories(&a, &b, 0.9).expect("a-b");
+        manager.link_memories(&c, &b, 0.8).expect("c-b");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &[a.clone(), c.clone()],
+                &[b.clone()],
+                4,
+                5,
+                MemoryScope::Project,
+                &["relates_to".to_string()],
+            )
+            .expect("multi-source path query");
+        assert_eq!(outcome.paths.len(), 2, "{outcome:?}");
+        assert!(outcome.unresolved_from.is_empty(), "{outcome:?}");
+        assert!(outcome.paths.iter().all(|path| {
+            path.edges
+                .iter()
+                .all(|edge| matches!(edge.kind, crate::memory_graph::EdgeKind::RelatesTo { .. }))
+        }));
+
+        let unknown = manager
+            .paths_between_anchors(
+                &[a.clone()],
+                &[b.clone()],
+                4,
+                5,
+                MemoryScope::Project,
+                &["invented_relation".to_string()],
+            )
+            .expect("unknown relation query");
+        assert!(unknown.paths.is_empty(), "{unknown:?}");
+        assert_eq!(unknown.unknown_relations, vec!["invented_relation"]);
+
+        let missing = manager
+            .paths_between_anchors(
+                &["missing-anchor".to_string()],
+                &[b],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("missing anchor query");
+        assert!(missing.paths.is_empty(), "{missing:?}");
+        assert_eq!(missing.unresolved_from, vec!["missing-anchor"]);
+    });
+}

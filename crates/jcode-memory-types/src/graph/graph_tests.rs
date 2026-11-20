@@ -156,6 +156,39 @@ fn k_shortest_paths_returns_distinct_routes() {
 }
 
 #[test]
+fn relation_filter_selects_only_the_allowed_edge_types() {
+    let mut graph = MemoryGraph::new();
+    let a = graph.add_memory(make_test_memory("alpha memory"));
+    let b = graph.add_memory(make_test_memory("beta memory"));
+    let c = graph.add_memory(make_test_memory("gamma memory"));
+
+    graph.link_memories(&a, &b, 0.9);
+    graph.add_edge(&a, &c, EdgeKind::NextStep);
+    graph.add_edge(&c, &b, EdgeKind::NextStep);
+
+    let semantic = graph.k_shortest_paths_with_relations(&a, &b, 3, 3, &["relates_to"]);
+    assert_eq!(semantic.len(), 1);
+    assert_eq!(semantic[0].nodes, vec![a.clone(), b.clone()]);
+
+    let procedural = graph.k_shortest_paths_with_relations(&a, &b, 3, 3, &["next_step"]);
+    assert_eq!(procedural.len(), 1);
+    assert_eq!(procedural[0].nodes, vec![a, c, b]);
+    assert!(
+        procedural[0]
+            .edges
+            .iter()
+            .all(|edge| matches!(edge.kind, EdgeKind::NextStep))
+    );
+}
+
+#[test]
+fn edge_kind_parse_rejects_unknown_names() {
+    assert_eq!(EdgeKind::parse(" next_step "), Some(EdgeKind::NextStep));
+    assert_eq!(EdgeKind::parse("relates_to"), Some(EdgeKind::RelatesTo { weight: 1.0 }));
+    assert_eq!(EdgeKind::parse("invented_relation"), None);
+}
+
+#[test]
 fn path_respects_depth_limit() {
     let mut graph = MemoryGraph::new();
     let a = graph.add_memory(make_test_memory("alpha memory"));
