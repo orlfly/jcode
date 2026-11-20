@@ -103,6 +103,73 @@ fn test_link_memories() {
 }
 
 #[test]
+fn weighted_path_prefers_strong_semantic_chain() {
+    let mut graph = MemoryGraph::new();
+    let a = graph.add_memory(make_test_memory("alpha memory"));
+    let b = graph.add_memory(make_test_memory("beta memory"));
+    let c = graph.add_memory(make_test_memory("gamma memory"));
+
+    graph.link_memories(&a, &b, 0.1);
+    graph.link_memories(&a, &c, 0.9);
+    graph.link_memories(&c, &b, 0.9);
+
+    let path = graph
+        .weighted_shortest_path(&a, &b, 3)
+        .expect("path should exist");
+    assert_eq!(path.nodes, vec![a.clone(), c.clone(), b.clone()]);
+    assert_eq!(path.edges.len(), 2);
+    assert!(path.cost < 1.0);
+}
+
+#[test]
+fn weighted_path_traverses_tag_hub() {
+    let mut graph = MemoryGraph::new();
+    let a = graph.add_memory(make_test_memory("alpha memory").with_tags(vec!["shared".into()]));
+    let b = graph.add_memory(make_test_memory("beta memory").with_tags(vec!["shared".into()]));
+
+    let path = graph
+        .weighted_shortest_path(&a, &b, 3)
+        .expect("tag hub path should exist");
+    assert_eq!(path.nodes, vec![a, "tag:shared".to_string(), b]);
+    assert_eq!(path.edges.len(), 2);
+}
+
+#[test]
+fn k_shortest_paths_returns_distinct_routes() {
+    let mut graph = MemoryGraph::new();
+    let a = graph.add_memory(make_test_memory("alpha memory"));
+    let b = graph.add_memory(make_test_memory("beta memory"));
+    let c = graph.add_memory(make_test_memory("gamma memory"));
+    let d = graph.add_memory(make_test_memory("delta memory"));
+
+    graph.link_memories(&a, &b, 0.9);
+    graph.link_memories(&a, &c, 0.8);
+    graph.link_memories(&c, &b, 0.8);
+    graph.link_memories(&a, &d, 0.7);
+    graph.link_memories(&d, &b, 0.7);
+
+    let paths = graph.k_shortest_paths(&a, &b, 4, 3);
+    assert!(paths.len() >= 2);
+    assert_eq!(paths[0].nodes.first(), Some(&a));
+    assert_eq!(paths[0].nodes.last(), Some(&b));
+    assert_ne!(paths[0].nodes, paths[1].nodes);
+}
+
+#[test]
+fn path_respects_depth_limit() {
+    let mut graph = MemoryGraph::new();
+    let a = graph.add_memory(make_test_memory("alpha memory"));
+    let b = graph.add_memory(make_test_memory("beta memory"));
+    let c = graph.add_memory(make_test_memory("gamma memory"));
+
+    graph.link_memories(&a, &b, 0.9);
+    graph.link_memories(&b, &c, 0.9);
+
+    assert!(graph.weighted_shortest_path(&a, &c, 1).is_none());
+    assert!(graph.weighted_shortest_path(&a, &c, 2).is_some());
+}
+
+#[test]
 fn test_supersede() {
     let mut graph = MemoryGraph::new();
     let old_id = graph.add_memory(make_test_memory("Old info"));

@@ -254,6 +254,37 @@ fn builds_compaction_prompt_with_summary_and_truncated_tool_result() {
 }
 
 #[test]
+fn compaction_prompt_requires_nine_section_checkpoint_contracts() {
+    let prompt = build_compaction_prompt(&[Message::user("probe")], None, 10_000);
+    for section in [
+        "## Primary Request and Intent",
+        "## Key Technical Concepts",
+        "## Files and Code",
+        "## Errors and Fixes",
+        "## Pending Jobs",
+        "## Current Work",
+        "## Next Step",
+        "## Critical Context",
+    ] {
+        assert!(prompt.contains(section), "missing section: {section}");
+    }
+    for tag in [
+        "[CONSTRAINT]",
+        "[RETRACTED]",
+        "[ERROR_FIX]",
+        "[DECISION]",
+        "[TODO]",
+        "authority=checkpoint",
+    ] {
+        assert!(prompt.contains(tag), "missing contract marker: {tag}");
+    }
+    assert!(
+        prompt.contains("Do not add a `## Graph Memory State` section"),
+        "prompt must leave deterministic graph anchors to the runtime"
+    );
+}
+
+#[test]
 fn truncates_on_utf8_boundary() {
     assert_eq!(truncate_str_boundary("éabc", 1), "");
     assert_eq!(truncate_str_boundary("éabc", 2), "é");

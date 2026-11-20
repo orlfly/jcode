@@ -82,15 +82,52 @@ pub const EMBEDDING_HISTORY_WINDOW: usize = 10;
 /// Per-manager semantic embedding cache capacity.
 pub const SEMANTIC_EMBED_CACHE_CAPACITY: usize = 256;
 
-pub const SUMMARY_PROMPT: &str = r#"Summarize our conversation so you can continue this work later.
+pub const SUMMARY_PROMPT: &str = r#"Create a durable checkpoint that lets you continue this work later.
 
-Write in natural language with these sections:
-- **Context:** What we're working on and why (1-2 sentences)
-- **What we did:** Key actions taken, files changed, problems solved
-- **Current state:** What works, what's broken, what's next
-- **User preferences:** Specific requirements or decisions they made
+Return Markdown with every section below, in this order. Write `(none)` when a
+section is empty. Do not add a `## Graph Memory State` section: the runtime
+appends deterministic graph anchors after your checkpoint.
 
-Be concise but preserve important details. You can search the full conversation later if you need exact error messages or code snippets."#;
+## Primary Request and Intent
+The user's original goal and how it evolved. Quote decisive wording exactly.
+
+## Key Technical Concepts
+Stack, conventions, patterns, and constraints that affect the work.
+
+## Files and Code
+Exact paths and the key changes made or still required.
+
+## Errors and Fixes
+Exact error strings, causes, fixes, and any user correction.
+
+## Pending Jobs
+Explicit unfinished tasks. Keep each item actionable.
+
+## Current Work
+What was happening at the checkpoint, including the last verified state.
+
+## Next Step
+One concrete next action.
+
+## Critical Context
+Use one structured bullet per item, preserving exact text:
+- `[CONSTRAINT] ...` hard user or environment constraint
+- `[RETRACTED] ...` conclusion that must not be reused
+- `[ERROR_FIX] ...` error and the fix that worked
+- `[DECISION] ...` choice made and why
+- `[TODO] ...` deferred action
+
+These are non-graph facts. Mark each bullet `authority=checkpoint`. Never
+present them as externally verified evidence.
+
+Rules:
+- Preserve exact identifiers, paths, commands, versions, numbers, and error
+  strings. Do not paraphrase them.
+- Prefer compact factual bullets over narrative prose.
+- Do not include raw tool payloads or long code blocks.
+- If a previous summary exists, merge it: keep still-true facts, drop obsolete
+  ones, and produce one checkpoint rather than stacking summaries.
+- The checkpoint must be shorter than the conversation it replaces."#;
 
 /// A completed summary covering turns up to a certain point
 #[derive(Debug, Clone)]

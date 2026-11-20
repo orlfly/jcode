@@ -12,7 +12,7 @@ use crate::{MemoryEntry, MemoryStore, ValidationReport, validate_graph};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 /// Current graph format version for migration detection
 pub const GRAPH_VERSION: u32 = 2;
@@ -113,8 +113,42 @@ pub enum EdgeKind {
     NextStep,
 }
 
+/// One hop in a weighted memory-graph path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPathEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: EdgeKind,
+    pub cost: f32,
+}
+
+/// A loop-free path between two memory-graph nodes.
+///
+/// Paths may pass through `tag:` / `cluster:` hub nodes. Consumers that only
+/// want memories should filter those node ids out for display, but keep them in
+/// the path so the traversal remains auditable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPath {
+    pub nodes: Vec<String>,
+    pub edges: Vec<MemoryPathEdge>,
+    pub cost: f32,
+    pub confidence: f32,
+}
+
 fn default_weight() -> f32 {
     1.0
+}
+
+fn scaled_memory_cost(cost: f32) -> u64 {
+    (cost.max(0.0) * 1000.0).round() as u64
+}
+
+fn memory_edge_key(edge: &MemoryPathEdge) -> (String, String, String) {
+    (
+        edge.from.clone(),
+        edge.to.clone(),
+        serde_json::to_string(&edge.kind).unwrap_or_default(),
+    )
 }
 
 impl EdgeKind {
@@ -771,6 +805,254 @@ impl MemoryGraph {
 
         // Keep only the top-scoring results
         top_k_scored(results, max_results)
+    }
+
+    // ==================== Weighted Path Search ====================
+
+    /// Cheapest loop-free path between two graph nodes.
+    ///
+    /// The cost model mirrors the retrieval-layer design document:
+    /// structural edge cost + hub penalty + low-confidence penalty. `HasTag`
+    /// and `InCluster` edges are traversable in both directions so a tag can
+    /// act as a bounded hub; typed directional edges (`DerivedFrom`,
+    /// `Contains`, `NextStep`, `Supersedes`) only traverse forward.
+    pub fn weighted_shortest_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+    ) -> Option<MemoryPath> {
+        self.memory_dijkstra(from, to, max_depth, &BTreeSet::new(), &BTreeSet::new())
+    }
+
+    /// Yen's k-best loop-free paths under [`Self::weighted_shortest_path`]'s
+    /// cost model. Results are sorted by cost, then by node sequence for
+    /// deterministic ties.
+    pub fn k_shortest_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        k: usize,
+    ) -> Vec<MemoryPath> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let Some(first) = self.weighted_shortest_path(from, to, max_depth) else {
+            return Vec::new();
+        };
+        let mut accepted = vec![first];
+        let mut candidates: Vec<MemoryPath> = Vec::new();
+
+        while accepted.len() < k {
+            let previous = accepted.last().expect("accepted path").clone();
+            for spur_index in 0..previous.nodes.len().saturating_sub(1) {
+                let spur_node = previous.nodes[spur_index].clone();
+                let root_nodes = previous.nodes[..=spur_index].to_vec();
+                let root_edges = previous.edges[..spur_index].to_vec();
+
+                let mut removed_edges = BTreeSet::new();
+                for path in &accepted {
+                    if path.nodes.len() > spur_index
+                        && path.nodes[..=spur_index] == root_nodes
+                        && let Some(edge) = path.edges.get(spur_index)
+                    {
+                        removed_edges.insert(memory_edge_key(edge));
+                    }
+                }
+                let blocked_nodes: BTreeSet<String> =
+                    root_nodes[..spur_index].iter().cloned().collect();
+
+                let Some(spur) = self.memory_dijkstra(
+                    &spur_node,
+                    to,
+                    max_depth.saturating_sub(spur_index),
+                    &removed_edges,
+                    &blocked_nodes,
+                ) else {
+                    continue;
+                };
+
+                let mut nodes = root_nodes;
+                nodes.extend(spur.nodes.into_iter().skip(1));
+                let mut edges = root_edges;
+                edges.extend(spur.edges);
+                if accepted.iter().any(|path| path.nodes == nodes)
+                    || candidates.iter().any(|path| path.nodes == nodes)
+                {
+                    continue;
+                }
+                candidates.push(self.memory_path_from(nodes, edges));
+            }
+
+            if candidates.is_empty() {
+                break;
+            }
+            candidates.sort_by(|left, right| {
+                left.cost
+                    .total_cmp(&right.cost)
+                    .then_with(|| left.nodes.cmp(&right.nodes))
+            });
+            accepted.push(candidates.remove(0));
+        }
+        accepted
+    }
+
+    fn memory_dijkstra(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        removed_edges: &BTreeSet<(String, String, String)>,
+        blocked_nodes: &BTreeSet<String>,
+    ) -> Option<MemoryPath> {
+        if from == to {
+            return Some(self.memory_path_from(vec![from.to_string()], Vec::new()));
+        }
+        if !self.memories.contains_key(from) && !self.tags.contains_key(from) {
+            return None;
+        }
+        let mut queue: BinaryHeap<Reverse<(u64, String, usize, Vec<String>)>> = BinaryHeap::new();
+        queue.push(Reverse((0, from.to_string(), 0, vec![from.to_string()])));
+        let mut best: HashMap<(String, usize), u64> = HashMap::new();
+        best.insert((from.to_string(), 0), 0);
+
+        while let Some(Reverse((cost, node, depth, nodes))) = queue.pop() {
+            if node == to {
+                return self.memory_path_from_nodes(nodes);
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for (next, edge) in self.memory_neighbors(&node) {
+                if removed_edges.contains(&memory_edge_key(&edge))
+                    || blocked_nodes.contains(&next)
+                    || nodes.contains(&next)
+                {
+                    continue;
+                }
+                let next_cost = cost.saturating_add(scaled_memory_cost(edge.cost));
+                let key = (next.clone(), depth + 1);
+                if best
+                    .get(&key)
+                    .is_some_and(|existing| *existing <= next_cost)
+                {
+                    continue;
+                }
+                best.insert(key, next_cost);
+                let mut next_nodes = nodes.clone();
+                next_nodes.push(next.clone());
+                queue.push(Reverse((next_cost, next, depth + 1, next_nodes)));
+            }
+        }
+        None
+    }
+
+    fn memory_neighbors(&self, node_id: &str) -> Vec<(String, MemoryPathEdge)> {
+        let mut out = Vec::new();
+        for edge in self.get_edges(node_id) {
+            out.push((
+                edge.target.clone(),
+                MemoryPathEdge {
+                    from: node_id.to_string(),
+                    to: edge.target.clone(),
+                    kind: edge.kind.clone(),
+                    cost: self.memory_edge_cost(edge),
+                },
+            ));
+        }
+        for source in self.get_incoming(node_id) {
+            let Some(edge) = self
+                .get_edges(source)
+                .iter()
+                .find(|edge| edge.target == node_id)
+            else {
+                continue;
+            };
+            if matches!(
+                edge.kind,
+                EdgeKind::HasTag
+                    | EdgeKind::InCluster
+                    | EdgeKind::RelatesTo { .. }
+                    | EdgeKind::Contradicts
+            ) {
+                out.push((
+                    source.to_string(),
+                    MemoryPathEdge {
+                        from: node_id.to_string(),
+                        to: source.to_string(),
+                        kind: edge.kind.clone(),
+                        cost: self.memory_edge_cost(edge),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    fn memory_edge_cost(&self, edge: &Edge) -> f32 {
+        let base = match &edge.kind {
+            EdgeKind::HasTag => 0.45,
+            EdgeKind::InCluster => 0.8,
+            EdgeKind::RelatesTo { weight } => 1.0 - 0.8 * weight.clamp(0.0, 1.0),
+            EdgeKind::Supersedes => 0.15,
+            EdgeKind::Contradicts => 2.0,
+            EdgeKind::DerivedFrom => 0.35,
+            EdgeKind::Contains => 0.2,
+            EdgeKind::NextStep => 0.2,
+        };
+        let degree = self
+            .tags
+            .get(&edge.target)
+            .map(|tag| tag.count as usize)
+            .or_else(|| {
+                self.memories.contains_key(&edge.target).then(|| {
+                    self.get_edges(&edge.target).len() + self.get_incoming(&edge.target).len()
+                })
+            })
+            .unwrap_or(0);
+        let hub_penalty = 0.10 * ((1 + degree) as f32).ln();
+        let confidence = self
+            .memories
+            .get(&edge.target)
+            .map(|entry| entry.confidence.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        (base + hub_penalty + 0.5 * (1.0 - confidence)).max(0.01)
+    }
+
+    fn memory_path_from_nodes(&self, nodes: Vec<String>) -> Option<MemoryPath> {
+        let mut edges = Vec::with_capacity(nodes.len().saturating_sub(1));
+        for pair in nodes.windows(2) {
+            let from = &pair[0];
+            let to = &pair[1];
+            let edge = self
+                .memory_neighbors(from)
+                .into_iter()
+                .filter(|(next, _)| next == to)
+                .min_by(|left, right| left.1.cost.total_cmp(&right.1.cost))
+                .map(|(_, edge)| edge)?;
+            edges.push(edge);
+        }
+        Some(self.memory_path_from(nodes, edges))
+    }
+
+    fn memory_path_from(&self, nodes: Vec<String>, edges: Vec<MemoryPathEdge>) -> MemoryPath {
+        let mut cost = 0.0;
+        let mut confidence = 1.0f32;
+        for edge in &edges {
+            cost += edge.cost;
+        }
+        for node in &nodes {
+            if let Some(entry) = self.memories.get(node) {
+                confidence = confidence.min(entry.confidence.clamp(0.0, 1.0));
+            }
+        }
+        MemoryPath {
+            nodes,
+            edges,
+            cost,
+            confidence,
+        }
     }
 
     // ==================== Migration ====================

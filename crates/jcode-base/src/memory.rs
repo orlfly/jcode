@@ -251,6 +251,59 @@ pub fn score_l1_relevance(
     if hits < 2 { 0.0 } else { ratio.min(0.5) }
 }
 
+/// Resolve a path endpoint without requiring the caller to know an internal id.
+fn resolve_path_anchor(graph: &MemoryGraph, anchor: &str) -> Option<String> {
+    let anchor = anchor.trim();
+    if anchor.is_empty() {
+        return None;
+    }
+    if graph.get_memory(anchor).is_some() {
+        return Some(anchor.to_string());
+    }
+    if let Some(subject) = anchor.strip_prefix("subject:") {
+        let wanted = jcode_memory_types::reconcile::normalize_subject_key(subject);
+        return pick_best_path_entry(graph.active_memories().filter(|entry| {
+            entry.subject_key.as_deref().is_some_and(|candidate| {
+                jcode_memory_types::reconcile::normalize_subject_key(candidate)
+                    .eq_ignore_ascii_case(&wanted)
+            })
+        }));
+    }
+    if let Some(tag) = anchor.strip_prefix("tag:") {
+        return pick_best_path_entry(
+            graph
+                .get_memories_by_tag(tag)
+                .into_iter()
+                .filter(|entry| entry.is_retrievable_now()),
+        );
+    }
+
+    let normalized = normalize_search_text(anchor);
+    if normalized.is_empty() {
+        return None;
+    }
+    let normalized_subject = jcode_memory_types::reconcile::normalize_subject_key(anchor);
+    pick_best_path_entry(graph.active_memories().filter(|entry| {
+        (!normalized_subject.is_empty()
+            && entry.subject_key.as_deref().is_some_and(|subject| {
+                let subject = jcode_memory_types::reconcile::normalize_subject_key(subject);
+                subject.contains(&normalized_subject) || normalized_subject.contains(&subject)
+            }))
+            || normalize_search_text(&entry.searchable_text()).contains(&normalized)
+    }))
+}
+
+fn pick_best_path_entry<'a>(entries: impl Iterator<Item = &'a MemoryEntry>) -> Option<String> {
+    entries
+        .max_by(|left, right| {
+            left.confidence
+                .total_cmp(&right.confidence)
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| right.id.cmp(&left.id))
+        })
+        .map(|entry| entry.id.clone())
+}
+
 /// Whether the sidecar is currently auto-disabled due to sustained judge
 /// failures. Exposed for the TUI status badge so the user can see why memory
 /// is silently running on the no-LLM path.
@@ -6685,6 +6738,67 @@ impl MemoryManager {
             .collect();
 
         Ok(entries)
+    }
+
+    /// Cheapest k memory-graph paths between two anchors.
+    ///
+    /// Anchors accept a stable memory id, `subject:<key>`, `tag:<name>`, or a
+    /// normalized text fragment. Both endpoints must resolve inside the same
+    /// store; cross-store links are intentionally not synthesized here because
+    /// the graph does not yet persist bridge edges between project and global
+    /// stores.
+    pub fn path_between(
+        &self,
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        limit: usize,
+        scope: MemoryScope,
+    ) -> Result<Vec<jcode_memory_types::MemoryPath>> {
+        if from_anchor.trim().is_empty() || to_anchor.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let depth = depth.clamp(1, 8);
+        let limit = limit.min(20);
+        let mut paths = Vec::new();
+        let mut graphs = Vec::new();
+        if scope.includes_project() {
+            graphs.push(self.load_project_graph()?);
+        }
+        if scope.includes_global() {
+            graphs.push(self.load_global_graph()?);
+        }
+        for graph in graphs {
+            let Some(from) = resolve_path_anchor(&graph, from_anchor) else {
+                continue;
+            };
+            let Some(to) = resolve_path_anchor(&graph, to_anchor) else {
+                continue;
+            };
+            paths.extend(graph.k_shortest_paths(&from, &to, depth, limit));
+        }
+        paths.sort_by(|left, right| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.nodes.cmp(&right.nodes))
+        });
+        paths.truncate(limit);
+        Ok(paths)
+    }
+
+    /// Fetch one memory by id from the requested scope.
+    pub fn get_by_id(&self, id: &str, scope: MemoryScope) -> Result<Option<MemoryEntry>> {
+        if scope.includes_project()
+            && let Some(entry) = self.load_project_graph()?.get_memory(id)
+        {
+            return Ok(Some(entry.clone()));
+        }
+        if scope.includes_global()
+            && let Some(entry) = self.load_global_graph()?.get_memory(id)
+        {
+            return Ok(Some(entry.clone()));
+        }
+        Ok(None)
     }
 
     /// Find similar memories with cascade retrieval through the graph

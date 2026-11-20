@@ -8,7 +8,8 @@ pub use engineering_ontology::{
 
 pub mod graph;
 pub use graph::{
-    ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, TagEntry,
+    ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, MemoryPath,
+    MemoryPathEdge, TagEntry,
 };
 
 pub mod instance;

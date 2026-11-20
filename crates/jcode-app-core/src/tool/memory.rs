@@ -79,7 +79,8 @@ struct MemoryInput {
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
-    /// For related action: traversal depth (default: 2)
+    /// For related action: traversal depth (default: 2). For path: max hops
+    /// (default: 4, capped at 8).
     #[serde(default)]
     depth: Option<usize>,
     /// Maximum results. Recall defaults to 10, list/search remain uncapped when omitted.
@@ -133,7 +134,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Manage memory (remember/recall/search/list/forget/link). Default scope: project."
+        "Manage memory (remember/recall/search/list/forget/link/path). Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -143,7 +144,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "path", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -162,9 +163,15 @@ impl Tool for MemoryTool {
                     "enum": ["project", "global", "all"],
                     "description": "project (default; repo/env facts), global (any-project facts only), all. Env details stay project."
                 },
-                "from_id": { "type": "string" },
-                "to_id": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, or list. Zero returns no results. Recall defaults to 10." },
+                "from_id": {
+                    "type": "string",
+                    "description": "For action=link: source memory id. For action=path: start anchor (id, subject:<key>, tag:<name>, or text)."
+                },
+                "to_id": {
+                    "type": "string",
+                    "description": "For action=link: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
+                },
+                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
                 "anchor": {
                     "type": "string",
                     "description": "For action=recall: engineering graph anchor (file:, error:, command:, task:). Returns the stored subgraph around it."
@@ -604,6 +611,82 @@ impl Tool for MemoryTool {
                     Ok(ToolOutput::new(out))
                 }
             }
+            "path" => {
+                let from = input
+                    .from_id
+                    .ok_or_else(|| anyhow::anyhow!("from_id required for path"))?;
+                let to = input
+                    .to_id
+                    .ok_or_else(|| anyhow::anyhow!("to_id required for path"))?;
+                let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                let depth = input.depth.unwrap_or(4);
+                let limit = input.limit.unwrap_or(3);
+
+                memory::set_state(MemoryState::ToolAction {
+                    action: "path".into(),
+                    detail: format!(
+                        "{} -> {}",
+                        truncate_for_widget(&from, 15),
+                        truncate_for_widget(&to, 15)
+                    ),
+                });
+                let paths = manager.path_between(&from, &to, depth, limit, scope)?;
+                memory::add_event(MemoryEventKind::ToolRecalled {
+                    query: format!(
+                        "path:{}->{}",
+                        truncate_for_widget(&from, 15),
+                        truncate_for_widget(&to, 15)
+                    ),
+                    count: paths.len(),
+                });
+                memory::set_state(MemoryState::Idle);
+
+                if paths.is_empty() {
+                    Ok(ToolOutput::new(format!(
+                        "No memory path found from '{}' to '{}' within depth {} (scope {:?}). Try different anchors or a larger depth.",
+                        from, to, depth, scope
+                    )))
+                } else {
+                    let mut out = format!(
+                        "Found {} memory path(s) from '{}' to '{}':\n",
+                        paths.len(),
+                        from,
+                        to
+                    );
+                    for (index, path) in paths.iter().enumerate() {
+                        out.push_str(&format!(
+                            "\nPath {}: cost {:.2}, confidence {:.0}%, {} node(s)\n",
+                            index + 1,
+                            path.cost,
+                            path.confidence * 100.0,
+                            path.nodes.len()
+                        ));
+                        for (node_index, node_id) in path.nodes.iter().enumerate() {
+                            match manager.get_by_id(node_id, scope)? {
+                                Some(entry) => out.push_str(&format!(
+                                    "  [{}] {}\n    id: {}\n",
+                                    entry.category,
+                                    truncate_for_widget(&entry.content, 200),
+                                    entry.id
+                                )),
+                                None if node_id.starts_with("tag:") => out.push_str(&format!(
+                                    "  [tag] {}\n",
+                                    node_id.trim_start_matches("tag:")
+                                )),
+                                None => out.push_str(&format!("  [node] {}\n", node_id)),
+                            }
+                            if let Some(edge) = path.edges.get(node_index) {
+                                out.push_str(&format!(
+                                    "  --{} (cost {:.2})-->\n",
+                                    memory_edge_label(&edge.kind),
+                                    edge.cost
+                                ));
+                            }
+                        }
+                    }
+                    Ok(ToolOutput::new(out))
+                }
+            }
             "review" => {
                 let review_action = input.review_action.as_deref().unwrap_or("list");
                 match review_action {
@@ -957,6 +1040,20 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
     }
 }
 
+fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
+    use crate::memory_graph::EdgeKind;
+    match kind {
+        EdgeKind::HasTag => "has_tag".to_string(),
+        EdgeKind::InCluster => "in_cluster".to_string(),
+        EdgeKind::RelatesTo { weight } => format!("relates_to({weight:.2})"),
+        EdgeKind::Supersedes => "supersedes".to_string(),
+        EdgeKind::Contradicts => "contradicts".to_string(),
+        EdgeKind::DerivedFrom => "derived_from".to_string(),
+        EdgeKind::Contains => "contains".to_string(),
+        EdgeKind::NextStep => "next_step".to_string(),
+    }
+}
+
 /// Validate a user-supplied memory id. Keeps the id set small enough to be
 /// safe in storage paths and printable in tool output, and avoids whitespace,
 /// control characters, and JSON/scope-relevant punctuation that would let a
@@ -1034,6 +1131,66 @@ mod tests {
         assert!(!props.contains_key("weight"));
         assert!(!props.contains_key("depth"));
         assert!(!props.contains_key("mode"));
+    }
+
+    #[tokio::test]
+    async fn path_action_finds_weighted_route_between_memories() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new();
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        for (id, content) in [
+            ("mem_path_a", "alpha quasar calibration note"),
+            ("mem_path_b", "beta nebula observation note"),
+            ("mem_path_c", "gamma pulsar timing note"),
+        ] {
+            let output = tool
+                .execute(
+                    json!({"action":"remember","id":id,"content":content,"scope":"project"}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap()
+                .output;
+            assert!(output.contains("Remembered"), "{output}");
+        }
+        for (from, to, weight) in [
+            ("mem_path_a", "mem_path_c", 0.95),
+            ("mem_path_c", "mem_path_b", 0.95),
+        ] {
+            let output = tool
+                .execute(
+                    json!({"action":"link","from_id":from,"to_id":to,"weight":weight,"scope":"project"}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap()
+                .output;
+            assert!(output.contains("Linked memories"), "{output}");
+        }
+
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":"mem_path_a",
+                    "to_id":"mem_path_b",
+                    "scope":"project",
+                    "depth":3,
+                    "limit":2
+                }),
+                ctx,
+            )
+            .await
+            .unwrap()
+            .output;
+
+        assert!(output.contains("Found 1 memory path(s)"), "{output}");
+        assert!(output.contains("mem_path_c"), "{output}");
+        assert!(output.contains("relates_to"), "{output}");
     }
 
     fn test_ctx(working_dir: Option<std::path::PathBuf>) -> ToolContext {
