@@ -1579,3 +1579,24 @@ async fn refused_compaction_keeps_original_messages_issue_2089() {
     assert_eq!(manager.compacted_count(), 0);
     assert_eq!(manager.summary_chars(), 0);
 }
+
+#[test]
+fn attach_task_contracts_keeps_verbatim_entries_and_orders_retracted_first() {
+    let messages = vec![
+        Message::user("[TODO] add the regression test\n[RETRACTED] cache is source of truth"),
+        Message::assistant_text(&"x".repeat(400)),
+    ];
+    let summary = "## Critical Context\n- existing fact\n".to_string();
+
+    let out = attach_task_contracts(summary, &messages, None);
+    assert_eq!(out.matches("## Task Contracts").count(), 1, "{out}");
+    assert!(
+        out.contains("[RETRACTED] cache is source of truth"),
+        "{out}"
+    );
+    assert!(out.contains("[TODO] add the regression test"), "{out}");
+    assert!(
+        out.find("[RETRACTED]").unwrap() < out.find("[TODO]").unwrap(),
+        "{out}"
+    );
+}

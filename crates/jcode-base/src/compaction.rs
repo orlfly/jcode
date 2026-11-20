@@ -30,15 +30,17 @@ pub use jcode_compaction_core::{
     CHARS_PER_TOKEN, COMPACTION_THRESHOLD, CRITICAL_THRESHOLD, CompactionAction, CompactionEvent,
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
-    MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
+    MAX_INJECTED_CONTRACTS, MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
     SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
     TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
     compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
     emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
-    is_image_rejection_error, is_request_payload_too_large_error, mean_embedding,
-    message_char_count, reusable_cache_tokens_from_usage, safe_compaction_cutoff,
-    semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
-    summary_payload_char_count, preserve_protected_checkpoint_lines,
+    extract_contract_entries, inject_contract_block, is_image_rejection_error,
+    is_request_payload_too_large_error, mean_embedding, merge_contract_entries, message_char_count,
+    parse_contract_block, preserve_protected_checkpoint_lines, render_contract_block,
+    reusable_cache_tokens_from_usage, safe_compaction_cutoff, semantic_cache_key,
+    semantic_goal_text, semantic_message_text, strip_contract_block,
+    strip_large_images_in_contents, summary_payload_char_count,
 };
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
@@ -1812,6 +1814,8 @@ async fn generate_compaction_artifact(
                     ));
                 }
                 summary_text = repaired;
+                summary_text =
+                    attach_task_contracts(summary_text, &messages, existing_summary.as_ref());
             }
             return Ok(CompactionResult {
                 summary_text,
@@ -1861,6 +1865,7 @@ async fn generate_compaction_artifact(
         ));
     }
     let summary_text = attach_graph_memory_state(summary_text, &messages);
+    let summary_text = attach_task_contracts(summary_text, &messages, existing_summary.as_ref());
 
     Ok(CompactionResult {
         summary_text,
@@ -1869,6 +1874,45 @@ async fn generate_compaction_artifact(
         duration_ms: start.elapsed().as_millis() as u64,
         summarized_messages: messages.len(),
     })
+}
+
+/// Append the verbatim task-contract block after the checkpoint.
+///
+/// This block is deliberately independent of the checkpoint body: summaries are
+/// rewritten each compaction, while `[RETRACTED]`, `[CONSTRAINT]`,
+/// `[ERROR_FIX]`, `[DECISION]`, and `[TODO]` entries must survive verbatim.
+fn attach_task_contracts(
+    summary_text: String,
+    messages: &[Message],
+    existing_summary: Option<&Summary>,
+) -> String {
+    let existing_entries = existing_summary
+        .map(|summary| parse_contract_block(&summary.text))
+        .unwrap_or_default();
+    let fresh_entries = extract_contract_entries(messages);
+    let summary_entries = parse_contract_block(&summary_text);
+    let entries = merge_contract_entries(
+        merge_contract_entries(existing_entries, fresh_entries),
+        summary_entries,
+    );
+    let without = strip_contract_block(&summary_text);
+    if entries.is_empty() {
+        return without;
+    }
+
+    let block = render_contract_block(&entries, MAX_INJECTED_CONTRACTS);
+    if block.is_empty() {
+        return without;
+    }
+    let source_chars: usize = messages.iter().map(message_char_count).sum();
+    if source_chars == 0 || without.chars().count() + block.chars().count() >= source_chars {
+        crate::logging::warn(&format!(
+            "[compaction] skipped task contracts: checkpoint plus contracts ({}) would not shrink source ({source_chars})",
+            without.chars().count() + block.chars().count()
+        ));
+        return without;
+    }
+    inject_contract_block(without, &entries, MAX_INJECTED_CONTRACTS)
 }
 
 /// Maximum chars reserved for the deterministic graph anchor block.

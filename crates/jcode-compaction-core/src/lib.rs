@@ -2,6 +2,13 @@ use jcode_message_types::{ContentBlock, Message, Role};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
+mod contracts;
+pub use contracts::{
+    CONTRACT_HEADING, CONTRACT_MARKERS, ContractAuthority, ContractEntry, ContractKind,
+    ContractStatus, MAX_INJECTED_CONTRACTS, extract_contract_entries, inject_contract_block,
+    merge_contract_entries, parse_contract_block, render_contract_block, strip_contract_block,
+};
+
 /// Default token budget (200k tokens - matches Claude's actual context limit)
 pub const DEFAULT_TOKEN_BUDGET: usize = 200_000;
 
@@ -86,7 +93,9 @@ pub const SUMMARY_PROMPT: &str = r#"Create a durable checkpoint that lets you co
 
 Return Markdown with every section below, in this order. Write `(none)` when a
 section is empty. Do not add a `## Graph Memory State` section: the runtime
-appends deterministic graph anchors after your checkpoint.
+appends deterministic graph anchors after your checkpoint. Do not add a
+`## Task Contracts` section either: the runtime rebuilds it verbatim from the
+marked bullets below.
 
 ## Primary Request and Intent
 The user's original goal and how it evolved. Quote decisive wording exactly.
@@ -163,7 +172,16 @@ pub fn preserve_protected_checkpoint_lines(
         return (summary, 0);
     };
     let mut missing: Vec<&str> = Vec::new();
+    let mut in_task_contracts = false;
     for line in existing.lines() {
+        let section = line.trim();
+        if section.starts_with("## ") {
+            in_task_contracts = section == CONTRACT_HEADING;
+            continue;
+        }
+        if in_task_contracts {
+            continue;
+        }
         let line = line.trim();
         if !is_protected_checkpoint_line(line) || summary.contains(line) {
             continue;
