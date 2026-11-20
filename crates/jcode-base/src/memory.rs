@@ -3278,7 +3278,7 @@ impl MemoryManager {
 
         let project = self.load_project_graph()?;
         let global = self.load_global_graph()?;
-        for (graph, is_project) in [(project, true), (global, false)] {
+        for (mut graph, is_project) in [(project, true), (global, false)] {
             let mixed_models = graph
                 .memories
                 .values()
