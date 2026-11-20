@@ -264,8 +264,13 @@ pub struct MemoryPathQueryOutcome {
     pub unresolved_to: Vec<String>,
     pub unknown_relations: Vec<String>,
     /// Stable diagnosis codes (E01 anchor unresolved, E03 disconnected,
-    /// E05 depth budget exhausted, E10 unknown relation).
+    /// E05 depth budget exhausted, E08 scope mismatch, E09 alignment gap,
+    /// E10 unknown relation).
     pub diagnosis: Vec<String>,
+    /// Coarse ownership of each diagnosis code, deduplicated.
+    pub missing_classes: Vec<String>,
+    /// Deterministic first repairs from the E01-E10 ladder.
+    pub next_actions: Vec<String>,
     /// Deterministic L0 relaxations applied after the first attempt, e.g.
     /// `depth 8 -> 16`. Empty when the original query succeeded.
     pub relaxations: Vec<String>,
@@ -275,6 +280,13 @@ pub struct MemoryPathQueryOutcome {
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
 const MAX_RELAXED_PATH_DEPTH: usize = 16;
+
+fn finalize_path_outcome(mut outcome: MemoryPathQueryOutcome) -> MemoryPathQueryOutcome {
+    outcome.missing_classes =
+        jcode_memory_types::missing_classes_for(&outcome.diagnosis);
+    outcome.next_actions = jcode_memory_types::next_actions_for(&outcome.diagnosis);
+    outcome
+}
 
 /// Explicit bridge between a project-scoped memory and a global memory.
 ///
@@ -7429,13 +7441,13 @@ impl MemoryManager {
             outcome.unresolved_from = froms.to_vec();
             outcome.unresolved_to = tos.to_vec();
             outcome.diagnosis.push("E01".to_string());
-            return Ok(outcome);
+            return Ok(finalize_path_outcome(outcome));
         }
         // A filter made only of unknown names must match nothing. Treating it
         // as an empty filter would turn a typo into an unrestricted query.
         if !unknown_relations.is_empty() && allowed.is_empty() {
             outcome.diagnosis.push("E10".to_string());
-            return Ok(outcome);
+            return Ok(finalize_path_outcome(outcome));
         }
 
         let mut graphs = Vec::new();
@@ -7449,15 +7461,19 @@ impl MemoryManager {
 
         let mut resolved_from = std::collections::HashSet::new();
         let mut resolved_to = std::collections::HashSet::new();
-        for (_, graph) in &graphs {
+        let mut resolved_from_stores = std::collections::HashSet::new();
+        let mut resolved_to_stores = std::collections::HashSet::new();
+        for (label, graph) in &graphs {
             for anchor in froms {
                 if resolve_path_anchor(graph, anchor).is_some() {
                     resolved_from.insert(anchor.clone());
+                    resolved_from_stores.insert(*label);
                 }
             }
             for anchor in tos {
                 if resolve_path_anchor(graph, anchor).is_some() {
                     resolved_to.insert(anchor.clone());
+                    resolved_to_stores.insert(*label);
                 }
             }
         }
@@ -7473,6 +7489,23 @@ impl MemoryManager {
             .collect();
         if !outcome.unresolved_from.is_empty() || !outcome.unresolved_to.is_empty() {
             outcome.diagnosis.push("E01".to_string());
+            let omitted = if scope.includes_project() && !scope.includes_global() {
+                self.load_global_graph().ok()
+            } else if scope.includes_global() && !scope.includes_project() {
+                self.load_project_graph().ok()
+            } else {
+                None
+            };
+            let found_in_omitted = omitted.as_ref().is_some_and(|graph| {
+                outcome
+                    .unresolved_from
+                    .iter()
+                    .chain(outcome.unresolved_to.iter())
+                    .any(|anchor| resolve_path_anchor(graph, anchor).is_some())
+            });
+            if found_in_omitted {
+                outcome.diagnosis.push("E08".to_string());
+            }
         }
         if !outcome.unknown_relations.is_empty() {
             outcome.diagnosis.push("E10".to_string());
@@ -7517,6 +7550,13 @@ impl MemoryManager {
         let mut seen = std::collections::HashSet::new();
         paths.retain(|path| seen.insert(path.nodes.clone()));
         paths.truncate(limit);
+        if paths.is_empty()
+            && !resolved_from.is_empty()
+            && !resolved_to.is_empty()
+            && resolved_from_stores.is_disjoint(&resolved_to_stores)
+        {
+            outcome.diagnosis.push("E09".to_string());
+        }
         if paths.is_empty() && outcome.diagnosis.is_empty() {
             outcome.diagnosis.push("E03".to_string());
             if depth >= 8 {
@@ -7524,7 +7564,7 @@ impl MemoryManager {
             }
         }
         outcome.paths = paths;
-        Ok(outcome)
+        Ok(finalize_path_outcome(outcome))
     }
 
     /// Fetch one memory by id from the requested scope.

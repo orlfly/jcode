@@ -5061,6 +5061,82 @@ fn path_query_relaxes_depth_once_and_records_it() {
 }
 
 #[test]
+fn path_query_reports_scope_mismatch_as_e08() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-scope-mismatch");
+        let mut global = MemoryGraph::new();
+        let g0 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "global scope-only anchor",
+        ));
+        manager.save_global_graph(&global).expect("save global");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &[g0.clone()],
+                &[g0],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("scope mismatch query");
+        assert!(outcome.paths.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.diagnosis, vec!["E01", "E08"]);
+        assert_eq!(
+            outcome.missing_classes,
+            vec!["semantic_gap".to_string(), "query_side".to_string()]
+        );
+        assert!(
+            outcome
+                .next_actions
+                .iter()
+                .any(|action| action.starts_with("E08 L0:")),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
+fn path_query_reports_unbridged_store_split_as_e09() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-alignment-gap");
+        let p0 = manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "project alignment anchor",
+            ))
+            .expect("project anchor");
+        let mut global = MemoryGraph::new();
+        let g0 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "global alignment anchor",
+        ));
+        manager.save_global_graph(&global).expect("save global");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &[p0],
+                &[g0],
+                4,
+                5,
+                MemoryScope::All,
+                &[],
+            )
+            .expect("alignment gap query");
+        assert!(outcome.paths.is_empty(), "{outcome:?}");
+        assert!(outcome.diagnosis.contains(&"E09".to_string()), "{outcome:?}");
+        assert!(
+            outcome
+                .next_actions
+                .iter()
+                .any(|action| action.starts_with("E09 L2:")),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
 fn explicit_bridge_stitches_project_and_global_paths() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/bridge-path");

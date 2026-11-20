@@ -789,6 +789,15 @@ impl Tool for MemoryTool {
                 if !outcome.diagnosis.is_empty() {
                     diagnostics.push(format!("diagnosis: {}", outcome.diagnosis.join(", ")));
                 }
+                if !outcome.missing_classes.is_empty() {
+                    diagnostics.push(format!(
+                        "missing class: {}",
+                        outcome.missing_classes.join(", ")
+                    ));
+                }
+                for action in &outcome.next_actions {
+                    diagnostics.push(format!("next action: {action}"));
+                }
                 for relaxation in &outcome.relaxations {
                     diagnostics.push(format!("relaxation: {relaxation}"));
                 }

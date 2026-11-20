@@ -11,6 +11,11 @@ pub use path_plan::{
     PathPlan, PathPlanTask, PlanActionType, PlanRisk, build_path_plan,
 };
 
+pub mod path_diagnosis;
+pub use path_diagnosis::{
+    PathDiagnosisCode, PathMissingClass, missing_classes_for, next_actions_for,
+};
+
 pub mod graph;
 pub use graph::{
     ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, MemoryPath,
