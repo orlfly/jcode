@@ -5024,3 +5024,96 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         assert_eq!(disconnected.diagnosis, vec!["E03", "E05"]);
     });
 }
+
+#[test]
+fn explicit_bridge_stitches_project_and_global_paths() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/bridge-path");
+        let p0 = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "project entry zero"))
+            .expect("p0");
+        let p1 = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "project entry one"))
+            .expect("p1");
+        manager.link_memories(&p0, &p1, 0.9).expect("project edge");
+
+        let mut global = MemoryGraph::new();
+        let g1 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "global entry one",
+        ));
+        let g2 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "global entry two",
+        ));
+        global.link_memories(&g1, &g2, 0.9);
+        manager.save_global_graph(&global).expect("save global");
+
+        let bridge = manager
+            .link_bridge(&p1, &g1, 0.9, "test")
+            .expect("link bridge");
+        assert_eq!(manager.list_bridges().expect("list").len(), 1);
+
+        let forward = manager
+            .paths_between_anchors(
+                &[p0.clone()],
+                &[g2.clone()],
+                4,
+                5,
+                MemoryScope::All,
+                &[],
+            )
+            .expect("forward bridge path");
+        assert!(
+            forward.paths.iter().any(|path| {
+                path.nodes == vec![p0.clone(), p1.clone(), g1.clone(), g2.clone()]
+                    && path.edges.iter().any(|edge| {
+                        matches!(edge.kind, crate::memory_graph::EdgeKind::Bridge)
+                    })
+            }),
+            "{forward:?}"
+        );
+
+        let reverse = manager
+            .paths_between_anchors(
+                &[g2.clone()],
+                &[p0.clone()],
+                4,
+                5,
+                MemoryScope::All,
+                &[],
+            )
+            .expect("reverse bridge path");
+        assert!(
+            reverse.paths.iter().any(|path| {
+                path.nodes == vec![g2.clone(), g1.clone(), p1.clone(), p0.clone()]
+            }),
+            "{reverse:?}"
+        );
+
+        let filtered = manager
+            .paths_between_anchors(
+                &[p0.clone()],
+                &[g2.clone()],
+                4,
+                5,
+                MemoryScope::All,
+                &["relates_to".to_string()],
+            )
+            .expect("filtered bridge path");
+        assert!(
+            filtered.paths.iter().all(|path| {
+                path.edges
+                    .iter()
+                    .all(|edge| !matches!(edge.kind, crate::memory_graph::EdgeKind::Bridge))
+            }),
+            "{filtered:?}"
+        );
+
+        assert!(manager.unlink_bridge(&bridge.id).expect("unlink"));
+        let after = manager
+            .paths_between_anchors(&[p0], &[g2], 4, 5, MemoryScope::All, &[])
+            .expect("after unlink");
+        assert!(after.paths.is_empty(), "{after:?}");
+    });
+}

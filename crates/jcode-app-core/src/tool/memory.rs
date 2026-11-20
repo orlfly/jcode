@@ -149,7 +149,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Manage memory (remember/recall/search/list/forget/link/path/embed). Default scope: project."
+        "Manage memory (remember/recall/search/list/forget/link/bridge/path/embed). Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -159,7 +159,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "path", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "related", "path", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -180,11 +180,11 @@ impl Tool for MemoryTool {
                 },
                 "from_id": {
                     "type": "string",
-                    "description": "For action=link: source memory id. For action=path: start anchor (id, subject:<key>, tag:<name>, or text)."
+                    "description": "For action=link or bridge: source memory id. For action=path: start anchor (id, subject:<key>, tag:<name>, or text)."
                 },
                 "to_id": {
                     "type": "string",
-                    "description": "For action=link: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
+                    "description": "For action=link or bridge: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
                 },
                 "from_anchors": {
                     "type": "array",
@@ -626,6 +626,49 @@ impl Tool for MemoryTool {
                     "Linked memories {} -> {} (weight {:.2})",
                     from_id, to_id, weight
                 )))
+            }
+            "bridge" => {
+                let project_id = input
+                    .from_id
+                    .ok_or_else(|| anyhow::anyhow!("from_id (project memory) required"))?;
+                let global_id = input
+                    .to_id
+                    .ok_or_else(|| anyhow::anyhow!("to_id (global memory) required"))?;
+                let weight = input.weight.unwrap_or(0.8);
+                memory::set_state(MemoryState::ToolAction {
+                    action: "bridge".into(),
+                    detail: format!(
+                        "{} -> {}",
+                        truncate_for_widget(&project_id, 15),
+                        truncate_for_widget(&global_id, 15)
+                    ),
+                });
+                let bridge = manager.link_bridge(&project_id, &global_id, weight, "user")?;
+                memory::set_state(MemoryState::Idle);
+                Ok(ToolOutput::new(format!(
+                    "Bridged project memory {} to global memory {} (id {}, weight {:.2}, confidence {:.2}).",
+                    bridge.project_id,
+                    bridge.global_id,
+                    bridge.id,
+                    bridge.weight,
+                    bridge.confidence
+                )))
+            }
+            "unbridge" => {
+                let id = input
+                    .id
+                    .ok_or_else(|| anyhow::anyhow!("id required for unbridge"))?;
+                memory::set_state(MemoryState::ToolAction {
+                    action: "unbridge".into(),
+                    detail: truncate_for_widget(&id, 30),
+                });
+                let removed = manager.unlink_bridge(&id)?;
+                memory::set_state(MemoryState::Idle);
+                if removed {
+                    Ok(ToolOutput::new(format!("Removed bridge {id}.")))
+                } else {
+                    Ok(ToolOutput::new(format!("No bridge found with id {id}.")))
+                }
             }
             "related" => {
                 let id = input.id.ok_or_else(|| anyhow::anyhow!("id required"))?;
@@ -1316,6 +1359,7 @@ fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
         EdgeKind::DerivedFrom => "derived_from".to_string(),
         EdgeKind::Contains => "contains".to_string(),
         EdgeKind::NextStep => "next_step".to_string(),
+        EdgeKind::Bridge => "bridge".to_string(),
     }
 }
 
@@ -1456,6 +1500,72 @@ mod tests {
         assert!(output.contains("Found 1 memory path(s)"), "{output}");
         assert!(output.contains("mem_path_c"), "{output}");
         assert!(output.contains("relates_to"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn bridge_action_stitches_project_and_global_paths() {
+        use jcode_base::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let p0 = tool
+            .manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "project bridge zero",
+            ))
+            .expect("p0");
+        let p1 = tool
+            .manager
+            .remember_project(MemoryEntry::new(
+                MemoryCategory::Fact,
+                "project bridge one",
+            ))
+            .expect("p1");
+        tool.manager
+            .link_memories(&p0, &p1, 0.9)
+            .expect("project edge");
+        let mut global = MemoryGraph::new();
+        let g1 = global.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global bridge one"));
+        let g2 = global.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global bridge two"));
+        global.link_memories(&g1, &g2, 0.9);
+        tool.manager
+            .save_global_graph(&global)
+            .expect("save global");
+
+        let output = tool
+            .execute(
+                json!({"action":"bridge","from_id":p1,"to_id":g1,"weight":0.9}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("bridge");
+        assert!(
+            output.output.contains("Bridged project memory"),
+            "{}",
+            output.output
+        );
+
+        let output = tool
+            .execute(
+                json!({"action":"path","from_id":p0,"to_id":g2,"scope":"all","depth":4}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("bridge path");
+        assert!(output.output.contains("bridge"), "{}", output.output);
+        assert!(
+            output.output.contains("global bridge two"),
+            "{}",
+            output.output
+        );
     }
 
     #[tokio::test]

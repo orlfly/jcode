@@ -1026,6 +1026,7 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::DerivedFrom => "derived_from",
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
+        EdgeKind::Bridge => "bridge",
     }
 }
 
@@ -1039,6 +1040,7 @@ fn parse_edge_kind(name: &str) -> Option<EdgeKind> {
         "derived_from" => EdgeKind::DerivedFrom,
         "contains" => EdgeKind::Contains,
         "next_step" => EdgeKind::NextStep,
+        "bridge" => EdgeKind::Bridge,
         _ => return None,
     })
 }

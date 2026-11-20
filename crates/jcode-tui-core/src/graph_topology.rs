@@ -289,6 +289,7 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::DerivedFrom => "derived_from",
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
+        EdgeKind::Bridge => "bridge",
     }
 }
 

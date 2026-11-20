@@ -111,6 +111,11 @@ pub enum EdgeKind {
     Contains,
     /// Ordered step edge between consecutive procedural steps.
     NextStep,
+    /// Explicit cross-store bridge between a project instance and a global one.
+    ///
+    /// This edge exists only in stitched path results; the bridge registry keeps
+    /// the persisted pair, so project and global memory files stay independent.
+    Bridge,
 }
 
 /// One hop in a weighted memory-graph path.
@@ -170,6 +175,7 @@ impl EdgeKind {
             EdgeKind::DerivedFrom => "derived_from",
             EdgeKind::Contains => "contains",
             EdgeKind::NextStep => "next_step",
+            EdgeKind::Bridge => "bridge",
         }
     }
 
@@ -185,6 +191,7 @@ impl EdgeKind {
             "derived_from" => EdgeKind::DerivedFrom,
             "contains" => EdgeKind::Contains,
             "next_step" => EdgeKind::NextStep,
+            "bridge" => EdgeKind::Bridge,
             _ => return None,
         })
     }
@@ -200,6 +207,7 @@ impl EdgeKind {
             EdgeKind::DerivedFrom => 0.7,
             EdgeKind::Contains => 0.9,
             EdgeKind::NextStep => 0.8,
+            EdgeKind::Bridge => 0.9,
         }
     }
 }
@@ -1057,6 +1065,7 @@ impl MemoryGraph {
                     | EdgeKind::InCluster
                     | EdgeKind::RelatesTo { .. }
                     | EdgeKind::Contradicts
+                    | EdgeKind::Bridge
             ) && relation_allowed(&edge.kind, allowed_relations)
             {
                 out.push((
@@ -1083,6 +1092,7 @@ impl MemoryGraph {
             EdgeKind::DerivedFrom => 0.35,
             EdgeKind::Contains => 0.2,
             EdgeKind::NextStep => 0.2,
+            EdgeKind::Bridge => 0.25,
         };
         let degree = self
             .tags

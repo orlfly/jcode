@@ -270,6 +270,23 @@ pub struct MemoryPathQueryOutcome {
     pub depth: usize,
 }
 
+/// Explicit bridge between a project-scoped memory and a global memory.
+///
+/// Bridges are the only sanctioned way to join project and global paths. They
+/// are persisted separately so neither store's graph file is rewritten and the
+/// alignment can be audited or removed independently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryBridge {
+    pub id: String,
+    pub project_store: String,
+    pub project_id: String,
+    pub global_id: String,
+    pub weight: f32,
+    pub confidence: f32,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+}
+
 fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -284,6 +301,31 @@ fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn stitch_paths_with_bridge(
+    left: &jcode_memory_types::MemoryPath,
+    bridge: jcode_memory_types::MemoryPathEdge,
+    right: &jcode_memory_types::MemoryPath,
+    bridge_confidence: f32,
+) -> Option<jcode_memory_types::MemoryPath> {
+    let bridge_from = bridge.from.clone();
+    let bridge_to = bridge.to.clone();
+    let bridge_cost = bridge.cost;
+    if left.nodes.last() != Some(&bridge_from) || right.nodes.first() != Some(&bridge_to) {
+        return None;
+    }
+    let mut nodes = left.nodes.clone();
+    nodes.extend(right.nodes.iter().cloned());
+    let mut edges = left.edges.clone();
+    edges.push(bridge);
+    edges.extend(right.edges.iter().cloned());
+    Some(jcode_memory_types::MemoryPath {
+        nodes,
+        edges,
+        cost: left.cost + bridge_cost + right.cost,
+        confidence: left.confidence.min(bridge_confidence).min(right.confidence),
+    })
 }
 
 /// Resolve a path endpoint without requiring the caller to know an internal id.
@@ -7072,6 +7114,217 @@ impl MemoryManager {
             .paths)
     }
 
+    fn bridge_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("bridges.json"))
+    }
+
+    pub fn list_bridges(&self) -> Result<Vec<MemoryBridge>> {
+        let path = self.bridge_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        storage::read_json(&path)
+    }
+
+    fn save_bridges(&self, bridges: &[MemoryBridge]) -> Result<()> {
+        storage::write_json(&self.bridge_store_path()?, &bridges)
+    }
+
+    /// Link one project memory to one global memory as an explicit bridge.
+    pub fn link_bridge(
+        &self,
+        project_id: &str,
+        global_id: &str,
+        weight: f32,
+        source: &str,
+    ) -> Result<MemoryBridge> {
+        let project_dir = self
+            .get_project_dir()
+            .ok_or_else(|| anyhow::anyhow!("bridge requires a project directory"))?;
+        let project_store = project_store_key(&project_dir);
+        let project = self.load_project_graph()?;
+        let project_entry = project
+            .get_memory(project_id)
+            .ok_or_else(|| anyhow::anyhow!("project memory not found: {project_id}"))?;
+        let global = self.load_global_graph()?;
+        let global_entry = global
+            .get_memory(global_id)
+            .ok_or_else(|| anyhow::anyhow!("global memory not found: {global_id}"))?;
+        let bridge = MemoryBridge {
+            id: format!("bridge:{project_id}:{global_id}"),
+            project_store,
+            project_id: project_id.to_string(),
+            global_id: global_id.to_string(),
+            weight: weight.clamp(0.0, 1.0),
+            confidence: project_entry
+                .confidence
+                .min(global_entry.confidence)
+                .clamp(0.0, 1.0),
+            source: source.to_string(),
+            created_at: Utc::now(),
+        };
+        let mut bridges = self.list_bridges()?;
+        bridges.retain(|existing| existing.id != bridge.id);
+        bridges.push(bridge.clone());
+        bridges.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_bridges(&bridges)?;
+        Ok(bridge)
+    }
+
+    /// Remove a bridge by id. Returns whether a row was removed.
+    pub fn unlink_bridge(&self, id: &str) -> Result<bool> {
+        let mut bridges = self.list_bridges()?;
+        let before = bridges.len();
+        bridges.retain(|bridge| bridge.id != id);
+        if bridges.len() == before {
+            return Ok(false);
+        }
+        self.save_bridges(&bridges)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stitched_bridge_paths(
+        &self,
+        project: &MemoryGraph,
+        global: &MemoryGraph,
+        froms: &[String],
+        tos: &[String],
+        depth: usize,
+        limit: usize,
+        allowed_relations: &[&str],
+    ) -> Result<Vec<jcode_memory_types::MemoryPath>> {
+        if !allowed_relations.is_empty()
+            && !allowed_relations
+                .iter()
+                .any(|relation| relation.eq_ignore_ascii_case("bridge"))
+        {
+            return Ok(Vec::new());
+        }
+        let Some(project_dir) = self.get_project_dir() else {
+            return Ok(Vec::new());
+        };
+        let project_store = project_store_key(&project_dir);
+        let bridges: Vec<MemoryBridge> = self
+            .list_bridges()?
+            .into_iter()
+            .filter(|bridge| bridge.project_store == project_store)
+            .collect();
+        if bridges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for bridge in bridges {
+            let bridge_cost = 0.2 + 0.5 * (1.0 - bridge.confidence.clamp(0.0, 1.0));
+            for from_anchor in froms {
+                let Some(from_project) = resolve_path_anchor(project, from_anchor) else {
+                    continue;
+                };
+                let left_paths = project.k_shortest_paths_with_relations(
+                    &from_project,
+                    &bridge.project_id,
+                    depth,
+                    limit,
+                    allowed_relations,
+                );
+                if left_paths.is_empty() {
+                    continue;
+                }
+                for to_anchor in tos {
+                    let Some(to_global) = resolve_path_anchor(global, to_anchor) else {
+                        continue;
+                    };
+                    let right_paths = global.k_shortest_paths_with_relations(
+                        &bridge.global_id,
+                        &to_global,
+                        depth,
+                        limit,
+                        allowed_relations,
+                    );
+                    for left in &left_paths {
+                        for right in &right_paths {
+                            if left.edges.len() + 1 + right.edges.len() > depth {
+                                continue;
+                            }
+                            let edge = jcode_memory_types::MemoryPathEdge {
+                                from: bridge.project_id.clone(),
+                                to: bridge.global_id.clone(),
+                                kind: jcode_memory_types::EdgeKind::Bridge,
+                                cost: bridge_cost,
+                            };
+                            if let Some(path) = stitch_paths_with_bridge(
+                                left,
+                                edge,
+                                right,
+                                bridge.confidence,
+                            ) {
+                                out.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reverse direction: start in global, cross into project.
+            for from_anchor in froms {
+                let Some(from_global) = resolve_path_anchor(global, from_anchor) else {
+                    continue;
+                };
+                let left_paths = global.k_shortest_paths_with_relations(
+                    &from_global,
+                    &bridge.global_id,
+                    depth,
+                    limit,
+                    allowed_relations,
+                );
+                if left_paths.is_empty() {
+                    continue;
+                }
+                for to_anchor in tos {
+                    let Some(to_project) = resolve_path_anchor(project, to_anchor) else {
+                        continue;
+                    };
+                    let right_paths = project.k_shortest_paths_with_relations(
+                        &bridge.project_id,
+                        &to_project,
+                        depth,
+                        limit,
+                        allowed_relations,
+                    );
+                    for left in &left_paths {
+                        for right in &right_paths {
+                            if left.edges.len() + 1 + right.edges.len() > depth {
+                                continue;
+                            }
+                            let edge = jcode_memory_types::MemoryPathEdge {
+                                from: bridge.global_id.clone(),
+                                to: bridge.project_id.clone(),
+                                kind: jcode_memory_types::EdgeKind::Bridge,
+                                cost: bridge_cost,
+                            };
+                            if let Some(path) = stitch_paths_with_bridge(
+                                left,
+                                edge,
+                                right,
+                                bridge.confidence,
+                            ) {
+                                out.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Cheapest k memory-graph paths between two anchor sets.
     ///
     /// This is the deterministic half of the design document's constrained
@@ -7131,16 +7384,16 @@ impl MemoryManager {
 
         let mut graphs = Vec::new();
         if scope.includes_project() {
-            graphs.push(self.load_project_graph()?);
+            graphs.push(("project", self.load_project_graph()?));
         }
         if scope.includes_global() {
-            graphs.push(self.load_global_graph()?);
+            graphs.push(("global", self.load_global_graph()?));
         }
         outcome.stores_searched = graphs.len();
 
         let mut resolved_from = std::collections::HashSet::new();
         let mut resolved_to = std::collections::HashSet::new();
-        for graph in &graphs {
+        for (_, graph) in &graphs {
             for anchor in &froms {
                 if resolve_path_anchor(graph, anchor).is_some() {
                     resolved_from.insert(anchor.clone());
@@ -7170,7 +7423,7 @@ impl MemoryManager {
         }
 
         let mut paths = Vec::new();
-        for graph in &graphs {
+        for (_, graph) in &graphs {
             let from_nodes: Vec<String> = froms
                 .iter()
                 .filter_map(|anchor| resolve_path_anchor(graph, anchor))
@@ -7186,6 +7439,25 @@ impl MemoryManager {
                     ));
                 }
             }
+        }
+        let project = graphs
+            .iter()
+            .find(|(label, _)| *label == "project")
+            .map(|(_, graph)| graph);
+        let global = graphs
+            .iter()
+            .find(|(label, _)| *label == "global")
+            .map(|(_, graph)| graph);
+        if let (Some(project), Some(global)) = (project, global) {
+            paths.extend(self.stitched_bridge_paths(
+                project,
+                global,
+                &froms,
+                &tos,
+                depth,
+                limit,
+                &allowed,
+            )?);
         }
         paths.sort_by(|left, right| {
             left.cost
