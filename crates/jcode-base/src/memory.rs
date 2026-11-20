@@ -3630,6 +3630,140 @@ impl MemoryManager {
         Ok(results)
     }
 
+    /// Hybrid memory retrieval over FTS, gvec vector search, and exact tag
+    /// lookup.
+    ///
+    /// The three channels are fused with reciprocal rank fusion (RRF), then a
+    /// small strength/recency/confidence prior is added. This keeps lexical
+    /// precision for paths and identifiers while recovering semantic neighbours
+    /// that FTS misses, and lets shared tags pull related memories into the
+    /// candidate pool without scanning the whole graph.
+    pub fn hybrid_search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: MemoryScope,
+    ) -> Result<Vec<(MemoryEntry, f32)>> {
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries: std::collections::HashMap<String, MemoryEntry> =
+            std::collections::HashMap::new();
+        if scope.includes_project() {
+            for (id, entry) in &self.load_project_graph()?.memories {
+                entries.insert(id.clone(), entry.clone());
+            }
+        }
+        if scope.includes_global() {
+            for (id, entry) in &self.load_global_graph()?.memories {
+                entries.entry(id.clone()).or_insert_with(|| entry.clone());
+            }
+        }
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const RRF_K: f32 = 60.0;
+        let mut fused: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        let mut add_rank = |id: &str, rank: usize| {
+            if entries.contains_key(id) {
+                *fused.entry(id.to_string()).or_insert(0.0) +=
+                    1.0 / (RRF_K + rank as f32 + 1.0);
+            }
+        };
+
+        // Lexical channel. `search_scoped` already uses the gvec FTS5 backend
+        // when available and falls back to the in-memory scan otherwise.
+        for (rank, entry) in self.search_scoped(query, scope)?.iter().enumerate() {
+            add_rank(&entry.id, rank);
+        }
+
+        // Dense channel. Failures (missing model, dimension mismatch, no
+        // embeddings) degrade to the lexical channel instead of failing recall.
+        let mut store_keys = Vec::new();
+        if scope.includes_project()
+            && let Some(project) = self.get_project_dir()
+        {
+            store_keys.push(StoreKey::new(project_store_key(&project)));
+        }
+        if scope.includes_global() {
+            store_keys.push(StoreKey::new(global_store_key().to_string()));
+        }
+        let backend = if self.test_mode {
+            test_backend()
+        } else {
+            graph_backend()
+        };
+        if let Ok((query_embedding, _model)) =
+            crate::embedding_backend::embed_query_active(query)
+        {
+            for key in &store_keys {
+                match backend.vector_search(key, &query_embedding, (limit * 5).max(24)) {
+                    Ok(hits) => {
+                        for (rank, (id, _score)) in hits.iter().enumerate() {
+                            add_rank(id, rank);
+                        }
+                    }
+                    Err(error) => crate::logging::info(&format!(
+                        "Hybrid vector search failed for {}: {error}",
+                        key.as_str()
+                    )),
+                }
+            }
+        }
+
+        // Exact tag channel. Query terms are used as tag anchors; this is
+        // deliberately limited to a handful of terms so a long query does not
+        // explode into hundreds of tag probes.
+        let terms: Vec<String> = normalize_search_text(query)
+            .split_whitespace()
+            .filter(|term| term.len() >= 3)
+            .take(8)
+            .map(str::to_string)
+            .collect();
+        for key in &store_keys {
+            for term in &terms {
+                match backend.tag_search(key, term, (limit * 2).max(8)) {
+                    Ok(hits) => {
+                        for (rank, (id, _score)) in hits.iter().enumerate() {
+                            add_rank(id, rank);
+                        }
+                    }
+                    Err(error) => crate::logging::info(&format!(
+                        "Hybrid tag search failed for {}: {error}",
+                        key.as_str()
+                    )),
+                }
+            }
+        }
+
+        let now = Utc::now();
+        let mut scored: Vec<(MemoryEntry, f32)> = fused
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let entry = entries.remove(&id)?;
+                if !entry.is_retrievable_now() {
+                    return None;
+                }
+                let age_days = (now - entry.updated_at).num_seconds() as f32 / 86_400.0;
+                let prior = (entry.strength as f32).ln() * 0.002
+                    + (-age_days / 14.0).exp() * 0.004
+                    + entry.confidence.clamp(0.0, 1.0) * 0.05;
+                Some((entry, score + prior))
+            })
+            .collect();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.id.cmp(&right.0.id))
+        });
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
     pub fn list_all(&self) -> Result<Vec<MemoryEntry>> {
         self.list_all_scoped(MemoryScope::All)
     }

@@ -29,7 +29,7 @@
 
 use crate::storage;
 use anyhow::{Context, Result};
-use gvec::{Database, Graph};
+use gvec::{Database, Distance, Graph, VectorValue};
 use gvec_core::sql::SqlExecutor as _;
 use gvec_core::storage::Storage;
 use jcode_memory_types::{
@@ -687,6 +687,97 @@ impl GraphBackend for SqliteGvecBackend {
         }
         Ok(out)
     }
+
+    fn vector_search(&self, key: &StoreKey, query: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
+        if query.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.graph(key)?;
+        let query = VectorValue::F32(query.to_vec());
+        let indexed = ensure_vector_index(&g).and_then(|_| {
+            g.vector_search("Memory", "embedding", &query, k)
+                .map_err(|e| anyhow::anyhow!("gvec vector_search: {e}"))
+        });
+        let hits = match indexed {
+            Ok(hits) => hits,
+            Err(error) => {
+                crate::logging::info(&format!(
+                    "gvec vector index unavailable, using exact scan: {error}"
+                ));
+                g.exact_vector_search("Memory", "embedding", &query, k, Distance::Cosine)?
+            }
+        };
+        let mut out = Vec::with_capacity(hits.len());
+        for (rowid, distance) in hits {
+            if let Some(id) = rowid_to_memory_id(&g, rowid)? {
+                // The index uses cosine distance: 0 is identical, 2 is
+                // opposite. Convert to a descending similarity score.
+                out.push((id, (1.0 - distance).clamp(-1.0, 1.0)));
+            }
+        }
+        Ok(out)
+    }
+
+    fn tag_search(&self, key: &StoreKey, tag: &str, k: usize) -> Result<Vec<(String, f32)>> {
+        let tag = tag.trim();
+        if tag.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let g = self.graph(key)?;
+        ensure_tag_index(&g)?;
+        let rowids = g.tag_search("Memory", "tags", tag, k)?;
+        let mut out = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            if let Some(id) = rowid_to_memory_id(&g, rowid)? {
+                out.push((id, 1.0));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Lazily create the cosine HNSW index over `Memory.embedding`.
+///
+/// The index is rebuilt by gvec when it is created. If the store contains
+/// mixed embedding models with different dimensions, creation fails; callers
+/// fall back to an exact scan that filters by query dimension.
+fn ensure_vector_index(graph: &Graph) -> Result<()> {
+    let exists = graph
+        .list_vector_indexes()?
+        .iter()
+        .any(|meta| meta.label == "Memory" && meta.property == "embedding");
+    if exists {
+        return Ok(());
+    }
+    graph
+        .create_vector_index(
+            "Memory",
+            "embedding",
+            "hnsw",
+            Some("cosine"),
+            Some(json!({
+                "m": 16,
+                "ef_construction": 200,
+                "ef_search": 64
+            })),
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("create Memory.embedding vector index: {e}"))
+}
+
+/// Lazily create the exact tag index over `Memory.tags`.
+fn ensure_tag_index(graph: &Graph) -> Result<()> {
+    let exists = graph
+        .list_tag_indexes()?
+        .iter()
+        .any(|meta| meta.label == "Memory" && meta.property == "tags");
+    if exists {
+        return Ok(());
+    }
+    graph
+        .create_tag_index("Memory", "tags")
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("create Memory.tags tag index: {e}"))
 }
 
 /// Lazily create a standalone-content FTS5 shadow index for
@@ -1264,6 +1355,48 @@ mod tests {
             hits[0].0, py_hits[0].0,
             "rust and python must hit distinct rows"
         );
+    }
+
+    #[test]
+    fn vector_search_finds_nearest_memory_through_gvec_index() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("vector-test");
+
+        let mut graph = MemoryGraph::new();
+        let mut near = MemoryEntry::new(MemoryCategory::Fact, "near vector");
+        near.set_embedding(Some(vec![1.0, 0.0, 0.0]), Some("test-model".into()));
+        let near_id = graph.add_memory(near);
+        let mut far = MemoryEntry::new(MemoryCategory::Fact, "far vector");
+        far.set_embedding(Some(vec![0.0, 1.0, 0.0]), Some("test-model".into()));
+        let far_id = graph.add_memory(far);
+        backend.save(&key, &graph).unwrap();
+
+        let hits = backend.vector_search(&key, &[0.9, 0.1, 0.0], 2).unwrap();
+        assert_eq!(
+            hits.first().map(|(id, _)| id.as_str()),
+            Some(near_id.as_str())
+        );
+        assert!(hits.iter().any(|(id, _)| id == &far_id));
+    }
+
+    #[test]
+    fn tag_search_finds_memory_by_exact_tag() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("tag-test");
+
+        let mut graph = MemoryGraph::new();
+        let rust = graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "rust memory").with_tags(vec!["rust".into()]),
+        );
+        let python = graph.add_memory(
+            MemoryEntry::new(MemoryCategory::Fact, "python memory")
+                .with_tags(vec!["python".into()]),
+        );
+        backend.save(&key, &graph).unwrap();
+
+        let hits = backend.tag_search(&key, "rust", 10).unwrap();
+        assert_eq!(hits, vec![(rust, 1.0)]);
+        assert!(backend.tag_search(&key, "rust", 10).unwrap()[0].0 != python);
     }
 
     #[test]

@@ -86,7 +86,7 @@ struct MemoryInput {
     /// Maximum results. Recall defaults to 10, list/search remain uncapped when omitted.
     #[serde(default)]
     limit: Option<usize>,
-    /// For recall action: retrieval mode
+    /// For recall: `recent` or `jev`. For search: `hybrid` (FTS + vector + tags).
     #[serde(default)]
     mode: Option<String>,
     /// For recall action: engineering graph anchor such as `file:src/lib.rs`.
@@ -172,6 +172,11 @@ impl Tool for MemoryTool {
                     "description": "For action=link: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
                 },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
+                "mode": {
+                    "type": "string",
+                    "enum": ["recent", "jev", "hybrid"],
+                    "description": "Retrieval mode. For recall: recent or jev. For search: hybrid (FTS + vector + tags)."
+                },
                 "anchor": {
                     "type": "string",
                     "description": "For action=recall: engineering graph anchor (file:, error:, command:, task:). Returns the stored subgraph around it."
@@ -458,10 +463,18 @@ impl Tool for MemoryTool {
                     action: "search".into(),
                     detail: truncate_for_widget(&query, 40),
                 });
-                let mut results = manager.search_scoped(&query, scope)?;
-                if let Some(limit) = input.limit {
+                let limit = input.limit.unwrap_or(10);
+                let results = if input.mode.as_deref() == Some("hybrid") {
+                    manager
+                        .hybrid_search_scoped(&query, limit, scope)?
+                        .into_iter()
+                        .map(|(entry, _score)| entry)
+                        .collect()
+                } else {
+                    let mut results = manager.search_scoped(&query, scope)?;
                     results.truncate(limit);
-                }
+                    results
+                };
                 memory::add_event(MemoryEventKind::ToolRecalled {
                     query: truncate_for_widget(&query, 40),
                     count: results.len(),
@@ -1126,11 +1139,11 @@ mod tests {
         assert!(props.contains_key("from_id"));
         assert!(props.contains_key("to_id"));
         assert!(props.contains_key("limit"));
+        assert!(props.contains_key("mode"));
         assert!(props.contains_key("anchor"));
         assert!(props.contains_key("extraction_action"));
         assert!(!props.contains_key("weight"));
         assert!(!props.contains_key("depth"));
-        assert!(!props.contains_key("mode"));
     }
 
     #[tokio::test]

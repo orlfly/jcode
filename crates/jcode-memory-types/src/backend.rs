@@ -151,6 +151,33 @@ pub trait GraphBackend: Debug + Send + Sync {
         Ok(vec![])
     }
 
+    /// Run a vector similarity search over the Memory nodes of `key`.
+    ///
+    /// `query` is the query embedding. Returns `(memory_id, similarity)` pairs
+    /// ordered by descending similarity. Backends without a vector index return
+    /// an empty list so callers can fall back to lexical or graph retrieval.
+    fn vector_search(
+        &self,
+        _key: &StoreKey,
+        _query: &[f32],
+        _k: usize,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Ok(vec![])
+    }
+
+    /// Search Memory nodes by an exact tag value.
+    ///
+    /// Returns `(memory_id, score)` pairs, highest score first. The default is
+    /// empty so JSON and custom backends keep working unchanged.
+    fn tag_search(
+        &self,
+        _key: &StoreKey,
+        _tag: &str,
+        _k: usize,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Ok(vec![])
+    }
+
     /// Enumerate every store key that currently has persisted state.
     ///
     /// Used by cross-project maintenance passes (e.g. the ambient garden's
