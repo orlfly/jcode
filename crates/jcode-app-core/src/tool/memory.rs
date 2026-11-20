@@ -85,6 +85,9 @@ struct MemoryInput {
     /// For path action: canonical EdgeKind names to allow. Empty means all.
     #[serde(default)]
     relation_allow: Option<Vec<String>>,
+    /// For path action: memory (default) or engineering.
+    #[serde(default)]
+    graph: Option<String>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -192,11 +195,13 @@ impl Tool for MemoryTool {
                 },
                 "relation_allow": {
                     "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["has_tag", "in_cluster", "relates_to", "supersedes", "contradicts", "derived_from", "contains", "next_step"]
-                    },
-                    "description": "For action=path: restrict traversal to these relation types. Omit to allow all."
+                    "items": { "type": "string" },
+                    "description": "For action=path: restrict traversal to these relation names. Omit to allow all. Memory graph uses EdgeKind names; engineering graph uses relation ids like modifies/causes."
+                },
+                "graph": {
+                    "type": "string",
+                    "enum": ["memory", "engineering"],
+                    "description": "For action=path: which persisted graph to search. Default memory; engineering reads session engineering episodes by anchor id."
                 },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
                 "mode": {
@@ -672,6 +677,15 @@ impl Tool for MemoryTool {
                     return Err(anyhow::anyhow!("to_id or to_anchors required for path"));
                 }
                 let relations = input.relation_allow.unwrap_or_default();
+                let graph_kind = input.graph.unwrap_or_else(|| "memory".to_string());
+                if graph_kind == "engineering" {
+                    return Self::path_engineering(&froms, &tos, depth, limit, &relations);
+                }
+                if graph_kind != "memory" {
+                    return Err(anyhow::anyhow!(
+                        "Unknown path graph: {graph_kind}. Use memory or engineering"
+                    ));
+                }
 
                 memory::set_state(MemoryState::ToolAction {
                     action: "path".into(),
@@ -1078,6 +1092,100 @@ impl Tool for MemoryTool {
 }
 
 impl MemoryTool {
+    /// Search persisted engineering episode graphs for typed anchor paths.
+    fn path_engineering(
+        froms: &[String],
+        tos: &[String],
+        depth: usize,
+        limit: usize,
+        relations: &[String],
+    ) -> Result<ToolOutput> {
+        if limit == 0 {
+            return Ok(ToolOutput::new("No engineering paths requested."));
+        }
+        let store = EngineeringStore::open_default()
+            .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+        let allowed: Vec<&str> = relations.iter().map(String::as_str).collect();
+        let mut hits = Vec::new();
+        for from in froms {
+            for to in tos {
+                hits.extend(
+                    store
+                        .path_between_anchors(from, to, depth, limit, &allowed)
+                        .map_err(|error| anyhow::anyhow!("engineering path query: {error}"))?,
+                );
+            }
+        }
+        hits.sort_by(|left, right| {
+            left.path
+                .cost
+                .total_cmp(&right.path.cost)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.path.nodes.cmp(&right.path.nodes))
+        });
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|hit| seen.insert((hit.session_id.clone(), hit.path.nodes.clone())));
+        hits.truncate(limit);
+
+        if hits.is_empty() {
+            let mut out = format!(
+                "No engineering path found from [{}] to [{}] within depth {}.",
+                froms.join(", "),
+                tos.join(", "),
+                depth.clamp(1, 16)
+            );
+            if !relations.is_empty() {
+                out.push_str(&format!(
+                    "\n- relation allow-list: {} (unknown names match nothing)",
+                    relations.join(", ")
+                ));
+            }
+            return Ok(ToolOutput::new(out));
+        }
+
+        let mut out = format!(
+            "Found {} engineering path(s) from [{}] to [{}] (depth {}):\n",
+            hits.len(),
+            froms.join(", "),
+            tos.join(", "),
+            depth.clamp(1, 16)
+        );
+        let mut current_session = None;
+        for (index, hit) in hits.iter().enumerate() {
+            if current_session.as_deref() != Some(hit.session_id.as_str()) {
+                out.push_str(&format!("\n## session {}\n", hit.session_id));
+                if let Some(working_dir) = hit.working_dir.as_deref() {
+                    out.push_str(&format!("working_dir: {working_dir}\n"));
+                }
+                current_session = Some(hit.session_id.clone());
+            }
+            out.push_str(&format!(
+                "\nPath {}: cost {:.2}, confidence {:.0}%, {} hop(s)\n",
+                index + 1,
+                hit.path.cost,
+                hit.path.confidence * 100.0,
+                hit.path.hop_count()
+            ));
+            for (node_index, node_id) in hit.path.nodes.iter().enumerate() {
+                let label = hit
+                    .node_labels
+                    .get(node_index)
+                    .map(String::as_str)
+                    .unwrap_or(node_id);
+                out.push_str(&format!("  `{node_id}` ({label})\n"));
+                if let Some(relation) = hit.path.relations.get(node_index) {
+                    let relation_label = hit
+                        .relation_labels
+                        .get(node_index)
+                        .map(String::as_str)
+                        .unwrap_or(relation);
+                    out.push_str(&format!("  --{relation_label}-->\n"));
+                }
+            }
+        }
+        Ok(ToolOutput::new(out))
+    }
+
     /// Read back persisted episode subgraphs around a stable graph id.
     fn recall_engineering_anchor(anchor: &str, depth: usize, limit: usize) -> Result<ToolOutput> {
         if limit == 0 {
@@ -1433,6 +1541,85 @@ mod tests {
             output.output
         );
         assert!(output.output.contains("modifies"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn path_action_reads_persisted_engineering_graph() {
+        use crate::message::{ContentBlock, Message, Role};
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "edit".to_string(),
+                    input: json!({
+                        "file_path": "src/lib.rs",
+                        "old_string": "a",
+                        "new_string": "b",
+                    }),
+                    thought_signature: None,
+                }]
+                .into(),
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: "ok".to_string(),
+                    is_error: Some(false),
+                }]
+                .into(),
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+        ];
+        let extraction = jcode_base::engineering_episode::extract_engineering_episode(
+            "session-path",
+            &messages,
+            Some("/repo"),
+        );
+        EngineeringStore::open_default()
+            .expect("store")
+            .save_graph("session-path", Some("/repo"), &extraction.graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"action:call-1",
+                    "to_id":"file:src/lib.rs",
+                    "relation_allow":["modifies"],
+                    "depth":2
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("engineering path");
+        assert!(
+            output.output.contains("Found 1 engineering path(s)"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("session-path"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("modifies"), "{}", output.output);
+        assert!(
+            output.output.contains("file:src/lib.rs"),
+            "{}",
+            output.output
+        );
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use jcode_memory_types::engineering_ontology::{
-    CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringRelation,
+    CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringPath, EngineeringRelation,
     default_engineering_ontology,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -42,6 +42,19 @@ pub struct EngineeringAnchorRecall {
     pub session_id: String,
     pub working_dir: Option<String>,
     pub graph: EngineeringGraph,
+}
+
+/// One scored path between two engineering anchors.
+///
+/// Labels are resolved at read time so callers can render the route without
+/// re-opening the session graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineeringPathHit {
+    pub session_id: String,
+    pub working_dir: Option<String>,
+    pub path: EngineeringPath,
+    pub node_labels: Vec<String>,
+    pub relation_labels: Vec<String>,
 }
 
 /// One session selected by the engineering retention policy.
@@ -610,6 +623,114 @@ impl EngineeringStore {
         }
         Ok(out)
     }
+
+    /// Find stored engineering paths between two stable anchors.
+    ///
+    /// Only sessions whose entity index contains both anchors are decoded. The
+    /// result is sorted by path cost, then session id and node sequence so the
+    /// same store always yields the same route order.
+    pub fn path_between_anchors(
+        &self,
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        limit: usize,
+        allowed_relations: &[&str],
+    ) -> Result<Vec<EngineeringPathHit>> {
+        let from_anchor = from_anchor.trim();
+        let to_anchor = to_anchor.trim();
+        if from_anchor.is_empty() || to_anchor.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let depth = depth.clamp(1, 16);
+        let limit = limit.min(20);
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT e.session_id, e.working_dir, e.graph_json, e.graph_blob
+                FROM engineering_graphs e
+                WHERE EXISTS (
+                    SELECT 1 FROM engineering_entity_index i
+                    WHERE i.session_id = e.session_id AND i.entity_id = ?1
+                )
+                  AND EXISTS (
+                    SELECT 1 FROM engineering_entity_index i
+                    WHERE i.session_id = e.session_id AND i.entity_id = ?2
+                )
+                ORDER BY e.updated_at DESC
+                "#,
+            )
+            .context("prepare engineering path query")?;
+        let rows = statement
+            .query_map(params![from_anchor, to_anchor], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })
+            .context("query engineering paths")?;
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let (session_id, working_dir, json, blob) = row.context("read engineering path row")?;
+            let graph = match decode_graph(&json, blob.as_deref()) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::logging::warn(&format!(
+                        "engineering store skipped malformed graph for {session_id}: {error}"
+                    ));
+                    continue;
+                }
+            };
+            for path in graph.k_shortest_paths(
+                from_anchor,
+                to_anchor,
+                depth,
+                allowed_relations,
+                limit,
+            ) {
+                let node_labels = path
+                    .nodes
+                    .iter()
+                    .map(|id| {
+                        graph
+                            .entity(id)
+                            .map(|entity| entity.name.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect();
+                let relation_labels = path
+                    .relations
+                    .iter()
+                    .map(|id| {
+                        graph
+                            .relation(id)
+                            .map(|relation| relation.relation.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect();
+                hits.push(EngineeringPathHit {
+                    session_id: session_id.clone(),
+                    working_dir: working_dir.clone(),
+                    path,
+                    node_labels,
+                    relation_labels,
+                });
+            }
+        }
+        hits.sort_by(|left, right| {
+            left.path
+                .cost
+                .total_cmp(&right.path.cost)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.path.nodes.cmp(&right.path.nodes))
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
 }
 
 fn configure_connection(connection: &Connection) -> Result<()> {
@@ -780,6 +901,50 @@ mod tests {
         assert!(graph.entities.contains_key("command:cargo-test"));
         assert!(graph.entities.contains_key("error:boom"));
         assert_eq!(graph.relations.len(), 2);
+    }
+
+    #[test]
+    fn path_between_anchors_returns_scored_typed_route() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        store
+            .save_graph("session-1", Some("/repo"), &sample_graph())
+            .expect("save");
+
+        let hits = store
+            .path_between_anchors(
+                "command:cargo-test",
+                "file:src/lib.rs",
+                3,
+                5,
+                &["modifies"],
+            )
+            .expect("path");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "session-1");
+        assert_eq!(
+            hits[0].path.nodes,
+            vec![
+                "command:cargo-test".to_string(),
+                "file:src/lib.rs".to_string()
+            ]
+        );
+        assert_eq!(hits[0].relation_labels, vec!["modifies"]);
+        assert_eq!(
+            hits[0].node_labels,
+            vec!["cargo test".to_string(), "src/lib.rs".to_string()]
+        );
+        assert!(hits[0].working_dir.as_deref() == Some("/repo"));
+
+        let filtered = store
+            .path_between_anchors(
+                "command:cargo-test",
+                "file:src/lib.rs",
+                3,
+                5,
+                &["causes"],
+            )
+            .expect("filtered path");
+        assert!(filtered.is_empty());
     }
 
     #[test]
