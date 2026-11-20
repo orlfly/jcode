@@ -1414,11 +1414,11 @@ pub(crate) enum MemoryCommand {
 
     /// Inspect and resolve the memory review queue
     Review {
-        /// list, triage, accept, accept-batch, prune-stale, reject, defer, or reopen
+        /// list, triage, accept, accept-batch, prune-stale, reject, defer, reopen, or retarget
         #[arg(default_value = "list")]
         action: String,
 
-        /// Review item id (required for accept/reject/defer/reopen)
+        /// Review item id (required for accept/reject/defer/reopen/retarget)
         id: Option<String>,
 
         /// Filter for list: pending, accepted, rejected, deferred, all
@@ -1436,6 +1436,10 @@ pub(crate) enum MemoryCommand {
         /// Comma-separated actions for accept-batch (empty means all)
         #[arg(long)]
         actions: Option<String>,
+
+        /// Corrected admission action for retarget: insert or relate
+        #[arg(long)]
+        new_action: Option<String>,
 
         /// Maximum items for accept-batch
         #[arg(long, default_value_t = 100)]

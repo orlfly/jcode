@@ -2406,6 +2406,54 @@ impl MemoryManager {
         Ok(updated)
     }
 
+    /// Re-open a deferred review with a corrected admission action.
+    pub fn retarget_review(
+        &self,
+        id: &str,
+        new_action: &str,
+        reviewer: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryReviewItem> {
+        let new_action = new_action.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(new_action.as_str(), "insert" | "relate"),
+            "unsupported review retarget action '{new_action}'; use insert or relate"
+        );
+
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        let item = items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Review item not found: {id}"))?;
+        anyhow::ensure!(
+            item.status == ReviewStatus::Deferred,
+            "Review item {id} is not deferred"
+        );
+        if new_action == "relate" {
+            anyhow::ensure!(
+                item.old.is_some(),
+                "cannot retarget review {id} to relate without an old target"
+            );
+        }
+
+        item.action = new_action.clone();
+        item.status = ReviewStatus::Pending;
+        item.confirmed_by = Some(reviewer.to_string());
+        item.confirmed_at = Some(Utc::now());
+        if let Some(note) = note {
+            item.note = Some(note.to_string());
+        }
+        if new_action == "insert" {
+            item.old = None;
+            item.related.clear();
+            item.diff = vec!["new".to_string()];
+        }
+        let updated = item.clone();
+        review::save_items(&path, &items)?;
+        Ok(updated)
+    }
+
     fn manager_for_review(&self, item: &MemoryReviewItem) -> Result<MemoryManager> {
         match item.project_dir.as_deref() {
             Some(dir) if !dir.trim().is_empty() => Ok(self.clone().with_project_dir(dir)),

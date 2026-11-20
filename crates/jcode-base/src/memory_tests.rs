@@ -4293,6 +4293,41 @@ fn deferred_review_can_be_reopened_and_accepted() {
 }
 
 #[test]
+fn deferred_review_can_be_retargeted_and_accepted() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-retarget");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "The sandbox bucket is named sandbox-2026",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.3),
+        );
+        let MemoryWriteOutcome::PendingReview { review_id, .. } =
+            manager.remember_project_governed(entry).unwrap()
+        else {
+            panic!("low confidence should queue");
+        };
+
+        manager
+            .defer_review(&review_id, "tester", Some("wrong action"))
+            .unwrap();
+        let retargeted = manager
+            .retarget_review(&review_id, "insert", "tester", Some("admit as new"))
+            .unwrap();
+        assert_eq!(retargeted.action, "insert");
+        assert_eq!(retargeted.status, ReviewStatus::Pending);
+        assert!(retargeted.old.is_none());
+
+        manager
+            .accept_review(&review_id, "tester", Some("verified"))
+            .unwrap();
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 1);
+    });
+}
+
+#[test]
 fn accepting_relate_review_links_new_memory_to_old() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/review-relate");

@@ -1648,6 +1648,7 @@ pub enum MemorySubcommand {
         reviewer: String,
         note: Option<String>,
         actions: Option<String>,
+        new_action: Option<String>,
         max: usize,
         project: Option<String>,
         apply: bool,
@@ -2311,6 +2312,7 @@ async fn run_memory_command_for_dir(
             reviewer,
             note,
             actions,
+            new_action,
             max,
             project,
             apply,
@@ -2423,7 +2425,7 @@ async fn run_memory_command_for_dir(
                     }
                 }
             }
-            "accept" | "reject" | "defer" | "reopen" => {
+            "accept" | "reject" | "defer" | "reopen" | "retarget" => {
                 let id = id
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("review id required for {}", action))?;
@@ -2431,7 +2433,13 @@ async fn run_memory_command_for_dir(
                     "accept" => manager.accept_review(id, &reviewer, note.as_deref())?,
                     "reject" => manager.reject_review(id, &reviewer, note.as_deref())?,
                     "defer" => manager.defer_review(id, &reviewer, note.as_deref())?,
-                    _ => manager.reopen_review(id, &reviewer, note.as_deref())?,
+                    "reopen" => manager.reopen_review(id, &reviewer, note.as_deref())?,
+                    _ => {
+                        let new_action = new_action.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("--new-action is required for retarget")
+                        })?;
+                        manager.retarget_review(id, new_action, &reviewer, note.as_deref())?
+                    }
                 };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&item)?);
