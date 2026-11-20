@@ -3300,22 +3300,70 @@ impl MemoryManager {
             ids.truncate(available);
 
             let mut changed = false;
-            for id in ids {
-                attempted += 1;
-                let Some(entry) = graph.memories.get_mut(&id) else {
+            // Remote embedders are charged per HTTP request, so backfill in
+            // small batches. If a batch fails, retry its rows individually so
+            // one oversized or malformed memory cannot strand its neighbours.
+            const BATCH: usize = 32;
+            for chunk in ids.chunks(BATCH) {
+                let chunk_ids: Vec<String> = chunk
+                    .iter()
+                    .filter(|id| graph.memories.contains_key(*id))
+                    .cloned()
+                    .collect();
+                if chunk_ids.is_empty() {
                     continue;
-                };
-                match crate::embedding_backend::embed_passage_active(&entry.content) {
-                    Ok((embedding, model)) => {
-                        entry.set_embedding(Some(embedding), Some(model));
-                        generated += 1;
-                        changed = true;
+                }
+                attempted += chunk_ids.len();
+                let texts: Vec<String> = chunk_ids
+                    .iter()
+                    .filter_map(|id| graph.memories.get(id).map(|entry| entry.content.clone()))
+                    .collect();
+                let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                let batch = crate::embedding_backend::embed_passages_active(&text_refs);
+                let mut stored = false;
+                match batch {
+                    Ok((vectors, model)) if vectors.len() == chunk_ids.len() => {
+                        for (id, embedding) in chunk_ids.iter().zip(vectors) {
+                            if let Some(entry) = graph.memories.get_mut(id) {
+                                entry.set_embedding(Some(embedding), Some(model.clone()));
+                                generated += 1;
+                                changed = true;
+                            }
+                        }
+                        stored = true;
+                    }
+                    Ok((vectors, _)) => {
+                        crate::logging::info(&format!(
+                            "bounded embedding backfill batch returned {} vectors for {} passages",
+                            vectors.len(),
+                            chunk_ids.len()
+                        ));
                     }
                     Err(error) => {
-                        failed += 1;
                         crate::logging::info(&format!(
-                            "bounded embedding backfill failed for {id}: {error}"
+                            "bounded embedding backfill batch failed: {error}"
                         ));
+                    }
+                }
+                if stored {
+                    continue;
+                }
+                for id in chunk_ids {
+                    let Some(entry) = graph.memories.get_mut(&id) else {
+                        continue;
+                    };
+                    match crate::embedding_backend::embed_passage_active(&entry.content) {
+                        Ok((embedding, model)) => {
+                            entry.set_embedding(Some(embedding), Some(model));
+                            generated += 1;
+                            changed = true;
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            crate::logging::info(&format!(
+                                "bounded embedding backfill failed for {id}: {error}"
+                            ));
+                        }
                     }
                 }
             }
@@ -3344,7 +3392,7 @@ impl MemoryManager {
             .memories
             .values()
             .chain(global.memories.values())
-            .filter(|entry| entry.embedding.is_none())
+            .filter(|entry| entry.embedding.is_none() && entry.is_retrievable_now())
             .count())
     }
 

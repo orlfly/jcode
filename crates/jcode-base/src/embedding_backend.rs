@@ -335,6 +335,17 @@ pub fn embed_passage_active(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
     Ok((vec, backend.model_id().to_string()))
 }
 
+/// Embed several stored passages with one backend instance.
+///
+/// Remote backends override `embed_passages` to amortize an HTTP round-trip
+/// over the whole batch; local backends simply loop. Callers use this for
+/// maintenance backfills so a remote embedder is not invoked once per row.
+pub fn embed_passages_active(texts: &[&str]) -> anyhow::Result<(Vec<Vec<f32>>, String)> {
+    let backend = active_backend();
+    let vectors = backend.embed_passages(texts)?;
+    Ok((vectors, backend.model_id().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
