@@ -134,7 +134,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Manage memory (remember/recall/search/list/forget/link/path). Default scope: project."
+        "Manage memory (remember/recall/search/list/forget/link/path/embed). Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -144,7 +144,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "path", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related", "path", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -700,6 +700,19 @@ impl Tool for MemoryTool {
                     Ok(ToolOutput::new(out))
                 }
             }
+            "embed" => {
+                let limit = input.limit.unwrap_or(64).min(512);
+                memory::set_state(MemoryState::ToolAction {
+                    action: "embed".into(),
+                    detail: format!("limit {limit}"),
+                });
+                let (generated, failed, remaining) =
+                    manager.backfill_embeddings_bounded(limit)?;
+                memory::set_state(MemoryState::Idle);
+                Ok(ToolOutput::new(format!(
+                    "Embedding backfill: {generated} generated, {failed} failed, {remaining} still missing (limit {limit})."
+                )))
+            }
             "review" => {
                 let review_action = input.review_action.as_deref().unwrap_or("list");
                 match review_action {
@@ -1204,6 +1217,25 @@ mod tests {
         assert!(output.contains("Found 1 memory path(s)"), "{output}");
         assert!(output.contains("mem_path_c"), "{output}");
         assert!(output.contains("relates_to"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn embed_action_reports_empty_store_without_loading_a_model() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({"action":"embed","scope":"project","limit":1}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(output.contains("0 generated"), "{output}");
+        assert!(output.contains("0 still missing"), "{output}");
     }
 
     fn test_ctx(working_dir: Option<std::path::PathBuf>) -> ToolContext {

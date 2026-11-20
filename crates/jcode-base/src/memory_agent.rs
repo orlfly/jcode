@@ -144,10 +144,19 @@ fn run_finalize_maintenance(working_dir: Option<&str>) {
     if let Ok(report) = manager.reclassify_project_store(true)
         && report.total_changes() > 0
     {
-        crate::logging::info(&format!(
-            "Memory classification pass: {}",
-            report.summary()
-        ));
+        crate::logging::info(&format!("Memory classification pass: {}", report.summary()));
+    }
+    // Keep the gvec vector index covered without turning finalize into a full
+    // re-embed of the historical store. Remaining rows are picked up on later
+    // finalizes or by an explicit `memory embed` call.
+    match manager.backfill_embeddings_bounded(24) {
+        Ok((generated, failed, remaining)) if generated > 0 || failed > 0 => {
+            crate::logging::info(&format!(
+                "Memory embedding backfill: {generated} generated, {failed} failed, {remaining} still missing"
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => crate::logging::info(&format!("Memory embedding backfill failed: {error}")),
     }
     if let Ok(proposals) = manager.distill_skill_evidence() {
         if !proposals.is_empty() {

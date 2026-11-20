@@ -3260,6 +3260,94 @@ impl MemoryManager {
         Ok((generated, failed))
     }
 
+    /// Backfill at most `limit` missing embeddings.
+    ///
+    /// This is the incremental variant used at session finalize and by the
+    /// `memory embed` tool action. It avoids turning a large historical store
+    /// into a synchronous full re-embed. A store that already contains vectors
+    /// from a different model is skipped rather than mixing vector spaces.
+    pub fn backfill_embeddings_bounded(&self, limit: usize) -> Result<(usize, usize, usize)> {
+        if limit == 0 {
+            return Ok((0, 0, self.count_missing_embeddings()?));
+        }
+        let active_model = crate::embedding_backend::active_model_id();
+        let remaining_before = self.count_missing_embeddings()?;
+        let mut generated = 0;
+        let mut failed = 0;
+        let mut attempted = 0usize;
+
+        let project = self.load_project_graph()?;
+        let global = self.load_global_graph()?;
+        for (graph, is_project) in [(project, true), (global, false)] {
+            let mixed_models = graph
+                .memories
+                .values()
+                .any(|entry| entry.embedding.is_some() && !entry.embedding_matches_model(&active_model));
+            if mixed_models {
+                crate::logging::warn(
+                    "embedding backfill skipped a store with mixed embedding models",
+                );
+                continue;
+            }
+            let mut ids: Vec<String> = graph
+                .memories
+                .values()
+                .filter(|entry| entry.embedding.is_none() && entry.is_retrievable_now())
+                .map(|entry| entry.id.clone())
+                .collect();
+            ids.sort();
+            let available = limit.saturating_sub(attempted);
+            ids.truncate(available);
+
+            let mut changed = false;
+            for id in ids {
+                attempted += 1;
+                let Some(entry) = graph.memories.get_mut(&id) else {
+                    continue;
+                };
+                match crate::embedding_backend::embed_passage_active(&entry.content) {
+                    Ok((embedding, model)) => {
+                        entry.set_embedding(Some(embedding), Some(model));
+                        generated += 1;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        crate::logging::info(&format!(
+                            "bounded embedding backfill failed for {id}: {error}"
+                        ));
+                    }
+                }
+            }
+            if changed {
+                if is_project {
+                    self.save_project_graph(&graph)?;
+                } else {
+                    self.save_global_graph(&graph)?;
+                }
+            }
+            if attempted >= limit {
+                break;
+            }
+        }
+        Ok((
+            generated,
+            failed,
+            remaining_before.saturating_sub(generated),
+        ))
+    }
+
+    fn count_missing_embeddings(&self) -> Result<usize> {
+        let project = self.load_project_graph()?;
+        let global = self.load_global_graph()?;
+        Ok(project
+            .memories
+            .values()
+            .chain(global.memories.values())
+            .filter(|entry| entry.embedding.is_none())
+            .count())
+    }
+
     /// Mirror-side half of accepting a skill proposal: write the mirror link
     /// node and one `skill:<name> -derived_from-> mem_*` edge per evidence id
     /// that exists, then record a first invocation so the loop is observable.
