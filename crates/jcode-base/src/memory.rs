@@ -263,6 +263,9 @@ pub struct MemoryPathQueryOutcome {
     pub unresolved_from: Vec<String>,
     pub unresolved_to: Vec<String>,
     pub unknown_relations: Vec<String>,
+    /// Stable diagnosis codes (E01 anchor unresolved, E03 disconnected,
+    /// E05 depth budget exhausted, E10 unknown relation).
+    pub diagnosis: Vec<String>,
     pub stores_searched: usize,
     pub depth: usize,
 }
@@ -7116,13 +7119,13 @@ impl MemoryManager {
         if froms.is_empty() || tos.is_empty() || limit == 0 {
             outcome.unresolved_from = froms;
             outcome.unresolved_to = tos;
+            outcome.diagnosis.push("E01".to_string());
             return Ok(outcome);
         }
         // A filter made only of unknown names must match nothing. Treating it
         // as an empty filter would turn a typo into an unrestricted query.
         if !relations.is_empty() && allowed.is_empty() {
-            outcome.unresolved_from = froms;
-            outcome.unresolved_to = tos;
+            outcome.diagnosis.push("E10".to_string());
             return Ok(outcome);
         }
 
@@ -7159,6 +7162,12 @@ impl MemoryManager {
             .filter(|anchor| !resolved_to.contains(*anchor))
             .cloned()
             .collect();
+        if !outcome.unresolved_from.is_empty() || !outcome.unresolved_to.is_empty() {
+            outcome.diagnosis.push("E01".to_string());
+        }
+        if !outcome.unknown_relations.is_empty() {
+            outcome.diagnosis.push("E10".to_string());
+        }
 
         let mut paths = Vec::new();
         for graph in &graphs {
@@ -7186,6 +7195,12 @@ impl MemoryManager {
         let mut seen = std::collections::HashSet::new();
         paths.retain(|path| seen.insert(path.nodes.clone()));
         paths.truncate(limit);
+        if paths.is_empty() && outcome.diagnosis.is_empty() {
+            outcome.diagnosis.push("E03".to_string());
+            if depth >= 8 {
+                outcome.diagnosis.push("E05".to_string());
+            }
+        }
         outcome.paths = paths;
         Ok(outcome)
     }

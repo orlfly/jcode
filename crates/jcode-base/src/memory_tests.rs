@@ -4956,6 +4956,9 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         let c = manager
             .remember_project(MemoryEntry::new(MemoryCategory::Fact, "gamma path anchor"))
             .expect("gamma");
+        let d = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "delta isolated anchor"))
+            .expect("delta");
         manager.link_memories(&a, &b, 0.9).expect("a-b");
         manager.link_memories(&c, &b, 0.8).expect("c-b");
 
@@ -4971,6 +4974,7 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
             .expect("multi-source path query");
         assert_eq!(outcome.paths.len(), 2, "{outcome:?}");
         assert!(outcome.unresolved_from.is_empty(), "{outcome:?}");
+        assert!(outcome.diagnosis.is_empty(), "{outcome:?}");
         assert!(outcome.paths.iter().all(|path| {
             path.edges
                 .iter()
@@ -4989,6 +4993,8 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
             .expect("unknown relation query");
         assert!(unknown.paths.is_empty(), "{unknown:?}");
         assert_eq!(unknown.unknown_relations, vec!["invented_relation"]);
+        assert_eq!(unknown.diagnosis, vec!["E10"]);
+        assert!(unknown.unresolved_from.is_empty(), "{unknown:?}");
 
         let missing = manager
             .paths_between_anchors(
@@ -5002,5 +5008,19 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
             .expect("missing anchor query");
         assert!(missing.paths.is_empty(), "{missing:?}");
         assert_eq!(missing.unresolved_from, vec!["missing-anchor"]);
+        assert_eq!(missing.diagnosis, vec!["E01"]);
+
+        let disconnected = manager
+            .paths_between_anchors(
+                &[a],
+                &[d],
+                8,
+                5,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("disconnected query");
+        assert!(disconnected.paths.is_empty(), "{disconnected:?}");
+        assert_eq!(disconnected.diagnosis, vec!["E03", "E05"]);
     });
 }

@@ -714,6 +714,9 @@ impl Tool for MemoryTool {
                         outcome.unknown_relations.join(", ")
                     ));
                 }
+                if !outcome.diagnosis.is_empty() {
+                    diagnostics.push(format!("diagnosis: {}", outcome.diagnosis.join(", ")));
+                }
 
                 if paths.is_empty() {
                     let mut out = format!(
