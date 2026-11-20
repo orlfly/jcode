@@ -16,6 +16,11 @@ pub use path_diagnosis::{
     PathDiagnosisCode, PathMissingClass, missing_classes_for, next_actions_for,
 };
 
+pub mod ontology_gate;
+pub use ontology_gate::{
+    OntologyGateDecision, OntologyGateExit, SixQuestionSignals, route_ontology_definition,
+};
+
 pub mod graph;
 pub use graph::{
     ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, MemoryPath,

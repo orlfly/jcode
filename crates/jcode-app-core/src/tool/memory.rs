@@ -113,6 +113,9 @@ struct MemoryInput {
     /// For ontology action: inline patch object
     #[serde(default)]
     patch: Option<Value>,
+    /// For ontology_action=gate: structured six-question evidence.
+    #[serde(default)]
+    gate: Option<Value>,
     /// For ontology action: path to a patch JSON file
     #[serde(default)]
     patch_file: Option<String>,
@@ -222,8 +225,21 @@ impl Tool for MemoryTool {
                 },
                 "ontology_action": {
                     "type": "string",
-                    "enum": ["show", "propose", "validate", "apply", "history", "rollback"],
+                    "enum": ["show", "propose", "validate", "gate", "apply", "history", "rollback"],
                     "description": "For action=ontology. Review sessions may show/validate/propose only."
+                },
+                "gate": {
+                    "type": "object",
+                    "description": "For ontology_action=gate: structured six-question evidence.",
+                    "properties": {
+                        "validation_path": { "type": "boolean" },
+                        "machine_consumed": { "type": "boolean" },
+                        "compliance_risk": { "type": "boolean" },
+                        "cross_scope_consistency": { "type": "boolean" },
+                        "closed_examples": { "type": "boolean" },
+                        "unresolved_questions": { "type": "array", "items": { "type": "string" } },
+                        "conflicting_evidence": { "type": "boolean" }
+                    }
                 },
                 "patch": {
                     "type": "object",
@@ -974,6 +990,41 @@ impl Tool for MemoryTool {
 
                 let scope = OntologyScope::parse(input.scope.as_deref().unwrap_or("project"))?;
                 let ontology_action = input.ontology_action.as_deref().unwrap_or("show");
+
+                if ontology_action == "gate" {
+                    use crate::memory_types::{
+                        SixQuestionSignals, route_ontology_definition,
+                    };
+
+                    let signals = input
+                        .gate
+                        .clone()
+                        .map(serde_json::from_value::<SixQuestionSignals>)
+                        .transpose()?
+                        .unwrap_or_default();
+                    let decision = route_ontology_definition(&signals);
+                    let definition = input.content.as_deref().unwrap_or("(unnamed definition)");
+                    let matched = if decision.matched_questions.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        decision.matched_questions.join(", ")
+                    };
+                    let mut out = format!(
+                        "Six-question gate: {}\ndefinition: {}\nmatched: {}\nrule layer: {}",
+                        decision.exit.as_str(),
+                        definition,
+                        matched,
+                        if decision.rule_layer_required {
+                            "required"
+                        } else {
+                            "not required"
+                        }
+                    );
+                    for reason in &decision.reasons {
+                        out.push_str(&format!("\n- {reason}"));
+                    }
+                    return Ok(ToolOutput::new(out));
+                }
 
                 let patch = if let Some(value) = input.patch.clone() {
                     Some(serde_json::from_value::<OntologyPatch>(value)?)
@@ -2443,5 +2494,63 @@ mod tests {
             .await
             .unwrap();
         assert!(updated.output.contains("ttl=45d"), "{}", updated.output);
+    }
+
+    #[tokio::test]
+    async fn ontology_gate_routes_structured_signals() {
+        let _guard = crate::storage::lock_test_env();
+        let tool = MemoryTool::new();
+        let ctx = test_ctx(None);
+
+        let pass = tool
+            .execute(
+                json!({
+                    "action":"ontology",
+                    "ontology_action":"gate",
+                    "content":"invoice status",
+                    "gate":{"validation_path":true,"compliance_risk":true}
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            pass.output.contains("Six-question gate: auto_pass"),
+            "{}",
+            pass.output
+        );
+        assert!(pass.output.contains("Q1, Q3"), "{}", pass.output);
+        assert!(
+            pass.output.contains("rule layer: required"),
+            "{}",
+            pass.output
+        );
+
+        let clarify = tool
+            .execute(
+                json!({
+                    "action":"ontology",
+                    "ontology_action":"gate",
+                    "gate":{"unresolved_questions":["Q3"]}
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            clarify.output.contains("Six-question gate: clarify"),
+            "{}",
+            clarify.output
+        );
+
+        let fallback = tool
+            .execute(json!({"action":"ontology","ontology_action":"gate"}), ctx)
+            .await
+            .unwrap();
+        assert!(
+            fallback.output.contains("Six-question gate: llm_only"),
+            "{}",
+            fallback.output
+        );
     }
 }
