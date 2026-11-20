@@ -19,6 +19,7 @@ use jcode_memory_types::engineering_ontology::{
     CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringPath, EngineeringRelation,
     default_engineering_ontology,
 };
+use jcode_memory_types::{PathPlan, build_path_plan};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ pub struct EngineeringPathHit {
     pub path: EngineeringPath,
     pub node_labels: Vec<String>,
     pub relation_labels: Vec<String>,
+    pub plan: PathPlan,
 }
 
 /// One session selected by the engineering retention policy.
@@ -712,12 +714,14 @@ impl EngineeringStore {
                             .unwrap_or_else(|| id.clone())
                     })
                     .collect();
+                let plan = build_path_plan(&graph, &path);
                 hits.push(EngineeringPathHit {
                     session_id: session_id.clone(),
                     working_dir: working_dir.clone(),
                     path,
                     node_labels,
                     relation_labels,
+                    plan,
                 });
             }
         }
@@ -933,6 +937,12 @@ mod tests {
             hits[0].node_labels,
             vec!["cargo test".to_string(), "src/lib.rs".to_string()]
         );
+        assert_eq!(hits[0].plan.tasks.len(), 1);
+        assert_eq!(
+            hits[0].plan.tasks[0].action_type,
+            jcode_memory_types::PlanActionType::Execute
+        );
+        assert!(hits[0].plan.tasks[0].approval);
         assert!(hits[0].working_dir.as_deref() == Some("/repo"));
 
         let filtered = store

@@ -88,6 +88,9 @@ struct MemoryInput {
     /// For path action: memory (default) or engineering.
     #[serde(default)]
     graph: Option<String>,
+    /// For engineering paths: include the deterministic PathPlan.
+    #[serde(default)]
+    plan: Option<bool>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -202,6 +205,10 @@ impl Tool for MemoryTool {
                     "type": "string",
                     "enum": ["memory", "engineering"],
                     "description": "For action=path: which persisted graph to search. Default memory; engineering reads session engineering episodes by anchor id."
+                },
+                "plan": {
+                    "type": "boolean",
+                    "description": "For action=path graph=engineering: include the deterministic PathPlan (actions, success checks, approval gates)."
                 },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
                 "mode": {
@@ -678,8 +685,16 @@ impl Tool for MemoryTool {
                 }
                 let relations = input.relation_allow.unwrap_or_default();
                 let graph_kind = input.graph.unwrap_or_else(|| "memory".to_string());
+                let include_plan = input.plan.unwrap_or(false);
                 if graph_kind == "engineering" {
-                    return Self::path_engineering(&froms, &tos, depth, limit, &relations);
+                    return Self::path_engineering(
+                        &froms,
+                        &tos,
+                        depth,
+                        limit,
+                        &relations,
+                        include_plan,
+                    );
                 }
                 if graph_kind != "memory" {
                     return Err(anyhow::anyhow!(
@@ -1099,6 +1114,7 @@ impl MemoryTool {
         depth: usize,
         limit: usize,
         relations: &[String],
+        include_plan: bool,
     ) -> Result<ToolOutput> {
         if limit == 0 {
             return Ok(ToolOutput::new("No engineering paths requested."));
@@ -1180,6 +1196,41 @@ impl MemoryTool {
                         .map(String::as_str)
                         .unwrap_or(relation);
                     out.push_str(&format!("  --{relation_label}-->\n"));
+                }
+            }
+            if include_plan {
+                out.push_str(&format!(
+                    "  plan: confidence {:.0}%, {} task(s)",
+                    hit.plan.confidence * 100.0,
+                    hit.plan.tasks.len()
+                ));
+                if hit.plan.approval_gates.is_empty() {
+                    out.push_str(", no approval gates\n");
+                } else {
+                    out.push_str(&format!(
+                        ", approval gates: {}\n",
+                        hit.plan.approval_gates.join(", ")
+                    ));
+                }
+                for task in &hit.plan.tasks {
+                    let depends = if task.depends_on.is_empty() {
+                        "none".to_string()
+                    } else {
+                        task.depends_on.join(", ")
+                    };
+                    out.push_str(&format!(
+                        "  {} [{}] {} (depends: {depends}, risk: {}, approval: {})\n    success: {}\n    evidence: {}\n",
+                        task.id,
+                        task.action_type.as_str(),
+                        task.title,
+                        task.risk.as_str(),
+                        if task.approval { "yes" } else { "no" },
+                        task.success_check,
+                        task.evidence_ref
+                    ));
+                }
+                for warning in &hit.plan.warnings {
+                    out.push_str(&format!("  warning: {warning}\n"));
                 }
             }
         }
@@ -1598,6 +1649,7 @@ mod tests {
                     "from_id":"action:call-1",
                     "to_id":"file:src/lib.rs",
                     "relation_allow":["modifies"],
+                    "plan":true,
                     "depth":2
                 }),
                 test_ctx(None),
@@ -1620,6 +1672,9 @@ mod tests {
             "{}",
             output.output
         );
+        assert!(output.output.contains("plan: confidence"), "{}", output.output);
+        assert!(output.output.contains("success:"), "{}", output.output);
+        assert!(output.output.contains("evidence:"), "{}", output.output);
     }
 
     #[tokio::test]

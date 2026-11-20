@@ -6,6 +6,11 @@ pub use engineering_ontology::{
     EngineeringValidationReport, EntityStatus, PropertyValueKind, default_engineering_ontology,
 };
 
+pub mod path_plan;
+pub use path_plan::{
+    PathPlan, PathPlanTask, PlanActionType, PlanRisk, build_path_plan,
+};
+
 pub mod graph;
 pub use graph::{
     ClusterEntry, Edge, EdgeKind, GRAPH_VERSION, GraphMetadata, MemoryGraph, MemoryPath,
