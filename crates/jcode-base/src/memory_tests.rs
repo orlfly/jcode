@@ -5026,6 +5026,41 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
 }
 
 #[test]
+fn path_query_relaxes_depth_once_and_records_it() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-depth-relax");
+        let mut graph = MemoryGraph::new();
+        let ids: Vec<String> = (0..10)
+            .map(|index| {
+                graph.add_memory(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("depth chain node {index}"),
+                ))
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            graph.link_memories(&pair[0], &pair[1], 0.9);
+        }
+        manager.save_project_graph(&graph).expect("save chain graph");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &[ids[0].clone()],
+                &[ids[9].clone()],
+                8,
+                5,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("relaxed path query");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.paths[0].nodes.len(), 10, "{outcome:?}");
+        assert_eq!(outcome.depth, 16);
+        assert_eq!(outcome.relaxations, vec!["depth 8 -> 16".to_string()]);
+    });
+}
+
+#[test]
 fn explicit_bridge_stitches_project_and_global_paths() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/bridge-path");

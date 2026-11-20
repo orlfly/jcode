@@ -266,9 +266,15 @@ pub struct MemoryPathQueryOutcome {
     /// Stable diagnosis codes (E01 anchor unresolved, E03 disconnected,
     /// E05 depth budget exhausted, E10 unknown relation).
     pub diagnosis: Vec<String>,
+    /// Deterministic L0 relaxations applied after the first attempt, e.g.
+    /// `depth 8 -> 16`. Empty when the original query succeeded.
+    pub relaxations: Vec<String>,
     pub stores_searched: usize,
     pub depth: usize,
 }
+
+const MAX_INITIAL_PATH_DEPTH: usize = 8;
+const MAX_RELAXED_PATH_DEPTH: usize = 16;
 
 /// Explicit bridge between a project-scoped memory and a global memory.
 ///
@@ -7333,8 +7339,8 @@ impl MemoryManager {
     /// restricts traversal to canonical `EdgeKind` names. Unknown relation
     /// names are reported instead of silently widening the search.
     ///
-    /// Paths still never cross project/global stores, because no persisted
-    /// bridge edges exist between them.
+    /// Paths cross project/global stores only through explicitly registered
+    /// bridges; no implicit cross-store edges are created.
     pub fn paths_between_anchors(
         &self,
         from_anchors: &[String],
@@ -7346,14 +7352,11 @@ impl MemoryManager {
     ) -> Result<MemoryPathQueryOutcome> {
         let froms = normalize_path_anchors(from_anchors);
         let tos = normalize_path_anchors(to_anchors);
-        let depth = depth.clamp(1, 8);
+        let depth = depth.clamp(1, MAX_INITIAL_PATH_DEPTH);
         let limit = limit.min(20);
-        let mut outcome = MemoryPathQueryOutcome {
-            depth,
-            ..MemoryPathQueryOutcome::default()
-        };
 
         let mut allowed_owned = Vec::new();
+        let mut unknown_relations = Vec::new();
         for relation in relations {
             let relation = relation.trim();
             if relation.is_empty() {
@@ -7362,22 +7365,75 @@ impl MemoryManager {
             if jcode_memory_types::EdgeKind::parse(relation).is_some() {
                 allowed_owned.push(relation.to_string());
             } else {
-                outcome.unknown_relations.push(relation.to_string());
+                unknown_relations.push(relation.to_string());
             }
         }
-        outcome.unknown_relations.sort();
-        outcome.unknown_relations.dedup();
+        unknown_relations.sort();
+        unknown_relations.dedup();
         let allowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
 
+        let mut outcome = self.paths_between_anchors_inner(
+            &froms,
+            &tos,
+            depth,
+            limit,
+            scope,
+            &allowed,
+            &unknown_relations,
+        )?;
+
+        // L0 depth relaxation: E05 means anchors are connected but the first
+        // budget was too small. Retry once and record the parameter change so
+        // callers can tell a real path from a widened search.
+        if outcome.paths.is_empty()
+            && outcome.diagnosis.iter().any(|code| code == "E05")
+            && depth < MAX_RELAXED_PATH_DEPTH
+        {
+            let relaxed_depth = MAX_RELAXED_PATH_DEPTH;
+            let mut relaxed = self.paths_between_anchors_inner(
+                &froms,
+                &tos,
+                relaxed_depth,
+                limit,
+                scope,
+                &allowed,
+                &unknown_relations,
+            )?;
+            relaxed
+                .relaxations
+                .push(format!("depth {depth} -> {relaxed_depth}"));
+            relaxed.depth = relaxed_depth;
+            outcome = relaxed;
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paths_between_anchors_inner(
+        &self,
+        froms: &[String],
+        tos: &[String],
+        depth: usize,
+        limit: usize,
+        scope: MemoryScope,
+        allowed: &[&str],
+        unknown_relations: &[String],
+    ) -> Result<MemoryPathQueryOutcome> {
+        let mut outcome = MemoryPathQueryOutcome {
+            depth,
+            unknown_relations: unknown_relations.to_vec(),
+            ..MemoryPathQueryOutcome::default()
+        };
+
         if froms.is_empty() || tos.is_empty() || limit == 0 {
-            outcome.unresolved_from = froms;
-            outcome.unresolved_to = tos;
+            outcome.unresolved_from = froms.to_vec();
+            outcome.unresolved_to = tos.to_vec();
             outcome.diagnosis.push("E01".to_string());
             return Ok(outcome);
         }
         // A filter made only of unknown names must match nothing. Treating it
         // as an empty filter would turn a typo into an unrestricted query.
-        if !relations.is_empty() && allowed.is_empty() {
+        if !unknown_relations.is_empty() && allowed.is_empty() {
             outcome.diagnosis.push("E10".to_string());
             return Ok(outcome);
         }
@@ -7394,12 +7450,12 @@ impl MemoryManager {
         let mut resolved_from = std::collections::HashSet::new();
         let mut resolved_to = std::collections::HashSet::new();
         for (_, graph) in &graphs {
-            for anchor in &froms {
+            for anchor in froms {
                 if resolve_path_anchor(graph, anchor).is_some() {
                     resolved_from.insert(anchor.clone());
                 }
             }
-            for anchor in &tos {
+            for anchor in tos {
                 if resolve_path_anchor(graph, anchor).is_some() {
                     resolved_to.insert(anchor.clone());
                 }
@@ -7407,12 +7463,12 @@ impl MemoryManager {
         }
         outcome.unresolved_from = froms
             .iter()
-            .filter(|anchor| !resolved_from.contains(*anchor))
+            .filter(|anchor| !resolved_from.contains(anchor.as_str()))
             .cloned()
             .collect();
         outcome.unresolved_to = tos
             .iter()
-            .filter(|anchor| !resolved_to.contains(*anchor))
+            .filter(|anchor| !resolved_to.contains(anchor.as_str()))
             .cloned()
             .collect();
         if !outcome.unresolved_from.is_empty() || !outcome.unresolved_to.is_empty() {
@@ -7434,9 +7490,9 @@ impl MemoryManager {
                 .collect();
             for from in &from_nodes {
                 for to in &to_nodes {
-                    paths.extend(graph.k_shortest_paths_with_relations(
-                        from, to, depth, limit, &allowed,
-                    ));
+                    paths.extend(
+                        graph.k_shortest_paths_with_relations(from, to, depth, limit, &allowed),
+                    );
                 }
             }
         }
@@ -7449,15 +7505,9 @@ impl MemoryManager {
             .find(|(label, _)| *label == "global")
             .map(|(_, graph)| graph);
         if let (Some(project), Some(global)) = (project, global) {
-            paths.extend(self.stitched_bridge_paths(
-                project,
-                global,
-                &froms,
-                &tos,
-                depth,
-                limit,
-                &allowed,
-            )?);
+            paths.extend(
+                self.stitched_bridge_paths(project, global, froms, tos, depth, limit, &allowed)?,
+            );
         }
         paths.sort_by(|left, right| {
             left.cost

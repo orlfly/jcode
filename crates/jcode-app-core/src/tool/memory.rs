@@ -789,6 +789,9 @@ impl Tool for MemoryTool {
                 if !outcome.diagnosis.is_empty() {
                     diagnostics.push(format!("diagnosis: {}", outcome.diagnosis.join(", ")));
                 }
+                for relaxation in &outcome.relaxations {
+                    diagnostics.push(format!("relaxation: {relaxation}"));
+                }
 
                 if paths.is_empty() {
                     let mut out = format!(
@@ -803,7 +806,7 @@ impl Tool for MemoryTool {
                         out.push_str(&format!("\n- {diagnostic}"));
                     }
                     out.push_str(
-                        "\nTry different anchors, a larger depth (capped at 8), or a wider scope.",
+                        "\nTry different anchors or a wider scope; E05 depth is relaxed once from 8 to 16 automatically.",
                     );
                     Ok(ToolOutput::new(out))
                 } else {
@@ -1524,10 +1527,7 @@ mod tests {
             .expect("p0");
         let p1 = tool
             .manager
-            .remember_project(MemoryEntry::new(
-                MemoryCategory::Fact,
-                "project bridge one",
-            ))
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "project bridge one"))
             .expect("p1");
         tool.manager
             .link_memories(&p0, &p1, 0.9)
