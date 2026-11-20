@@ -129,6 +129,86 @@ Rules:
   ones, and produce one checkpoint rather than stacking summaries.
 - The checkpoint must be shorter than the conversation it replaces."#;
 
+/// Contract bullets that must survive every incremental checkpoint merge.
+///
+/// `[CONSTRAINT]` and `[RETRACTED]` are the two non-graph facts whose loss is
+/// irreversible: dropping a hard constraint invites a policy violation, and
+/// dropping a retraction revives a conclusion the user already rejected.
+pub const PROTECTED_CHECKPOINT_MARKERS: [&str; 2] = ["[CONSTRAINT]", "[RETRACTED]"];
+
+fn is_protected_checkpoint_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    let line = line.trim_start_matches('`');
+    PROTECTED_CHECKPOINT_MARKERS
+        .iter()
+        .any(|marker| line.starts_with(marker))
+}
+
+/// Carry protected contract bullets from the previous checkpoint into the new
+/// one when the model silently dropped them.
+///
+/// This is a deterministic backstop, not a replacement for the prompt: exact
+/// original text is preserved (no paraphrasing), duplicates are skipped, and
+/// missing bullets are inserted into `Critical Context`. Returns the repaired
+/// summary and the number of bullets re-inserted.
+pub fn preserve_protected_checkpoint_lines(
+    existing: Option<&str>,
+    summary: String,
+) -> (String, usize) {
+    let Some(existing) = existing else {
+        return (summary, 0);
+    };
+    let mut missing: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        let line = line.trim();
+        if !is_protected_checkpoint_line(line) || summary.contains(line) {
+            continue;
+        }
+        if !missing.iter().any(|seen| *seen == line) {
+            missing.push(line);
+        }
+    }
+    if missing.is_empty() {
+        return (summary, 0);
+    }
+
+    let mut out = summary.trim_end().to_string();
+    let mut block = String::new();
+    for line in &missing {
+        block.push_str(line);
+        block.push('\n');
+    }
+
+    const HEADING: &str = "## Critical Context";
+    if let Some(heading_start) = out.find(HEADING) {
+        let after_heading = heading_start + HEADING.len();
+        let insert_at = out[after_heading..]
+            .find("\n## ")
+            .map(|offset| after_heading + offset + 1)
+            .unwrap_or(out.len());
+        if insert_at == out.len() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.insert_str(insert_at, &block);
+    } else if let Some(graph_state) = out.find("## Graph Memory State") {
+        let mut section = String::from(HEADING);
+        section.push('\n');
+        section.push_str(&block);
+        section.push('\n');
+        out.insert_str(graph_state, &section);
+    } else {
+        out.push_str("\n\n");
+        out.push_str(HEADING);
+        out.push('\n');
+        out.push_str(&block);
+    }
+    (out, missing.len())
+}
+
 /// A completed summary covering turns up to a certain point
 #[derive(Debug, Clone)]
 pub struct Summary {

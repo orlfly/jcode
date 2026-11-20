@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn protected_checkpoint_lines_survive_incremental_merge() {
+    let existing = r#"## Critical Context
+- `[CONSTRAINT]` never force-push to master
+- `[RETRACTED]` the cache is not the source of truth
+- `[ERROR_FIX]` rebuild the bridge after changing the protocol
+"#;
+    let summary = r#"## Current Work
+refactoring
+
+## Critical Context
+- `[ERROR_FIX]` rebuild the bridge after changing the protocol
+"#;
+
+    let (repaired, inserted) =
+        preserve_protected_checkpoint_lines(Some(existing), summary.to_string());
+    assert_eq!(inserted, 2);
+    assert!(repaired.contains("- `[CONSTRAINT]` never force-push to master"));
+    assert!(repaired.contains("- `[RETRACTED]` the cache is not the source of truth"));
+    assert!(repaired.contains("- `[ERROR_FIX]` rebuild the bridge after changing the protocol"));
+    assert_eq!(
+        repaired.matches("[ERROR_FIX]").count(),
+        1,
+        "existing non-protected lines must not be duplicated: {repaired}"
+    );
+}
+
+#[test]
+fn protected_checkpoint_lines_are_inserted_before_graph_state() {
+    let existing = "## Critical Context\n- `[CONSTRAINT]` keep the public API stable\n";
+    let summary = "## Current Work\nediting\n\n## Graph Memory State\n- file:src/lib.rs\n";
+    let (repaired, inserted) =
+        preserve_protected_checkpoint_lines(Some(existing), summary.to_string());
+    assert_eq!(inserted, 1);
+    let constraint = repaired.find("[CONSTRAINT]").expect("constraint");
+    let graph_state = repaired.find("## Graph Memory State").expect("graph state");
+    assert!(
+        constraint < graph_state,
+        "contract line must stay inside the checkpoint body: {repaired}"
+    );
+}
+
+#[test]
+fn protected_checkpoint_lines_noop_without_existing_or_missing_lines() {
+    let summary = "## Critical Context\n- `[CONSTRAINT]` keep it\n";
+    let (unchanged, inserted) =
+        preserve_protected_checkpoint_lines(None, summary.to_string());
+    assert_eq!(inserted, 0);
+    assert_eq!(unchanged, summary);
+
+    let (unchanged, inserted) =
+        preserve_protected_checkpoint_lines(Some(summary), summary.to_string());
+    assert_eq!(inserted, 0);
+    assert_eq!(unchanged, summary);
+}
+
+#[test]
 fn emergency_truncation_noops_keep_shared_bodies_at_exact_limits() {
     let canonical = vec![Message::user("unchanged"), tool_image_msg(4096)];
     let mut request = canonical.clone();

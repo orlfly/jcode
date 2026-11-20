@@ -38,7 +38,7 @@ pub use jcode_compaction_core::{
     is_image_rejection_error, is_request_payload_too_large_error, mean_embedding,
     message_char_count, reusable_cache_tokens_from_usage, safe_compaction_cutoff,
     semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
-    summary_payload_char_count,
+    summary_payload_char_count, preserve_protected_checkpoint_lines,
 };
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
@@ -1798,8 +1798,23 @@ async fn generate_compaction_artifact(
                 encrypted_content.len(),
             ));
         } else if native.openai_encrypted_content.is_some() || native.summary_text.is_some() {
+            let mut summary_text = native.summary_text.unwrap_or_default();
+            if !summary_text.trim().is_empty() {
+                let (repaired, preserved) = preserve_protected_checkpoint_lines(
+                    existing_summary
+                        .as_ref()
+                        .map(|summary| summary.text.as_str()),
+                    summary_text,
+                );
+                if preserved > 0 {
+                    crate::logging::warn(&format!(
+                        "[compaction] restored {preserved} protected checkpoint line(s) dropped by native compaction"
+                    ));
+                }
+                summary_text = repaired;
+            }
             return Ok(CompactionResult {
-                summary_text: native.summary_text.unwrap_or_default(),
+                summary_text,
                 openai_encrypted_content: native.openai_encrypted_content,
                 covers_up_to_turn: messages.len(),
                 duration_ms: start.elapsed().as_millis() as u64,
@@ -1834,6 +1849,17 @@ async fn generate_compaction_artifact(
     );
 
     let summary_text = validate_compaction_summary(summary)?;
+    let (summary_text, preserved) = preserve_protected_checkpoint_lines(
+        existing_summary
+            .as_ref()
+            .map(|summary| summary.text.as_str()),
+        summary_text,
+    );
+    if preserved > 0 {
+        crate::logging::warn(&format!(
+            "[compaction] restored {preserved} protected checkpoint line(s) dropped by the summarizer"
+        ));
+    }
     let summary_text = attach_graph_memory_state(summary_text, &messages);
 
     Ok(CompactionResult {
