@@ -4245,6 +4245,54 @@ fn reject_review_leaves_graph_unchanged() {
 }
 
 #[test]
+fn deferred_review_can_be_reopened_and_accepted() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/review-reopen");
+        let entry = MemoryEntry::new(
+            MemoryCategory::Observation,
+            "The staging bucket is named stage-2025",
+        )
+        .with_provenance(
+            ProvenanceRecord::new("session_test", ExtractionMethod::LlmExtraction)
+                .with_confidence(0.3),
+        );
+        let MemoryWriteOutcome::PendingReview { review_id, .. } =
+            manager.remember_project_governed(entry).unwrap()
+        else {
+            panic!("low confidence should queue");
+        };
+
+        let deferred = manager
+            .defer_review(&review_id, "tester", Some("needs more evidence"))
+            .unwrap();
+        assert_eq!(deferred.status, ReviewStatus::Deferred);
+        assert!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .is_empty()
+        );
+
+        let reopened = manager
+            .reopen_review(&review_id, "tester", Some("evidence reviewed"))
+            .unwrap();
+        assert_eq!(reopened.status, ReviewStatus::Pending);
+        assert_eq!(
+            manager
+                .list_reviews(Some(ReviewStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        manager
+            .accept_review(&review_id, "tester", Some("verified"))
+            .unwrap();
+        assert_eq!(manager.load_project_graph().unwrap().memory_count(), 1);
+    });
+}
+
+#[test]
 fn accepting_relate_review_links_new_memory_to_old() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/review-relate");

@@ -2386,6 +2386,26 @@ impl MemoryManager {
         Ok(updated)
     }
 
+    /// Re-open a deferred review so it can be accepted, rejected, or deferred again.
+    pub fn reopen_review(
+        &self,
+        id: &str,
+        reviewer: &str,
+        note: Option<&str>,
+    ) -> Result<MemoryReviewItem> {
+        let path = review::queue_path(self.test_mode)?;
+        let mut items = review::load_items(&path)?;
+        anyhow::ensure!(
+            review::find_item(&items, id)
+                .is_some_and(|item| item.status == ReviewStatus::Deferred),
+            "Review item {id} is not deferred"
+        );
+        let updated =
+            review::update_status(&mut items, id, ReviewStatus::Pending, Some(reviewer), note)?;
+        review::save_items(&path, &items)?;
+        Ok(updated)
+    }
+
     fn manager_for_review(&self, item: &MemoryReviewItem) -> Result<MemoryManager> {
         match item.project_dir.as_deref() {
             Some(dir) if !dir.trim().is_empty() => Ok(self.clone().with_project_dir(dir)),

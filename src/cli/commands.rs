@@ -2423,14 +2423,15 @@ async fn run_memory_command_for_dir(
                     }
                 }
             }
-            "accept" | "reject" | "defer" => {
+            "accept" | "reject" | "defer" | "reopen" => {
                 let id = id
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("review id required for {}", action))?;
                 let item = match action.as_str() {
                     "accept" => manager.accept_review(id, &reviewer, note.as_deref())?,
                     "reject" => manager.reject_review(id, &reviewer, note.as_deref())?,
-                    _ => manager.defer_review(id, &reviewer, note.as_deref())?,
+                    "defer" => manager.defer_review(id, &reviewer, note.as_deref())?,
+                    _ => manager.reopen_review(id, &reviewer, note.as_deref())?,
                 };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&item)?);
