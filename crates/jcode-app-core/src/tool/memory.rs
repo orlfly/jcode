@@ -946,6 +946,33 @@ impl Tool for MemoryTool {
                 for relaxation in &outcome.relaxations {
                     diagnostics.push(format!("relaxation: {relaxation}"));
                 }
+                let mut quality_flags = Vec::new();
+                for quality in &outcome.quality {
+                    for flag in &quality.flags {
+                        if !quality_flags.contains(flag) {
+                            quality_flags.push(*flag);
+                        }
+                    }
+                }
+                let decision = crate::memory_types::select_next_action(
+                    &crate::memory_types::DecisionSignals {
+                        has_paths: !paths.is_empty(),
+                        path_confidence: paths
+                            .iter()
+                            .map(|path| path.confidence)
+                            .fold(0.0, f32::max),
+                        diagnosis: outcome.diagnosis.clone(),
+                        quality_flags,
+                        planning_requested: input.plan.unwrap_or(false),
+                        attempts_remaining: 1,
+                    },
+                );
+                diagnostics.push(format!(
+                    "decision: {} (priority {}): {}",
+                    decision.action.as_str(),
+                    decision.priority,
+                    decision.reason
+                ));
 
                 if paths.is_empty() {
                     let mut out = format!(
@@ -1701,6 +1728,7 @@ mod tests {
         assert!(output.contains("Found 1 memory path(s)"), "{output}");
         assert!(output.contains("mem_path_c"), "{output}");
         assert!(output.contains("relates_to"), "{output}");
+        assert!(output.contains("decision: terminate"), "{output}");
     }
 
     #[tokio::test]
@@ -1843,6 +1871,7 @@ mod tests {
             "{hypothesized}"
         );
         assert!(hypothesized.contains("hypothesized"), "{hypothesized}");
+        assert!(hypothesized.contains("decision: reason"), "{hypothesized}");
 
         let accepted = tool
             .execute(
