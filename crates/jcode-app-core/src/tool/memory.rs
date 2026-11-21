@@ -161,6 +161,9 @@ struct MemoryInput {
     /// For action=decision: {action, problem, start_node, relation, ...}.
     #[serde(default)]
     decision: Option<Value>,
+    /// For action=domain: {action, text, facts, id, limit}.
+    #[serde(default)]
+    domain: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +205,23 @@ struct DecisionTraceInput {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DomainFactInput {
+    action: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    predicate: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    facts: Vec<crate::memory_types::DomainFact>,
+}
+
 #[async_trait]
 impl Tool for MemoryTool {
     fn name(&self) -> &str {
@@ -212,7 +232,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Memory CRUD, links/paths, belief/decision traces. Default: project."
+        "Memory CRUD, links/paths, belief/decision/domain facts. Default: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -222,7 +242,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "decision", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -367,6 +387,10 @@ impl Tool for MemoryTool {
                 "decision": {
                     "type": "object",
                     "description": "For action=decision: {action: record|search|list|forget, ...}."
+                },
+                "domain": {
+                    "type": "object",
+                    "description": "For action=domain: {action, text, facts, id, limit}."
                 }
             },
             "required": ["action"]
@@ -1170,11 +1194,13 @@ impl Tool for MemoryTool {
                     decision.reason
                 ));
 
-                let decision_examples = input
+                let rerank_problem = input
                     .query
+                    .clone()
+                    .or_else(|| input.content.clone())
+                    .filter(|problem| !problem.trim().is_empty());
+                let decision_examples = rerank_problem
                     .as_deref()
-                    .or(input.content.as_deref())
-                    .filter(|problem| !problem.trim().is_empty())
                     .map(|problem| {
                         let mut query =
                             crate::memory_types::DecisionStepQuery::new(problem).with_limit(3);
@@ -1182,6 +1208,15 @@ impl Tool for MemoryTool {
                             query = query.with_start_node(start_node.clone());
                         }
                         manager.rank_decision_steps(&query)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let domain_facts = rerank_problem
+                    .as_deref()
+                    .map(|problem| {
+                        manager.rank_domain_facts(
+                            &crate::memory_types::DomainFactQuery::new(problem).with_limit(5),
+                        )
                     })
                     .transpose()?
                     .unwrap_or_default();
@@ -1199,6 +1234,7 @@ impl Tool for MemoryTool {
                         out.push_str(&format!("\n- {diagnostic}"));
                     }
                     append_decision_examples(&mut out, &decision_examples);
+                    append_domain_facts(&mut out, &domain_facts);
                     out.push_str(
                         "\nTry different anchors or a wider scope; E05 depth is relaxed once from 8 to 16 automatically.",
                     );
@@ -1290,6 +1326,7 @@ impl Tool for MemoryTool {
                         }
                     }
                     append_decision_examples(&mut out, &decision_examples);
+                    append_domain_facts(&mut out, &domain_facts);
                     Ok(ToolOutput::new(out))
                 }
             }
@@ -1504,6 +1541,71 @@ impl Tool for MemoryTool {
                     }
                     other => Err(anyhow::anyhow!(
                         "unknown decision action: {other}; use record, search, list or forget"
+                    )),
+                }
+            }
+            "domain" => {
+                let raw = input
+                    .domain
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("domain action requires `domain` object"))?;
+                let request: DomainFactInput = serde_json::from_value(raw)?;
+                match request.action.as_str() {
+                    "record" => {
+                        if request.facts.is_empty() {
+                            return Err(anyhow::anyhow!(
+                                "domain record requires a non-empty `facts` array"
+                            ));
+                        }
+                        let inserted = manager.record_domain_facts(&request.facts)?;
+                        Ok(ToolOutput::new(format!(
+                            "Recorded {} domain fact(s), {} new\n\n{}",
+                            request.facts.len(),
+                            inserted,
+                            serde_json::to_string_pretty(&request.facts)?
+                        )))
+                    }
+                    "search" => {
+                        let text = request
+                            .text
+                            .ok_or_else(|| anyhow::anyhow!("domain search requires `text`"))?;
+                        let mut query = crate::memory_types::DomainFactQuery::new(&text)
+                            .with_limit(request.limit.unwrap_or(8));
+                        if let Some(subject) = request.subject {
+                            query = query.with_subject(subject);
+                        }
+                        if let Some(predicate) = request.predicate {
+                            query = query.with_predicate(predicate);
+                        }
+                        let hits = manager.rank_domain_facts(&query)?;
+                        Ok(ToolOutput::new(format!(
+                            "Found {} domain fact(s) for `{}`\n\n{}",
+                            hits.len(),
+                            text,
+                            serde_json::to_string_pretty(&hits)?
+                        )))
+                    }
+                    "list" => {
+                        let facts = manager.list_domain_facts()?;
+                        Ok(ToolOutput::new(format!(
+                            "{} domain fact(s)\n\n{}",
+                            facts.len(),
+                            serde_json::to_string_pretty(&facts)?
+                        )))
+                    }
+                    "forget" => {
+                        let id = request
+                            .id
+                            .ok_or_else(|| anyhow::anyhow!("domain forget requires `id`"))?;
+                        let removed = manager.forget_domain_fact(&id)?;
+                        Ok(ToolOutput::new(if removed {
+                            format!("Forgot domain fact {id}")
+                        } else {
+                            format!("Domain fact {id} not found")
+                        }))
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "unknown domain action: {other}; use record, search, list or forget"
                     )),
                 }
             }
@@ -2080,6 +2182,25 @@ fn append_decision_examples(
     }
 }
 
+fn append_domain_facts(out: &mut String, facts: &[crate::memory_types::DomainFactMatch]) {
+    if facts.is_empty() {
+        return;
+    }
+    out.push_str("\nDomain facts (explicit user statements):\n");
+    for hit in facts {
+        let fact = &hit.fact;
+        out.push_str(&format!(
+            "- score {:.2} | {} -[{}]-> {} | {} | provenance {}\n",
+            hit.score,
+            fact.subject,
+            fact.predicate,
+            fact.object,
+            fact.statement,
+            fact.source_locator
+        ));
+    }
+}
+
 fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
     use crate::memory_graph::EdgeKind;
     match kind {
@@ -2348,6 +2469,20 @@ mod tests {
                 "eval:path",
             )
             .expect("record decision example");
+        tool.manager
+            .record_domain_facts(&[jcode_base::memory_types::DomainFact {
+                id: "domain:path".to_string(),
+                subject: "parser crash".to_string(),
+                predicate: "uses".to_string(),
+                object: "module owner".to_string(),
+                statement: "parser crash uses module owner".to_string(),
+                source_session: "session-path".to_string(),
+                source_role: "user".to_string(),
+                source_locator: "message:0#sentence:0".to_string(),
+                confidence: 0.75,
+                created_at: chrono::Utc::now(),
+            }])
+            .expect("record domain fact");
 
         let output = tool
             .execute(
@@ -2373,6 +2508,14 @@ mod tests {
         assert!(output.contains("relates_to / outgoing"), "{output}");
         assert!(output.contains("score "), "{output}");
         assert!(output.contains("model model-v1"), "{output}");
+        assert!(
+            output.contains("Domain facts (explicit user statements)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("parser crash -[uses]-> module owner"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
@@ -3624,6 +3767,101 @@ mod tests {
             .unwrap();
         assert!(
             forgotten.output.contains("Forgot decision step"),
+            "{}",
+            forgotten.output
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_action_records_searches_and_forgets() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        let recorded = tool
+            .execute(
+                json!({
+                    "action":"domain",
+                    "domain":{
+                        "action":"record",
+                        "facts":[{
+                            "id":"domain:billing",
+                            "subject":"Billing service",
+                            "predicate":"uses",
+                            "object":"Stripe",
+                            "statement":"Billing service uses Stripe",
+                            "source_session":"session-domain",
+                            "source_role":"user",
+                            "source_locator":"message:0#sentence:0",
+                            "confidence":0.75,
+                            "created_at":"2026-01-01T00:00:00Z"
+                        }]
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            recorded.output.contains("Recorded 1 domain fact(s), 1 new"),
+            "{}",
+            recorded.output
+        );
+
+        let searched = tool
+            .execute(
+                json!({
+                    "action":"domain",
+                    "domain":{"action":"search","text":"Stripe billing","limit":3}
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            searched.output.contains("Found 1 domain fact"),
+            "{}",
+            searched.output
+        );
+        assert!(
+            searched.output.contains("domain:billing"),
+            "{}",
+            searched.output
+        );
+        assert!(searched.output.contains("\"score\""), "{}", searched.output);
+
+        let listed = tool
+            .execute(
+                json!({"action":"domain","domain":{"action":"list"}}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.output.contains("1 domain fact(s)"),
+            "{}",
+            listed.output
+        );
+
+        let forgotten = tool
+            .execute(
+                json!({
+                    "action":"domain",
+                    "domain":{"action":"forget","id":"domain:billing"}
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            forgotten.output.contains("Forgot domain fact domain:billing"),
             "{}",
             forgotten.output
         );

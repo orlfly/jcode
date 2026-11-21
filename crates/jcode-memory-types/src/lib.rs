@@ -38,6 +38,9 @@ pub use decision_trace::{
     DecisionDirection, DecisionStep, DecisionStepMatch, DecisionStepQuery, rank_decision_steps,
 };
 
+pub mod domain_fact;
+pub use domain_fact::{DomainFact, DomainFactMatch, DomainFactQuery, rank_domain_facts};
+
 pub mod reward;
 pub use reward::{
     RewardSignals, RewardWeights, quality_penalty, quality_signal, shaped_reward,

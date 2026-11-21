@@ -424,6 +424,27 @@ fn persist_engineering_episode(session_id: &str, working_dir: Option<&str>, mess
     }
 }
 
+/// Persist explicit user-stated domain facts before compaction rewrites them.
+fn persist_domain_facts(session_id: &str, messages: &[Message]) {
+    let extraction = jcode_base::domain_facts::extract_domain_facts(session_id, messages);
+    if extraction.facts.is_empty() {
+        return;
+    }
+    let manager = crate::memory::MemoryManager::new();
+    match manager.record_domain_facts(&extraction.facts) {
+        Ok(inserted) => logging::info(&format!(
+            "Routed {} domain fact(s) before compaction for session {} ({} new)",
+            extraction.facts.len(),
+            session_id,
+            inserted
+        )),
+        Err(err) => logging::warn(&format!(
+            "Failed to persist domain facts for session {}: {}",
+            session_id, err
+        )),
+    }
+}
+
 /// Route facts into the graph before compaction rewrites provider history.
 /// Anchors rendered into the checkpoint only resolve if this runs while the
 /// messages being summarized are still available.
@@ -446,6 +467,7 @@ fn maybe_persist_engineering_episode_before_compaction(
         usage * 100.0
     ));
     persist_engineering_episode(session_id, working_dir, messages);
+    persist_domain_facts(session_id, messages);
 }
 
 /// Tracks which checkpoint generation and anchors were already injected.

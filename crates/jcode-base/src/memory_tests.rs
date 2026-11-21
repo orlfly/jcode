@@ -5481,6 +5481,58 @@ fn decision_steps_require_verified_source_and_rank() {
 }
 
 #[test]
+fn domain_facts_persist_dedup_and_rank() {
+    with_temp_home(|_| {
+        use jcode_memory_types::{DomainFact, DomainFactQuery};
+
+        let manager = MemoryManager::new_test();
+        let fact = |id: &str, subject: &str, object: &str| DomainFact {
+            id: id.to_string(),
+            subject: subject.to_string(),
+            predicate: "uses".to_string(),
+            object: object.to_string(),
+            statement: format!("{subject} uses {object}"),
+            source_session: "session-domain".to_string(),
+            source_role: "user".to_string(),
+            source_locator: "message:0#sentence:0".to_string(),
+            confidence: 0.75,
+            created_at: chrono::Utc::now(),
+        };
+        let billing = fact("domain:billing", "Billing service", "Stripe");
+        let search = fact("domain:search", "Search service", "Elastic");
+        assert_eq!(
+            manager
+                .record_domain_facts(&[billing.clone(), search.clone()])
+                .expect("record facts"),
+            2
+        );
+        assert_eq!(
+            manager
+                .record_domain_facts(&[billing.clone()])
+                .expect("dedup fact"),
+            0
+        );
+        assert_eq!(manager.list_domain_facts().expect("list facts").len(), 2);
+
+        let hits = manager
+            .rank_domain_facts(&DomainFactQuery::new("Stripe billing").with_limit(1))
+            .expect("rank facts");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fact.id, "domain:billing");
+        assert!(hits[0].score > 0.0);
+
+        let reopened = MemoryManager::new_test();
+        assert_eq!(reopened.list_domain_facts().expect("reload facts").len(), 2);
+        assert!(
+            manager
+                .forget_domain_fact("domain:billing")
+                .expect("forget fact")
+        );
+        assert_eq!(manager.list_domain_facts().expect("list after forget").len(), 1);
+    });
+}
+
+#[test]
 fn path_quality_marks_stale_and_weak_provenance() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-quality");

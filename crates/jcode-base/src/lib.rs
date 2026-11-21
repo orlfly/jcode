@@ -44,6 +44,7 @@ pub mod embedding_backend;
 #[cfg(not(feature = "embeddings"))]
 pub mod embedding_stub;
 pub mod engineering_episode;
+pub mod domain_facts;
 pub mod engineering_store;
 pub mod env;
 pub mod external_auth;

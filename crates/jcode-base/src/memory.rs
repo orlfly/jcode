@@ -7606,6 +7606,83 @@ impl MemoryManager {
         Ok(true)
     }
 
+    fn domain_fact_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("domain_facts.json"))
+    }
+
+    pub fn list_domain_facts(&self) -> Result<Vec<jcode_memory_types::DomainFact>> {
+        let path = self.domain_fact_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut facts: Vec<jcode_memory_types::DomainFact> = storage::read_json(&path)?;
+        facts.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(facts)
+    }
+
+    fn save_domain_facts(&self, facts: &[jcode_memory_types::DomainFact]) -> Result<()> {
+        storage::write_json(&self.domain_fact_store_path()?, facts)
+    }
+
+    /// Merge typed facts into the sidecar. The same triple replaces its prior
+    /// row, and the store keeps the newest 512 facts so repeated compaction
+    /// cannot grow it without bound.
+    pub fn record_domain_facts(
+        &self,
+        facts: &[jcode_memory_types::DomainFact],
+    ) -> Result<usize> {
+        if facts.is_empty() {
+            return Ok(0);
+        }
+        let mut stored = self.list_domain_facts()?;
+        let before = stored.len();
+        for fact in facts {
+            if fact.subject.trim().is_empty()
+                || fact.predicate.trim().is_empty()
+                || fact.object.trim().is_empty()
+            {
+                anyhow::bail!("domain fact requires subject, predicate and object");
+            }
+            stored.retain(|existing| existing.id != fact.id);
+            stored.push(fact.clone());
+        }
+        stored.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        stored.truncate(512);
+        stored.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_domain_facts(&stored)?;
+        Ok(stored.len().saturating_sub(before))
+    }
+
+    pub fn rank_domain_facts(
+        &self,
+        query: &jcode_memory_types::DomainFactQuery,
+    ) -> Result<Vec<jcode_memory_types::DomainFactMatch>> {
+        let facts = self.list_domain_facts()?;
+        Ok(jcode_memory_types::rank_domain_facts(query, &facts))
+    }
+
+    pub fn forget_domain_fact(&self, id: &str) -> Result<bool> {
+        let mut facts = self.list_domain_facts()?;
+        let before = facts.len();
+        facts.retain(|fact| fact.id != id);
+        if facts.len() == before {
+            return Ok(false);
+        }
+        self.save_domain_facts(&facts)?;
+        Ok(true)
+    }
+
     /// Link one project memory to one global memory as an explicit bridge.
     pub fn link_bridge(
         &self,
