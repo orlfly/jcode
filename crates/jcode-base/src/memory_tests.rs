@@ -5299,6 +5299,38 @@ fn shadow_edge_is_hidden_until_accepted() {
             .paths_between_anchors(&[a.clone()], &[b.clone()], 2, 2, MemoryScope::Project, &[])
             .expect("pending shadow path");
         assert!(hidden.paths.is_empty(), "{hidden:?}");
+        let hypothesized = manager
+            .paths_between_anchors_with_options(
+                &[a.clone()],
+                &[b.clone()],
+                2,
+                2,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    include_hypotheses: true,
+                },
+            )
+            .expect("hypothesized shadow path");
+        assert_eq!(hypothesized.paths.len(), 1, "{hypothesized:?}");
+        assert!(
+            hypothesized.quality[0].has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
+            "{hypothesized:?}"
+        );
+        let filtered = manager
+            .paths_between_anchors_with_options(
+                &[a.clone()],
+                &[b.clone()],
+                2,
+                2,
+                MemoryScope::Project,
+                &["relates_to".to_string()],
+                crate::memory::MemoryPathQueryOptions {
+                    include_hypotheses: true,
+                },
+            )
+            .expect("filtered hypothesized path");
+        assert_eq!(filtered.paths.len(), 1, "{filtered:?}");
 
         let accepted = manager
             .review_shadow_edge(&edge.id, true)

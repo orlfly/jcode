@@ -116,6 +116,15 @@ pub enum EdgeKind {
     /// This edge exists only in stitched path results; the bridge registry keeps
     /// the persisted pair, so project and global memory files stay independent.
     Bridge,
+    /// Candidate edge from the shadow registry, used only inside a query.
+    ///
+    /// The main graph never persists this kind. Path results carrying it must be
+    /// treated as hypotheses until the shadow edge is explicitly accepted.
+    Hypothesized {
+        relation: String,
+        weight: f32,
+        confidence: f32,
+    },
 }
 
 /// One hop in a weighted memory-graph path.
@@ -158,9 +167,15 @@ fn memory_edge_key(edge: &MemoryPathEdge) -> (String, String, String) {
 
 fn relation_allowed(kind: &EdgeKind, allowed_relations: &[&str]) -> bool {
     allowed_relations.is_empty()
-        || allowed_relations
-            .iter()
-            .any(|allowed| kind.as_str().eq_ignore_ascii_case(allowed.trim()))
+        || allowed_relations.iter().any(|allowed| {
+            let allowed = allowed.trim();
+            kind.as_str().eq_ignore_ascii_case(allowed)
+                || matches!(
+                    kind,
+                    EdgeKind::Hypothesized { relation, .. }
+                        if relation.eq_ignore_ascii_case(allowed)
+                )
+        })
 }
 
 impl EdgeKind {
@@ -176,6 +191,7 @@ impl EdgeKind {
             EdgeKind::Contains => "contains",
             EdgeKind::NextStep => "next_step",
             EdgeKind::Bridge => "bridge",
+            EdgeKind::Hypothesized { .. } => "hypothesized",
         }
     }
 
@@ -192,6 +208,11 @@ impl EdgeKind {
             "contains" => EdgeKind::Contains,
             "next_step" => EdgeKind::NextStep,
             "bridge" => EdgeKind::Bridge,
+            "hypothesized" => EdgeKind::Hypothesized {
+                relation: "relates_to".to_string(),
+                weight: 0.5,
+                confidence: 0.5,
+            },
             _ => return None,
         })
     }
@@ -208,6 +229,7 @@ impl EdgeKind {
             EdgeKind::Contains => 0.9,
             EdgeKind::NextStep => 0.8,
             EdgeKind::Bridge => 0.9,
+            EdgeKind::Hypothesized { weight, .. } => *weight,
         }
     }
 }
@@ -1071,6 +1093,7 @@ impl MemoryGraph {
                     | EdgeKind::RelatesTo { .. }
                     | EdgeKind::Contradicts
                     | EdgeKind::Bridge
+                    | EdgeKind::Hypothesized { .. }
             ) && relation_allowed(&edge.kind, allowed_relations)
             {
                 out.push((
@@ -1098,6 +1121,9 @@ impl MemoryGraph {
             EdgeKind::Contains => 0.2,
             EdgeKind::NextStep => 0.2,
             EdgeKind::Bridge => 0.25,
+            EdgeKind::Hypothesized { confidence, .. } => {
+                2.0 + 0.5 * (1.0 - confidence.clamp(0.0, 1.0))
+            }
         };
         let degree = self
             .tags

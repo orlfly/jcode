@@ -264,6 +264,7 @@ fn upsert_edge(graph: &Graph, from: &str, to: &str, kind: &EdgeKind) -> Result<(
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
         EdgeKind::Bridge => "bridge",
+        EdgeKind::Hypothesized { .. } => "hypothesized",
     };
     let properties = json!({
         "kind_payload": kind_json,
@@ -337,6 +338,7 @@ fn delete_edge(graph: &Graph, from: &str, to: &str, kind: &EdgeKind) -> Result<(
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
         EdgeKind::Bridge => "bridge",
+        EdgeKind::Hypothesized { .. } => "hypothesized",
     };
     let edges = graph
         .storage

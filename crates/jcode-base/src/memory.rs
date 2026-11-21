@@ -281,6 +281,13 @@ pub struct MemoryPathQueryOutcome {
     pub depth: usize,
 }
 
+/// Optional query-time behaviour that does not change the persisted graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryPathQueryOptions {
+    /// Admit pending shadow edges as virtual `hypothesized` edges.
+    pub include_hypotheses: bool,
+}
+
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
 const MAX_RELAXED_PATH_DEPTH: usize = 16;
 
@@ -336,6 +343,16 @@ fn assess_path_quality(
         quality.push(
             PathQualityFlag::StitchedPath,
             "path crosses an explicit cross-store bridge".to_string(),
+        );
+    }
+    if path
+        .edges
+        .iter()
+        .any(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::Hypothesized { .. }))
+    {
+        quality.push(
+            PathQualityFlag::HypothesizedEdge,
+            "path crosses a pending shadow edge".to_string(),
         );
     }
     if !relaxations.is_empty() {
@@ -7652,6 +7669,28 @@ impl MemoryManager {
         scope: MemoryScope,
         relations: &[String],
     ) -> Result<MemoryPathQueryOutcome> {
+        self.paths_between_anchors_with_options(
+            from_anchors,
+            to_anchors,
+            depth,
+            limit,
+            scope,
+            relations,
+            MemoryPathQueryOptions::default(),
+        )
+    }
+
+    /// Path query with explicit query-time options such as shadow hypotheses.
+    pub fn paths_between_anchors_with_options(
+        &self,
+        from_anchors: &[String],
+        to_anchors: &[String],
+        depth: usize,
+        limit: usize,
+        scope: MemoryScope,
+        relations: &[String],
+        options: MemoryPathQueryOptions,
+    ) -> Result<MemoryPathQueryOutcome> {
         let froms = normalize_path_anchors(from_anchors);
         let tos = normalize_path_anchors(to_anchors);
         let depth = depth.clamp(1, MAX_INITIAL_PATH_DEPTH);
@@ -7683,6 +7722,7 @@ impl MemoryManager {
             &allowed,
             &unknown_relations,
             &[],
+            options.include_hypotheses,
         )?;
 
         // L0 depth relaxation: E05 means anchors are connected but the first
@@ -7703,6 +7743,7 @@ impl MemoryManager {
                 &allowed,
                 &unknown_relations,
                 std::slice::from_ref(&relaxation),
+                options.include_hypotheses,
             )?;
             relaxed.relaxations.push(relaxation);
             relaxed.depth = relaxed_depth;
@@ -7722,6 +7763,7 @@ impl MemoryManager {
         allowed: &[&str],
         unknown_relations: &[String],
         relaxations: &[String],
+        include_hypotheses: bool,
     ) -> Result<MemoryPathQueryOutcome> {
         let mut outcome = MemoryPathQueryOutcome {
             depth,
@@ -7750,6 +7792,31 @@ impl MemoryManager {
             graphs.push(("global", self.load_global_graph()?));
         }
         outcome.stores_searched = graphs.len();
+        if include_hypotheses {
+            let pending = self.list_shadow_edges(Some(ShadowEdgeStatus::Pending))?;
+            let project_key = self.get_project_dir().map(|dir| project_store_key(&dir));
+            for (label, graph) in &mut graphs {
+                let store_key = if *label == "global" {
+                    Some("global")
+                } else {
+                    project_key.as_deref()
+                };
+                let Some(store_key) = store_key else {
+                    continue;
+                };
+                for edge in pending.iter().filter(|edge| edge.store_key == store_key) {
+                    graph.add_edge(
+                        &edge.from_id,
+                        &edge.to_id,
+                        jcode_memory_types::EdgeKind::Hypothesized {
+                            relation: edge.relation.clone(),
+                            weight: edge.weight,
+                            confidence: edge.confidence,
+                        },
+                    );
+                }
+            }
+        }
 
         let mut resolved_from = std::collections::HashSet::new();
         let mut resolved_to = std::collections::HashSet::new();

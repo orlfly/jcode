@@ -1027,6 +1027,7 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
         EdgeKind::Bridge => "bridge",
+        EdgeKind::Hypothesized { .. } => "hypothesized",
     }
 }
 
@@ -1041,6 +1042,11 @@ fn parse_edge_kind(name: &str) -> Option<EdgeKind> {
         "contains" => EdgeKind::Contains,
         "next_step" => EdgeKind::NextStep,
         "bridge" => EdgeKind::Bridge,
+        "hypothesized" => EdgeKind::Hypothesized {
+            relation: "relates_to".to_string(),
+            weight: 0.5,
+            confidence: 0.5,
+        },
         _ => return None,
     })
 }

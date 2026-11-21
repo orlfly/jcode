@@ -91,6 +91,9 @@ struct MemoryInput {
     /// For engineering paths: include the deterministic PathPlan.
     #[serde(default)]
     plan: Option<bool>,
+    /// For path action: admit pending shadow edges as hypothesized edges.
+    #[serde(default)]
+    include_hypotheses: Option<bool>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -221,6 +224,10 @@ impl Tool for MemoryTool {
                 "plan": {
                     "type": "boolean",
                     "description": "For action=path graph=engineering: include the deterministic PathPlan (actions, success checks, approval gates)."
+                },
+                "include_hypotheses": {
+                    "type": "boolean",
+                    "description": "For action=path: include pending shadow edges as hypotheses."
                 },
                 "shadow_action": {
                     "type": "string",
@@ -883,8 +890,16 @@ impl Tool for MemoryTool {
                         truncate_for_widget(&tos.join(","), 15)
                     ),
                 });
-                let outcome = manager.paths_between_anchors(
-                    &froms, &tos, depth, limit, scope, &relations,
+                let outcome = manager.paths_between_anchors_with_options(
+                    &froms,
+                    &tos,
+                    depth,
+                    limit,
+                    scope,
+                    &relations,
+                    crate::memory::MemoryPathQueryOptions {
+                        include_hypotheses: input.include_hypotheses.unwrap_or(false),
+                    },
                 )?;
                 let paths = &outcome.paths;
                 memory::add_event(MemoryEventKind::ToolRecalled {
@@ -1545,6 +1560,7 @@ fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
         EdgeKind::Contains => "contains".to_string(),
         EdgeKind::NextStep => "next_step".to_string(),
         EdgeKind::Bridge => "bridge".to_string(),
+        EdgeKind::Hypothesized { relation, .. } => format!("hypothesized:{relation}"),
     }
 }
 
@@ -1806,6 +1822,27 @@ mod tests {
             .unwrap()
             .output;
         assert!(listed.contains(&id), "{listed}");
+
+        let hypothesized = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":"mem_shadow_a",
+                    "to_id":"mem_shadow_b",
+                    "scope":"project",
+                    "depth":2,
+                    "include_hypotheses":true
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(
+            hypothesized.contains("Found 1 memory path(s)"),
+            "{hypothesized}"
+        );
+        assert!(hypothesized.contains("hypothesized"), "{hypothesized}");
 
         let accepted = tool
             .execute(
