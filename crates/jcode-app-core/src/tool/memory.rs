@@ -177,7 +177,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -257,7 +257,7 @@ impl Tool for MemoryTool {
                 },
                 "anchor": {
                     "type": "string",
-                    "description": "For action=recall: engineering graph anchor (file:, error:, command:, task:). Returns the stored subgraph around it."
+                    "description": "For action=recall/readback: engineering graph anchor (file:, error:, command:, task:)."
                 },
                 "ontology_action": {
                     "type": "string",
@@ -432,6 +432,20 @@ impl Tool for MemoryTool {
                             .unwrap_or_default()
                     ))),
                 }
+            }
+            "readback" => {
+                let mut anchors = input.from_anchors.unwrap_or_default();
+                if let Some(anchor) = input.anchor {
+                    anchors.push(anchor);
+                }
+                if let Some(query) = input.query.as_deref() {
+                    anchors.extend(parse_checkpoint_anchors(query));
+                }
+                Self::readback_checkpoint(
+                    anchors,
+                    input.depth.unwrap_or(1),
+                    input.limit.unwrap_or(8),
+                )
             }
             "recall" => {
                 let limit = input.limit.unwrap_or(10);
@@ -1466,6 +1480,77 @@ impl Tool for MemoryTool {
 }
 
 impl MemoryTool {
+    /// Resolve checkpoint anchors against the persisted engineering graphs.
+    fn readback_checkpoint(anchors: Vec<String>, depth: usize, limit: usize) -> Result<ToolOutput> {
+        let mut unique = Vec::new();
+        for anchor in anchors {
+            let anchor = anchor.trim();
+            if !anchor.is_empty() && !unique.iter().any(|seen| seen == anchor) {
+                unique.push(anchor.to_string());
+            }
+        }
+        if unique.is_empty() {
+            return Err(anyhow::anyhow!(
+                "readback requires anchor, from_anchors, or query containing `- `id` | Class | summary` lines"
+            ));
+        }
+        if limit == 0 {
+            return Ok(ToolOutput::new("No graph anchors requested."));
+        }
+
+        let store = EngineeringStore::open_default()
+            .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+        let anchors: Vec<String> = unique.into_iter().take(limit.min(8)).collect();
+        let mut out = format!(
+            "Graph readback for {} anchor(s) at depth {depth}:\n",
+            anchors.len()
+        );
+        let mut missing = 0usize;
+        for anchor in &anchors {
+            let recalls = store
+                .recall_anchor(anchor, depth, 2)
+                .map_err(|error| anyhow::anyhow!("readback engineering anchor: {error}"))?;
+            if recalls.is_empty() {
+                missing += 1;
+                out.push_str(&format!(
+                    "\n## `{anchor}`\nmissing: no stored engineering graph contains this anchor.\n"
+                ));
+                continue;
+            }
+            for recall in recalls.iter().take(2) {
+                out.push_str(&format!(
+                    "\n## `{anchor}` (session {})\n",
+                    recall.session_id
+                ));
+                match recall.graph.entities.get(anchor) {
+                    Some(entity) => {
+                        out.push_str(&format!("class: {}\nfact: {}\n", entity.class, entity.name));
+                    }
+                    None => out.push_str("class: unresolved\n"),
+                }
+                let mut edges = 0usize;
+                for relation in recall.graph.relations.values() {
+                    if relation.from == *anchor || relation.to == *anchor {
+                        out.push_str(&format!(
+                            "- `{}` -{}-> `{}`\n",
+                            relation.from, relation.relation, relation.to
+                        ));
+                        edges += 1;
+                        if edges >= 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if missing > 0 {
+            out.push_str(&format!(
+                "\nmissing anchors: {missing}; try action=recall anchor=<id> depth=2 or memory path.\n"
+            ));
+        }
+        Ok(ToolOutput::new(out))
+    }
+
     /// Search persisted engineering episode graphs for typed anchor paths.
     fn path_engineering(
         froms: &[String],
@@ -1662,6 +1747,25 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Extract anchor ids from `## Graph Memory State` bullet lines.
+fn parse_checkpoint_anchors(text: &str) -> Vec<String> {
+    let mut anchors = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("- `") else {
+            continue;
+        };
+        let Some((id, _)) = rest.split_once('`') else {
+            continue;
+        };
+        let id = id.trim();
+        if !id.is_empty() && !anchors.iter().any(|seen| seen == id) {
+            anchors.push(id.to_string());
+        }
+    }
+    anchors
 }
 
 fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
@@ -2168,6 +2272,37 @@ mod tests {
             output.output
         );
         assert!(output.output.contains("modifies"), "{}", output.output);
+
+        let readback = tool
+            .execute(
+                json!({
+                    "action":"readback",
+                    "query":"## Graph Memory State\n- `file:src/lib.rs` | File | src/lib.rs\n- `missing:anchor` | File | missing.rs",
+                    "depth":1,
+                    "limit":4
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("checkpoint readback");
+        assert!(
+            readback.output.contains("Graph readback for 2 anchor(s)"),
+            "{}",
+            readback.output
+        );
+        assert!(
+            readback.output.contains("class: file"),
+            "{}",
+            readback.output
+        );
+        assert!(readback.output.contains("modifies"), "{}", readback.output);
+        assert!(
+            readback
+                .output
+                .contains("missing: no stored engineering graph"),
+            "{}",
+            readback.output
+        );
     }
 
     #[tokio::test]
