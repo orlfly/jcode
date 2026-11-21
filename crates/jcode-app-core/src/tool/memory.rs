@@ -91,6 +91,9 @@ struct MemoryInput {
     /// For engineering paths: include the deterministic PathPlan.
     #[serde(default)]
     plan: Option<bool>,
+    /// For action=path: structured PathQuery IR.
+    #[serde(default)]
+    path_query: Option<crate::memory_types::PathQuery>,
     /// For path action: admit pending shadow edges as hypothesized edges.
     #[serde(default)]
     include_hypotheses: Option<bool>,
@@ -224,6 +227,10 @@ impl Tool for MemoryTool {
                 "plan": {
                     "type": "boolean",
                     "description": "For action=path graph=engineering: include the deterministic PathPlan (actions, success checks, approval gates)."
+                },
+                "path_query": {
+                    "type": "object",
+                    "description": "For action=path: structured PathQuery object."
                 },
                 "include_hypotheses": {
                     "type": "boolean",
@@ -844,28 +851,75 @@ impl Tool for MemoryTool {
                 }
             }
             "path" => {
-                let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
-                let depth = input.depth.unwrap_or(4);
-                let limit = input.limit.unwrap_or(3);
-                let mut froms = input.from_anchors.unwrap_or_default();
-                if let Some(from) = input.from_id {
-                    froms.insert(0, from);
-                }
-                let mut tos = input.to_anchors.unwrap_or_default();
-                if let Some(to) = input.to_id {
-                    tos.insert(0, to);
-                }
+                let (
+                    scope,
+                    depth,
+                    limit,
+                    froms,
+                    tos,
+                    relations,
+                    graph_kind,
+                    include_plan,
+                    include_hypotheses,
+                ) = if let Some(query) = input.path_query.clone() {
+                    query.validate().map_err(|errors| {
+                        anyhow::anyhow!("invalid path_query: {}", errors.join("; "))
+                    })?;
+                    let scope = match query.scope() {
+                        crate::memory_types::PathQueryScope::Project => MemoryScope::Project,
+                        crate::memory_types::PathQueryScope::Global => MemoryScope::Global,
+                        crate::memory_types::PathQueryScope::All => MemoryScope::All,
+                    };
+                    let graph_kind = query.graph_kind().as_str().to_string();
+                    (
+                        scope,
+                        query.depth(4),
+                        query.limit(3),
+                        query.start,
+                        query.goal,
+                        query.constraints.relations,
+                        graph_kind,
+                        query.constraints.plan,
+                        query.constraints.include_hypotheses,
+                    )
+                } else {
+                    let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                    let depth = input.depth.unwrap_or(4);
+                    let limit = input.limit.unwrap_or(3);
+                    let mut froms = input.from_anchors.unwrap_or_default();
+                    if let Some(from) = input.from_id {
+                        froms.insert(0, from);
+                    }
+                    let mut tos = input.to_anchors.unwrap_or_default();
+                    if let Some(to) = input.to_id {
+                        tos.insert(0, to);
+                    }
+                    let relations = input.relation_allow.unwrap_or_default();
+                    let graph_kind = input.graph.unwrap_or_else(|| "memory".to_string());
+                    let include_plan = input.plan.unwrap_or(false);
+                    let include_hypotheses = input.include_hypotheses.unwrap_or(false);
+                    (
+                        scope,
+                        depth,
+                        limit,
+                        froms,
+                        tos,
+                        relations,
+                        graph_kind,
+                        include_plan,
+                        include_hypotheses,
+                    )
+                };
                 if froms.is_empty() {
                     return Err(anyhow::anyhow!(
-                        "from_id or from_anchors required for path"
+                        "from_id, from_anchors, or path_query.start required for path"
                     ));
                 }
                 if tos.is_empty() {
-                    return Err(anyhow::anyhow!("to_id or to_anchors required for path"));
+                    return Err(anyhow::anyhow!(
+                        "to_id, to_anchors, or path_query.goal required for path"
+                    ));
                 }
-                let relations = input.relation_allow.unwrap_or_default();
-                let graph_kind = input.graph.unwrap_or_else(|| "memory".to_string());
-                let include_plan = input.plan.unwrap_or(false);
                 if graph_kind == "engineering" {
                     return Self::path_engineering(
                         &froms,
@@ -898,7 +952,7 @@ impl Tool for MemoryTool {
                     scope,
                     &relations,
                     crate::memory::MemoryPathQueryOptions {
-                        include_hypotheses: input.include_hypotheses.unwrap_or(false),
+                        include_hypotheses,
                     },
                 )?;
                 let paths = &outcome.paths;
@@ -963,7 +1017,7 @@ impl Tool for MemoryTool {
                             .fold(0.0, f32::max),
                         diagnosis: outcome.diagnosis.clone(),
                         quality_flags,
-                        planning_requested: input.plan.unwrap_or(false),
+                        planning_requested: include_plan,
                         attempts_remaining: 1,
                     },
                 );
@@ -1754,7 +1808,7 @@ mod tests {
                     "depth":3,
                     "limit":2
                 }),
-                ctx,
+                ctx.clone(),
             )
             .await
             .unwrap()
@@ -1765,6 +1819,50 @@ mod tests {
         assert!(output.contains("relates_to"), "{output}");
         assert!(output.contains("decision: terminate"), "{output}");
         assert!(output.contains("reward:"), "{output}");
+
+        let structured = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "path_query":{
+                        "start":["mem_path_a"],
+                        "goal":["mem_path_b"],
+                        "graph":"memory",
+                        "constraints":{
+                            "scope":"project",
+                            "depth":3,
+                            "limit":2,
+                            "relations":["relates_to"]
+                        }
+                    }
+                }),
+                ctx,
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(
+            structured.contains("Found 1 memory path(s)"),
+            "{structured}"
+        );
+        assert!(structured.contains("mem_path_c"), "{structured}");
+
+        let invalid = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "path_query":{
+                        "start":["mem_path_a"],
+                        "goal":["mem_path_b"],
+                        "constraints":{"relations":["invented_relation"]}
+                    }
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("unknown memory relation"), "{invalid}");
     }
 
     #[tokio::test]
