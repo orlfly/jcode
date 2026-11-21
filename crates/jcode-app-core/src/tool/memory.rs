@@ -94,6 +94,15 @@ struct MemoryInput {
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
+    /// For shadow propose: candidate confidence (0.0-1.0).
+    #[serde(default)]
+    confidence: Option<f32>,
+    /// For shadow propose: relation name. Default relates_to.
+    #[serde(default)]
+    relation: Option<String>,
+    /// For action=shadow: list | propose | accept | reject.
+    #[serde(default)]
+    shadow_action: Option<String>,
     /// For related action: traversal depth (default: 2). For path: max hops
     /// (default: 4, capped at 8).
     #[serde(default)]
@@ -152,7 +161,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Manage memory (remember/recall/search/list/forget/link/bridge/path/embed). Default scope: project."
+        "Manage memory (remember/recall/search/list/forget/link/bridge/shadow/path/embed). Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -162,7 +171,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "related", "path", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -212,6 +221,19 @@ impl Tool for MemoryTool {
                 "plan": {
                     "type": "boolean",
                     "description": "For action=path graph=engineering: include the deterministic PathPlan (actions, success checks, approval gates)."
+                },
+                "shadow_action": {
+                    "type": "string",
+                    "enum": ["list", "propose", "accept", "reject"],
+                    "description": "For action=shadow: list, propose, accept, reject."
+                },
+                "relation": {
+                    "type": "string",
+                    "description": "For action=shadow: edge relation. Default relates_to."
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "For action=shadow: candidate confidence 0.0-1.0."
                 },
                 "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
                 "mode": {
@@ -684,6 +706,98 @@ impl Tool for MemoryTool {
                     Ok(ToolOutput::new(format!("Removed bridge {id}.")))
                 } else {
                     Ok(ToolOutput::new(format!("No bridge found with id {id}.")))
+                }
+            }
+            "shadow" => {
+                use crate::memory::ShadowEdgeStatus;
+
+                let shadow_action = input.shadow_action.as_deref().unwrap_or("list");
+                match shadow_action {
+                    "list" => {
+                        let scope =
+                            Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                        let status = input
+                            .status
+                            .as_deref()
+                            .map(|value| {
+                                ShadowEdgeStatus::parse(value).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Unknown shadow status: {value}. Use pending, accepted, or rejected"
+                                    )
+                                })
+                            })
+                            .transpose()?;
+                        let mut edges = manager.list_shadow_edges_scoped(status, scope)?;
+                        if let Some(limit) = input.limit {
+                            edges.truncate(limit);
+                        }
+                        if edges.is_empty() {
+                            return Ok(ToolOutput::new("No shadow edges found.".to_string()));
+                        }
+                        let mut out = format!("Shadow edges ({}):", edges.len());
+                        for edge in edges {
+                            out.push_str(&format!(
+                                "\n- {} [{}] {} -{}-> {} (weight {:.2}, confidence {:.2})",
+                                edge.id,
+                                edge.status.as_str(),
+                                edge.from_id,
+                                edge.relation,
+                                edge.to_id,
+                                edge.weight,
+                                edge.confidence
+                            ));
+                        }
+                        Ok(ToolOutput::new(out))
+                    }
+                    "propose" => {
+                        let from_id = input
+                            .from_id
+                            .ok_or_else(|| anyhow::anyhow!("from_id required for shadow propose"))?;
+                        let to_id = input
+                            .to_id
+                            .ok_or_else(|| anyhow::anyhow!("to_id required for shadow propose"))?;
+                        let scope =
+                            Self::parse_scope(input.scope.as_deref(), MemoryScope::Project)?;
+                        let relation = input.relation.as_deref().unwrap_or("relates_to");
+                        let edge = manager.propose_shadow_edge(
+                            &from_id,
+                            &to_id,
+                            relation,
+                            input.weight.unwrap_or(0.5),
+                            input.confidence.unwrap_or(0.5),
+                            input.content.as_deref(),
+                            "user",
+                            scope,
+                        )?;
+                        Ok(ToolOutput::new(format!(
+                            "Proposed shadow edge {} [pending] {} -{}-> {} (weight {:.2}, confidence {:.2}). Accept with action=shadow shadow_action=accept id={}.",
+                            edge.id,
+                            edge.from_id,
+                            edge.relation,
+                            edge.to_id,
+                            edge.weight,
+                            edge.confidence,
+                            edge.id
+                        )))
+                    }
+                    "accept" | "reject" => {
+                        let id = input.id.ok_or_else(|| {
+                            anyhow::anyhow!("id required for shadow {shadow_action}")
+                        })?;
+                        let accept = shadow_action == "accept";
+                        let edge = manager.review_shadow_edge(&id, accept)?;
+                        if accept {
+                            Ok(ToolOutput::new(format!(
+                                "Accepted shadow edge {}; wrote {} -> {} ({}).",
+                                edge.id, edge.from_id, edge.to_id, edge.relation
+                            )))
+                        } else {
+                            Ok(ToolOutput::new(format!("Rejected shadow edge {}.", edge.id)))
+                        }
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "Unknown shadow_action: {other}. Use list, propose, accept, or reject"
+                    )),
                 }
             }
             "related" => {
@@ -1634,6 +1748,90 @@ mod tests {
             "{}",
             output.output
         );
+    }
+
+    #[tokio::test]
+    async fn shadow_action_proposes_lists_and_accepts() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new();
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        for (id, content) in [
+            ("mem_shadow_a", "alpha quasar calibration"),
+            ("mem_shadow_b", "zulu nebula observation"),
+        ] {
+            let output = tool
+                .execute(
+                    json!({"action":"remember","id":id,"content":content,"scope":"project"}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap()
+                .output;
+            assert!(output.contains("Remembered"), "{output}");
+        }
+
+        let proposed = tool
+            .execute(
+                json!({
+                    "action":"shadow",
+                    "shadow_action":"propose",
+                    "from_id":"mem_shadow_a",
+                    "to_id":"mem_shadow_b",
+                    "scope":"project",
+                    "content":"test evidence"
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(proposed.contains("[pending]"), "{proposed}");
+        let id = proposed
+            .split("shadow edge ")
+            .nth(1)
+            .and_then(|rest| rest.split(" [pending]").next())
+            .expect("shadow edge id")
+            .to_string();
+
+        let listed = tool
+            .execute(
+                json!({"action":"shadow","shadow_action":"list","scope":"project"}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(listed.contains(&id), "{listed}");
+
+        let accepted = tool
+            .execute(
+                json!({"action":"shadow","shadow_action":"accept","id":id}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(accepted.contains("Accepted shadow edge"), "{accepted}");
+
+        let path = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":"mem_shadow_a",
+                    "to_id":"mem_shadow_b",
+                    "scope":"project",
+                    "depth":2
+                }),
+                ctx,
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(path.contains("Found 1 memory path(s)"), "{path}");
     }
 
     #[tokio::test]

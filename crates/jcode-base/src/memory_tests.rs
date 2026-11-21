@@ -5270,3 +5270,51 @@ fn explicit_bridge_stitches_project_and_global_paths() {
         assert!(after.paths.is_empty(), "{after:?}");
     });
 }
+
+#[test]
+fn shadow_edge_is_hidden_until_accepted() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/shadow-edge");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "shadow source note"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "shadow target note"));
+        manager
+            .save_project_graph(&graph)
+            .expect("save shadow graph");
+
+        let edge = manager
+            .propose_shadow_edge(
+                &a,
+                &b,
+                "relates_to",
+                0.9,
+                0.8,
+                Some("test evidence"),
+                "test",
+                MemoryScope::Project,
+            )
+            .expect("propose shadow");
+        assert_eq!(edge.status, crate::memory::ShadowEdgeStatus::Pending);
+        let hidden = manager
+            .paths_between_anchors(&[a.clone()], &[b.clone()], 2, 2, MemoryScope::Project, &[])
+            .expect("pending shadow path");
+        assert!(hidden.paths.is_empty(), "{hidden:?}");
+
+        let accepted = manager
+            .review_shadow_edge(&edge.id, true)
+            .expect("accept shadow");
+        assert_eq!(accepted.status, crate::memory::ShadowEdgeStatus::Accepted);
+        let promoted = manager
+            .paths_between_anchors(&[a], &[b], 2, 2, MemoryScope::Project, &[])
+            .expect("accepted shadow path");
+        assert_eq!(promoted.paths.len(), 1, "{promoted:?}");
+        assert!(
+            matches!(
+                promoted.paths[0].edges[0].kind,
+                crate::memory_graph::EdgeKind::RelatesTo { weight }
+                    if (weight - 0.9).abs() < 0.001
+            ),
+            "{promoted:?}"
+        );
+    });
+}

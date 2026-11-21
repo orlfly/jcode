@@ -364,6 +364,56 @@ pub struct MemoryBridge {
     pub created_at: DateTime<Utc>,
 }
 
+/// Lifecycle of a shadow edge proposed by an extractor or model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowEdgeStatus {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+impl ShadowEdgeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// A candidate edge that is not part of the main graph until reviewed.
+///
+/// Pending shadow edges are never traversed by path queries. Accepting one
+/// writes the real edge; rejecting one only changes registry status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryShadowEdge {
+    pub id: String,
+    pub store_key: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub relation: String,
+    pub weight: f32,
+    pub confidence: f32,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    pub status: ShadowEdgeStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime<Utc>>,
+}
+
 fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -7264,6 +7314,187 @@ impl MemoryManager {
         }
         self.save_bridges(&bridges)?;
         Ok(true)
+    }
+
+    fn shadow_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("shadow_edges.json"))
+    }
+
+    pub fn list_shadow_edges(
+        &self,
+        status: Option<ShadowEdgeStatus>,
+    ) -> Result<Vec<MemoryShadowEdge>> {
+        let path = self.shadow_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut edges: Vec<MemoryShadowEdge> = storage::read_json(&path)?;
+        if let Some(status) = status {
+            edges.retain(|edge| edge.status == status);
+        }
+        edges.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(edges)
+    }
+
+    pub fn list_shadow_edges_scoped(
+        &self,
+        status: Option<ShadowEdgeStatus>,
+        scope: MemoryScope,
+    ) -> Result<Vec<MemoryShadowEdge>> {
+        let mut edges = self.list_shadow_edges(status)?;
+        match scope {
+            MemoryScope::Project => {
+                if let Some(dir) = self.get_project_dir() {
+                    let store = project_store_key(&dir);
+                    edges.retain(|edge| edge.store_key == store);
+                } else {
+                    edges.clear();
+                }
+            }
+            MemoryScope::Global => edges.retain(|edge| edge.store_key == "global"),
+            MemoryScope::All => {}
+        }
+        Ok(edges)
+    }
+
+    fn save_shadow_edges(&self, edges: &[MemoryShadowEdge]) -> Result<()> {
+        storage::write_json(&self.shadow_store_path()?, &edges)
+    }
+
+    /// Propose a candidate edge without touching the main graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_shadow_edge(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        relation: &str,
+        weight: f32,
+        confidence: f32,
+        evidence: Option<&str>,
+        source: &str,
+        scope: MemoryScope,
+    ) -> Result<MemoryShadowEdge> {
+        let kind = jcode_memory_types::EdgeKind::parse(relation)
+            .ok_or_else(|| anyhow::anyhow!("unknown shadow relation: {relation}"))?;
+        anyhow::ensure!(
+            !matches!(kind, jcode_memory_types::EdgeKind::Bridge),
+            "bridge edges are registered with `bridge`, not shadow edges"
+        );
+        let (store_key, graph) = match scope {
+            MemoryScope::Project => {
+                let dir = self.get_project_dir().ok_or_else(|| {
+                    anyhow::anyhow!("project shadow edges require a project directory")
+                })?;
+                (project_store_key(&dir), self.load_project_graph()?)
+            }
+            MemoryScope::Global => ("global".to_string(), self.load_global_graph()?),
+            MemoryScope::All => {
+                anyhow::bail!("choose project or global scope for a shadow edge")
+            }
+        };
+        anyhow::ensure!(
+            graph.get_memory(from_id).is_some(),
+            "shadow edge source not found: {from_id}"
+        );
+        anyhow::ensure!(
+            graph.get_memory(to_id).is_some(),
+            "shadow edge target not found: {to_id}"
+        );
+        let relation = kind.as_str().to_string();
+        let edge = MemoryShadowEdge {
+            id: format!("shadow:{store_key}:{from_id}:{to_id}:{relation}"),
+            store_key,
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            relation,
+            weight: weight.clamp(0.0, 1.0),
+            confidence: confidence.clamp(0.0, 1.0),
+            source: source.to_string(),
+            evidence: evidence.map(str::to_string),
+            status: ShadowEdgeStatus::Pending,
+            created_at: Utc::now(),
+            reviewed_at: None,
+        };
+        let mut edges = self.list_shadow_edges(None)?;
+        if let Some(existing) = edges.iter().find(|existing| existing.id == edge.id) {
+            anyhow::ensure!(
+                existing.status != ShadowEdgeStatus::Accepted,
+                "shadow edge {} is already accepted",
+                edge.id
+            );
+        }
+        edges.retain(|existing| existing.id != edge.id);
+        edges.push(edge.clone());
+        edges.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_shadow_edges(&edges)?;
+        Ok(edge)
+    }
+
+    /// Accept or reject one pending shadow edge. Acceptance writes the real
+    /// graph edge; rejection only records the decision.
+    pub fn review_shadow_edge(&self, id: &str, accept: bool) -> Result<MemoryShadowEdge> {
+        let mut edges = self.list_shadow_edges(None)?;
+        let index = edges
+            .iter()
+            .position(|edge| edge.id == id)
+            .ok_or_else(|| anyhow::anyhow!("shadow edge not found: {id}"))?;
+        anyhow::ensure!(
+            edges[index].status == ShadowEdgeStatus::Pending,
+            "shadow edge {id} is already {}",
+            edges[index].status.as_str()
+        );
+        let mut edge = edges.remove(index);
+        if accept {
+            let parsed = jcode_memory_types::EdgeKind::parse(&edge.relation)
+                .ok_or_else(|| anyhow::anyhow!("unknown shadow relation: {}", edge.relation))?;
+            let kind = match parsed {
+                jcode_memory_types::EdgeKind::RelatesTo { .. } => {
+                    jcode_memory_types::EdgeKind::RelatesTo {
+                        weight: edge.weight.clamp(0.0, 1.0),
+                    }
+                }
+                other => other,
+            };
+            let (mut graph, save_project) = if edge.store_key == "global" {
+                (self.load_global_graph()?, false)
+            } else {
+                let dir = self.get_project_dir().ok_or_else(|| {
+                    anyhow::anyhow!("project shadow edge requires a project directory")
+                })?;
+                anyhow::ensure!(
+                    project_store_key(&dir) == edge.store_key,
+                    "shadow edge belongs to another project store"
+                );
+                (self.load_project_graph()?, true)
+            };
+            anyhow::ensure!(
+                graph.get_memory(&edge.from_id).is_some()
+                    && graph.get_memory(&edge.to_id).is_some(),
+                "shadow edge endpoints no longer exist"
+            );
+            graph.add_edge(&edge.from_id, &edge.to_id, kind);
+            if save_project {
+                self.save_project_graph(&graph)?;
+            } else {
+                self.save_global_graph(&graph)?;
+            }
+        }
+        edge.status = if accept {
+            ShadowEdgeStatus::Accepted
+        } else {
+            ShadowEdgeStatus::Rejected
+        };
+        edge.reviewed_at = Some(Utc::now());
+        edges.push(edge.clone());
+        edges.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_shadow_edges(&edges)?;
+        Ok(edge)
     }
 
     #[allow(clippy::too_many_arguments)]
