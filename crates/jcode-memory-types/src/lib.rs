@@ -20,7 +20,9 @@ pub mod path_quality;
 pub use path_quality::{PathQuality, PathQualityFlag};
 
 pub mod path_query;
-pub use path_query::{PathGraphKind, PathQuery, PathQueryConstraints, PathQueryScope};
+pub use path_query::{
+    PathGraphKind, PathObjective, PathQuery, PathQueryConstraints, PathQueryScope,
+};
 
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};

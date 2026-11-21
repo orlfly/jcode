@@ -62,11 +62,34 @@ impl PathQueryScope {
     }
 }
 
+/// Cost-versus-confidence ordering after constraints are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathObjective {
+    MinCost,
+    MaxConfidence,
+}
+
+impl PathObjective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MinCost => "min_cost",
+            Self::MaxConfidence => "max_confidence",
+        }
+    }
+}
+
 /// Query constraints after entity linking.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathQueryConstraints {
     #[serde(default)]
     pub relations: Vec<String>,
+    #[serde(default)]
+    pub deny_relations: Vec<String>,
+    #[serde(default)]
+    pub min_confidence: Option<f32>,
+    #[serde(default)]
+    pub objective: Option<PathObjective>,
     #[serde(default)]
     pub depth: Option<usize>,
     #[serde(default)]
@@ -80,7 +103,7 @@ pub struct PathQueryConstraints {
 }
 
 /// One validated path query.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathQuery {
     pub start: Vec<String>,
     pub goal: Vec<String>,
@@ -144,13 +167,23 @@ impl PathQuery {
             errors.push("limit must be at most 20".to_string());
         }
         if self.graph_kind() == PathGraphKind::Memory {
-            for relation in &self.constraints.relations {
+            for relation in self
+                .constraints
+                .relations
+                .iter()
+                .chain(self.constraints.deny_relations.iter())
+            {
                 let relation = relation.trim();
                 if relation.is_empty() || EdgeKind::parse(relation).is_some() {
                     continue;
                 }
                 errors.push(format!("unknown memory relation: {relation}"));
             }
+        }
+        if let Some(confidence) = self.constraints.min_confidence
+            && !(0.0..=1.0).contains(&confidence)
+        {
+            errors.push("min_confidence must be between 0.0 and 1.0".to_string());
         }
         if errors.is_empty() {
             Ok(())
@@ -172,6 +205,9 @@ mod tests {
             graph: Some(PathGraphKind::Memory),
             constraints: PathQueryConstraints {
                 relations: vec!["relates_to".to_string()],
+                deny_relations: vec!["contradicts".to_string()],
+                min_confidence: Some(0.6),
+                objective: Some(PathObjective::MaxConfidence),
                 depth: Some(4),
                 limit: Some(3),
                 scope: Some(PathQueryScope::Project),
@@ -181,6 +217,10 @@ mod tests {
         assert!(query.validate().is_ok());
         assert_eq!(query.graph_kind(), PathGraphKind::Memory);
         assert_eq!(query.scope(), PathQueryScope::Project);
+        assert_eq!(
+            query.constraints.objective,
+            Some(PathObjective::MaxConfidence)
+        );
     }
 
     #[test]
@@ -191,6 +231,8 @@ mod tests {
             graph: None,
             constraints: PathQueryConstraints {
                 relations: vec!["invented".to_string()],
+                deny_relations: vec!["also_invented".to_string()],
+                min_confidence: Some(1.5),
                 depth: Some(99),
                 limit: Some(99),
                 ..PathQueryConstraints::default()
@@ -202,6 +244,7 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("unknown memory relation"))
         );
+        assert!(errors.iter().any(|error| error.contains("min_confidence")));
         assert!(errors.iter().any(|error| error.contains("depth")));
         assert!(errors.iter().any(|error| error.contains("limit")));
     }

@@ -865,6 +865,11 @@ impl Tool for MemoryTool {
                 }
             }
             "path" => {
+                let mut query_filters: Option<(
+                    Vec<String>,
+                    Option<f32>,
+                    Option<crate::memory_types::PathObjective>,
+                )> = None;
                 let (
                     scope,
                     depth,
@@ -884,6 +889,16 @@ impl Tool for MemoryTool {
                         crate::memory_types::PathQueryScope::Global => MemoryScope::Global,
                         crate::memory_types::PathQueryScope::All => MemoryScope::All,
                     };
+                    if !query.constraints.deny_relations.is_empty()
+                        || query.constraints.min_confidence.is_some()
+                        || query.constraints.objective.is_some()
+                    {
+                        query_filters = Some((
+                            query.constraints.deny_relations.clone(),
+                            query.constraints.min_confidence,
+                            query.constraints.objective,
+                        ));
+                    }
                     let graph_kind = query.graph_kind().as_str().to_string();
                     (
                         scope,
@@ -935,6 +950,11 @@ impl Tool for MemoryTool {
                     ));
                 }
                 if graph_kind == "engineering" {
+                    if query_filters.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "path_query deny_relations/min_confidence/objective are only supported for the memory graph"
+                        ));
+                    }
                     return Self::path_engineering(
                         &froms,
                         &tos,
@@ -958,17 +978,50 @@ impl Tool for MemoryTool {
                         truncate_for_widget(&tos.join(","), 15)
                     ),
                 });
-                let outcome = manager.paths_between_anchors_with_options(
+                let engine_limit = query_filters
+                    .as_ref()
+                    .map_or(limit, |_| (limit.saturating_mul(3)).min(20));
+                let mut outcome = manager.paths_between_anchors_with_options(
                     &froms,
                     &tos,
                     depth,
-                    limit,
+                    engine_limit,
                     scope,
                     &relations,
                     crate::memory::MemoryPathQueryOptions {
                         include_hypotheses,
                     },
                 )?;
+                if let Some((deny_relations, min_confidence, objective)) = query_filters {
+                    let mut paired: Vec<_> = std::mem::take(&mut outcome.paths)
+                        .into_iter()
+                        .zip(std::mem::take(&mut outcome.quality))
+                        .collect();
+                    let before = paired.len();
+                    paired.retain(|(path, _)| {
+                        !path.edges.iter().any(|edge| {
+                            let label = memory_edge_relation(&edge.kind);
+                            deny_relations
+                                .iter()
+                                .any(|deny| label.eq_ignore_ascii_case(deny.trim()))
+                        }) && min_confidence.map_or(true, |min| path.confidence >= min)
+                    });
+                    if objective == Some(crate::memory_types::PathObjective::MaxConfidence) {
+                        paired.sort_by(|(left, _), (right, _)| {
+                            right
+                                .confidence
+                                .total_cmp(&left.confidence)
+                                .then_with(|| left.cost.total_cmp(&right.cost))
+                        });
+                    }
+                    paired.truncate(limit);
+                    if paired.is_empty() && before > 0 {
+                        outcome.next_actions.push(
+                            "query constraints excluded all candidate paths; relax deny_relations or min_confidence".to_string(),
+                        );
+                    }
+                    (outcome.paths, outcome.quality) = paired.into_iter().unzip();
+                }
                 let paths = &outcome.paths;
                 memory::add_event(MemoryEventKind::ToolRecalled {
                     query: format!(
@@ -1797,6 +1850,15 @@ fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
     }
 }
 
+fn memory_edge_relation(kind: &crate::memory_graph::EdgeKind) -> String {
+    use crate::memory_graph::EdgeKind;
+    match kind {
+        EdgeKind::RelatesTo { .. } => "relates_to".to_string(),
+        EdgeKind::Hypothesized { relation, .. } => relation.clone(),
+        other => memory_edge_label(other),
+    }
+}
+
 /// Validate a user-supplied memory id. Keeps the id set small enough to be
 /// safe in storage paths and printable in tool output, and avoids whitespace,
 /// control characters, and JSON/scope-relevant punctuation that would let a
@@ -1953,7 +2015,7 @@ mod tests {
                         }
                     }
                 }),
-                ctx,
+                ctx.clone(),
             )
             .await
             .unwrap()
@@ -1963,6 +2025,33 @@ mod tests {
             "{structured}"
         );
         assert!(structured.contains("mem_path_c"), "{structured}");
+
+        let denied = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "path_query":{
+                        "start":["mem_path_a"],
+                        "goal":["mem_path_b"],
+                        "graph":"memory",
+                        "constraints":{
+                            "scope":"project",
+                            "depth":3,
+                            "limit":2,
+                            "deny_relations":["relates_to"]
+                        }
+                    }
+                }),
+                ctx,
+            )
+            .await
+            .expect("deny relation query")
+            .output;
+        assert!(denied.contains("No memory path found"), "{denied}");
+        assert!(
+            denied.contains("query constraints excluded all candidate paths"),
+            "{denied}"
+        );
 
         let invalid = tool
             .execute(
