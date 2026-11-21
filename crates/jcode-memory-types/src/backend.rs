@@ -87,6 +87,26 @@ pub trait GraphBackend: Debug + Send + Sync {
     /// `memory.backend` diagnostic field.
     fn name(&self) -> &str;
 
+    /// Revision of the store identified by `key`.
+    ///
+    /// Callers may cache the graph returned by [`load`](Self::load) and
+    /// reuse it while this value is unchanged. Implementations backed by
+    /// a shared store must include external mutations, not only writes
+    /// made through this process. Returning a constant opts out of
+    /// revision-based caching.
+    fn graph_revision(&self, _key: &StoreKey) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Namespace for process-local graph caches.
+    ///
+    /// Backends that can open more than one physical store must include
+    /// that store's identity, otherwise entries for different databases
+    /// with the same [`StoreKey`] would collide.
+    fn cache_namespace(&self) -> String {
+        self.name().to_string()
+    }
+
     /// Load the graph identified by `key`.
     ///
     /// Returns `Ok(MemoryGraph::new())` when the store does not yet

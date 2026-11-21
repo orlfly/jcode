@@ -55,7 +55,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-use cache::{cache_graph, cache_graph_for_backend, cached_graph};
+use cache::{cache_graph, cached_graph};
 pub use jcode_memory_types::{
     AdmissionTier, ChangeLevel, ConfirmationGate, MemoryReviewItem, MemoryReviewState,
     ReviewRecommendation, ReviewStatus, admission_tier,
@@ -5248,18 +5248,11 @@ impl MemoryManager {
             seen_keys.insert(key.as_str().to_string());
             visited += 1;
             if visit(key.as_str(), &mut graph) {
-                match backend.save(&key, &graph) {
-                    Ok(()) => {
-                        if !self.test_mode {
-                            cache_graph_for_backend(backend.name(), &key, &graph, 0);
-                        }
-                    }
-                    Err(e) => {
-                        crate::logging::warn(&format!(
-                            "store save after maintenance failed for {}: {e}",
-                            key.as_str()
-                        ));
-                    }
+                if let Err(e) = backend.save(&key, &graph) {
+                    crate::logging::warn(&format!(
+                        "store save after maintenance failed for {}: {e}",
+                        key.as_str()
+                    ));
                 }
             }
         }
@@ -6992,9 +6985,6 @@ impl MemoryManager {
                     // is what lets a later load notice that the ontology the
                     // store was authored against has changed.
                     self.bind_and_check_ontology(&key, &backend, &mut graph);
-                    if !self.test_mode {
-                        cache_graph_for_backend(backend.name(), &key, &graph, 0);
-                    }
                     return Ok(graph);
                 }
                 Err(e) => {
@@ -7113,9 +7103,6 @@ impl MemoryManager {
                         let _ = backend.save(&key, &graph);
                     }
                     self.bind_and_check_ontology(&key, &backend, &mut graph);
-                    if !self.test_mode {
-                        cache_graph_for_backend(backend.name(), &key, &graph, 0);
-                    }
                     return Ok(graph);
                 }
                 Err(e) => {
@@ -7224,9 +7211,6 @@ impl MemoryManager {
                         .unwrap_or_else(|| "<none>".to_string())
                 );
             }
-            if !self.test_mode {
-                cache_graph_for_backend(backend.name(), &key, graph, 0);
-            }
             return Ok(());
         }
         self.save_project_graph_json(graph)
@@ -7326,9 +7310,6 @@ impl MemoryManager {
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "<none>".to_string())
                 );
-            }
-            if !self.test_mode {
-                cache_graph_for_backend(backend.name(), &key, graph, 0);
             }
             return Ok(());
         }

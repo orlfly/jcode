@@ -1,11 +1,13 @@
 use crate::memory_graph::MemoryGraph;
 use jcode_memory_types::StoreKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 // === Graph Cache ===
+
+const BACKEND_CACHE_LIMIT: usize = 8;
 
 struct GraphCacheEntry {
     graph: MemoryGraph,
@@ -14,7 +16,6 @@ struct GraphCacheEntry {
     /// backend's save path.
     modified: Option<SystemTime>,
     // Only read by cached_graph_for_backend; path-mode entries carry 0.
-    #[allow(dead_code)]
     version: u64,
 }
 
@@ -24,6 +25,10 @@ struct GraphCache {
     /// New entries keyed by `(backend_name, store_key)`; only valid
     /// while `version` matches the backend's current generation.
     backend_entries: HashMap<(String, String), GraphCacheEntry>,
+    /// FIFO insertion order for `backend_entries`, bounded so a
+    /// maintenance sweep over many stores cannot pin every graph in
+    /// memory for the rest of the process.
+    backend_order: VecDeque<(String, String)>,
 }
 
 impl GraphCache {
@@ -31,6 +36,7 @@ impl GraphCache {
         Self {
             entries: HashMap::new(),
             backend_entries: HashMap::new(),
+            backend_order: VecDeque::new(),
         }
     }
 }
@@ -88,20 +94,29 @@ pub fn cache_graph_for_backend(
     version: u64,
 ) {
     if let Ok(mut cache) = graph_cache().lock() {
-        cache.backend_entries.insert(
-            (backend_name.to_string(), key.as_str().to_string()),
-            GraphCacheEntry {
-                graph: graph.clone(),
-                modified: None,
-                version,
-            },
-        );
+        let cache_key = (backend_name.to_string(), key.as_str().to_string());
+        if cache
+            .backend_entries
+            .insert(
+                cache_key.clone(),
+                GraphCacheEntry {
+                    graph: graph.clone(),
+                    modified: None,
+                    version,
+                },
+            )
+            .is_none()
+        {
+            cache.backend_order.push_back(cache_key);
+        }
+        while cache.backend_order.len() > BACKEND_CACHE_LIMIT {
+            if let Some(expired) = cache.backend_order.pop_front() {
+                cache.backend_entries.remove(&expired);
+            }
+        }
     }
 }
 
-// Dormant since the backend cache fell out of use; kept for the planned
-// backend-level graph reuse.
-#[allow(dead_code)]
 pub fn cached_graph_for_backend(
     backend_name: &str,
     key: &StoreKey,

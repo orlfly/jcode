@@ -40,7 +40,11 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Internal handle that owns both the SQLite connection and the named
 /// graphs. Cloning is cheap (Arc).
@@ -67,6 +71,14 @@ pub struct SqliteGvecBackend {
     /// when the same `Storage` is shared across threads inside one
     /// process.
     write_lock: Arc<Mutex<()>>,
+    /// Bumped after every successful write through this backend.
+    ///
+    /// SQLite's `PRAGMA data_version` only changes for commits made by
+    /// other connections, so the process-local write counter covers our
+    /// own writes and the pragma covers cross-process writers.
+    revision: Arc<AtomicU64>,
+    /// Cache namespace unique to this physical database.
+    cache_namespace: String,
 }
 
 impl Debug for SqliteGvecBackend {
@@ -113,10 +125,13 @@ impl SqliteGvecBackend {
         let path_str = path.to_string_lossy().to_string();
         let db = Database::open(&path_str)
             .with_context(|| format!("SqliteGvecBackend::open({path_str})"))?;
+        let cache_namespace = format!("sqlite-gvec:{}", path.display());
         Ok(Self {
             db: DbHandle { db: Arc::new(db) },
             file: path,
             write_lock: Arc::new(Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
+            cache_namespace,
         })
     }
 
@@ -125,10 +140,16 @@ impl SqliteGvecBackend {
     pub fn open_in_memory() -> Result<Self> {
         let db = Database::open_in_memory()
             .map_err(|e| anyhow::anyhow!("SqliteGvecBackend::open_in_memory: {e}"))?;
+        let cache_namespace = format!(
+            "sqlite-gvec:memory:{}",
+            NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+        );
         Ok(Self {
             db: DbHandle { db: Arc::new(db) },
             file: PathBuf::from(":memory:"),
             write_lock: Arc::new(Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
+            cache_namespace,
         })
     }
 
@@ -138,6 +159,20 @@ impl SqliteGvecBackend {
             .db
             .graph(&prefix)
             .map_err(|e| anyhow::anyhow!("open graph '{prefix}': {e}"))
+    }
+
+    fn revision_for(&self, graph: &Graph) -> u64 {
+        let external = graph
+            .storage
+            .exec_ref()
+            .query_one_json("PRAGMA data_version", &[])
+            .ok()
+            .flatten()
+            .and_then(|mut row| row.pop())
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let local = self.revision.load(Ordering::SeqCst);
+        local.wrapping_mul(1_000_003).wrapping_add(external)
     }
 
     // Unused now that load() reads through graph() directly; kept for
@@ -365,8 +400,23 @@ impl GraphBackend for SqliteGvecBackend {
         "sqlite-gvec"
     }
 
+    fn graph_revision(&self, key: &StoreKey) -> Result<u64> {
+        let graph = self.graph(key)?;
+        Ok(self.revision_for(&graph))
+    }
+
+    fn cache_namespace(&self) -> String {
+        self.cache_namespace.clone()
+    }
+
     fn load(&self, key: &StoreKey) -> Result<MemoryGraph> {
         let graph = self.graph(key)?;
+        let revision = self.revision_for(&graph);
+        if let Some(cached) =
+            crate::memory::cache::cached_graph_for_backend(&self.cache_namespace, key, revision)
+        {
+            return Ok(cached);
+        }
         let mut out = MemoryGraph::new();
         // Graph metadata (ontology binding, counters) is stored beside the node
         // tables. Before this existed `ReplaceMetadata` was a silent no-op, so
@@ -478,6 +528,12 @@ impl GraphBackend for SqliteGvecBackend {
             }
         }
 
+        crate::memory::cache::cache_graph_for_backend(
+            &self.cache_namespace,
+            key,
+            &out,
+            revision,
+        );
         Ok(out)
     }
 
@@ -523,6 +579,7 @@ impl GraphBackend for SqliteGvecBackend {
             upsert_edge(&g, &from, &to, &kind)?;
         }
         save_metadata(&g, &graph.metadata)?;
+        self.revision.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -577,6 +634,7 @@ impl GraphBackend for SqliteGvecBackend {
                 }
             }
         }
+        self.revision.fetch_add(1, Ordering::SeqCst);
         self.load(key)
     }
 
@@ -1401,6 +1459,85 @@ mod tests {
         let hits = backend.tag_search(&key, "rust", 10).unwrap();
         assert_eq!(hits, vec![(rust, 1.0)]);
         assert!(backend.tag_search(&key, "rust", 10).unwrap()[0].0 != python);
+    }
+
+    #[test]
+    fn load_reuses_graph_until_write() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("cache-test");
+
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "cached first"));
+        backend.save(&key, &graph).unwrap();
+
+        assert_eq!(backend.load(&key).unwrap().memory_count(), 1);
+        assert_eq!(backend.load(&key).unwrap().memory_count(), 1);
+
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "cached second"));
+        backend.save(&key, &graph).unwrap();
+        assert_eq!(
+            backend.load(&key).unwrap().memory_count(),
+            2,
+            "a backend write must invalidate the cached graph"
+        );
+    }
+
+    #[test]
+    fn graph_revision_sees_other_connection_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite");
+        let reader = SqliteGvecBackend::open(&path).unwrap();
+        let writer = SqliteGvecBackend::open(&path).unwrap();
+        let key = StoreKey::new("shared-cache");
+
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "shared first"));
+        reader.save(&key, &graph).unwrap();
+        assert_eq!(reader.load(&key).unwrap().memory_count(), 1);
+        let before = reader.graph_revision(&key).unwrap();
+
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "shared second"));
+        writer.save(&key, &graph).unwrap();
+
+        assert_ne!(
+            before,
+            reader.graph_revision(&key).unwrap(),
+            "PRAGMA data_version must expose the other connection's commit"
+        );
+        assert_eq!(
+            reader.load(&key).unwrap().memory_count(),
+            2,
+            "another connection's write must invalidate the cached graph"
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored"]
+    fn bench_load_reuses_backend_graph_cache() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("cache-bench");
+        let mut graph = MemoryGraph::new();
+        for index in 0..2_000 {
+            graph.add_memory(MemoryEntry::new(
+                MemoryCategory::Fact,
+                format!("cache benchmark memory {index}"),
+            ));
+        }
+        backend.save(&key, &graph).unwrap();
+
+        let baseline = std::time::Instant::now();
+        for _ in 0..20 {
+            backend.revision.fetch_add(1, Ordering::SeqCst);
+            let _ = backend.load(&key).unwrap();
+        }
+        let baseline = baseline.elapsed();
+
+        let cached = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = backend.load(&key).unwrap();
+        }
+        let cached = cached.elapsed();
+        eprintln!("backend graph cache baseline={baseline:?} cached={cached:?}");
     }
 
     #[test]
