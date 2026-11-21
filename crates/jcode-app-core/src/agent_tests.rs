@@ -51,6 +51,19 @@ fn graph_readback_is_appended_to_latest_user_text() {
     }
 }
 
+#[test]
+fn checkpoint_conflict_ignores_truncation_but_flags_divergence() {
+    assert!(!checkpoint_conflicts(
+        "cargo test -p jcode",
+        "cargo test -p jcode -- --nocapture"
+    ));
+    assert!(!checkpoint_conflicts("src/lib.rs", "src/lib.rs"));
+    assert!(checkpoint_conflicts(
+        "E0425 cannot find value",
+        "E0308 type mismatch"
+    ));
+}
+
 #[path = "agent_tests/cache_session_affinity.rs"]
 mod cache_session_affinity;
 

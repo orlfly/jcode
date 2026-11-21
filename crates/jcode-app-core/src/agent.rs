@@ -569,6 +569,22 @@ fn checkpoint_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+fn normalize_fact_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A checkpoint anchor summary may be a truncation of the L1 entity name. Only
+/// a non-prefix difference counts as a contradiction.
+fn checkpoint_conflicts(checkpoint: &str, l1: &str) -> bool {
+    let checkpoint = normalize_fact_text(checkpoint);
+    let l1 = normalize_fact_text(l1);
+    !checkpoint.is_empty()
+        && !l1.is_empty()
+        && checkpoint != l1
+        && !checkpoint.starts_with(&l1)
+        && !l1.starts_with(&checkpoint)
+}
+
 /// Build a compact L1 readback block for anchors referenced by the latest user
 /// message. Runs only after a checkpoint exists and only once per anchor.
 fn build_graph_readback(session: &Session, state: &mut GraphReadbackState) -> Option<String> {
@@ -600,6 +616,17 @@ fn build_graph_readback(session: &Session, state: &mut GraphReadbackState) -> Op
         if !name.is_empty() && name != entity.id {
             out.push_str(&format!("  fact: {name}\n"));
         }
+        if checkpoint_conflicts(&anchor.summary, name) {
+            logging::warn(&format!(
+                "Checkpoint readback conflict for session {} anchor {}: checkpoint={:?} L1={:?}",
+                session.id, anchor.id, anchor.summary, name
+            ));
+            out.push_str(&format!(
+                "  conflict: checkpoint={:?}; L1={:?} (L1 wins)\n",
+                truncate_readback_text(&anchor.summary, 80),
+                truncate_readback_text(name, 80)
+            ));
+        }
         let mut edges = 0usize;
         for relation in graph.relations.values() {
             if relation.from == anchor.id || relation.to == anchor.id {
@@ -617,6 +644,16 @@ fn build_graph_readback(session: &Session, state: &mut GraphReadbackState) -> Op
         rendered += 1;
     }
     if rendered == 0 { None } else { Some(out) }
+}
+
+fn truncate_readback_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Append the readback to the latest user text block so the provider sees it in
