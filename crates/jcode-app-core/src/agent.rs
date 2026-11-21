@@ -374,6 +374,8 @@ pub struct Agent {
     /// One logical runtime session, independent of the process-global legacy
     /// telemetry slot and of any TUI clients viewing this agent.
     concurrency_session: Option<crate::telemetry::ConcurrencySession>,
+    /// Per-checkpoint cache so anchor facts are injected at most once.
+    graph_readback: GraphReadbackState,
 }
 
 /// Persist one extraction and merge it with facts routed at earlier checkpoints.
@@ -444,6 +446,196 @@ fn maybe_persist_engineering_episode_before_compaction(
         usage * 100.0
     ));
     persist_engineering_episode(session_id, working_dir, messages);
+}
+
+/// Tracks which checkpoint generation and anchors were already injected.
+#[derive(Default)]
+struct GraphReadbackState {
+    summary_hash: u64,
+    injected: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckpointAnchor {
+    id: String,
+    class: String,
+    summary: String,
+}
+
+/// Parse `- `id` | class | summary` lines from a graph memory checkpoint.
+fn parse_checkpoint_anchor_lines(text: &str) -> Vec<CheckpointAnchor> {
+    let mut anchors = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("- `") else {
+            continue;
+        };
+        let Some((id, rest)) = rest.split_once('`') else {
+            continue;
+        };
+        let rest = rest.trim().strip_prefix('|').unwrap_or(rest.trim());
+        let mut parts = rest.split('|').map(str::trim);
+        let class = parts.next().unwrap_or_default();
+        let summary = parts.next().unwrap_or_default();
+        if id.trim().is_empty() {
+            continue;
+        }
+        anchors.push(CheckpointAnchor {
+            id: id.trim().to_string(),
+            class: class.to_string(),
+            summary: summary.to_string(),
+        });
+    }
+    anchors
+}
+
+fn select_checkpoint_anchors(
+    anchors: &[CheckpointAnchor],
+    user_text: &str,
+    injected: &std::collections::HashSet<String>,
+    limit: usize,
+) -> Vec<CheckpointAnchor> {
+    let lower = user_text.to_lowercase();
+    let mut selected = Vec::new();
+    for anchor in anchors {
+        if selected.len() >= limit {
+            break;
+        }
+        if injected.contains(&anchor.id) || !anchor_matches(anchor, user_text, &lower) {
+            continue;
+        }
+        selected.push(anchor.clone());
+    }
+    selected
+}
+
+fn anchor_matches(anchor: &CheckpointAnchor, text: &str, lower: &str) -> bool {
+    if text.contains(&anchor.id) {
+        return true;
+    }
+    match anchor.class.to_ascii_lowercase().as_str() {
+        "file" => {
+            let name = anchor
+                .summary
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&anchor.summary);
+            name.chars().count() >= 6 && name.contains('.') && lower.contains(&name.to_lowercase())
+        }
+        "error" => anchor
+            .summary
+            .split_whitespace()
+            .next()
+            .filter(|code| code.len() >= 4)
+            .is_some_and(|code| lower.contains(&code.to_lowercase())),
+        "command" => {
+            let prefix = anchor
+                .summary
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            prefix.len() >= 6 && lower.contains(&prefix.to_lowercase())
+        }
+        _ => anchor.summary.len() >= 12 && lower.contains(&anchor.summary.to_lowercase()),
+    }
+}
+
+fn latest_stored_user_text(messages: &[jcode_session_types::StoredMessage]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if message.role != Role::User {
+            continue;
+        }
+        let text = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn checkpoint_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Build a compact L1 readback block for anchors referenced by the latest user
+/// message. Runs only after a checkpoint exists and only once per anchor.
+fn build_graph_readback(session: &Session, state: &mut GraphReadbackState) -> Option<String> {
+    let summary_text = session.compaction.as_ref()?.summary_text.as_str();
+    if summary_text.trim().is_empty() {
+        return None;
+    }
+    let summary_hash = checkpoint_hash(summary_text);
+    if summary_hash != state.summary_hash {
+        state.summary_hash = summary_hash;
+        state.injected.clear();
+    }
+    let user_text = latest_stored_user_text(&session.messages)?;
+    let anchors = parse_checkpoint_anchor_lines(summary_text);
+    let selected = select_checkpoint_anchors(&anchors, &user_text, &state.injected, 3);
+    if selected.is_empty() {
+        return None;
+    }
+    let store = jcode_base::engineering_store::EngineeringStore::open_default().ok()?;
+    let graph = store.load_graph(&session.id).ok().flatten()?;
+    let mut out = String::from("## Graph Memory Readback (L1)\n\n");
+    let mut rendered = 0usize;
+    for anchor in selected {
+        let Some(entity) = graph.entities.get(&anchor.id) else {
+            continue;
+        };
+        out.push_str(&format!("- `{}` ({})\n", entity.id, entity.class));
+        let name = entity.name.trim();
+        if !name.is_empty() && name != entity.id {
+            out.push_str(&format!("  fact: {name}\n"));
+        }
+        let mut edges = 0usize;
+        for relation in graph.relations.values() {
+            if relation.from == anchor.id || relation.to == anchor.id {
+                out.push_str(&format!(
+                    "  - `{}` -{}-> `{}`\n",
+                    relation.from, relation.relation, relation.to
+                ));
+                edges += 1;
+                if edges >= 4 {
+                    break;
+                }
+            }
+        }
+        state.injected.insert(anchor.id);
+        rendered += 1;
+    }
+    if rendered == 0 { None } else { Some(out) }
+}
+
+/// Append the readback to the latest user text block so the provider sees it in
+/// the same turn without rewriting the checkpoint or splitting tool pairs.
+fn inject_graph_readback(messages: &mut [Message], readback: &str) -> bool {
+    let Some(message) = messages.iter_mut().rev().find(|message| {
+        message.role == Role::User
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { .. }))
+    }) else {
+        return false;
+    };
+    message.content.push(ContentBlock::Text {
+        text: format!("<system-reminder>\n{readback}</system-reminder>"),
+        cache_control: None,
+    });
+    true
 }
 
 impl Agent {
@@ -572,6 +764,7 @@ impl Agent {
             transcript_telemetry_sent: false,
             telemetry_session_deferred: false,
             concurrency_session: None,
+            graph_readback: GraphReadbackState::default(),
         };
         let t = Instant::now();
         agent.refresh_prompt_skills_snapshot();
@@ -900,6 +1093,7 @@ impl Agent {
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
         self.rewind_undo_snapshot = None;
+        self.graph_readback = GraphReadbackState::default();
     }
 
     /// Synchronize the remote client's selected skill, accepting only names
@@ -1032,9 +1226,11 @@ impl Agent {
                 Ok(mut manager) => {
                     let discarded_oversized_native =
                         manager.discard_oversized_openai_native_compaction();
+                    let graph_readback =
+                        build_graph_readback(&self.session, &mut self.graph_readback);
                     let session_id = self.session.id.clone();
                     let working_dir = self.session.working_dir.clone();
-                    let messages = {
+                    let mut messages = {
                         let all_messages = self.session.provider_messages();
                         if self.provider.uses_jcode_compaction() {
                             maybe_persist_engineering_episode_before_compaction(
@@ -1065,6 +1261,9 @@ impl Agent {
                         }
                         manager.messages_for_api_with(all_messages)
                     };
+                    if let Some(readback) = graph_readback {
+                        inject_graph_readback(&mut messages, &readback);
+                    }
                     let event = manager.take_compaction_event();
                     if event.is_some() || discarded_oversized_native {
                         self.sync_session_compaction_state_from_manager(&manager);

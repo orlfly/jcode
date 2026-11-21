@@ -8,6 +8,49 @@ use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[test]
+fn checkpoint_anchor_selection_matches_file_and_error_references() {
+    let summary = "## Graph Memory State\n\n- `file:src/compaction.rs` | file | src/compaction.rs\n- `error:abc` | error | E0425 cannot find value\n- `command:def` | command | cargo test -p jcode\n";
+    let anchors = parse_checkpoint_anchor_lines(summary);
+    assert_eq!(anchors.len(), 3);
+
+    let selected = select_checkpoint_anchors(
+        &anchors,
+        "please inspect compaction.rs and fix E0425",
+        &std::collections::HashSet::new(),
+        3,
+    );
+    let ids: Vec<&str> = selected.iter().map(|anchor| anchor.id.as_str()).collect();
+    assert_eq!(ids, vec!["file:src/compaction.rs", "error:abc"]);
+}
+
+#[test]
+fn injected_checkpoint_anchor_is_not_repeated() {
+    let anchors =
+        parse_checkpoint_anchor_lines("- `file:src/compaction.rs` | file | src/compaction.rs\n");
+    let mut injected = std::collections::HashSet::new();
+    injected.insert("file:src/compaction.rs".to_string());
+    let selected = select_checkpoint_anchors(&anchors, "compaction.rs again", &injected, 3);
+    assert!(selected.is_empty());
+}
+
+#[test]
+fn graph_readback_is_appended_to_latest_user_text() {
+    let mut messages = vec![Message::user("hello")];
+    assert!(inject_graph_readback(
+        &mut messages,
+        "## Graph Memory Readback (L1)\n- `file:src/lib.rs` (file)"
+    ));
+    assert_eq!(messages[0].content.len(), 2);
+    match &messages[0].content[1] {
+        ContentBlock::Text { text, .. } => {
+            assert!(text.contains("Graph Memory Readback"));
+            assert!(text.contains("<system-reminder>"));
+        }
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
 #[path = "agent_tests/cache_session_affinity.rs"]
 mod cache_session_affinity;
 
