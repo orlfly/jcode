@@ -304,6 +304,7 @@ fn assess_path_quality(
     path: &MemoryPath,
     entries: &std::collections::HashMap<&str, &crate::memory_types::MemoryEntry>,
     degrees: &std::collections::HashMap<&str, usize>,
+    ambiguous_nodes: &std::collections::HashSet<String>,
     relaxations: &[String],
 ) -> PathQuality {
     let mut quality = PathQuality::default();
@@ -353,6 +354,20 @@ fn assess_path_quality(
         quality.push(
             PathQualityFlag::HypothesizedEdge,
             "path crosses a pending shadow edge".to_string(),
+        );
+    }
+    let endpoint_ambiguous = path
+        .nodes
+        .first()
+        .is_some_and(|node| ambiguous_nodes.contains(node))
+        || path
+            .nodes
+            .last()
+            .is_some_and(|node| ambiguous_nodes.contains(node));
+    if endpoint_ambiguous {
+        quality.push(
+            PathQualityFlag::AmbiguousEntity,
+            "an endpoint anchor resolved to multiple candidates".to_string(),
         );
     }
     if !relaxations.is_empty() {
@@ -474,44 +489,53 @@ fn stitch_paths_with_bridge(
 
 /// Resolve a path endpoint without requiring the caller to know an internal id.
 fn resolve_path_anchor(graph: &MemoryGraph, anchor: &str) -> Option<String> {
+    pick_best_path_entry(path_anchor_entries(graph, anchor).into_iter())
+}
+
+fn path_anchor_entries<'a>(graph: &'a MemoryGraph, anchor: &str) -> Vec<&'a MemoryEntry> {
     let anchor = anchor.trim();
     if anchor.is_empty() {
-        return None;
+        return Vec::new();
     }
-    if graph.get_memory(anchor).is_some() {
-        return Some(anchor.to_string());
+    if let Some(entry) = graph.get_memory(anchor) {
+        return vec![entry];
     }
     if let Some(subject) = anchor.strip_prefix("subject:") {
         let wanted = jcode_memory_types::reconcile::normalize_subject_key(subject);
-        return pick_best_path_entry(graph.active_memories().filter(|entry| {
-            entry.subject_key.as_deref().is_some_and(|candidate| {
-                jcode_memory_types::reconcile::normalize_subject_key(candidate)
-                    .eq_ignore_ascii_case(&wanted)
+        return graph
+            .active_memories()
+            .filter(|entry| {
+                entry.subject_key.as_deref().is_some_and(|candidate| {
+                    jcode_memory_types::reconcile::normalize_subject_key(candidate)
+                        .eq_ignore_ascii_case(&wanted)
+                })
             })
-        }));
+            .collect();
     }
     if let Some(tag) = anchor.strip_prefix("tag:") {
-        return pick_best_path_entry(
-            graph
-                .get_memories_by_tag(tag)
-                .into_iter()
-                .filter(|entry| entry.is_retrievable_now()),
-        );
+        return graph
+            .get_memories_by_tag(tag)
+            .into_iter()
+            .filter(|entry| entry.is_retrievable_now())
+            .collect();
     }
 
     let normalized = normalize_search_text(anchor);
     if normalized.is_empty() {
-        return None;
+        return Vec::new();
     }
     let normalized_subject = jcode_memory_types::reconcile::normalize_subject_key(anchor);
-    pick_best_path_entry(graph.active_memories().filter(|entry| {
-        (!normalized_subject.is_empty()
-            && entry.subject_key.as_deref().is_some_and(|subject| {
-                let subject = jcode_memory_types::reconcile::normalize_subject_key(subject);
-                subject.contains(&normalized_subject) || normalized_subject.contains(&subject)
-            }))
-            || normalize_search_text(&entry.searchable_text()).contains(&normalized)
-    }))
+    graph
+        .active_memories()
+        .filter(|entry| {
+            (!normalized_subject.is_empty()
+                && entry.subject_key.as_deref().is_some_and(|subject| {
+                    let subject = jcode_memory_types::reconcile::normalize_subject_key(subject);
+                    subject.contains(&normalized_subject) || normalized_subject.contains(&subject)
+                }))
+                || normalize_search_text(&entry.searchable_text()).contains(&normalized)
+        })
+        .collect()
 }
 
 fn pick_best_path_entry<'a>(entries: impl Iterator<Item = &'a MemoryEntry>) -> Option<String> {
@@ -7822,15 +7846,24 @@ impl MemoryManager {
         let mut resolved_to = std::collections::HashSet::new();
         let mut resolved_from_stores = std::collections::HashSet::new();
         let mut resolved_to_stores = std::collections::HashSet::new();
+        let mut ambiguous_nodes = std::collections::HashSet::new();
         for (label, graph) in &graphs {
             for anchor in froms {
-                if resolve_path_anchor(graph, anchor).is_some() {
+                let candidates = path_anchor_entries(graph, anchor);
+                if candidates.len() > 1 {
+                    ambiguous_nodes.extend(candidates.iter().map(|entry| entry.id.clone()));
+                }
+                if pick_best_path_entry(candidates.into_iter()).is_some() {
                     resolved_from.insert(anchor.clone());
                     resolved_from_stores.insert(*label);
                 }
             }
             for anchor in tos {
-                if resolve_path_anchor(graph, anchor).is_some() {
+                let candidates = path_anchor_entries(graph, anchor);
+                if candidates.len() > 1 {
+                    ambiguous_nodes.extend(candidates.iter().map(|entry| entry.id.clone()));
+                }
+                if pick_best_path_entry(candidates.into_iter()).is_some() {
                     resolved_to.insert(anchor.clone());
                     resolved_to_stores.insert(*label);
                 }
@@ -7925,7 +7958,9 @@ impl MemoryManager {
         }
         outcome.quality = paths
             .iter()
-            .map(|path| assess_path_quality(path, &entries, &degrees, relaxations))
+            .map(|path| {
+                assess_path_quality(path, &entries, &degrees, &ambiguous_nodes, relaxations)
+            })
             .collect();
         if paths.is_empty()
             && !resolved_from.is_empty()

@@ -5133,6 +5133,50 @@ fn path_quality_marks_stale_and_weak_provenance() {
 }
 
 #[test]
+fn path_quality_marks_ambiguous_endpoint_anchor() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-ambiguous");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared ambiguous token alpha",
+        ));
+        let b = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared ambiguous token beta",
+        ));
+        let target = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "unique destination anchor",
+        ));
+        graph.link_memories(&a, &target, 0.9);
+        graph.link_memories(&b, &target, 0.9);
+        manager
+            .save_project_graph(&graph)
+            .expect("save ambiguous graph");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &["shared ambiguous token".to_string()],
+                &[target],
+                2,
+                2,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("ambiguous path");
+        assert!(!outcome.paths.is_empty(), "{outcome:?}");
+        assert!(
+            outcome
+                .quality
+                .iter()
+                .any(|quality| quality.has(jcode_memory_types::PathQualityFlag::AmbiguousEntity)),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
 fn path_query_reports_unbridged_store_split_as_e09() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-alignment-gap");
