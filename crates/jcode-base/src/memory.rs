@@ -297,10 +297,17 @@ pub struct AlignmentCandidate {
 }
 
 /// Optional query-time behaviour that does not change the persisted graph.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MemoryPathQueryOptions {
     /// Admit pending shadow edges as virtual `hypothesized` edges.
     pub include_hypotheses: bool,
+    /// Relations that must not appear in a returned path.
+    pub deny_relations: Vec<String>,
+    /// Drop paths whose confidence is below this threshold.
+    pub min_confidence: Option<f32>,
+    /// Optional ordering after filtering; the engine still computes k-best by
+    /// cost first.
+    pub objective: Option<jcode_memory_types::PathObjective>,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -7828,7 +7835,7 @@ impl MemoryManager {
             &allowed,
             &unknown_relations,
             &[],
-            options.include_hypotheses,
+            &options,
         )?;
 
         // L0 scope relaxation: E08 means an anchor exists only in the omitted
@@ -7848,7 +7855,7 @@ impl MemoryManager {
                 &allowed,
                 &unknown_relations,
                 std::slice::from_ref(&relaxation),
-                options.include_hypotheses,
+                &options,
             )?;
             relaxed.relaxations.push(relaxation);
             outcome = relaxed;
@@ -7875,7 +7882,7 @@ impl MemoryManager {
                 &allowed,
                 &unknown_relations,
                 &applied,
-                options.include_hypotheses,
+                &options,
             )?;
             relaxed.relaxations = applied;
             relaxed.depth = relaxed_depth;
@@ -7895,7 +7902,7 @@ impl MemoryManager {
         allowed: &[&str],
         unknown_relations: &[String],
         relaxations: &[String],
-        include_hypotheses: bool,
+        options: &MemoryPathQueryOptions,
     ) -> Result<MemoryPathQueryOutcome> {
         let mut outcome = MemoryPathQueryOutcome {
             depth,
@@ -7924,7 +7931,7 @@ impl MemoryManager {
             graphs.push(("global", self.load_global_graph()?));
         }
         outcome.stores_searched = graphs.len();
-        if include_hypotheses {
+        if options.include_hypotheses {
             let pending = self.list_shadow_edges(Some(ShadowEdgeStatus::Pending))?;
             let project_key = self.get_project_dir().map(|dir| project_store_key(&dir));
             for (label, graph) in &mut graphs {
@@ -8057,6 +8064,27 @@ impl MemoryManager {
         });
         let mut seen = std::collections::HashSet::new();
         paths.retain(|path| seen.insert(path.nodes.clone()));
+        if !options.deny_relations.is_empty() {
+            paths.retain(|path| {
+                !path.edges.iter().any(|edge| {
+                    options
+                        .deny_relations
+                        .iter()
+                        .any(|deny| deny.trim().eq_ignore_ascii_case(edge.kind.relation_name()))
+                })
+            });
+        }
+        if let Some(min_confidence) = options.min_confidence {
+            paths.retain(|path| path.confidence >= min_confidence);
+        }
+        if options.objective == Some(jcode_memory_types::PathObjective::MaxConfidence) {
+            paths.sort_by(|left, right| {
+                right
+                    .confidence
+                    .total_cmp(&left.confidence)
+                    .then_with(|| left.cost.total_cmp(&right.cost))
+            });
+        }
         paths.truncate(limit);
         let mut entries = std::collections::HashMap::new();
         let mut degrees = std::collections::HashMap::new();

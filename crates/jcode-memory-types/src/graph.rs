@@ -179,6 +179,22 @@ fn relation_allowed(kind: &EdgeKind, allowed_relations: &[&str]) -> bool {
 }
 
 impl EdgeKind {
+    /// Canonical relation name without weight or confidence decorations.
+    pub fn relation_name(&self) -> &str {
+        match self {
+            Self::HasTag => "has_tag",
+            Self::InCluster => "in_cluster",
+            Self::RelatesTo { .. } => "relates_to",
+            Self::Supersedes => "supersedes",
+            Self::Contradicts => "contradicts",
+            Self::DerivedFrom => "derived_from",
+            Self::Contains => "contains",
+            Self::NextStep => "next_step",
+            Self::Bridge => "bridge",
+            Self::Hypothesized { relation, .. } => relation,
+        }
+    }
+
     /// Canonical wire name used by relation filters and provenance.
     pub fn as_str(&self) -> &'static str {
         match self {

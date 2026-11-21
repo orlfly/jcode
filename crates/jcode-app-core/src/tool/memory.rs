@@ -978,49 +978,28 @@ impl Tool for MemoryTool {
                         truncate_for_widget(&tos.join(","), 15)
                     ),
                 });
-                let engine_limit = query_filters
-                    .as_ref()
-                    .map_or(limit, |_| (limit.saturating_mul(3)).min(20));
-                let mut outcome = manager.paths_between_anchors_with_options(
+                let outcome = manager.paths_between_anchors_with_options(
                     &froms,
                     &tos,
                     depth,
-                    engine_limit,
+                    limit,
                     scope,
                     &relations,
                     crate::memory::MemoryPathQueryOptions {
                         include_hypotheses,
+                        deny_relations: query_filters
+                            .as_ref()
+                            .map(|filters| filters.0.clone())
+                            .unwrap_or_default(),
+                        min_confidence: query_filters.as_ref().and_then(|filters| filters.1),
+                        objective: query_filters.as_ref().and_then(|filters| filters.2),
                     },
                 )?;
-                if let Some((deny_relations, min_confidence, objective)) = query_filters {
-                    let mut paired: Vec<_> = std::mem::take(&mut outcome.paths)
-                        .into_iter()
-                        .zip(std::mem::take(&mut outcome.quality))
-                        .collect();
-                    let before = paired.len();
-                    paired.retain(|(path, _)| {
-                        !path.edges.iter().any(|edge| {
-                            let label = memory_edge_relation(&edge.kind);
-                            deny_relations
-                                .iter()
-                                .any(|deny| label.eq_ignore_ascii_case(deny.trim()))
-                        }) && min_confidence.map_or(true, |min| path.confidence >= min)
-                    });
-                    if objective == Some(crate::memory_types::PathObjective::MaxConfidence) {
-                        paired.sort_by(|(left, _), (right, _)| {
-                            right
-                                .confidence
-                                .total_cmp(&left.confidence)
-                                .then_with(|| left.cost.total_cmp(&right.cost))
-                        });
-                    }
-                    paired.truncate(limit);
-                    if paired.is_empty() && before > 0 {
-                        outcome.next_actions.push(
-                            "query constraints excluded all candidate paths; relax deny_relations or min_confidence".to_string(),
-                        );
-                    }
-                    (outcome.paths, outcome.quality) = paired.into_iter().unzip();
+                let mut outcome = outcome;
+                if outcome.paths.is_empty() && query_filters.is_some() {
+                    outcome.next_actions.push(
+                        "query constraints excluded all candidate paths; relax deny_relations or min_confidence".to_string(),
+                    );
                 }
                 let paths = &outcome.paths;
                 memory::add_event(MemoryEventKind::ToolRecalled {
@@ -1847,15 +1826,6 @@ fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
         EdgeKind::NextStep => "next_step".to_string(),
         EdgeKind::Bridge => "bridge".to_string(),
         EdgeKind::Hypothesized { relation, .. } => format!("hypothesized:{relation}"),
-    }
-}
-
-fn memory_edge_relation(kind: &crate::memory_graph::EdgeKind) -> String {
-    use crate::memory_graph::EdgeKind;
-    match kind {
-        EdgeKind::RelatesTo { .. } => "relates_to".to_string(),
-        EdgeKind::Hypothesized { relation, .. } => relation.clone(),
-        other => memory_edge_label(other),
     }
 }
 

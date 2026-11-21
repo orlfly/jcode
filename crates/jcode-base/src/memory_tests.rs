@@ -4996,6 +4996,22 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         assert_eq!(unknown.diagnosis, vec!["E10"]);
         assert!(unknown.unresolved_from.is_empty(), "{unknown:?}");
 
+        let denied = manager
+            .paths_between_anchors_with_options(
+                &[a.clone()],
+                &[b.clone()],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    deny_relations: vec!["relates_to".to_string()],
+                    ..Default::default()
+                },
+            )
+            .expect("denied relation query");
+        assert!(denied.paths.is_empty(), "{denied:?}");
+
         let missing = manager
             .paths_between_anchors(
                 &["missing-anchor".to_string()],
@@ -5392,6 +5408,7 @@ fn shadow_edge_is_hidden_until_accepted() {
                 &[],
                 crate::memory::MemoryPathQueryOptions {
                     include_hypotheses: true,
+                    ..Default::default()
                 },
             )
             .expect("hypothesized shadow path");
@@ -5410,6 +5427,7 @@ fn shadow_edge_is_hidden_until_accepted() {
                 &["relates_to".to_string()],
                 crate::memory::MemoryPathQueryOptions {
                     include_hypotheses: true,
+                    ..Default::default()
                 },
             )
             .expect("filtered hypothesized path");
