@@ -155,6 +155,21 @@ struct MemoryInput {
     /// Optional reviewer note
     #[serde(default)]
     note: Option<String>,
+    /// For action=belief: {state, observation, goal, max_steps}.
+    #[serde(default)]
+    belief: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BeliefUpdateInput {
+    #[serde(default)]
+    state: Option<crate::memory_types::BeliefState>,
+    #[serde(default)]
+    observation: Option<crate::memory_types::BeliefObservation>,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    max_steps: Option<u32>,
 }
 
 #[async_trait]
@@ -167,7 +182,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Manage memory (remember/recall/search/list/forget/link/bridge/shadow/path/embed). Default scope: project."
+        "Memory CRUD, graph links/paths, belief state. Default scope: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -177,7 +192,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -198,11 +213,11 @@ impl Tool for MemoryTool {
                 },
                 "from_id": {
                     "type": "string",
-                    "description": "For action=link or bridge: source memory id. For action=path: start anchor (id, subject:<key>, tag:<name>, or text)."
+                    "description": "For link/bridge: source id. For path: start anchor."
                 },
                 "to_id": {
                     "type": "string",
-                    "description": "For action=link or bridge: target memory id. For action=path: goal anchor (id, subject:<key>, tag:<name>, or text)."
+                    "description": "For link/bridge: target id. For path: goal anchor."
                 },
                 "from_anchors": {
                     "type": "array",
@@ -217,16 +232,16 @@ impl Tool for MemoryTool {
                 "relation_allow": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "For action=path: restrict traversal to these relation names. Omit to allow all. Memory graph uses EdgeKind names; engineering graph uses relation ids like modifies/causes."
+                    "description": "For path: allowed relation names; omit to allow all."
                 },
                 "graph": {
                     "type": "string",
                     "enum": ["memory", "engineering"],
-                    "description": "For action=path: which persisted graph to search. Default memory; engineering reads session engineering episodes by anchor id."
+                    "description": "For path: memory (default) or engineering graph."
                 },
                 "plan": {
                     "type": "boolean",
-                    "description": "For action=path graph=engineering: include the deterministic PathPlan (actions, success checks, approval gates)."
+                    "description": "For engineering path: include deterministic PathPlan."
                 },
                 "path_query": {
                     "type": "object",
@@ -249,7 +264,7 @@ impl Tool for MemoryTool {
                     "type": "number",
                     "description": "For action=shadow: candidate confidence 0.0-1.0."
                 },
-                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall, search, list, or path. Zero returns no results. Recall defaults to 10, path defaults to 3." },
+                "limit": { "type": "integer", "minimum": 0, "description": "Max results for recall/search/list/path. 0 returns none." },
                 "mode": {
                     "type": "string",
                     "enum": ["recent", "jev", "hybrid"],
@@ -314,6 +329,10 @@ impl Tool for MemoryTool {
                 "note": {
                     "type": "string",
                     "description": "Optional reviewer note."
+                },
+                "belief": {
+                    "type": "object",
+                    "description": "For action=belief: {state, observation, goal, max_steps}."
                 }
             },
             "required": ["action"]
@@ -1293,6 +1312,55 @@ impl Tool for MemoryTool {
                         "unknown review action: {other}; use list, accept, reject or defer"
                     )),
                 }
+            }
+            "belief" => {
+                let raw = input
+                    .belief
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("belief action requires `belief` object"))?;
+                let request: BeliefUpdateInput = serde_json::from_value(raw)?;
+                let BeliefUpdateInput {
+                    state,
+                    observation,
+                    goal,
+                    max_steps,
+                } = request;
+                let goal = goal
+                    .or_else(|| input.content.clone())
+                    .unwrap_or_else(|| "decision task".to_string());
+                let mut state = state.unwrap_or_else(|| {
+                    let max_steps = max_steps.unwrap_or(input.limit.unwrap_or(5).max(1) as u32);
+                    crate::memory_types::BeliefState::new(goal, max_steps)
+                });
+                let step = observation.map(|observation| state.observe(observation));
+                let best = state
+                    .best_hypothesis()
+                    .map(|hypothesis| {
+                        format!("{} @ {:.3}", hypothesis.id, hypothesis.confidence)
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                let action = step
+                    .as_ref()
+                    .map(|step| step.action.as_str())
+                    .unwrap_or("none");
+                let blocked = if state.blocked_anchors.is_empty() {
+                    "none".to_string()
+                } else {
+                    state
+                        .blocked_anchors
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let payload = json!({ "belief": &state, "step": &step });
+                Ok(ToolOutput::new(format!(
+                    "Belief step {} / {}: confidence {:.3}, best {best}, action {action}\nblocked anchors: {blocked}\n\n{}",
+                    state.step,
+                    state.max_steps,
+                    state.confidence(),
+                    serde_json::to_string_pretty(&payload)?
+                )))
             }
             "health" => {
                 if let Some(extraction_action) = input.extraction_action.as_deref() {
@@ -3137,6 +3205,77 @@ mod tests {
             .await
             .unwrap();
         assert!(updated.output.contains("ttl=45d"), "{}", updated.output);
+    }
+
+    #[tokio::test]
+    async fn belief_action_initializes_and_carries_state() {
+        let _guard = crate::storage::lock_test_env();
+        let tool = MemoryTool::new();
+        let ctx = test_ctx(None);
+
+        let first = tool
+            .execute(
+                json!({
+                    "action":"belief",
+                    "belief":{
+                        "goal":"find the root cause",
+                        "max_steps":4,
+                        "observation":{
+                            "kind":"path_missing",
+                            "from":"error:E0425",
+                            "to":"file:src/lib.rs",
+                            "diagnosis":["E03"],
+                            "missing_class":"change"
+                        }
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(first.output.contains("Belief step 1 / 4"), "{}", first.output);
+        assert!(first.output.contains("\"path_missing\""), "{}", first.output);
+        assert!(first.output.contains("\"action\": \"complete\""), "{}", first.output);
+        assert!(first.output.contains("\"open_diagnoses\""), "{}", first.output);
+
+        let payload_start = first.output.find("\n\n").expect("summary separator") + 2;
+        let payload: Value =
+            serde_json::from_str(&first.output[payload_start..]).expect("belief payload JSON");
+        let state = payload["belief"].clone();
+        assert_eq!(state["step"], 1);
+
+        let second = tool
+            .execute(
+                json!({
+                    "action":"belief",
+                    "belief":{
+                        "state":state,
+                        "observation":{
+                            "kind":"path_found",
+                            "from":"error:E0425",
+                            "to":"file:src/lib.rs",
+                            "path_confidence":0.9,
+                            "cost":1.0,
+                            "quality_flags":[]
+                        }
+                    }
+                }),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(second.output.contains("Belief step 2 / 4"), "{}", second.output);
+        assert!(second.output.contains("\"path_found\""), "{}", second.output);
+        assert!(
+            second.output.contains("\"action\": \"terminate\""),
+            "{}",
+            second.output
+        );
+        assert!(
+            second.output.contains("\"open_diagnoses\": []"),
+            "{}",
+            second.output
+        );
     }
 
     #[tokio::test]
