@@ -462,6 +462,14 @@ fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
     out
 }
 
+fn scope_label(scope: MemoryScope) -> &'static str {
+    match scope {
+        MemoryScope::Project => "project",
+        MemoryScope::Global => "global",
+        MemoryScope::All => "all",
+    }
+}
+
 fn stitch_paths_with_bridge(
     left: &jcode_memory_types::MemoryPath,
     bridge: jcode_memory_types::MemoryPathEdge,
@@ -7749,6 +7757,30 @@ impl MemoryManager {
             options.include_hypotheses,
         )?;
 
+        // L0 scope relaxation: E08 means an anchor exists only in the omitted
+        // store. Retry once across all stores.
+        let mut effective_scope = scope;
+        if outcome.paths.is_empty()
+            && scope != MemoryScope::All
+            && outcome.diagnosis.iter().any(|code| code == "E08")
+        {
+            let relaxation = format!("scope {} -> all", scope_label(scope));
+            let mut relaxed = self.paths_between_anchors_inner(
+                &froms,
+                &tos,
+                depth,
+                limit,
+                MemoryScope::All,
+                &allowed,
+                &unknown_relations,
+                std::slice::from_ref(&relaxation),
+                options.include_hypotheses,
+            )?;
+            relaxed.relaxations.push(relaxation);
+            outcome = relaxed;
+            effective_scope = MemoryScope::All;
+        }
+
         // L0 depth relaxation: E05 means anchors are connected but the first
         // budget was too small. Retry once and record the parameter change so
         // callers can tell a real path from a widened search.
@@ -7758,18 +7790,20 @@ impl MemoryManager {
         {
             let relaxed_depth = MAX_RELAXED_PATH_DEPTH;
             let relaxation = format!("depth {depth} -> {relaxed_depth}");
+            let mut applied = outcome.relaxations.clone();
+            applied.push(relaxation);
             let mut relaxed = self.paths_between_anchors_inner(
                 &froms,
                 &tos,
                 relaxed_depth,
                 limit,
-                scope,
+                effective_scope,
                 &allowed,
                 &unknown_relations,
-                std::slice::from_ref(&relaxation),
+                &applied,
                 options.include_hypotheses,
             )?;
-            relaxed.relaxations.push(relaxation);
+            relaxed.relaxations = applied;
             relaxed.depth = relaxed_depth;
             outcome = relaxed;
         }

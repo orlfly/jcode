@@ -5065,7 +5065,7 @@ fn path_query_relaxes_depth_once_and_records_it() {
 }
 
 #[test]
-fn path_query_reports_scope_mismatch_as_e08() {
+fn path_query_relaxes_scope_mismatch_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-scope-mismatch");
         let mut global = MemoryGraph::new();
@@ -5085,17 +5085,14 @@ fn path_query_reports_scope_mismatch_as_e08() {
                 &[],
             )
             .expect("scope mismatch query");
-        assert!(outcome.paths.is_empty(), "{outcome:?}");
-        assert_eq!(outcome.diagnosis, vec!["E01", "E08"]);
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert!(outcome.diagnosis.is_empty(), "{outcome:?}");
         assert_eq!(
-            outcome.missing_classes,
-            vec!["semantic_gap".to_string(), "query_side".to_string()]
+            outcome.relaxations,
+            vec!["scope project -> all".to_string()]
         );
         assert!(
-            outcome
-                .next_actions
-                .iter()
-                .any(|action| action.starts_with("E08 L0:")),
+            outcome.quality[0].has(jcode_memory_types::PathQualityFlag::RelaxedQuery),
             "{outcome:?}"
         );
     });
