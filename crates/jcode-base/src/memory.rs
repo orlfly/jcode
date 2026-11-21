@@ -7906,6 +7906,7 @@ impl MemoryManager {
         unknown_relations.sort();
         unknown_relations.dedup();
         let allowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
+        let mut graphs = self.load_path_graphs(scope)?;
 
         let mut outcome = self.paths_between_anchors_inner(
             &froms,
@@ -7916,6 +7917,7 @@ impl MemoryManager {
             &allowed,
             &unknown_relations,
             &[],
+            &mut graphs,
             &options,
         )?;
 
@@ -7927,6 +7929,12 @@ impl MemoryManager {
             && outcome.diagnosis.iter().any(|code| code == "E08")
         {
             let relaxation = format!("scope {} -> all", scope_label(scope));
+            if !scope.includes_project() {
+                graphs.insert(0, ("project", self.load_project_graph()?));
+            }
+            if !scope.includes_global() {
+                graphs.push(("global", self.load_global_graph()?));
+            }
             let mut relaxed = self.paths_between_anchors_inner(
                 &froms,
                 &tos,
@@ -7936,6 +7944,7 @@ impl MemoryManager {
                 &allowed,
                 &unknown_relations,
                 std::slice::from_ref(&relaxation),
+                &mut graphs,
                 &options,
             )?;
             relaxed.relaxations.push(relaxation);
@@ -7963,6 +7972,7 @@ impl MemoryManager {
                 &allowed,
                 &unknown_relations,
                 &applied,
+                &mut graphs,
                 &options,
             )?;
             relaxed.relaxations = applied;
@@ -7998,6 +8008,7 @@ impl MemoryManager {
                     &allowed,
                     &unknown_relations,
                     &applied,
+                    &mut graphs,
                     &options,
                 )?;
                 grounded.relaxations = applied;
@@ -8250,6 +8261,7 @@ impl MemoryManager {
         allowed: &[&str],
         unknown_relations: &[String],
         relaxations: &[String],
+        graphs: &mut Vec<(&'static str, MemoryGraph)>,
         options: &MemoryPathQueryOptions,
     ) -> Result<MemoryPathQueryOutcome> {
         let mut outcome = MemoryPathQueryOutcome {
@@ -8271,18 +8283,11 @@ impl MemoryManager {
             return Ok(finalize_path_outcome(outcome));
         }
 
-        let mut graphs = Vec::new();
-        if scope.includes_project() {
-            graphs.push(("project", self.load_project_graph()?));
-        }
-        if scope.includes_global() {
-            graphs.push(("global", self.load_global_graph()?));
-        }
         outcome.stores_searched = graphs.len();
         if options.include_hypotheses {
             let pending = self.list_shadow_edges(Some(ShadowEdgeStatus::Pending))?;
             let project_key = self.get_project_dir().map(|dir| project_store_key(&dir));
-            for (label, graph) in &mut graphs {
+            for (label, graph) in graphs.iter_mut() {
                 let store_key = if *label == "global" {
                     Some("global")
                 } else {
@@ -8312,7 +8317,7 @@ impl MemoryManager {
         let mut from_store_by_anchor = std::collections::HashMap::new();
         let mut to_store_by_anchor = std::collections::HashMap::new();
         let mut ambiguous_nodes = std::collections::HashSet::new();
-        for (label, graph) in &graphs {
+        for (label, graph) in graphs.iter() {
             for anchor in froms {
                 let candidates = path_anchor_entries(graph, anchor);
                 if candidates.len() > 1 {
@@ -8382,7 +8387,7 @@ impl MemoryManager {
         }
 
         let mut paths = Vec::new();
-        for (_, graph) in &graphs {
+        for (_, graph) in graphs.iter() {
             let from_nodes: Vec<String> = froms
                 .iter()
                 .filter_map(|anchor| resolve_path_anchor(graph, anchor))
@@ -8443,7 +8448,7 @@ impl MemoryManager {
         paths.truncate(limit);
         let mut entries = std::collections::HashMap::new();
         let mut degrees = std::collections::HashMap::new();
-        for (_, graph) in &graphs {
+        for (_, graph) in graphs.iter() {
             for path in &paths {
                 for node in &path.nodes {
                     if let Some(entry) = graph.get_memory(node) {

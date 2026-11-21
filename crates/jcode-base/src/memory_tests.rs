@@ -5219,6 +5219,90 @@ fn bench_waypoint_query_reuses_loaded_graphs() {
 }
 
 #[test]
+#[ignore = "benchmark; run with --ignored"]
+fn bench_depth_relaxation_reuses_loaded_graphs() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-depth-bench");
+        let mut graph = MemoryGraph::new();
+        for index in 0..2_000 {
+            graph.add_memory(MemoryEntry::new(
+                MemoryCategory::Fact,
+                format!("benchmark filler memory {index}"),
+            ));
+        }
+        let chain: Vec<String> = (0..10)
+            .map(|index| {
+                graph.add_memory(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("depth benchmark chain node {index}"),
+                ))
+            })
+            .collect();
+        for pair in chain.windows(2) {
+            graph.link_memories(&pair[0], &pair[1], 0.9);
+        }
+        manager.save_project_graph(&graph).expect("save bench graph");
+        let options = crate::memory::MemoryPathQueryOptions::default();
+
+        let baseline = std::time::Instant::now();
+        for _ in 0..20 {
+            let mut graphs = manager
+                .load_path_graphs(MemoryScope::Project)
+                .expect("load graphs");
+            let _ = manager
+                .paths_between_anchors_inner(
+                    &[chain[0].clone()],
+                    &[chain[9].clone()],
+                    8,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    &[],
+                    &[],
+                    &mut graphs,
+                    &options,
+                )
+                .expect("depth 8 attempt");
+            let mut graphs = manager
+                .load_path_graphs(MemoryScope::Project)
+                .expect("reload graphs");
+            let _ = manager
+                .paths_between_anchors_inner(
+                    &[chain[0].clone()],
+                    &[chain[9].clone()],
+                    16,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    &[],
+                    &[],
+                    &mut graphs,
+                    &options,
+                )
+                .expect("depth 16 attempt");
+        }
+        let baseline = baseline.elapsed();
+
+        let reused = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = manager
+                .paths_between_anchors_with_options(
+                    &[chain[0].clone()],
+                    &[chain[9].clone()],
+                    8,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    options.clone(),
+                )
+                .expect("relaxed query");
+        }
+        let reused = reused.elapsed();
+        eprintln!("depth relaxation reload baseline={baseline:?} reused={reused:?}");
+    });
+}
+
+#[test]
 fn path_query_relaxes_scope_mismatch_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-scope-mismatch");
