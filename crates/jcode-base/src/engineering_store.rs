@@ -687,6 +687,7 @@ impl EngineeringStore {
                     continue;
                 }
             };
+            let graph = graph.infer_relations(&default_engineering_ontology());
             for path in graph.k_shortest_paths(
                 from_anchor,
                 to_anchor,
@@ -955,6 +956,29 @@ mod tests {
             )
             .expect("filtered path");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn path_query_uses_inferred_inverse_relations() {
+        use jcode_memory_types::engineering_ontology::{
+            CLASS_SESSION, REL_CONTAINS, REL_PART_OF,
+        };
+
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_SESSION, "session:s", "session"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_PART_OF, "session:s"));
+        store
+            .save_graph("session-inverse", None, &graph)
+            .expect("save graph");
+
+        let hits = store
+            .path_between_anchors("session:s", "file:a", 2, 5, &[REL_CONTAINS])
+            .expect("inferred path");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path.nodes, vec!["session:s", "file:a"]);
+        assert_eq!(hits[0].relation_labels, vec![REL_CONTAINS]);
     }
 
     #[test]

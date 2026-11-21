@@ -233,6 +233,14 @@ pub struct EngineeringRelationDef {
     pub max_cardinality: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concerns: Vec<String>,
+    /// Relation whose direction is the inverse of this one. Inference creates
+    /// only virtual edges; the stored graph is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_of: Option<String>,
+    /// Broader relation this one specializes. A query allowing the parent also
+    /// admits this relation as a virtual parent edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_property_of: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -255,6 +263,8 @@ impl EngineeringRelationDef {
             directed: true,
             max_cardinality: None,
             concerns: Vec::new(),
+            inverse_of: None,
+            sub_property_of: None,
         }
     }
 
@@ -265,6 +275,16 @@ impl EngineeringRelationDef {
 
     pub fn with_max_cardinality(mut self, max: u32) -> Self {
         self.max_cardinality = Some(max);
+        self
+    }
+
+    pub fn with_inverse_of(mut self, relation: impl Into<String>) -> Self {
+        self.inverse_of = Some(relation.into());
+        self
+    }
+
+    pub fn with_sub_property_of(mut self, relation: impl Into<String>) -> Self {
+        self.sub_property_of = Some(relation.into());
         self
     }
 
@@ -851,6 +871,66 @@ impl EngineeringGraph {
             .values()
             .filter(|entity| entity.class == class)
             .collect()
+    }
+
+    /// Add query-time inverse and sub-property edges from the ontology.
+    ///
+    /// The returned graph is a virtual view: stored relations are unchanged.
+    /// Each edge keeps the source relation id in its locator and is discounted
+    /// to 95% of the source confidence so inferred hops never look stronger
+    /// than observed evidence.
+    pub fn infer_relations(&self, ontology: &EngineeringOntology) -> EngineeringGraph {
+        let mut inferred = self.clone();
+        let now = Utc::now();
+        let sources: Vec<EngineeringRelation> = self
+            .relations
+            .values()
+            .filter(|relation| relation.is_effective_at(now))
+            .cloned()
+            .collect();
+        for relation in sources {
+            let Some(definition) = ontology.relations.get(&relation.relation) else {
+                continue;
+            };
+            if let Some(inverse) = definition
+                .inverse_of
+                .as_deref()
+                .filter(|inverse| !inverse.trim().is_empty())
+            {
+                let id = format!("inferred:inverse:{}:{}", relation.id, inverse);
+                if !inferred.relations.contains_key(&id) {
+                    let confidence = (relation.confidence * 0.95).clamp(0.0, 1.0);
+                    let mut edge = EngineeringRelation::new(&relation.to, inverse, &relation.from);
+                    edge.id = id;
+                    edge.confidence = confidence;
+                    edge.provenance =
+                        EngineeringProvenance::new(format!("inferred:inverse_of:{}", relation.id))
+                            .with_locator(relation.id.clone())
+                            .with_confidence(confidence);
+                    inferred.relations.insert(edge.id.clone(), edge);
+                }
+            }
+            if let Some(parent) = definition
+                .sub_property_of
+                .as_deref()
+                .filter(|parent| !parent.trim().is_empty())
+            {
+                let id = format!("inferred:sub:{}:{}", relation.id, parent);
+                if !inferred.relations.contains_key(&id) {
+                    let confidence = (relation.confidence * 0.95).clamp(0.0, 1.0);
+                    let mut edge =
+                        EngineeringRelation::new(&relation.from, parent, &relation.to);
+                    edge.id = id;
+                    edge.confidence = confidence;
+                    edge.provenance =
+                        EngineeringProvenance::new(format!("inferred:sub_property_of:{}", relation.id))
+                            .with_locator(relation.id.clone())
+                            .with_confidence(confidence);
+                    inferred.relations.insert(edge.id.clone(), edge);
+                }
+            }
+        }
+        inferred
     }
 
     pub fn outgoing(&self, id: &str) -> Vec<&EngineeringRelation> {
@@ -1882,6 +1962,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
                 CLASS_ARTIFACT,
             ],
         )
+        .with_inverse_of(REL_PART_OF)
         .with_concern(CONCERN_ENGINEERING_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_PART_OF,
@@ -1902,6 +1983,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
                 CLASS_ARTIFACT,
             ],
         )
+        .with_inverse_of(REL_CONTAINS)
         .with_concern(CONCERN_ENGINEERING_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_DEPENDS_ON,
@@ -1928,6 +2010,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
             &[CLASS_FILE, CLASS_CRATE],
             &[CLASS_FILE, CLASS_CRATE],
         )
+        .with_sub_property_of(REL_DEPENDS_ON)
         .with_concern(CONCERN_CONSTRUCTION),
         EngineeringRelationDef::new(
             REL_DEFINES,
@@ -2207,6 +2290,45 @@ mod tests {
         graph.insert_entity(entity);
         let report = graph.validate(&ontology);
         assert!(report.errors().iter().any(|issue| issue.code == "EG05"));
+    }
+
+    #[test]
+    fn inverse_relation_inference_traverses_reverse_part_of() {
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_SESSION, "session:s", "session"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_PART_OF, "session:s"));
+
+        let inferred = graph.infer_relations(&default_engineering_ontology());
+        let path = inferred
+            .shortest_path("session:s", "file:a", 2, &[REL_CONTAINS])
+            .expect("inverse contains path");
+        assert_eq!(path, vec!["session:s", "file:a"]);
+        let relation = inferred
+            .relation("inferred:inverse:rel:file:a:part_of:session:s:contains")
+            .expect("virtual inverse relation");
+        assert_eq!(relation.relation, REL_CONTAINS);
+        assert!(relation.provenance.source.starts_with("inferred:inverse_of:"));
+        assert!(relation.confidence < 0.8);
+    }
+
+    #[test]
+    fn subproperty_inference_expands_depends_on() {
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_IMPORTS, "file:b"));
+
+        let inferred = graph.infer_relations(&default_engineering_ontology());
+        let path = inferred
+            .shortest_path("file:a", "file:b", 1, &[REL_DEPENDS_ON])
+            .expect("subproperty depends_on path");
+        assert_eq!(path, vec!["file:a", "file:b"]);
+        let relation_id = format!("inferred:sub:rel:file:a:imports:file:b:{REL_DEPENDS_ON}");
+        let relation = inferred
+            .relation(&relation_id)
+            .expect("virtual subproperty relation");
+        assert_eq!(relation.relation, REL_DEPENDS_ON);
     }
 
     #[test]
