@@ -9,6 +9,12 @@ pub use contracts::{
     merge_contract_entries, parse_contract_block, render_contract_block, strip_contract_block,
 };
 
+mod key_facts;
+pub use key_facts::{
+    KeyFact, KeyFactCoverage, KeyFactKind, MAX_KEY_FACT_CHARS, MAX_KEY_FACTS, extract_key_facts,
+    measure_key_fact_coverage, render_key_fact_reserve,
+};
+
 /// Default token budget (200k tokens - matches Claude's actual context limit)
 pub const DEFAULT_TOKEN_BUDGET: usize = 200_000;
 

@@ -36,8 +36,9 @@ pub use jcode_compaction_core::{
     compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
     emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
     extract_contract_entries, inject_contract_block, is_image_rejection_error,
-    is_request_payload_too_large_error, mean_embedding, merge_contract_entries, message_char_count,
-    parse_contract_block, preserve_protected_checkpoint_lines, render_contract_block,
+    is_request_payload_too_large_error, mean_embedding, measure_key_fact_coverage,
+    merge_contract_entries, message_char_count, parse_contract_block,
+    preserve_protected_checkpoint_lines, render_contract_block, render_key_fact_reserve,
     reusable_cache_tokens_from_usage, safe_compaction_cutoff, semantic_cache_key,
     semantic_goal_text, semantic_message_text, strip_contract_block,
     strip_large_images_in_contents, summary_payload_char_count,
@@ -1865,6 +1866,7 @@ async fn generate_compaction_artifact(
         ));
     }
     let summary_text = attach_graph_memory_state(summary_text, &messages);
+    let summary_text = attach_key_fact_reserve(summary_text, &messages);
     let summary_text = attach_task_contracts(summary_text, &messages, existing_summary.as_ref());
 
     Ok(CompactionResult {
@@ -1964,6 +1966,34 @@ fn truncate_graph_state(graph_state: &str, max_chars: usize) -> String {
     if let Some(last_newline) = out.rfind('\n') {
         out.truncate(last_newline);
     }
+    out
+}
+
+/// Keep exact file paths, commands, and error codes that the model omitted.
+///
+/// The shrink proof only guarantees the checkpoint is shorter, not that it kept
+/// the facts needed to resume. Missing facts are appended verbatim unless doing
+/// so would make the checkpoint larger than the source messages.
+fn attach_key_fact_reserve(summary_text: String, messages: &[Message]) -> String {
+    let coverage = measure_key_fact_coverage(messages, &summary_text);
+    if coverage.missing.is_empty() {
+        return summary_text;
+    }
+    let reserve = render_key_fact_reserve(&coverage.missing);
+    if reserve.is_empty() {
+        return summary_text;
+    }
+    let source_chars: usize = messages.iter().map(message_char_count).sum();
+    let candidate_chars = summary_text.chars().count() + 2 + reserve.chars().count();
+    if source_chars == 0 || candidate_chars >= source_chars {
+        crate::logging::warn(&format!(
+            "[compaction] skipped key facts: checkpoint plus reserve ({candidate_chars}) would not shrink source ({source_chars})"
+        ));
+        return summary_text;
+    }
+    let mut out = summary_text;
+    out.push_str("\n\n");
+    out.push_str(&reserve);
     out
 }
 

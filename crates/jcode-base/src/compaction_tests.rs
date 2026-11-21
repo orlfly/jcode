@@ -55,6 +55,28 @@ fn make_text_message(role: Role, text: &str) -> Message {
 }
 
 #[test]
+fn key_fact_reserve_restores_dropped_paths_and_errors() {
+    let long_context = format!(
+        "discussion {} crates/jcode-base/src/compaction.rs failed with error[E0425]",
+        "context ".repeat(120)
+    );
+    let messages = vec![make_text_message(Role::User, &long_context)];
+    let summary = "## Current Work\nshort checkpoint".to_string();
+    let out = attach_key_fact_reserve(summary, &messages);
+    assert!(out.contains("## Key Facts (verbatim)"), "{out}");
+    assert!(out.contains("crates/jcode-base/src/compaction.rs"), "{out}");
+    assert!(out.contains("E0425"), "{out}");
+}
+
+#[test]
+fn key_fact_reserve_skips_when_checkpoint_would_not_shrink() {
+    let messages = vec![make_text_message(Role::User, "src/lib.rs E0425")];
+    let summary = "x".repeat(200);
+    let out = attach_key_fact_reserve(summary.clone(), &messages);
+    assert_eq!(out, summary);
+}
+
+#[test]
 fn test_new_manager() {
     let manager = CompactionManager::new();
     assert_eq!(manager.compacted_count, 0);
