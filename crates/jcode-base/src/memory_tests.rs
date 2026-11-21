@@ -5337,6 +5337,58 @@ fn path_query_relaxes_scope_mismatch_and_records_it() {
 }
 
 #[test]
+fn path_outcome_maps_to_belief_observation() {
+    let found = MemoryPathQueryOutcome {
+        paths: vec![MemoryPath {
+            nodes: vec!["a".into(), "b".into()],
+            edges: Vec::new(),
+            cost: 1.25,
+            confidence: 0.8,
+        }],
+        quality: vec![jcode_memory_types::PathQuality {
+            flags: vec![jcode_memory_types::PathQualityFlag::HypothesizedEdge],
+            reasons: vec!["pending shadow edge".into()],
+        }],
+        ..MemoryPathQueryOutcome::default()
+    };
+    match found.belief_observation("a", "b") {
+        jcode_memory_types::BeliefObservation::PathFound {
+            from,
+            to,
+            path_confidence,
+            cost,
+            quality_flags,
+        } => {
+            assert_eq!((from.as_str(), to.as_str()), ("a", "b"));
+            assert_eq!(path_confidence, 0.8);
+            assert_eq!(cost, 1.25);
+            assert_eq!(
+                quality_flags,
+                vec![jcode_memory_types::PathQualityFlag::HypothesizedEdge]
+            );
+        }
+        other => panic!("expected PathFound, got {other:?}"),
+    }
+
+    let missing = MemoryPathQueryOutcome {
+        diagnosis: vec!["E03".into(), "E09".into()],
+        missing_classes: vec!["change".into()],
+        ..MemoryPathQueryOutcome::default()
+    };
+    match missing.belief_observation("a", "b") {
+        jcode_memory_types::BeliefObservation::PathMissing {
+            diagnosis,
+            missing_class,
+            ..
+        } => {
+            assert_eq!(diagnosis, vec!["E03".to_string(), "E09".to_string()]);
+            assert_eq!(missing_class.as_deref(), Some("change"));
+        }
+        other => panic!("expected PathMissing, got {other:?}"),
+    }
+}
+
+#[test]
 fn path_quality_marks_stale_and_weak_provenance() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-quality");

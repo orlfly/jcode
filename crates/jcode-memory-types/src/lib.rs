@@ -27,6 +27,12 @@ pub use path_query::{
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
+pub mod belief;
+pub use belief::{
+    BeliefObservation, BeliefState, BeliefStep, DEFAULT_PRUNE_THRESHOLD, Hypothesis,
+    update_confidence,
+};
+
 pub mod reward;
 pub use reward::{
     RewardSignals, RewardWeights, quality_penalty, quality_signal, shaped_reward,

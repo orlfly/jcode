@@ -288,6 +288,41 @@ pub struct MemoryPathQueryOutcome {
     pub depth: usize,
 }
 
+impl MemoryPathQueryOutcome {
+    /// Convert one query result into the observation consumed by the POMDP
+    /// belief state. The best path is used; when there is no path, diagnosis
+    /// and missing-class fields become negative evidence.
+    pub fn belief_observation(
+        &self,
+        from: impl Into<String>,
+        to: impl Into<String>,
+    ) -> jcode_memory_types::BeliefObservation {
+        let from = from.into();
+        let to = to.into();
+        if let Some(path) = self.paths.first() {
+            let quality_flags = self
+                .quality
+                .first()
+                .map(|quality| quality.flags.clone())
+                .unwrap_or_default();
+            jcode_memory_types::BeliefObservation::PathFound {
+                from,
+                to,
+                path_confidence: path.confidence,
+                cost: path.cost,
+                quality_flags,
+            }
+        } else {
+            jcode_memory_types::BeliefObservation::PathMissing {
+                from,
+                to,
+                diagnosis: self.diagnosis.clone(),
+                missing_class: self.missing_classes.first().cloned(),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnchorSuggestion {
     pub anchor: String,
