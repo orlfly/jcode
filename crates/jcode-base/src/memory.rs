@@ -8007,6 +8007,83 @@ impl MemoryManager {
         Ok(outcome)
     }
 
+    /// Load the graphs for one query so multi-leg searches do not reload and
+    /// deep-clone them per leg.
+    fn load_path_graphs(&self, scope: MemoryScope) -> Result<Vec<(&'static str, MemoryGraph)>> {
+        let mut graphs = Vec::new();
+        if scope.includes_project() {
+            graphs.push(("project", self.load_project_graph()?));
+        }
+        if scope.includes_global() {
+            graphs.push(("global", self.load_global_graph()?));
+        }
+        Ok(graphs)
+    }
+
+    fn best_path_from_loaded_graphs(
+        &self,
+        graphs: &[(&str, MemoryGraph)],
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        allowed: &[&str],
+        options: &MemoryPathQueryOptions,
+    ) -> Result<Option<MemoryPath>> {
+        let mut paths = Vec::new();
+        for (_, graph) in graphs {
+            let Some(from) = resolve_path_anchor(graph, from_anchor) else {
+                continue;
+            };
+            let Some(to) = resolve_path_anchor(graph, to_anchor) else {
+                continue;
+            };
+            paths.extend(graph.k_shortest_paths_with_relations(&from, &to, depth, 1, allowed));
+        }
+        let project = graphs
+            .iter()
+            .find(|(label, _)| *label == "project")
+            .map(|(_, graph)| graph);
+        let global = graphs
+            .iter()
+            .find(|(label, _)| *label == "global")
+            .map(|(_, graph)| graph);
+        if let (Some(project), Some(global)) = (project, global) {
+            paths.extend(self.stitched_bridge_paths(
+                project,
+                global,
+                &[from_anchor.to_string()],
+                &[to_anchor.to_string()],
+                depth,
+                1,
+                allowed,
+            )?);
+        }
+        if !options.deny_relations.is_empty() {
+            paths.retain(|path| {
+                !path.edges.iter().any(|edge| {
+                    options
+                        .deny_relations
+                        .iter()
+                        .any(|deny| deny.trim().eq_ignore_ascii_case(edge.kind.relation_name()))
+                })
+            });
+        }
+        if let Some(min_confidence) = options.min_confidence {
+            paths.retain(|path| path.confidence >= min_confidence);
+        }
+        if options.objective == Some(jcode_memory_types::PathObjective::MaxConfidence) {
+            paths.sort_by(|left, right| {
+                right
+                    .confidence
+                    .total_cmp(&left.confidence)
+                    .then_with(|| left.cost.total_cmp(&right.cost))
+            });
+        } else {
+            paths.sort_by(|left, right| left.cost.total_cmp(&right.cost));
+        }
+        Ok(paths.into_iter().next())
+    }
+
     /// Query a start -> waypoint... -> goal chain by computing one best leg at
     /// a time. This is intentionally not a globally optimal k-waypoint search;
     /// each returned path is marked `stitched_path` for downstream verification.
@@ -8040,6 +8117,27 @@ impl MemoryManager {
 
         let froms = normalize_path_anchors(from_anchors);
         let tos = normalize_path_anchors(to_anchors);
+        let graphs = self.load_path_graphs(scope)?;
+        let allowed_owned: Vec<String> = relations
+            .iter()
+            .map(|relation| relation.trim())
+            .filter(|relation| {
+                !relation.is_empty() && jcode_memory_types::EdgeKind::parse(relation).is_some()
+            })
+            .map(str::to_string)
+            .collect();
+        if !relations.is_empty() && allowed_owned.is_empty() {
+            return self.paths_between_anchors_with_options(
+                from_anchors,
+                to_anchors,
+                depth,
+                limit,
+                scope,
+                relations,
+                options,
+            );
+        }
+        let allowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
         let mut paths = Vec::new();
         let mut failure = None;
         for from in &froms {
@@ -8051,19 +8149,36 @@ impl MemoryManager {
                 let mut confidence = 1.0f32;
                 let mut complete = true;
                 for (index, target) in waypoints.iter().chain(std::iter::once(to)).enumerate() {
-                    let leg = self.paths_between_anchors_with_options(
-                        &[leg_from.clone()],
-                        &[target.clone()],
+                    let fast = self.best_path_from_loaded_graphs(
+                        &graphs,
+                        &leg_from,
+                        target,
                         depth,
-                        1,
-                        scope,
-                        relations,
-                        options.clone(),
+                        &allowed,
+                        &options,
                     )?;
-                    let Some(path) = leg.paths.first() else {
-                        failure = Some(leg);
-                        complete = false;
-                        break;
+                    let path = if let Some(path) = fast {
+                        path
+                    } else {
+                        // Preserve diagnosis, auto-grounding and relaxation on
+                        // a failed leg, but do not pay the full graph reload on
+                        // the common successful path.
+                        let leg = self.paths_between_anchors_with_options(
+                            &[leg_from.clone()],
+                            &[target.clone()],
+                            depth,
+                            1,
+                            scope,
+                            relations,
+                            options.clone(),
+                        )?;
+                        if let Some(path) = leg.paths.first() {
+                            path.clone()
+                        } else {
+                            failure = Some(leg);
+                            complete = false;
+                            break;
+                        }
                     };
                     if index == 0 {
                         nodes.extend(path.nodes.iter().cloned());

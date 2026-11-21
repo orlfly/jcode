@@ -5153,6 +5153,72 @@ fn path_query_chains_waypoints() {
 }
 
 #[test]
+#[ignore = "benchmark: run with --ignored --nocapture"]
+fn bench_waypoint_query_reuses_loaded_graphs() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-waypoint-bench");
+        let mut graph = MemoryGraph::new();
+        let ids: Vec<String> = (0..2_000)
+            .map(|index| {
+                graph.add_memory(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("benchmark filler memory {index}"),
+                ))
+            })
+            .collect();
+        graph.link_memories(&ids[0], &ids[1], 0.9);
+        graph.link_memories(&ids[1], &ids[2], 0.9);
+        manager.save_project_graph(&graph).expect("save bench graph");
+        let options = crate::memory::MemoryPathQueryOptions::default();
+
+        let baseline = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = manager
+                .paths_between_anchors_with_options(
+                    &[ids[0].clone()],
+                    &[ids[1].clone()],
+                    3,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    options.clone(),
+                )
+                .expect("leg one");
+            let _ = manager
+                .paths_between_anchors_with_options(
+                    &[ids[1].clone()],
+                    &[ids[2].clone()],
+                    3,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    options.clone(),
+                )
+                .expect("leg two");
+        }
+        let baseline = baseline.elapsed();
+
+        let reused = std::time::Instant::now();
+        for _ in 0..20 {
+            let _ = manager
+                .paths_via_waypoints(
+                    &[ids[0].clone()],
+                    &[ids[2].clone()],
+                    &[ids[1].clone()],
+                    3,
+                    1,
+                    MemoryScope::Project,
+                    &[],
+                    options.clone(),
+                )
+                .expect("waypoint query");
+        }
+        let reused = reused.elapsed();
+        eprintln!("waypoint graph reload baseline={baseline:?} reused={reused:?}");
+    });
+}
+
+#[test]
 fn path_query_relaxes_scope_mismatch_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-scope-mismatch");
