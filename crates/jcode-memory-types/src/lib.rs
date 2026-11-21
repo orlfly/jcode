@@ -16,6 +16,9 @@ pub use path_diagnosis::{
     PathDiagnosisCode, PathMissingClass, missing_classes_for, next_actions_for,
 };
 
+pub mod path_quality;
+pub use path_quality::{PathQuality, PathQualityFlag};
+
 pub mod ontology_gate;
 pub use ontology_gate::{
     OntologyGateDecision, OntologyGateExit, SixQuestionSignals, route_ontology_definition,

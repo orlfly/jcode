@@ -854,6 +854,14 @@ impl Tool for MemoryTool {
                             path.confidence * 100.0,
                             path.nodes.len()
                         ));
+                        if let Some(quality) = outcome.quality.get(index)
+                            && !quality.is_empty()
+                        {
+                            out.push_str(&format!("  quality: {}\n", quality.label()));
+                            for reason in &quality.reasons {
+                                out.push_str(&format!("    - {reason}\n"));
+                            }
+                        }
                         for (node_index, node_id) in path.nodes.iter().enumerate() {
                             match manager.get_by_id(node_id, scope)? {
                                 Some(entry) => out.push_str(&format!(

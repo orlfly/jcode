@@ -5057,6 +5057,10 @@ fn path_query_relaxes_depth_once_and_records_it() {
         assert_eq!(outcome.paths[0].nodes.len(), 10, "{outcome:?}");
         assert_eq!(outcome.depth, 16);
         assert_eq!(outcome.relaxations, vec!["depth 8 -> 16".to_string()]);
+        assert!(
+            outcome.quality[0].has(jcode_memory_types::PathQualityFlag::RelaxedQuery),
+            "{outcome:?}"
+        );
     });
 }
 
@@ -5092,6 +5096,37 @@ fn path_query_reports_scope_mismatch_as_e08() {
                 .next_actions
                 .iter()
                 .any(|action| action.starts_with("E08 L0:")),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
+fn path_quality_marks_stale_and_weak_provenance() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-quality");
+        let mut graph = MemoryGraph::new();
+        let mut a = MemoryEntry::new(MemoryCategory::Fact, "stale quality alpha");
+        a.updated_at = chrono::Utc::now() - chrono::Duration::days(60);
+        let mut b = MemoryEntry::new(MemoryCategory::Fact, "stale quality beta");
+        b.updated_at = chrono::Utc::now() - chrono::Duration::days(60);
+        let a_id = graph.add_memory(a);
+        let b_id = graph.add_memory(b);
+        graph.link_memories(&a_id, &b_id, 0.9);
+        manager
+            .save_project_graph(&graph)
+            .expect("save quality graph");
+
+        let outcome = manager
+            .paths_between_anchors(&[a_id], &[b_id], 2, 2, MemoryScope::Project, &[])
+            .expect("quality path");
+        let quality = &outcome.quality[0];
+        assert!(
+            quality.has(jcode_memory_types::PathQualityFlag::StaleEdge),
+            "{outcome:?}"
+        );
+        assert!(
+            quality.has(jcode_memory_types::PathQualityFlag::LowProvenance),
             "{outcome:?}"
         );
     });
@@ -5182,6 +5217,13 @@ fn explicit_bridge_stitches_project_and_global_paths() {
                         matches!(edge.kind, crate::memory_graph::EdgeKind::Bridge)
                     })
             }),
+            "{forward:?}"
+        );
+        assert!(
+            forward
+                .quality
+                .iter()
+                .any(|quality| quality.has(jcode_memory_types::PathQualityFlag::StitchedPath)),
             "{forward:?}"
         );
 

@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use jcode_memory_types::layered::{
     OntologyLayer, compose_ontology_layers, diff_ontology_layer, layer_stack_hash,
 };
-use jcode_memory_types::{GraphBackend, StoreKey};
+use jcode_memory_types::{GraphBackend, MemoryPath, PathQuality, PathQualityFlag, StoreKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -260,6 +260,9 @@ pub fn score_l1_relevance(
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MemoryPathQueryOutcome {
     pub paths: Vec<jcode_memory_types::MemoryPath>,
+    /// Local quality signals aligned by index with `paths`.
+    #[serde(default)]
+    pub quality: Vec<PathQuality>,
     pub unresolved_from: Vec<String>,
     pub unresolved_to: Vec<String>,
     pub unknown_relations: Vec<String>,
@@ -282,10 +285,66 @@ const MAX_INITIAL_PATH_DEPTH: usize = 8;
 const MAX_RELAXED_PATH_DEPTH: usize = 16;
 
 fn finalize_path_outcome(mut outcome: MemoryPathQueryOutcome) -> MemoryPathQueryOutcome {
-    outcome.missing_classes =
-        jcode_memory_types::missing_classes_for(&outcome.diagnosis);
+    outcome.missing_classes = jcode_memory_types::missing_classes_for(&outcome.diagnosis);
     outcome.next_actions = jcode_memory_types::next_actions_for(&outcome.diagnosis);
     outcome
+}
+
+const STALE_EDGE_DAYS: i64 = 30;
+const HIGH_DEGREE_HUB: usize = 64;
+
+fn assess_path_quality(
+    path: &MemoryPath,
+    entries: &std::collections::HashMap<&str, &crate::memory_types::MemoryEntry>,
+    degrees: &std::collections::HashMap<&str, usize>,
+    relaxations: &[String],
+) -> PathQuality {
+    let mut quality = PathQuality::default();
+    let now = Utc::now();
+    for node in &path.nodes {
+        if let Some(entry) = entries.get(node.as_str()) {
+            if now.signed_duration_since(entry.updated_at).num_days() > STALE_EDGE_DAYS {
+                quality.push(
+                    PathQualityFlag::StaleEdge,
+                    format!("node {node} was last updated more than {STALE_EDGE_DAYS} days ago"),
+                );
+            }
+            let weak_provenance = entry.provenance.as_ref().is_none_or(|provenance| {
+                provenance.locator.is_none() && provenance.confidence < 0.7
+            });
+            if weak_provenance {
+                quality.push(
+                    PathQualityFlag::LowProvenance,
+                    format!("node {node} has no locator or low-confidence provenance"),
+                );
+            }
+        }
+        if let Some(degree) = degrees.get(node.as_str())
+            && *degree >= HIGH_DEGREE_HUB
+        {
+            quality.push(
+                PathQualityFlag::HighDegreeHub,
+                format!("node {node} has degree {degree} >= {HIGH_DEGREE_HUB}"),
+            );
+        }
+    }
+    if path
+        .edges
+        .iter()
+        .any(|edge| matches!(edge.kind, jcode_memory_types::EdgeKind::Bridge))
+    {
+        quality.push(
+            PathQualityFlag::StitchedPath,
+            "path crosses an explicit cross-store bridge".to_string(),
+        );
+    }
+    if !relaxations.is_empty() {
+        quality.push(
+            PathQualityFlag::RelaxedQuery,
+            format!("query relaxation: {}", relaxations.join("; ")),
+        );
+    }
+    quality
 }
 
 /// Explicit bridge between a project-scoped memory and a global memory.
@@ -7392,6 +7451,7 @@ impl MemoryManager {
             scope,
             &allowed,
             &unknown_relations,
+            &[],
         )?;
 
         // L0 depth relaxation: E05 means anchors are connected but the first
@@ -7402,6 +7462,7 @@ impl MemoryManager {
             && depth < MAX_RELAXED_PATH_DEPTH
         {
             let relaxed_depth = MAX_RELAXED_PATH_DEPTH;
+            let relaxation = format!("depth {depth} -> {relaxed_depth}");
             let mut relaxed = self.paths_between_anchors_inner(
                 &froms,
                 &tos,
@@ -7410,10 +7471,9 @@ impl MemoryManager {
                 scope,
                 &allowed,
                 &unknown_relations,
+                std::slice::from_ref(&relaxation),
             )?;
-            relaxed
-                .relaxations
-                .push(format!("depth {depth} -> {relaxed_depth}"));
+            relaxed.relaxations.push(relaxation);
             relaxed.depth = relaxed_depth;
             outcome = relaxed;
         }
@@ -7430,6 +7490,7 @@ impl MemoryManager {
         scope: MemoryScope,
         allowed: &[&str],
         unknown_relations: &[String],
+        relaxations: &[String],
     ) -> Result<MemoryPathQueryOutcome> {
         let mut outcome = MemoryPathQueryOutcome {
             depth,
@@ -7550,6 +7611,24 @@ impl MemoryManager {
         let mut seen = std::collections::HashSet::new();
         paths.retain(|path| seen.insert(path.nodes.clone()));
         paths.truncate(limit);
+        let mut entries = std::collections::HashMap::new();
+        let mut degrees = std::collections::HashMap::new();
+        for (_, graph) in &graphs {
+            for path in &paths {
+                for node in &path.nodes {
+                    if let Some(entry) = graph.get_memory(node) {
+                        entries.entry(node.as_str()).or_insert(entry);
+                    }
+                    degrees
+                        .entry(node.as_str())
+                        .or_insert_with(|| graph.node_degree(node));
+                }
+            }
+        }
+        outcome.quality = paths
+            .iter()
+            .map(|path| assess_path_quality(path, &entries, &degrees, relaxations))
+            .collect();
         if paths.is_empty()
             && !resolved_from.is_empty()
             && !resolved_to.is_empty()

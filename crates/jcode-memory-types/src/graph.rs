@@ -731,6 +731,11 @@ impl MemoryGraph {
             .unwrap_or_default()
     }
 
+    /// Outgoing plus incoming edge count for one node.
+    pub fn node_degree(&self, node_id: &str) -> usize {
+        self.get_edges(node_id).len() + self.get_incoming(node_id).len()
+    }
+
     /// Link two memories with a RelatesTo edge
     pub fn link_memories(&mut self, from: &str, to: &str, weight: f32) {
         self.add_edge(from, to, EdgeKind::RelatesTo { weight });
