@@ -563,6 +563,31 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_anchors_resolve_in_real_session_graph() {
+        let messages = vec![
+            tool_use("call-1", "bash", json!({"command": "cargo test -p jcode"})),
+            tool_result(
+                "call-1",
+                "error[E0425]: cannot find function truncate_with_ellipsis",
+                true,
+            ),
+        ];
+        let extraction = extract_engineering_episode("session-real", &messages, Some("/repo"));
+        let rendered = render_graph_memory_state(&messages, 24);
+        assert!(!rendered.is_empty(), "checkpoint anchors must not be empty");
+        for line in rendered.lines() {
+            let id = line
+                .strip_prefix("- `")
+                .and_then(|rest| rest.split('`').next())
+                .expect("anchor line format");
+            assert!(
+                extraction.graph.entities.contains_key(id),
+                "anchor {id} missing from persisted graph:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn extracts_edit_episode() {
         let messages = vec![
             tool_use(

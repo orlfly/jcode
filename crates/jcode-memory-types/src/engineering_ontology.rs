@@ -822,6 +822,22 @@ impl EngineeringGraph {
         self.relations.insert(relation.id.clone(), relation)
     }
 
+    /// Union another graph into this one, keeping existing entities and
+    /// relations when ids collide. Compaction extracts only the active segment,
+    /// so merging preserves facts routed from earlier checkpoints.
+    pub fn merge(&mut self, other: &Self) {
+        for (id, entity) in &other.entities {
+            self.entities
+                .entry(id.clone())
+                .or_insert_with(|| entity.clone());
+        }
+        for (id, relation) in &other.relations {
+            self.relations
+                .entry(id.clone())
+                .or_insert_with(|| relation.clone());
+        }
+    }
+
     pub fn entity(&self, id: &str) -> Option<&EngineeringEntity> {
         self.entities.get(id)
     }
@@ -2271,5 +2287,25 @@ mod tests {
         graph.insert_entity(entity);
         let report = graph.validate(&ontology);
         assert!(report.errors().iter().any(|issue| issue.code == "EG12"));
+    }
+
+    #[test]
+    fn merge_unions_entities_and_relations_without_overwriting() {
+        let mut graph = EngineeringGraph::new();
+        let mut first = file("f1");
+        first.name = "kept".to_string();
+        graph.insert_entity(first);
+
+        let mut other = EngineeringGraph::new();
+        let mut replacement = file("f1");
+        replacement.name = "ignored".to_string();
+        other.insert_entity(replacement);
+        other.insert_entity(test("test1"));
+        other.insert_relation(EngineeringRelation::new("test1", REL_TESTS, "f1"));
+
+        graph.merge(&other);
+        assert_eq!(graph.entities["f1"].name, "kept");
+        assert!(graph.entities.contains_key("test1"));
+        assert_eq!(graph.relations.len(), 1);
     }
 }

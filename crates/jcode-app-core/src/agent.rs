@@ -376,6 +376,76 @@ pub struct Agent {
     concurrency_session: Option<crate::telemetry::ConcurrencySession>,
 }
 
+/// Persist one extraction and merge it with facts routed at earlier checkpoints.
+fn persist_engineering_episode(session_id: &str, working_dir: Option<&str>, messages: &[Message]) {
+    let extraction = jcode_base::engineering_episode::extract_engineering_episode(
+        session_id,
+        messages,
+        working_dir,
+    );
+    if !extraction.warnings.is_empty() {
+        logging::warn(&format!(
+            "Engineering episode extraction for session {} produced {} warning(s)",
+            session_id,
+            extraction.warnings.len()
+        ));
+    }
+    let store = match jcode_base::engineering_store::EngineeringStore::open_default() {
+        Ok(store) => store,
+        Err(err) => {
+            logging::warn(&format!(
+                "Failed to open engineering graph store for session {}: {}",
+                session_id, err
+            ));
+            return;
+        }
+    };
+    let graph = match store.load_graph(session_id) {
+        Ok(Some(mut existing)) => {
+            existing.merge(&extraction.graph);
+            existing
+        }
+        Ok(None) => extraction.graph,
+        Err(err) => {
+            logging::warn(&format!(
+                "Failed to load existing engineering graph for session {}: {}",
+                session_id, err
+            ));
+            return;
+        }
+    };
+    if let Err(err) = store.save_graph(session_id, working_dir, &graph) {
+        logging::warn(&format!(
+            "Failed to persist engineering episode for session {}: {}",
+            session_id, err
+        ));
+    }
+}
+
+/// Route facts into the graph before compaction rewrites provider history.
+/// Anchors rendered into the checkpoint only resolve if this runs while the
+/// messages being summarized are still available.
+fn maybe_persist_engineering_episode_before_compaction(
+    manager: &crate::compaction::CompactionManager,
+    session_id: &str,
+    working_dir: Option<&str>,
+    messages: &[Message],
+) {
+    if manager.is_compacting() {
+        return;
+    }
+    let usage = manager.context_usage_with(messages);
+    if !manager.should_compact_with(messages) && usage < crate::compaction::CRITICAL_THRESHOLD {
+        return;
+    }
+    logging::info(&format!(
+        "Routing engineering facts before compaction for session {} (usage={:.1}%)",
+        session_id,
+        usage * 100.0
+    ));
+    persist_engineering_episode(session_id, working_dir, messages);
+}
+
 impl Agent {
     pub(crate) fn server_turn_observer(&self) -> TurnObserver {
         self.turn_ownership.observer()
@@ -802,40 +872,14 @@ impl Agent {
         }
     }
 
-    /// Persist the deterministic engineering episode graph after a compaction
-    /// boundary. Compaction is infrequent and already touches the full history,
-    /// so it is the natural checkpoint for the graph store.
+    /// Persist the deterministic engineering episode graph at session or
+    /// compaction boundaries, merging it with facts routed earlier.
     fn persist_engineering_episode_best_effort(&self, messages: &[Message]) {
-        let extraction = jcode_base::engineering_episode::extract_engineering_episode(
+        persist_engineering_episode(
             &self.session.id,
-            messages,
             self.session.working_dir.as_deref(),
+            messages,
         );
-        if !extraction.warnings.is_empty() {
-            logging::warn(&format!(
-                "Engineering episode extraction for session {} produced {} warning(s)",
-                self.session.id,
-                extraction.warnings.len()
-            ));
-        }
-        match jcode_base::engineering_store::EngineeringStore::open_default() {
-            Ok(store) => {
-                if let Err(err) = store.save_graph(
-                    &self.session.id,
-                    self.session.working_dir.as_deref(),
-                    &extraction.graph,
-                ) {
-                    logging::warn(&format!(
-                        "Failed to persist engineering episode for session {}: {}",
-                        self.session.id, err
-                    ));
-                }
-            }
-            Err(err) => logging::warn(&format!(
-                "Failed to open engineering graph store for session {}: {}",
-                self.session.id, err
-            )),
-        }
     }
 
     fn reset_runtime_state_for_session_change(&mut self) {
@@ -918,6 +962,8 @@ impl Agent {
         encrypted_content: String,
         compacted_count: usize,
     ) -> Result<(Option<u64>, Option<u64>)> {
+        let messages = self.session.provider_messages().to_vec();
+        self.persist_engineering_episode_best_effort(&messages);
         // Measure the context before and after so clients can show what the
         // compaction did. OpenAI does not report these sizes for native
         // compaction, so jcode's own estimate is the best available figure.
@@ -986,9 +1032,17 @@ impl Agent {
                 Ok(mut manager) => {
                     let discarded_oversized_native =
                         manager.discard_oversized_openai_native_compaction();
+                    let session_id = self.session.id.clone();
+                    let working_dir = self.session.working_dir.clone();
                     let messages = {
                         let all_messages = self.session.provider_messages();
                         if self.provider.uses_jcode_compaction() {
+                            maybe_persist_engineering_episode_before_compaction(
+                                &manager,
+                                &session_id,
+                                working_dir.as_deref(),
+                                all_messages,
+                            );
                             let action =
                                 manager.ensure_context_fits(all_messages, self.provider.clone());
                             match action {
@@ -1016,8 +1070,6 @@ impl Agent {
                         self.sync_session_compaction_state_from_manager(&manager);
                     }
                     if event.is_some() {
-                        let messages = self.session.provider_messages().to_vec();
-                        self.persist_engineering_episode_best_effort(&messages);
                         self.note_compaction_applied();
                         self.persist_session_best_effort("compaction completion");
                     }
