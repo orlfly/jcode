@@ -1014,6 +1014,19 @@ impl Tool for MemoryTool {
                 for relaxation in &outcome.relaxations {
                     diagnostics.push(format!("relaxation: {relaxation}"));
                 }
+                for candidate in &outcome.alignment_candidates {
+                    diagnostics.push(format!(
+                        "alignment candidate: {} ({}) <-> {} ({}) score {:.2}; propose shadow relation={} {} -> {}",
+                        candidate.from_id,
+                        candidate.from_store,
+                        candidate.to_id,
+                        candidate.to_store,
+                        candidate.score,
+                        candidate.relation,
+                        candidate.from_id,
+                        candidate.to_id
+                    ));
+                }
                 let mut quality_flags = Vec::new();
                 for quality in &outcome.quality {
                     for flag in &quality.flags {

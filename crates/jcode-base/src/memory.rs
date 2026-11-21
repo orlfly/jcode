@@ -277,8 +277,23 @@ pub struct MemoryPathQueryOutcome {
     /// Deterministic L0 relaxations applied after the first attempt, e.g.
     /// `depth 8 -> 16`. Empty when the original query succeeded.
     pub relaxations: Vec<String>,
+    /// L2 alignment suggestions when anchors exist in disjoint stores but no
+    /// bridge or same_as edge connects them. Candidates are never written.
+    #[serde(default)]
+    pub alignment_candidates: Vec<AlignmentCandidate>,
     pub stores_searched: usize,
     pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlignmentCandidate {
+    pub from_id: String,
+    pub to_id: String,
+    pub from_store: String,
+    pub to_store: String,
+    pub relation: String,
+    pub score: f32,
+    pub reason: String,
 }
 
 /// Optional query-time behaviour that does not change the persisted graph.
@@ -468,6 +483,65 @@ fn scope_label(scope: MemoryScope) -> &'static str {
         MemoryScope::Global => "global",
         MemoryScope::All => "all",
     }
+}
+
+fn alignment_candidates_for(
+    graphs: &[(&str, MemoryGraph)],
+    from_store_by_anchor: &std::collections::HashMap<String, String>,
+    to_store_by_anchor: &std::collections::HashMap<String, String>,
+) -> Vec<AlignmentCandidate> {
+    let mut candidates = Vec::new();
+    for (from_anchor, from_store) in from_store_by_anchor {
+        let Some((_, from_graph)) = graphs
+            .iter()
+            .find(|(label, _)| *label == from_store.as_str())
+        else {
+            continue;
+        };
+        let Some(from_id) = resolve_path_anchor(from_graph, from_anchor) else {
+            continue;
+        };
+        let Some(from_entry) = from_graph.get_memory(&from_id) else {
+            continue;
+        };
+        for (to_anchor, to_store) in to_store_by_anchor {
+            if from_store == to_store {
+                continue;
+            }
+            let Some((_, to_graph)) = graphs
+                .iter()
+                .find(|(label, _)| *label == to_store.as_str())
+            else {
+                continue;
+            };
+            let Some(to_id) = resolve_path_anchor(to_graph, to_anchor) else {
+                continue;
+            };
+            let Some(to_entry) = to_graph.get_memory(&to_id) else {
+                continue;
+            };
+            let score = jcode_memory_types::lexical_similarity(from_entry, to_entry);
+            if score < 0.5 {
+                continue;
+            }
+            candidates.push(AlignmentCandidate {
+                from_id: from_entry.id.clone(),
+                to_id: to_entry.id.clone(),
+                from_store: from_store.clone(),
+                to_store: to_store.clone(),
+                relation: "same_as".to_string(),
+                score,
+                reason: "lexical similarity across disjoint stores; review before proposing"
+                    .to_string(),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+    candidates.dedup_by(|left, right| {
+        left.from_id == right.from_id && left.to_id == right.to_id
+    });
+    candidates.truncate(3);
+    candidates
 }
 
 fn stitch_paths_with_bridge(
@@ -7880,6 +7954,8 @@ impl MemoryManager {
         let mut resolved_to = std::collections::HashSet::new();
         let mut resolved_from_stores = std::collections::HashSet::new();
         let mut resolved_to_stores = std::collections::HashSet::new();
+        let mut from_store_by_anchor = std::collections::HashMap::new();
+        let mut to_store_by_anchor = std::collections::HashMap::new();
         let mut ambiguous_nodes = std::collections::HashSet::new();
         for (label, graph) in &graphs {
             for anchor in froms {
@@ -7890,6 +7966,9 @@ impl MemoryManager {
                 if pick_best_path_entry(candidates.into_iter()).is_some() {
                     resolved_from.insert(anchor.clone());
                     resolved_from_stores.insert(*label);
+                    from_store_by_anchor
+                        .entry(anchor.clone())
+                        .or_insert_with(|| label.to_string());
                 }
             }
             for anchor in tos {
@@ -7900,6 +7979,9 @@ impl MemoryManager {
                 if pick_best_path_entry(candidates.into_iter()).is_some() {
                     resolved_to.insert(anchor.clone());
                     resolved_to_stores.insert(*label);
+                    to_store_by_anchor
+                        .entry(anchor.clone())
+                        .or_insert_with(|| label.to_string());
                 }
             }
         }
@@ -8002,6 +8084,11 @@ impl MemoryManager {
             && resolved_from_stores.is_disjoint(&resolved_to_stores)
         {
             outcome.diagnosis.push("E09".to_string());
+            outcome.alignment_candidates = alignment_candidates_for(
+                &graphs,
+                &from_store_by_anchor,
+                &to_store_by_anchor,
+            );
         }
         if paths.is_empty() && outcome.diagnosis.is_empty() {
             outcome.diagnosis.push("E03".to_string());

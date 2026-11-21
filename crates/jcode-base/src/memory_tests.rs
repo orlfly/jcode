@@ -5213,6 +5213,48 @@ fn path_query_reports_unbridged_store_split_as_e09() {
 }
 
 #[test]
+fn path_query_suggests_same_as_candidates_for_e09() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-alignment-candidates");
+        let mut project = MemoryGraph::new();
+        let project_id = project.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared deployment target primary database",
+        ));
+        manager
+            .save_project_graph(&project)
+            .expect("save project graph");
+        let mut global = MemoryGraph::new();
+        let global_id = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared deployment target primary database server",
+        ));
+        manager.save_global_graph(&global).expect("save global graph");
+
+        let outcome = manager
+            .paths_between_anchors(
+                &[project_id.clone()],
+                &[global_id.clone()],
+                4,
+                5,
+                MemoryScope::All,
+                &[],
+            )
+            .expect("alignment candidate query");
+        assert!(outcome.paths.is_empty(), "{outcome:?}");
+        assert!(outcome.diagnosis.contains(&"E09".to_string()), "{outcome:?}");
+        assert_eq!(outcome.alignment_candidates.len(), 1, "{outcome:?}");
+        let candidate = &outcome.alignment_candidates[0];
+        assert_eq!(candidate.from_id, project_id);
+        assert_eq!(candidate.to_id, global_id);
+        assert_eq!(candidate.from_store, "project");
+        assert_eq!(candidate.to_store, "global");
+        assert_eq!(candidate.relation, "same_as");
+        assert!(candidate.score >= 0.5, "{outcome:?}");
+    });
+}
+
+#[test]
 fn explicit_bridge_stitches_project_and_global_paths() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/bridge-path");
