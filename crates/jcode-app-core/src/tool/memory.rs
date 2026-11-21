@@ -1018,6 +1018,41 @@ impl Tool for MemoryTool {
                                 out.push_str(&format!("    - {reason}\n"));
                             }
                         }
+                        let flags = outcome
+                            .quality
+                            .get(index)
+                            .map(|quality| quality.flags.as_slice())
+                            .unwrap_or(&[]);
+                        let constraint = if outcome.diagnosis.is_empty() {
+                            1.0
+                        } else if outcome
+                            .diagnosis
+                            .iter()
+                            .any(|code| code == "E04" || code == "E10")
+                        {
+                            0.0
+                        } else {
+                            0.5
+                        };
+                        let reward = crate::memory_types::shaped_reward(
+                            &crate::memory_types::RewardSignals {
+                                accuracy: path.confidence,
+                                efficiency: 1.0 / (1.0 + path.cost.max(0.0)),
+                                semantic: path.confidence,
+                                constraint,
+                                completion: if flags.contains(
+                                    &crate::memory_types::PathQualityFlag::HypothesizedEdge,
+                                ) {
+                                    0.0
+                                } else {
+                                    1.0
+                                },
+                                plan: 0.5,
+                                quality: crate::memory_types::quality_signal(flags),
+                            },
+                            &crate::memory_types::RewardWeights::default(),
+                        );
+                        out.push_str(&format!("  reward: {reward:.2}\n"));
                         for (node_index, node_id) in path.nodes.iter().enumerate() {
                             match manager.get_by_id(node_id, scope)? {
                                 Some(entry) => out.push_str(&format!(
@@ -1729,6 +1764,7 @@ mod tests {
         assert!(output.contains("mem_path_c"), "{output}");
         assert!(output.contains("relates_to"), "{output}");
         assert!(output.contains("decision: terminate"), "{output}");
+        assert!(output.contains("reward:"), "{output}");
     }
 
     #[tokio::test]

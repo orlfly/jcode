@@ -22,6 +22,11 @@ pub use path_quality::{PathQuality, PathQualityFlag};
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
+pub mod reward;
+pub use reward::{
+    RewardSignals, RewardWeights, quality_penalty, quality_signal, shaped_reward,
+};
+
 pub mod ontology_gate;
 pub use ontology_gate::{
     OntologyGateDecision, OntologyGateExit, SixQuestionSignals, route_ontology_definition,
