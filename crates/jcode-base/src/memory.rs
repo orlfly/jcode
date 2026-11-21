@@ -8007,6 +8007,123 @@ impl MemoryManager {
         Ok(outcome)
     }
 
+    /// Query a start -> waypoint... -> goal chain by computing one best leg at
+    /// a time. This is intentionally not a globally optimal k-waypoint search;
+    /// each returned path is marked `stitched_path` for downstream verification.
+    pub fn paths_via_waypoints(
+        &self,
+        from_anchors: &[String],
+        to_anchors: &[String],
+        waypoints: &[String],
+        depth: usize,
+        limit: usize,
+        scope: MemoryScope,
+        relations: &[String],
+        options: MemoryPathQueryOptions,
+    ) -> Result<MemoryPathQueryOutcome> {
+        let waypoints: Vec<String> = waypoints
+            .iter()
+            .map(|anchor| anchor.trim().to_string())
+            .filter(|anchor| !anchor.is_empty())
+            .collect();
+        if waypoints.is_empty() {
+            return self.paths_between_anchors_with_options(
+                from_anchors,
+                to_anchors,
+                depth,
+                limit,
+                scope,
+                relations,
+                options,
+            );
+        }
+
+        let froms = normalize_path_anchors(from_anchors);
+        let tos = normalize_path_anchors(to_anchors);
+        let mut paths = Vec::new();
+        let mut failure = None;
+        for from in &froms {
+            for to in &tos {
+                let mut leg_from = from.clone();
+                let mut nodes = Vec::new();
+                let mut edges = Vec::new();
+                let mut cost = 0.0f32;
+                let mut confidence = 1.0f32;
+                let mut complete = true;
+                for (index, target) in waypoints.iter().chain(std::iter::once(to)).enumerate() {
+                    let leg = self.paths_between_anchors_with_options(
+                        &[leg_from.clone()],
+                        &[target.clone()],
+                        depth,
+                        1,
+                        scope,
+                        relations,
+                        options.clone(),
+                    )?;
+                    let Some(path) = leg.paths.first() else {
+                        failure = Some(leg);
+                        complete = false;
+                        break;
+                    };
+                    if index == 0 {
+                        nodes.extend(path.nodes.iter().cloned());
+                    } else {
+                        nodes.extend(path.nodes.iter().skip(1).cloned());
+                    }
+                    edges.extend(path.edges.iter().cloned());
+                    cost += path.cost;
+                    confidence = confidence.min(path.confidence);
+                    leg_from = target.clone();
+                }
+                if complete && !nodes.is_empty() {
+                    paths.push(MemoryPath {
+                        nodes,
+                        edges,
+                        cost,
+                        confidence,
+                    });
+                }
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(failure.unwrap_or_else(|| MemoryPathQueryOutcome {
+                unresolved_from: froms,
+                unresolved_to: tos,
+                diagnosis: vec!["E03".to_string()],
+                ..MemoryPathQueryOutcome::default()
+            }));
+        }
+
+        paths.sort_by(|left, right| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.nodes.cmp(&right.nodes))
+        });
+        let mut seen = std::collections::HashSet::new();
+        paths.retain(|path| seen.insert(path.nodes.clone()));
+        paths.truncate(limit.min(20));
+        let quality = paths
+            .iter()
+            .map(|_| {
+                let mut quality = PathQuality::default();
+                quality.push(
+                    jcode_memory_types::PathQualityFlag::StitchedPath,
+                    "waypoint chain is stitched from sequential best legs",
+                );
+                quality
+            })
+            .collect();
+        let outcome = MemoryPathQueryOutcome {
+            paths,
+            quality,
+            depth,
+            stores_searched: if scope == MemoryScope::All { 2 } else { 1 },
+            ..MemoryPathQueryOutcome::default()
+        };
+        Ok(finalize_path_outcome(outcome))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paths_between_anchors_inner(
         &self,

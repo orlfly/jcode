@@ -5120,6 +5120,39 @@ fn path_query_relaxes_depth_once_and_records_it() {
 }
 
 #[test]
+fn path_query_chains_waypoints() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-waypoints");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "waypoint start"));
+        let w = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "waypoint middle"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "waypoint goal"));
+        graph.link_memories(&a, &w, 0.9);
+        graph.link_memories(&w, &b, 0.9);
+        manager.save_project_graph(&graph).expect("save waypoint graph");
+
+        let outcome = manager
+            .paths_via_waypoints(
+                &[a.clone()],
+                &[b.clone()],
+                &[w.clone()],
+                3,
+                5,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions::default(),
+            )
+            .expect("waypoint chain");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.paths[0].nodes, vec![a, w, b]);
+        assert!(
+            outcome.quality[0].has(jcode_memory_types::PathQualityFlag::StitchedPath),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
 fn path_query_relaxes_scope_mismatch_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-scope-mismatch");

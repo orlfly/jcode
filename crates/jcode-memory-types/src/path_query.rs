@@ -110,6 +110,8 @@ pub struct PathQuery {
     pub start: Vec<String>,
     pub goal: Vec<String>,
     #[serde(default)]
+    pub waypoints: Vec<String>,
+    #[serde(default)]
     pub graph: Option<PathGraphKind>,
     #[serde(default)]
     pub constraints: PathQueryConstraints,
@@ -158,6 +160,12 @@ impl PathQuery {
         if start.len() > 16 || goal.len() > 16 {
             errors.push("start and goal accept at most 16 anchors each".to_string());
         }
+        if self.waypoints.len() > 3 {
+            errors.push("waypoints accept at most 3 anchors".to_string());
+        }
+        if self.waypoints.iter().any(|anchor| anchor.trim().is_empty()) {
+            errors.push("waypoints must not contain empty anchors".to_string());
+        }
         if let Some(depth) = self.constraints.depth
             && !(1..=8).contains(&depth)
         {
@@ -204,6 +212,7 @@ mod tests {
         let query = PathQuery {
             start: vec!["a".to_string()],
             goal: vec!["b".to_string()],
+            waypoints: vec!["w".to_string()],
             graph: Some(PathGraphKind::Memory),
             constraints: PathQueryConstraints {
                 relations: vec!["relates_to".to_string()],
@@ -230,6 +239,7 @@ mod tests {
         let query = PathQuery {
             start: vec!["a".to_string()],
             goal: vec!["b".to_string()],
+            waypoints: Vec::new(),
             graph: None,
             constraints: PathQueryConstraints {
                 relations: vec!["invented".to_string()],
@@ -256,6 +266,7 @@ mod tests {
         let query = PathQuery {
             start: vec!["file:src/lib.rs".to_string()],
             goal: vec!["error:E0425".to_string()],
+            waypoints: Vec::new(),
             graph: Some(PathGraphKind::Engineering),
             constraints: PathQueryConstraints {
                 relations: vec!["modifies".to_string()],

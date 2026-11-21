@@ -877,6 +877,7 @@ impl Tool for MemoryTool {
                     limit,
                     froms,
                     tos,
+                    waypoints,
                     relations,
                     graph_kind,
                     include_plan,
@@ -908,6 +909,7 @@ impl Tool for MemoryTool {
                         query.limit(3),
                         query.start,
                         query.goal,
+                        query.waypoints,
                         query.constraints.relations,
                         graph_kind,
                         query.constraints.plan,
@@ -935,6 +937,7 @@ impl Tool for MemoryTool {
                         limit,
                         froms,
                         tos,
+                        Vec::new(),
                         relations,
                         graph_kind,
                         include_plan,
@@ -980,24 +983,38 @@ impl Tool for MemoryTool {
                         truncate_for_widget(&tos.join(","), 15)
                     ),
                 });
-                let outcome = manager.paths_between_anchors_with_options(
-                    &froms,
-                    &tos,
-                    depth,
-                    limit,
-                    scope,
-                    &relations,
-                    crate::memory::MemoryPathQueryOptions {
-                        include_hypotheses,
-                        deny_relations: query_filters
-                            .as_ref()
-                            .map(|filters| filters.0.clone())
-                            .unwrap_or_default(),
-                        min_confidence: query_filters.as_ref().and_then(|filters| filters.1),
-                        objective: query_filters.as_ref().and_then(|filters| filters.2),
-                        auto_ground_anchors: auto_ground,
-                    },
-                )?;
+                let query_options = crate::memory::MemoryPathQueryOptions {
+                    include_hypotheses,
+                    deny_relations: query_filters
+                        .as_ref()
+                        .map(|filters| filters.0.clone())
+                        .unwrap_or_default(),
+                    min_confidence: query_filters.as_ref().and_then(|filters| filters.1),
+                    objective: query_filters.as_ref().and_then(|filters| filters.2),
+                    auto_ground_anchors: auto_ground,
+                };
+                let outcome = if waypoints.is_empty() {
+                    manager.paths_between_anchors_with_options(
+                        &froms,
+                        &tos,
+                        depth,
+                        limit,
+                        scope,
+                        &relations,
+                        query_options,
+                    )?
+                } else {
+                    manager.paths_via_waypoints(
+                        &froms,
+                        &tos,
+                        &waypoints,
+                        depth,
+                        limit,
+                        scope,
+                        &relations,
+                        query_options.clone(),
+                    )?
+                };
                 let mut outcome = outcome;
                 if outcome.paths.is_empty() && query_filters.is_some() {
                     outcome.next_actions.push(
