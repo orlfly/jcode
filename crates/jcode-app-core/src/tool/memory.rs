@@ -865,6 +865,7 @@ impl Tool for MemoryTool {
                 }
             }
             "path" => {
+                let mut auto_ground = false;
                 let mut query_filters: Option<(
                     Vec<String>,
                     Option<f32>,
@@ -899,6 +900,7 @@ impl Tool for MemoryTool {
                             query.constraints.objective,
                         ));
                     }
+                    auto_ground = query.constraints.auto_ground;
                     let graph_kind = query.graph_kind().as_str().to_string();
                     (
                         scope,
@@ -993,6 +995,7 @@ impl Tool for MemoryTool {
                             .unwrap_or_default(),
                         min_confidence: query_filters.as_ref().and_then(|filters| filters.1),
                         objective: query_filters.as_ref().and_then(|filters| filters.2),
+                        auto_ground_anchors: auto_ground,
                     },
                 )?;
                 let mut outcome = outcome;

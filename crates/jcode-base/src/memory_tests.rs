@@ -5029,7 +5029,7 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         let suggested = manager
             .paths_between_anchors(
                 &["alpha path anchor typo".to_string()],
-                &[b],
+                &[b.clone()],
                 4,
                 5,
                 MemoryScope::Project,
@@ -5040,6 +5040,29 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         assert!(
             suggested.anchor_suggestions.iter().any(|suggestion| suggestion.id == a),
             "{suggested:?}"
+        );
+
+        let grounded = manager
+            .paths_between_anchors_with_options(
+                &["alpha path anchor typo".to_string()],
+                &[b],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    auto_ground_anchors: true,
+                    ..Default::default()
+                },
+            )
+            .expect("auto grounded query");
+        assert_eq!(grounded.paths.len(), 1, "{grounded:?}");
+        assert!(
+            grounded
+                .relaxations
+                .iter()
+                .any(|relaxation| relaxation.starts_with("grounded anchor alpha path anchor typo ->")),
+            "{grounded:?}"
         );
 
         let disconnected = manager

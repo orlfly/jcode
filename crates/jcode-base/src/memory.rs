@@ -320,6 +320,8 @@ pub struct MemoryPathQueryOptions {
     /// Optional ordering after filtering; the engine still computes k-best by
     /// cost first.
     pub objective: Option<jcode_memory_types::PathObjective>,
+    /// Retry once with high-confidence suggestions for unresolved anchors.
+    pub auto_ground_anchors: bool,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -596,6 +598,38 @@ fn anchor_suggestions_for(
         suggestions.extend(candidates);
     }
     suggestions
+}
+
+fn select_grounding_replacements(
+    suggestions: &[AnchorSuggestion],
+    froms: &[String],
+    tos: &[String],
+) -> Vec<(String, String)> {
+    let mut replacements = Vec::new();
+    for anchor in froms.iter().chain(tos.iter()) {
+        if replacements
+            .iter()
+            .any(|(seen, _): &(String, String)| seen == anchor)
+        {
+            continue;
+        }
+        let mut candidates: Vec<&AnchorSuggestion> = suggestions
+            .iter()
+            .filter(|suggestion| suggestion.anchor == *anchor && suggestion.score >= 0.8)
+            .collect();
+        candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+        let Some(best) = candidates.first() else {
+            continue;
+        };
+        let unambiguous = candidates.len() == 1
+            || candidates
+                .get(1)
+                .is_none_or(|second| best.score - second.score >= 0.1);
+        if unambiguous {
+            replacements.push((anchor.clone(), best.id.clone()));
+        }
+    }
+    replacements
 }
 
 fn stitch_paths_with_bridge(
@@ -7934,6 +7968,41 @@ impl MemoryManager {
             relaxed.relaxations = applied;
             relaxed.depth = relaxed_depth;
             outcome = relaxed;
+        }
+        if outcome.paths.is_empty() && options.auto_ground_anchors {
+            let replacements =
+                select_grounding_replacements(&outcome.anchor_suggestions, &froms, &tos);
+            if !replacements.is_empty() {
+                let mut grounded_froms = froms.clone();
+                let mut grounded_tos = tos.clone();
+                let mut applied = outcome.relaxations.clone();
+                for (anchor, id) in &replacements {
+                    for candidate in &mut grounded_froms {
+                        if candidate == anchor {
+                            *candidate = id.clone();
+                        }
+                    }
+                    for candidate in &mut grounded_tos {
+                        if candidate == anchor {
+                            *candidate = id.clone();
+                        }
+                    }
+                    applied.push(format!("grounded anchor {anchor} -> {id}"));
+                }
+                let mut grounded = self.paths_between_anchors_inner(
+                    &grounded_froms,
+                    &grounded_tos,
+                    outcome.depth,
+                    limit,
+                    effective_scope,
+                    &allowed,
+                    &unknown_relations,
+                    &applied,
+                    &options,
+                )?;
+                grounded.relaxations = applied;
+                outcome = grounded;
+            }
         }
         Ok(outcome)
     }

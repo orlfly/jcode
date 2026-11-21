@@ -99,6 +99,8 @@ pub struct PathQueryConstraints {
     #[serde(default)]
     pub include_hypotheses: bool,
     #[serde(default)]
+    pub auto_ground: bool,
+    #[serde(default)]
     pub plan: bool,
 }
 
