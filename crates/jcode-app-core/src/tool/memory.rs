@@ -1025,6 +1025,16 @@ impl Tool for MemoryTool {
                         outcome.unresolved_to.join(", ")
                     ));
                 }
+                for suggestion in &outcome.anchor_suggestions {
+                    diagnostics.push(format!(
+                        "anchor candidate for `{}`: `{}` ({}) score {:.2}: {}",
+                        suggestion.anchor,
+                        suggestion.id,
+                        suggestion.store,
+                        suggestion.score,
+                        suggestion.content
+                    ));
+                }
                 if !outcome.unknown_relations.is_empty() {
                     diagnostics.push(format!(
                         "unknown relation(s) ignored: {}",

@@ -5015,7 +5015,7 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         let missing = manager
             .paths_between_anchors(
                 &["missing-anchor".to_string()],
-                &[b],
+                &[b.clone()],
                 4,
                 5,
                 MemoryScope::Project,
@@ -5025,6 +5025,22 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         assert!(missing.paths.is_empty(), "{missing:?}");
         assert_eq!(missing.unresolved_from, vec!["missing-anchor"]);
         assert_eq!(missing.diagnosis, vec!["E01"]);
+
+        let suggested = manager
+            .paths_between_anchors(
+                &["alpha path anchor typo".to_string()],
+                &[b],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("anchor suggestion query");
+        assert!(suggested.paths.is_empty(), "{suggested:?}");
+        assert!(
+            suggested.anchor_suggestions.iter().any(|suggestion| suggestion.id == a),
+            "{suggested:?}"
+        );
 
         let disconnected = manager
             .paths_between_anchors(

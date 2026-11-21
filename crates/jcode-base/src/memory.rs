@@ -281,8 +281,20 @@ pub struct MemoryPathQueryOutcome {
     /// bridge or same_as edge connects them. Candidates are never written.
     #[serde(default)]
     pub alignment_candidates: Vec<AlignmentCandidate>,
+    /// L1 grounding suggestions for anchors that did not resolve.
+    #[serde(default)]
+    pub anchor_suggestions: Vec<AnchorSuggestion>,
     pub stores_searched: usize,
     pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnchorSuggestion {
+    pub anchor: String,
+    pub id: String,
+    pub store: String,
+    pub score: f32,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -549,6 +561,41 @@ fn alignment_candidates_for(
     });
     candidates.truncate(3);
     candidates
+}
+
+fn anchor_suggestions_for(
+    graphs: &[(&str, MemoryGraph)],
+    unresolved: &[String],
+) -> Vec<AnchorSuggestion> {
+    let mut suggestions = Vec::new();
+    for anchor in unresolved {
+        let probe = jcode_memory_types::MemoryEntry::new(
+            jcode_memory_types::MemoryCategory::Fact,
+            anchor.clone(),
+        );
+        let mut candidates = Vec::new();
+        for (label, graph) in graphs {
+            for entry in graph.active_memories() {
+                let score = jcode_memory_types::lexical_similarity(&probe, entry);
+                if score < 0.25 {
+                    continue;
+                }
+                let content: String = entry.content.chars().take(120).collect();
+                candidates.push(AnchorSuggestion {
+                    anchor: anchor.clone(),
+                    id: entry.id.clone(),
+                    store: label.to_string(),
+                    score,
+                    content,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+        candidates.dedup_by(|left, right| left.id == right.id);
+        candidates.truncate(3);
+        suggestions.extend(candidates);
+    }
+    suggestions
 }
 
 fn stitch_paths_with_bridge(
@@ -8003,6 +8050,13 @@ impl MemoryManager {
             .cloned()
             .collect();
         if !outcome.unresolved_from.is_empty() || !outcome.unresolved_to.is_empty() {
+            let unresolved: Vec<String> = outcome
+                .unresolved_from
+                .iter()
+                .chain(outcome.unresolved_to.iter())
+                .cloned()
+                .collect();
+            outcome.anchor_suggestions = anchor_suggestions_for(&graphs, &unresolved);
             outcome.diagnosis.push("E01".to_string());
             let omitted = if scope.includes_project() && !scope.includes_global() {
                 self.load_global_graph().ok()
