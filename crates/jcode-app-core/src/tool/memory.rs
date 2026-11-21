@@ -158,6 +158,9 @@ struct MemoryInput {
     /// For action=belief: {state, observation, goal, max_steps}.
     #[serde(default)]
     belief: Option<Value>,
+    /// For action=decision: {action, problem, start_node, relation, ...}.
+    #[serde(default)]
+    decision: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +175,33 @@ struct BeliefUpdateInput {
     max_steps: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DecisionTraceInput {
+    action: String,
+    #[serde(default)]
+    problem: Option<String>,
+    #[serde(default)]
+    start_node: Option<String>,
+    #[serde(default)]
+    relation: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    goal_node: Option<String>,
+    #[serde(default)]
+    model_version: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    provenance: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[async_trait]
 impl Tool for MemoryTool {
     fn name(&self) -> &str {
@@ -182,7 +212,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Memory CRUD, graph links/paths, belief state. Default scope: project."
+        "Memory CRUD, links/paths, belief/decision traces. Default: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -192,7 +222,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "decision", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -333,6 +363,10 @@ impl Tool for MemoryTool {
                 "belief": {
                     "type": "object",
                     "description": "For action=belief: {state, observation, goal, max_steps}."
+                },
+                "decision": {
+                    "type": "object",
+                    "description": "For action=decision: {action: record|search|list|forget, ...}."
                 }
             },
             "required": ["action"]
@@ -1361,6 +1395,99 @@ impl Tool for MemoryTool {
                     state.confidence(),
                     serde_json::to_string_pretty(&payload)?
                 )))
+            }
+            "decision" => {
+                let raw = input
+                    .decision
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("decision action requires `decision` object"))?;
+                let request: DecisionTraceInput = serde_json::from_value(raw)?;
+                match request.action.as_str() {
+                    "record" => {
+                        if let Some(source) = request.source.as_deref()
+                            && !source.eq_ignore_ascii_case("verified")
+                        {
+                            return Err(anyhow::anyhow!(
+                                "only verified decision steps may be recorded (source={source})"
+                            ));
+                        }
+                        let problem = request
+                            .problem
+                            .ok_or_else(|| anyhow::anyhow!("decision record requires `problem`"))?;
+                        let start_node = request.start_node.ok_or_else(|| {
+                            anyhow::anyhow!("decision record requires `start_node`")
+                        })?;
+                        let relation = request.relation.ok_or_else(|| {
+                            anyhow::anyhow!("decision record requires `relation`")
+                        })?;
+                        let direction = crate::memory_types::DecisionDirection::parse(
+                            request.direction.as_deref().unwrap_or("outgoing"),
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "decision direction must be outgoing, incoming, or undirected"
+                            )
+                        })?;
+                        let step = manager.record_verified_decision_step(
+                            &problem,
+                            &start_node,
+                            &relation,
+                            direction,
+                            request.goal_node.as_deref(),
+                            request.model_version.as_deref(),
+                            request.outcome.as_deref(),
+                            request.provenance.as_deref().unwrap_or("manual:record"),
+                        )?;
+                        Ok(ToolOutput::new(format!(
+                            "Recorded verified decision {} ({})\n\n{}",
+                            step.id,
+                            step.problem,
+                            serde_json::to_string_pretty(&step)?
+                        )))
+                    }
+                    "search" => {
+                        let problem = request
+                            .problem
+                            .ok_or_else(|| anyhow::anyhow!("decision search requires `problem`"))?;
+                        let mut query = crate::memory_types::DecisionStepQuery::new(&problem)
+                            .with_limit(request.limit.unwrap_or(5));
+                        if let Some(start_node) = request.start_node {
+                            query = query.with_start_node(start_node);
+                        }
+                        if let Some(relation) = request.relation {
+                            query = query.with_relation(relation);
+                        }
+                        let hits = manager.rank_decision_steps(&query)?;
+                        Ok(ToolOutput::new(format!(
+                            "Found {} decision example(s) for `{}`\n\n{}",
+                            hits.len(),
+                            problem,
+                            serde_json::to_string_pretty(&hits)?
+                        )))
+                    }
+                    "list" => {
+                        let steps = manager.list_decision_steps()?;
+                        Ok(ToolOutput::new(format!(
+                            "{} verified decision step(s)\n\n{}",
+                            steps.len(),
+                            serde_json::to_string_pretty(&steps)?
+                        )))
+                    }
+                    "forget" => {
+                        let id = request.id.ok_or_else(|| {
+                            anyhow::anyhow!("decision forget requires `id`")
+                        })?;
+                        let removed = manager.forget_decision_step(&id)?;
+                        Ok(ToolOutput::new(if removed {
+                            format!("Forgot decision step {id}")
+                        } else {
+                            format!("Decision step {id} not found")
+                        }))
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "unknown decision action: {other}; use record, search, list or forget"
+                    )),
+                }
             }
             "health" => {
                 if let Some(extraction_action) = input.extraction_action.as_deref() {
@@ -3275,6 +3402,121 @@ mod tests {
             second.output.contains("\"open_diagnoses\": []"),
             "{}",
             second.output
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_action_records_searches_and_forgets() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        let recorded = tool
+            .execute(
+                json!({
+                    "action":"decision",
+                    "decision":{
+                        "action":"record",
+                        "problem":"fix parser crash",
+                        "start_node":"module:parser",
+                        "relation":"causes",
+                        "direction":"outgoing",
+                        "goal_node":"error:panic",
+                        "model_version":"model-v1",
+                        "outcome":"accepted",
+                        "provenance":"eval:parser"
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            recorded.output.contains("Recorded verified decision"),
+            "{}",
+            recorded.output
+        );
+        let payload_start = recorded
+            .output
+            .find("\n\n")
+            .expect("record summary separator")
+            + 2;
+        let recorded_json: Value =
+            serde_json::from_str(&recorded.output[payload_start..]).expect("decision JSON");
+        let id = recorded_json["id"].as_str().expect("decision id").to_string();
+        assert_eq!(recorded_json["source"], "verified");
+
+        let rejected = tool
+            .execute(
+                json!({
+                    "action":"decision",
+                    "decision":{
+                        "action":"record",
+                        "source":"candidate",
+                        "problem":"unsafe example",
+                        "start_node":"module:parser",
+                        "relation":"causes"
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await;
+        assert!(rejected.is_err(), "candidate traces must be rejected");
+
+        let searched = tool
+            .execute(
+                json!({
+                    "action":"decision",
+                    "decision":{
+                        "action":"search",
+                        "problem":"parser crash root cause",
+                        "start_node":"module:parser",
+                        "limit":3
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            searched.output.contains("Found 1 decision example"),
+            "{}",
+            searched.output
+        );
+        assert!(searched.output.contains("eval:parser"), "{}", searched.output);
+        assert!(searched.output.contains("\"score\""), "{}", searched.output);
+
+        let listed = tool
+            .execute(
+                json!({"action":"decision","decision":{"action":"list"}}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.output.contains("1 verified decision step"),
+            "{}",
+            listed.output
+        );
+
+        let forgotten = tool
+            .execute(
+                json!({"action":"decision","decision":{"action":"forget","id":id}}),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            forgotten.output.contains("Forgot decision step"),
+            "{}",
+            forgotten.output
         );
     }
 

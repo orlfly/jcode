@@ -7490,6 +7490,122 @@ impl MemoryManager {
         storage::write_json(&self.bridge_store_path()?, &bridges)
     }
 
+    fn decision_trace_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("decision_steps.json"))
+    }
+
+    pub fn list_decision_steps(&self) -> Result<Vec<jcode_memory_types::DecisionStep>> {
+        let path = self.decision_trace_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut steps: Vec<jcode_memory_types::DecisionStep> = storage::read_json(&path)?;
+        steps.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(steps)
+    }
+
+    fn save_decision_steps(&self, steps: &[jcode_memory_types::DecisionStep]) -> Result<()> {
+        storage::write_json(&self.decision_trace_store_path()?, steps)
+    }
+
+    /// Record one decision step. Only `verified` traces are accepted; storing a
+    /// rejected or candidate trace would turn a mistake into a future example.
+    pub fn record_decision_step(
+        &self,
+        step: jcode_memory_types::DecisionStep,
+    ) -> Result<jcode_memory_types::DecisionStep> {
+        if !step.is_verified() {
+            anyhow::bail!(
+                "decision step {} is not verified (source={}); refusing to index it",
+                step.id,
+                step.source
+            );
+        }
+        if step.problem.trim().is_empty() || step.start_node.trim().is_empty() {
+            anyhow::bail!("decision step requires a problem and a start node");
+        }
+        if step.relation.trim().is_empty() {
+            anyhow::bail!("decision step requires a relation");
+        }
+        let mut steps = self.list_decision_steps()?;
+        steps.retain(|existing| existing.id != step.id);
+        steps.push(step.clone());
+        steps.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_decision_steps(&steps)?;
+        Ok(step)
+    }
+
+    /// Convenience constructor for a verified step. The id is derived from the
+    /// trace fields so recording the same decision twice replaces one row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_verified_decision_step(
+        &self,
+        problem: &str,
+        start_node: &str,
+        relation: &str,
+        direction: jcode_memory_types::DecisionDirection,
+        goal_node: Option<&str>,
+        model_version: Option<&str>,
+        outcome: Option<&str>,
+        provenance: &str,
+    ) -> Result<jcode_memory_types::DecisionStep> {
+        let id = format!(
+            "decision:{:016x}",
+            fnv1a_64(&[
+                problem,
+                start_node,
+                relation,
+                direction.as_str(),
+                goal_node.unwrap_or_default(),
+            ])
+        );
+        let mut step = jcode_memory_types::DecisionStep::verified(
+            id,
+            problem,
+            start_node,
+            relation,
+            direction,
+            provenance,
+        );
+        if let Some(goal_node) = goal_node {
+            step = step.with_goal(goal_node);
+        }
+        if let Some(model_version) = model_version {
+            step = step.with_model_version(model_version);
+        }
+        if let Some(outcome) = outcome {
+            step = step.with_outcome(outcome);
+        }
+        self.record_decision_step(step)
+    }
+
+    /// Retrieve verified examples for a new problem. Structural anchor and
+    /// relation matches add a small bonus to lexical similarity.
+    pub fn rank_decision_steps(
+        &self,
+        query: &jcode_memory_types::DecisionStepQuery,
+    ) -> Result<Vec<jcode_memory_types::DecisionStepMatch>> {
+        let steps = self.list_decision_steps()?;
+        Ok(jcode_memory_types::rank_decision_steps(query, &steps))
+    }
+
+    pub fn forget_decision_step(&self, id: &str) -> Result<bool> {
+        let mut steps = self.list_decision_steps()?;
+        let before = steps.len();
+        steps.retain(|step| step.id != id);
+        if steps.len() == before {
+            return Ok(false);
+        }
+        self.save_decision_steps(&steps)?;
+        Ok(true)
+    }
+
     /// Link one project memory to one global memory as an explicit bridge.
     pub fn link_bridge(
         &self,
@@ -8803,6 +8919,20 @@ pub fn test_backend() -> Arc<dyn GraphBackend> {
     let root =
         crate::memory::backend::JsonBackend::default_root().unwrap_or_else(|_| PathBuf::from("."));
     Arc::new(crate::memory::backend::JsonBackend::new(root))
+}
+
+fn fnv1a_64(parts: &[&str]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Separator prevents ("ab", "c") and ("a", "bc") from colliding.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn link_pair(left: &str, right: &str) -> (String, String) {

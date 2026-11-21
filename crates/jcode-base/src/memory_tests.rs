@@ -5389,6 +5389,98 @@ fn path_outcome_maps_to_belief_observation() {
 }
 
 #[test]
+fn decision_steps_require_verified_source_and_rank() {
+    with_temp_home(|_| {
+        use jcode_memory_types::{
+            DecisionDirection, DecisionStep, DecisionStepQuery,
+        };
+
+        let manager = MemoryManager::new().with_project_dir("/decision-trace");
+        let parser = manager
+            .record_verified_decision_step(
+                "fix parser crash",
+                "module:parser",
+                "causes",
+                DecisionDirection::Outgoing,
+                Some("error:panic"),
+                Some("model-v1"),
+                Some("accepted"),
+                "eval:parser",
+            )
+            .expect("record parser step");
+        manager
+            .record_verified_decision_step(
+                "deploy the service",
+                "service:api",
+                "uses",
+                DecisionDirection::Outgoing,
+                None,
+                None,
+                None,
+                "eval:deploy",
+            )
+            .expect("record deploy step");
+        manager
+            .record_verified_decision_step(
+                "fix parser crash",
+                "module:parser",
+                "causes",
+                DecisionDirection::Outgoing,
+                Some("error:panic"),
+                Some("model-v1"),
+                Some("accepted"),
+                "eval:parser",
+            )
+            .expect("deduplicate parser step");
+
+        let steps = manager.list_decision_steps().expect("list steps");
+        assert_eq!(steps.len(), 2, "{steps:?}");
+
+        let mut candidate = DecisionStep::verified(
+            "decision:candidate",
+            "fix parser crash",
+            "module:parser",
+            "causes",
+            DecisionDirection::Outgoing,
+            "manual:candidate",
+        );
+        candidate.source = "candidate".to_string();
+        assert!(
+            manager.record_decision_step(candidate).is_err(),
+            "unverified traces must never enter the example index"
+        );
+
+        let hits = manager
+            .rank_decision_steps(
+                &DecisionStepQuery::new("parser crash root cause")
+                    .with_start_node("module:parser")
+                    .with_limit(1),
+            )
+            .expect("rank steps");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].step.id, parser.id);
+        assert!(hits[0].score > 0.0);
+        assert_eq!(hits[0].step.provenance, "eval:parser");
+        assert_eq!(hits[0].step.model_version.as_deref(), Some("model-v1"));
+
+        let reopened = MemoryManager::new().with_project_dir("/decision-trace");
+        assert_eq!(
+            reopened.list_decision_steps().expect("reload steps").len(),
+            2
+        );
+        assert!(
+            manager
+                .forget_decision_step(&parser.id)
+                .expect("forget parser step")
+        );
+        assert_eq!(
+            manager.list_decision_steps().expect("list after forget").len(),
+            1
+        );
+    });
+}
+
+#[test]
 fn path_quality_marks_stale_and_weak_provenance() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-quality");
