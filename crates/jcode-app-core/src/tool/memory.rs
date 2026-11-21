@@ -1170,6 +1170,22 @@ impl Tool for MemoryTool {
                     decision.reason
                 ));
 
+                let decision_examples = input
+                    .query
+                    .as_deref()
+                    .or(input.content.as_deref())
+                    .filter(|problem| !problem.trim().is_empty())
+                    .map(|problem| {
+                        let mut query =
+                            crate::memory_types::DecisionStepQuery::new(problem).with_limit(3);
+                        if let Some(start_node) = froms.first() {
+                            query = query.with_start_node(start_node.clone());
+                        }
+                        manager.rank_decision_steps(&query)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
                 if paths.is_empty() {
                     let mut out = format!(
                         "No memory path found from [{}] to [{}] within depth {} (scope {:?}, stores searched: {}).",
@@ -1182,6 +1198,7 @@ impl Tool for MemoryTool {
                     for diagnostic in &diagnostics {
                         out.push_str(&format!("\n- {diagnostic}"));
                     }
+                    append_decision_examples(&mut out, &decision_examples);
                     out.push_str(
                         "\nTry different anchors or a wider scope; E05 depth is relaxed once from 8 to 16 automatically.",
                     );
@@ -1272,6 +1289,7 @@ impl Tool for MemoryTool {
                             }
                         }
                     }
+                    append_decision_examples(&mut out, &decision_examples);
                     Ok(ToolOutput::new(out))
                 }
             }
@@ -2038,6 +2056,30 @@ fn parse_checkpoint_anchors(text: &str) -> Vec<String> {
     anchors
 }
 
+fn append_decision_examples(
+    out: &mut String,
+    examples: &[crate::memory_types::DecisionStepMatch],
+) {
+    if examples.is_empty() {
+        return;
+    }
+    out.push_str("\nDecision examples (verified, for relation reranking):\n");
+    for hit in examples {
+        let step = &hit.step;
+        let model = step.model_version.as_deref().unwrap_or("unrecorded");
+        out.push_str(&format!(
+            "- score {:.2} | {} | {} -[{} / {}]-> {} | model {model} | provenance {}\n",
+            hit.score,
+            step.problem,
+            step.start_node,
+            step.relation,
+            step.direction.as_str(),
+            step.goal_node.as_deref().unwrap_or("(open)"),
+            step.provenance
+        ));
+    }
+}
+
 fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
     use crate::memory_graph::EdgeKind;
     match kind {
@@ -2264,6 +2306,73 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(invalid.contains("unknown memory relation"), "{invalid}");
+    }
+
+    #[tokio::test]
+    async fn path_output_injects_verified_decision_examples() {
+        use jcode_base::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        let mut graph = MemoryGraph::new();
+        let from = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "parser crash evidence",
+        ));
+        let to = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "parser module owner",
+        ));
+        graph.link_memories(&from, &to, 0.9);
+        tool.manager
+            .save_project_graph(&graph)
+            .expect("save path graph");
+        tool.manager
+            .record_verified_decision_step(
+                "trace the parser crash to its owner",
+                &from,
+                "relates_to",
+                crate::memory_types::DecisionDirection::Outgoing,
+                Some(&to),
+                Some("model-v1"),
+                Some("accepted"),
+                "eval:path",
+            )
+            .expect("record decision example");
+
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":from,
+                    "to_id":to,
+                    "scope":"project",
+                    "query":"parser crash owner",
+                    "depth":3,
+                    "limit":1
+                }),
+                ctx,
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(
+            output.contains("Decision examples (verified, for relation reranking)"),
+            "{output}"
+        );
+        assert!(output.contains("eval:path"), "{output}");
+        assert!(output.contains("relates_to / outgoing"), "{output}");
+        assert!(output.contains("score "), "{output}");
+        assert!(output.contains("model model-v1"), "{output}");
     }
 
     #[tokio::test]
