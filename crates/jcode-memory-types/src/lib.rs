@@ -8,7 +8,7 @@ pub use engineering_ontology::{
 
 pub mod path_plan;
 pub use path_plan::{
-    PathPlan, PathPlanTask, PlanActionType, PlanRisk, build_path_plan,
+    PathPlan, PathPlanTask, PlanActionType, PlanRisk, PlanVerificationQuery, build_path_plan,
 };
 
 pub mod path_diagnosis;

@@ -3,7 +3,11 @@
 //! This is the mechanical half of the design document's Path -> Plan step: each
 //! relation is bound to one of the eight allowed action types, every task gets a
 //! success check and an evidence reference, and side-effect tasks inherit an
-//! approval gate. It does not invent missing preconditions or execute anything.
+//! approval gate. It derives existence preconditions and verification queries
+//! from the path itself, never invents missing world-state preconditions, and
+//! never executes anything.
+
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,12 +90,40 @@ pub struct PathPlanTask {
     pub risk: PlanRisk,
     pub approval: bool,
     pub confidence: f32,
+    #[serde(default)]
+    pub preconditions: Vec<String>,
+    #[serde(default)]
+    pub postconditions: Vec<String>,
+}
+
+/// One executable verification query attached to a plan task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanVerificationQuery {
+    pub id: String,
+    pub task_id: String,
+    pub query_ref: String,
+    pub expr: String,
+    pub evidence_ref: String,
 }
 
 /// A deterministic plan for one engineering path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathPlan {
+    #[serde(default)]
+    pub plan_id: String,
+    #[serde(default)]
+    pub source_path_id: String,
+    #[serde(default)]
+    pub goal: String,
     pub tasks: Vec<PathPlanTask>,
+    #[serde(default)]
+    pub verification_queries: Vec<PlanVerificationQuery>,
+    /// Topological execution stages. Tasks in one stage have no dependency
+    /// between them and may run in parallel.
+    #[serde(default)]
+    pub parallel_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    pub rollback: Vec<String>,
     pub confidence: f32,
     pub approval_gates: Vec<String>,
     pub warnings: Vec<String>,
@@ -101,6 +133,55 @@ impl PathPlan {
     pub fn task(&self, id: &str) -> Option<&PathPlanTask> {
         self.tasks.iter().find(|task| task.id == id)
     }
+
+    pub fn stage_count(&self) -> usize {
+        self.parallel_groups.len()
+    }
+}
+
+fn stable_plan_hash(parts: impl IntoIterator<Item = String>) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn parallel_groups(tasks: &[PathPlanTask]) -> (Vec<Vec<String>>, bool) {
+    let mut remaining: BTreeSet<String> = tasks.iter().map(|task| task.id.clone()).collect();
+    let known: HashSet<String> = remaining.iter().cloned().collect();
+    let mut completed = HashSet::new();
+    let mut groups = Vec::new();
+    while !remaining.is_empty() {
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|id| {
+                tasks
+                    .iter()
+                    .find(|task| &task.id == *id)
+                    .is_some_and(|task| {
+                        task.depends_on.iter().all(|dependency| {
+                            completed.contains(dependency) || !known.contains(dependency)
+                        })
+                    })
+            })
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            return (groups, false);
+        }
+        for id in &ready {
+            remaining.remove(id);
+            completed.insert(id.clone());
+        }
+        groups.push(ready);
+    }
+    (groups, true)
 }
 
 fn template(relation: &str) -> (PlanActionType, PlanRisk, &'static str) {
@@ -190,12 +271,24 @@ fn task_title(
 /// Compile one engineering path into a deterministic task DAG.
 ///
 /// Missing relation templates degrade to `verify`, never to an unconstrained
-/// side effect. The plan is linear in path order, which is the safe subset of
-/// the document's DAG requirement; callers can later relax independent tasks.
+/// side effect. Path order defines the safe data dependencies; `parallel_groups`
+/// exposes independent stages so callers can schedule them concurrently.
 pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> PathPlan {
     let mut tasks = Vec::with_capacity(path.relations.len());
+    let mut verification_queries = Vec::with_capacity(path.relations.len());
+    let mut rollback = Vec::new();
     let mut confidence = path.confidence;
     let mut previous: Option<String> = None;
+    let source_path_id = format!(
+        "PATH-{}",
+        stable_plan_hash(
+            path.nodes
+                .iter()
+                .cloned()
+                .chain(path.relations.iter().cloned())
+        )
+    );
+    let plan_id = format!("PLAN-{}", stable_plan_hash([source_path_id.clone()]));
 
     for (index, relation_id) in path.relations.iter().enumerate() {
         let Some(relation) = graph.relation(relation_id) else {
@@ -223,6 +316,17 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             .unwrap_or_else(|| path.nodes.get(index + 1).cloned().unwrap_or_default());
         let depends_on = previous.iter().cloned().collect();
         let approval = action.has_side_effects() && risk != PlanRisk::Low;
+        let from_class = graph
+            .entity(&path.nodes[index])
+            .map(|entity| entity.class.clone())
+            .unwrap_or_default();
+        let precondition = if from_class.is_empty() {
+            format!("{from_label} exists")
+        } else {
+            format!("{from_class}({from_label}) exists")
+        };
+        let postcondition = format!("{to_label} satisfies '{success_check}'");
+        let evidence_ref = format!("path/edge/{index}");
         tasks.push(PathPlanTask {
             id: id.clone(),
             action_type: action,
@@ -232,11 +336,23 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             to: path.nodes.get(index + 1).cloned().unwrap_or_default(),
             depends_on,
             success_check: success_check.to_string(),
-            evidence_ref: format!("path/edge/{index}"),
+            evidence_ref: evidence_ref.clone(),
             risk,
             approval,
             confidence: task_confidence,
+            preconditions: vec![precondition],
+            postconditions: vec![postcondition],
         });
+        verification_queries.push(PlanVerificationQuery {
+            id: format!("VQ-{}", index + 1),
+            task_id: id.clone(),
+            query_ref: format!("path/edge/{index}/verify"),
+            expr: success_check.to_string(),
+            evidence_ref,
+        });
+        if action.has_side_effects() {
+            rollback.push(format!("{id}: revert {} on {to_label}", relation.relation));
+        }
         previous = Some(id);
     }
 
@@ -257,13 +373,28 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             }
         }
     }
+    let (groups, acyclic) = parallel_groups(&tasks);
+    if !acyclic {
+        warnings.push("plan dependency cycle detected; split before execution".to_string());
+    }
     let approval_gates: Vec<String> = tasks
         .iter()
         .filter(|task| task.approval)
         .map(|task| task.id.clone())
         .collect();
     PathPlan {
+        plan_id,
+        source_path_id,
+        goal: path
+            .nodes
+            .last()
+            .and_then(|id| graph.entity(id))
+            .map(|entity| format!("Reach {}", entity.name))
+            .unwrap_or_else(|| "Reach goal".to_string()),
         tasks,
+        verification_queries,
+        parallel_groups: groups,
+        rollback,
         confidence,
         approval_gates,
         warnings,
@@ -305,6 +436,19 @@ mod tests {
         assert_eq!(plan.approval_gates, vec!["T2"]);
         assert!(plan.tasks.iter().all(|task| !task.success_check.is_empty()));
         assert!(plan.tasks.iter().all(|task| !task.evidence_ref.is_empty()));
+        assert!(plan.plan_id.starts_with("PLAN-"));
+        assert!(plan.source_path_id.starts_with("PATH-"));
+        assert_eq!(plan.goal, "Reach Patch");
+        assert_eq!(plan.verification_queries.len(), 2);
+        assert_eq!(plan.verification_queries[0].task_id, "T1");
+        assert_eq!(
+            plan.parallel_groups,
+            vec![vec!["T1".to_string()], vec!["T2".to_string()]]
+        );
+        assert_eq!(plan.stage_count(), 2);
+        assert_eq!(plan.rollback.len(), 1);
+        assert!(!plan.tasks[0].preconditions.is_empty());
+        assert!(!plan.tasks[0].postconditions.is_empty());
     }
 
     #[test]
@@ -344,5 +488,40 @@ mod tests {
                 .filter(|task| task.action_type.has_side_effects())
                 .all(|task| task.approval)
         );
+    }
+
+    #[test]
+    fn parallel_groups_expose_independent_tasks_and_detect_cycles() {
+        let task = |id: &str, depends_on: &[&str]| PathPlanTask {
+            id: id.to_string(),
+            action_type: PlanActionType::Verify,
+            title: id.to_string(),
+            relation: REL_BLOCKED_BY.to_string(),
+            from: "a".to_string(),
+            to: "b".to_string(),
+            depends_on: depends_on.iter().map(|id| (*id).to_string()).collect(),
+            success_check: "ok".to_string(),
+            evidence_ref: "path/edge/0".to_string(),
+            risk: PlanRisk::Low,
+            approval: false,
+            confidence: 1.0,
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        };
+        let (groups, acyclic) = parallel_groups(&[
+            task("T1", &[]),
+            task("T2", &[]),
+            task("T3", &["T1", "T2"]),
+        ]);
+        assert!(acyclic);
+        assert_eq!(
+            groups,
+            vec![
+                vec!["T1".to_string(), "T2".to_string()],
+                vec!["T3".to_string()]
+            ]
+        );
+        let (_, acyclic) = parallel_groups(&[task("T1", &["T2"]), task("T2", &["T1"])]);
+        assert!(!acyclic);
     }
 }

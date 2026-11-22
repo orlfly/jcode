@@ -2224,9 +2224,11 @@ impl MemoryTool {
             }
             if include_plan {
                 out.push_str(&format!(
-                    "  plan: confidence {:.0}%, {} task(s)",
+                    "  plan: confidence {:.0}%, {} task(s), {} stage(s), {} verification(s)",
                     hit.plan.confidence * 100.0,
-                    hit.plan.tasks.len()
+                    hit.plan.tasks.len(),
+                    hit.plan.stage_count(),
+                    hit.plan.verification_queries.len()
                 ));
                 if hit.plan.approval_gates.is_empty() {
                     out.push_str(", no approval gates\n");
