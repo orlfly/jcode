@@ -2323,12 +2323,13 @@ HPD 用中位数而非均值，避免少数超长路径拉偏；HCR 与 4.2 的�
 | 对齐冲突率 ACR | 冲突 same_as 数 / 已对齐实体数 | ≤0.02 | 主键校验与人工仲裁 |
 | 跨图查询成功率 XSR | 跨图层成功查询 / 跨图查询总数 | ≥0.90 | 修对齐与桥接 |
 | 编译成功率 QCS | 通过 Schema 与 EXPLAIN 的查询 / 总编译请求 | ≥0.98 | 修 IR 或编译器 |
+| 查询松弛率 RLR | 需要重写过滤条件的查询 / 总查询数 | ≤0.10 | 放宽默认过滤或补图覆盖 |
 | 约束保真度 Faithfulness | 保留的任务约束数 / 任务约束总数 | ≥0.95 | 修抽取与编译 |
 | 置信度校准 ECE | Σ_m (\|B_m\|/N)·\|acc(B_m)−conf(B_m)\| | ≤0.05 | 校准分数与阈值 |
 | 补全精确率 CPR | 验证为真的补全边 / 提出的补全边 | ≥0.80 | 提高 τ_link、加证据 |
 | 补全召回率 CRR | 成功恢复的 no-path / 可恢复 no-path | ≥0.60 | 扩展补全层级与数据源 |
 
-**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，ALR 对应 `alignment_coverage`。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值低于内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
+**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，RLR 对应 `relaxation_rate`，ALR 对应 `alignment_coverage`。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值越过内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS）、`Q14`（RLR），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
 
 ECE 衡量“说 0.8 置信度时是否真的有 80% 正确”，比单纯准确率更适合决策场景。CPR 与 CRR 需要人工标注的补全边集合，建议每季度更新一次。
 

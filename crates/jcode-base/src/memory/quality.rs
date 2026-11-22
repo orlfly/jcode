@@ -35,6 +35,8 @@ pub const MIN_EVIDENCE_COVERAGE: f32 = 0.95;
 pub const MAX_HUB_PATH_RATIO: f32 = 0.20;
 /// Minimum tolerated PathQuery compile success rate (QCS).
 pub const MIN_COMPILE_SUCCESS_RATE: f32 = 0.98;
+/// Maximum tolerated share of path queries that needed relaxation.
+pub const MAX_RELAXATION_RATE: f32 = 0.10;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +140,10 @@ pub struct QueryAuditMetrics {
     pub compile_successes: u64,
     #[serde(default = "default_rate")]
     pub compile_success_rate: f32,
+    #[serde(default)]
+    pub relaxed_queries: u64,
+    #[serde(default)]
+    pub relaxation_rate: f32,
     pub cross_graph_queries: u64,
     pub cross_graph_success: u64,
     pub cross_graph_success_rate: f32,
@@ -163,6 +169,8 @@ impl Default for QueryAuditMetrics {
             compile_attempts: 0,
             compile_successes: 0,
             compile_success_rate: 1.0,
+            relaxed_queries: 0,
+            relaxation_rate: 0.0,
             cross_graph_queries: 0,
             cross_graph_success: 0,
             cross_graph_success_rate: 1.0,
@@ -428,6 +436,9 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         metrics.hypothesized_edges += entry.hypothesized_edges as u64;
         metrics.low_provenance_paths += entry.low_provenance_paths as u64;
         metrics.hub_paths += entry.hub_paths as u64;
+        if !entry.relaxations.is_empty() {
+            metrics.relaxed_queries += 1;
+        }
         if entry.stores_searched > 1 {
             metrics.cross_graph_queries += 1;
             if entry.success {
@@ -465,6 +476,11 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         1.0
     } else {
         metrics.compile_successes as f32 / metrics.compile_attempts as f32
+    };
+    metrics.relaxation_rate = if metrics.total_queries == 0 {
+        0.0
+    } else {
+        metrics.relaxed_queries as f32 / metrics.total_queries as f32
     };
     metrics.cross_graph_success_rate = if metrics.cross_graph_queries == 0 {
         1.0
@@ -537,6 +553,16 @@ pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
             metrics.compile_success_rate,
             MIN_COMPILE_SUCCESS_RATE,
             "fix PathQuery IR templates or the compile whitelist",
+        ));
+    }
+    if metrics.relaxation_rate > MAX_RELAXATION_RATE {
+        findings.push(finding(
+            "Q14",
+            QualitySeverity::Warning,
+            "relaxation_rate",
+            metrics.relaxation_rate,
+            MAX_RELAXATION_RATE,
+            "loosen default filters or add missing graph coverage",
         ));
     }
     findings
@@ -678,7 +704,7 @@ mod tests {
                 stores_searched: 2,
                 depth: 3,
                 diagnosis: Vec::new(),
-                relaxations: Vec::new(),
+                relaxations: vec!["E04".to_string()],
                 low_provenance_paths: 1,
                 hub_paths: 0,
             },
@@ -731,6 +757,8 @@ mod tests {
         assert_eq!(metrics.compile_attempts, 1);
         assert_eq!(metrics.compile_successes, 1);
         assert_eq!(metrics.compile_success_rate, 1.0);
+        assert_eq!(metrics.relaxed_queries, 1);
+        assert_eq!(metrics.relaxation_rate, 0.5);
     }
 
     #[test]
@@ -751,6 +779,8 @@ mod tests {
             compile_attempts: 4,
             compile_successes: 3,
             compile_success_rate: 0.75,
+            relaxed_queries: 1,
+            relaxation_rate: 0.5,
             cross_graph_queries: 2,
             cross_graph_success: 1,
             cross_graph_success_rate: 0.5,
@@ -763,5 +793,6 @@ mod tests {
         assert!(findings.iter().any(|finding| finding.code == "Q11"));
         assert!(findings.iter().any(|finding| finding.code == "Q12"));
         assert!(findings.iter().any(|finding| finding.code == "Q13"));
+        assert!(findings.iter().any(|finding| finding.code == "Q14"));
     }
 }
