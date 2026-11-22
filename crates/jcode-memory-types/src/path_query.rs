@@ -107,6 +107,10 @@ pub struct PathQueryConstraints {
     /// Wall-clock budget for the path query and its L0 retries.
     #[serde(default)]
     pub query_budget_ms: Option<u64>,
+    /// Minimum anchor-grounding score. L0 lowers this to 0.5 and reports E06
+    /// when the requested threshold rejects every useful candidate.
+    #[serde(default)]
+    pub semantic_min_score: Option<f32>,
     #[serde(default)]
     pub auto_ground: bool,
     #[serde(default)]
@@ -204,6 +208,11 @@ impl PathQuery {
         {
             errors.push("min_confidence must be between 0.0 and 1.0".to_string());
         }
+        if let Some(score) = self.constraints.semantic_min_score
+            && !(0.0..=1.0).contains(&score)
+        {
+            errors.push("semantic_min_score must be between 0.0 and 1.0".to_string());
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -212,7 +221,7 @@ impl PathQuery {
     }
 }
 
-const QUERY_KEYS: [&str; 11] = [
+const QUERY_KEYS: [&str; 12] = [
     "from",
     "to",
     "via",
@@ -224,6 +233,7 @@ const QUERY_KEYS: [&str; 11] = [
     "limit",
     "objective",
     "budget_ms",
+    "semantic_min",
 ];
 
 fn query_tokens(text: &str) -> Vec<String> {
@@ -310,6 +320,7 @@ pub fn compile_path_query_text(
     let mut limit = None;
     let mut objective = None;
     let mut query_budget_ms = None;
+    let mut semantic_min_score = None;
     let mut errors = Vec::new();
 
     let mut index = 0;
@@ -396,6 +407,10 @@ pub fn compile_path_query_text(
                 Ok(value) => query_budget_ms = Some(value),
                 Err(_) => errors.push(format!("invalid budget_ms: {}", values[0])),
             },
+            "semantic_min" => match values[0].parse::<f32>() {
+                Ok(value) => semantic_min_score = Some(value),
+                Err(_) => errors.push(format!("invalid semantic_min: {}", values[0])),
+            },
             _ => {}
         }
     }
@@ -428,6 +443,7 @@ pub fn compile_path_query_text(
             scope,
             objective,
             query_budget_ms,
+            semantic_min_score,
             ..PathQueryConstraints::default()
         },
     };
@@ -483,6 +499,7 @@ mod tests {
                 relations: vec!["invented".to_string()],
                 deny_relations: vec!["also_invented".to_string()],
                 min_confidence: Some(1.5),
+                semantic_min_score: Some(1.5),
                 depth: Some(99),
                 limit: Some(99),
                 ..PathQueryConstraints::default()
@@ -495,6 +512,11 @@ mod tests {
                 .any(|error| error.contains("unknown memory relation"))
         );
         assert!(errors.iter().any(|error| error.contains("min_confidence")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("semantic_min_score"))
+        );
         assert!(errors.iter().any(|error| error.contains("depth")));
         assert!(errors.iter().any(|error| error.contains("limit")));
     }
@@ -535,7 +557,7 @@ mod tests {
     fn compiles_engineering_template_with_quoted_anchors() {
         let query = compile_path_query_text(
             "find from \"file:src/lib.rs\" to `api:/task` graph engineering \
-             relations defines implements depth 3 limit 2 budget_ms 50",
+             relations defines implements depth 3 limit 2 budget_ms 50 semantic_min 0.7",
             &["defines", "implements"],
         )
         .expect("compile");
@@ -546,6 +568,7 @@ mod tests {
         assert_eq!(query.constraints.depth, Some(3));
         assert_eq!(query.constraints.limit, Some(2));
         assert_eq!(query.constraints.query_budget_ms, Some(50));
+        assert_eq!(query.constraints.semantic_min_score, Some(0.7));
     }
 
     #[test]

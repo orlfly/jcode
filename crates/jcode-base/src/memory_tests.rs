@@ -5165,6 +5165,45 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
 }
 
 #[test]
+fn path_query_lowers_semantic_threshold_and_reports_e06() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/semantic-threshold");
+        let a = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "alpha path anchor"))
+            .expect("alpha");
+        let b = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "beta path anchor"))
+            .expect("beta");
+        manager.link_memories(&a, &b, 0.9).expect("a-b");
+
+        let outcome = manager
+            .paths_between_anchors_with_options(
+                &["alpha path anchor typo".to_string()],
+                &[b],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    auto_ground_anchors: true,
+                    semantic_min_score: Some(1.0),
+                    ..Default::default()
+                },
+            )
+            .expect("semantic threshold query");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert!(
+            outcome
+                .relaxations
+                .iter()
+                .any(|relaxation| relaxation == "semantic threshold 1.00 -> 0.50"),
+            "{outcome:?}"
+        );
+        assert!(outcome.diagnosis.iter().any(|code| code == "E06"), "{outcome:?}");
+    });
+}
+
+#[test]
 fn path_query_relaxes_depth_once_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-depth-relax");

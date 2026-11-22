@@ -103,6 +103,9 @@ struct MemoryInput {
     /// For action=path: wall-clock budget for the query and L0 retries.
     #[serde(default)]
     query_budget_ms: Option<u64>,
+    /// For action=path: minimum score for auto-grounding unresolved anchors.
+    #[serde(default)]
+    semantic_min_score: Option<f32>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -314,6 +317,10 @@ impl Tool for MemoryTool {
                 "query_budget_ms": {
                     "type": "integer",
                     "description": "For path: wall-clock query budget in milliseconds."
+                },
+                "semantic_min_score": {
+                    "type": "number",
+                    "description": "For path: minimum anchor grounding score (0.0-1.0)."
                 },
                 "shadow_action": {
                     "type": "string",
@@ -1000,6 +1007,7 @@ impl Tool for MemoryTool {
             }
             "path" => {
                 let mut auto_ground = false;
+                let mut semantic_min_score = None;
                 let mut query_filters: Option<(
                     Vec<String>,
                     Option<f32>,
@@ -1038,6 +1046,7 @@ impl Tool for MemoryTool {
                         ));
                     }
                     auto_ground = query.constraints.auto_ground;
+                    semantic_min_score = query.constraints.semantic_min_score;
                     let graph_kind = query.graph_kind().as_str().to_string();
                     (
                         scope,
@@ -1071,6 +1080,7 @@ impl Tool for MemoryTool {
                     let include_hypotheses = input.include_hypotheses.unwrap_or(false);
                     let include_ontology = input.include_ontology.unwrap_or(false);
                     let query_budget_ms = input.query_budget_ms;
+                    semantic_min_score = input.semantic_min_score;
                     (
                         scope,
                         depth,
@@ -1094,6 +1104,13 @@ impl Tool for MemoryTool {
                 if tos.is_empty() {
                     return Err(anyhow::anyhow!(
                         "to_id, to_anchors, or path_query.goal required for path"
+                    ));
+                }
+                if let Some(score) = semantic_min_score
+                    && !(0.0..=1.0).contains(&score)
+                {
+                    return Err(anyhow::anyhow!(
+                        "semantic_min_score must be between 0.0 and 1.0"
                     ));
                 }
                 if graph_kind == "engineering" || graph_kind == "ontology" {
@@ -1137,6 +1154,7 @@ impl Tool for MemoryTool {
                     objective: query_filters.as_ref().and_then(|filters| filters.2),
                     auto_ground_anchors: auto_ground,
                     query_budget_ms,
+                    semantic_min_score,
                 };
                 let outcome = if waypoints.is_empty() {
                     manager.paths_between_anchors_with_options(

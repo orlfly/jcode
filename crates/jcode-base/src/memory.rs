@@ -365,6 +365,9 @@ pub struct MemoryPathQueryOptions {
     pub auto_ground_anchors: bool,
     /// Wall-clock budget for the query and its deterministic L0 retries.
     pub query_budget_ms: Option<u64>,
+    /// Minimum score for auto-grounding an unresolved anchor. Defaults to 0.8
+    /// when auto-grounding is enabled.
+    pub semantic_min_score: Option<f32>,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -665,6 +668,7 @@ fn select_grounding_replacements(
     suggestions: &[AnchorSuggestion],
     froms: &[String],
     tos: &[String],
+    min_score: f32,
 ) -> Vec<(String, String)> {
     let mut replacements = Vec::new();
     for anchor in froms.iter().chain(tos.iter()) {
@@ -676,7 +680,7 @@ fn select_grounding_replacements(
         }
         let mut candidates: Vec<&AnchorSuggestion> = suggestions
             .iter()
-            .filter(|suggestion| suggestion.anchor == *anchor && suggestion.score >= 0.8)
+            .filter(|suggestion| suggestion.anchor == *anchor && suggestion.score >= min_score)
             .collect();
         candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
         let Some(best) = candidates.first() else {
@@ -8443,12 +8447,36 @@ impl MemoryManager {
             }
         }
         if outcome.paths.is_empty() && options.auto_ground_anchors && !budget_exhausted() {
-            let replacements =
-                select_grounding_replacements(&outcome.anchor_suggestions, &froms, &tos);
+            let requested_semantic = options
+                .semantic_min_score
+                .unwrap_or(0.8)
+                .clamp(0.0, 1.0);
+            let mut replacements = select_grounding_replacements(
+                &outcome.anchor_suggestions,
+                &froms,
+                &tos,
+                requested_semantic,
+            );
+            let mut relaxed_semantic = None;
+            if replacements.is_empty() && requested_semantic > 0.5 && !budget_exhausted() {
+                let lowered = select_grounding_replacements(
+                    &outcome.anchor_suggestions,
+                    &froms,
+                    &tos,
+                    0.5,
+                );
+                if !lowered.is_empty() {
+                    replacements = lowered;
+                    relaxed_semantic = Some(requested_semantic);
+                }
+            }
             if !replacements.is_empty() {
                 let mut grounded_froms = froms.clone();
                 let mut grounded_tos = tos.clone();
                 let mut applied = outcome.relaxations.clone();
+                if let Some(previous) = relaxed_semantic {
+                    applied.push(format!("semantic threshold {previous:.2} -> 0.50"));
+                }
                 for (anchor, id) in &replacements {
                     for candidate in &mut grounded_froms {
                         if candidate == anchor {
@@ -8475,6 +8503,10 @@ impl MemoryManager {
                     &options,
                 )?;
                 grounded.relaxations = applied;
+                if relaxed_semantic.is_some() && !grounded.diagnosis.iter().any(|code| code == "E06")
+                {
+                    grounded.diagnosis.push("E06".to_string());
+                }
                 outcome = grounded;
             }
         }
