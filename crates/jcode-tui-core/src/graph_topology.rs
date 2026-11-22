@@ -290,6 +290,7 @@ fn edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::Contains => "contains",
         EdgeKind::NextStep => "next_step",
         EdgeKind::Bridge => "bridge",
+        EdgeKind::SameAs => "same_as",
         EdgeKind::Hypothesized { .. } => "hypothesized",
     }
 }
