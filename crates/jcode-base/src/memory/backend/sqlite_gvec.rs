@@ -1297,6 +1297,33 @@ mod tests {
     }
 
     #[test]
+    fn same_as_edges_roundtrip_through_sqlite() {
+        let backend = SqliteGvecBackend::open_in_memory().unwrap();
+        let key = StoreKey::new("same-as-roundtrip-test");
+
+        let mut graph = MemoryGraph::new();
+        for (id, content) in [("mem_1", "first alias"), ("mem_2", "second alias")] {
+            let mut entry = MemoryEntry::new(MemoryCategory::Fact, content);
+            entry.id = id.into();
+            graph.add_memory(entry);
+        }
+        graph.add_edge("mem_1", "mem_2", EdgeKind::SameAs);
+        graph.add_edge("mem_2", "mem_1", EdgeKind::SameAs);
+        backend.save(&key, &graph).unwrap();
+
+        let loaded = backend.load(&key).unwrap();
+        let same_as = |from: &str, to: &str| {
+            loaded.edges.get(from).is_some_and(|edges| {
+                edges
+                    .iter()
+                    .any(|edge| edge.target == to && matches!(edge.kind, EdgeKind::SameAs))
+            })
+        };
+        assert!(same_as("mem_1", "mem_2"));
+        assert!(same_as("mem_2", "mem_1"));
+    }
+
+    #[test]
     fn save_drops_relates_edges_to_removed_memories() {
         let backend = SqliteGvecBackend::open_in_memory().unwrap();
         let key = StoreKey::new("removed-endpoint-test");
