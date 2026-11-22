@@ -639,6 +639,50 @@ impl EngineeringStore {
         limit: usize,
         allowed_relations: &[&str],
     ) -> Result<Vec<EngineeringPathHit>> {
+        self.path_between_anchors_impl(
+            from_anchor,
+            to_anchor,
+            depth,
+            limit,
+            allowed_relations,
+            false,
+        )
+    }
+
+    /// Query engineering instances with the ontology concept layer joined at
+    /// query time.
+    ///
+    /// Entities gain `instance_of` edges to their class nodes and classes expose
+    /// `has_instance` back-edges, so a path can go
+    /// `instance -> concept -> concept -> instance`. The persisted graph is not
+    /// modified.
+    pub fn path_between_anchors_with_ontology(
+        &self,
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        limit: usize,
+        allowed_relations: &[&str],
+    ) -> Result<Vec<EngineeringPathHit>> {
+        self.path_between_anchors_impl(
+            from_anchor,
+            to_anchor,
+            depth,
+            limit,
+            allowed_relations,
+            true,
+        )
+    }
+
+    fn path_between_anchors_impl(
+        &self,
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        limit: usize,
+        allowed_relations: &[&str],
+        include_ontology: bool,
+    ) -> Result<Vec<EngineeringPathHit>> {
         let from_anchor = from_anchor.trim();
         let to_anchor = to_anchor.trim();
         if from_anchor.is_empty() || to_anchor.is_empty() || limit == 0 {
@@ -687,7 +731,13 @@ impl EngineeringStore {
                     continue;
                 }
             };
-            let graph = graph.infer_relations(&default_engineering_ontology());
+            let ontology = default_engineering_ontology();
+            let graph = if include_ontology {
+                graph.with_ontology_layer(&ontology)
+            } else {
+                graph
+            };
+            let graph = graph.infer_relations(&ontology);
             for path in graph.k_shortest_paths(
                 from_anchor,
                 to_anchor,
@@ -1249,5 +1299,45 @@ mod tests {
         assert_eq!(hits[0].node_labels, vec!["File", "API"]);
         assert_eq!(hits[0].relation_labels, vec![REL_DEFINES]);
         assert_eq!(hits[0].plan.tasks.len(), 1);
+    }
+
+    #[test]
+    fn engineering_path_can_join_instances_through_ontology_layer() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(
+            EngineeringEntity::new(CLASS_FILE, "file:joined", "joined.rs")
+                .with_property("path", json!("joined.rs")),
+        );
+        graph.insert_entity(EngineeringEntity::new("api", "api:joined", "joined api"));
+        store
+            .save_graph("ontology-join", None, &graph)
+            .expect("save graph");
+
+        let direct = store
+            .path_between_anchors("file:joined", "api:joined", 4, 3, &[])
+            .expect("direct path");
+        assert!(direct.is_empty(), "{direct:?}");
+
+        let joined = store
+            .path_between_anchors_with_ontology("file:joined", "api:joined", 4, 3, &[])
+            .expect("ontology-joined path");
+        assert_eq!(joined.len(), 1, "{joined:?}");
+        assert_eq!(
+            joined[0].path.nodes,
+            vec!["file:joined", "concept:file", "concept:api", "api:joined"]
+        );
+        assert!(
+            joined[0]
+                .relation_labels
+                .iter()
+                .any(|label| label == "instance_of")
+        );
+        assert!(
+            joined[0]
+                .relation_labels
+                .iter()
+                .any(|label| label == "has_instance")
+        );
     }
 }

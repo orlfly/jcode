@@ -101,6 +101,9 @@ pub struct PathQueryConstraints {
     pub scope: Option<PathQueryScope>,
     #[serde(default)]
     pub include_hypotheses: bool,
+    /// For engineering paths: join the ontology concept layer at query time.
+    #[serde(default)]
+    pub include_ontology: bool,
     #[serde(default)]
     pub auto_ground: bool,
     #[serde(default)]

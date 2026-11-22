@@ -97,6 +97,9 @@ struct MemoryInput {
     /// For path action: admit pending shadow edges as hypothesized edges.
     #[serde(default)]
     include_hypotheses: Option<bool>,
+    /// For engineering paths: join the ontology concept layer.
+    #[serde(default)]
+    include_ontology: Option<bool>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -300,6 +303,10 @@ impl Tool for MemoryTool {
                 "include_hypotheses": {
                     "type": "boolean",
                     "description": "For action=path: include pending shadow edges as hypotheses."
+                },
+                "include_ontology": {
+                    "type": "boolean",
+                    "description": "For engineering path: join ontology concept layer."
                 },
                 "shadow_action": {
                     "type": "string",
@@ -1002,6 +1009,7 @@ impl Tool for MemoryTool {
                     graph_kind,
                     include_plan,
                     include_hypotheses,
+                    include_ontology,
                 ) = if let Some(query) = input.path_query.clone() {
                     query.validate().map_err(|errors| {
                         anyhow::anyhow!("invalid path_query: {}", errors.join("; "))
@@ -1034,6 +1042,7 @@ impl Tool for MemoryTool {
                         graph_kind,
                         query.constraints.plan,
                         query.constraints.include_hypotheses,
+                        query.constraints.include_ontology,
                     )
                 } else {
                     let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
@@ -1051,6 +1060,7 @@ impl Tool for MemoryTool {
                     let graph_kind = input.graph.unwrap_or_else(|| "memory".to_string());
                     let include_plan = input.plan.unwrap_or(false);
                     let include_hypotheses = input.include_hypotheses.unwrap_or(false);
+                    let include_ontology = input.include_ontology.unwrap_or(false);
                     (
                         scope,
                         depth,
@@ -1062,6 +1072,7 @@ impl Tool for MemoryTool {
                         graph_kind,
                         include_plan,
                         include_hypotheses,
+                        include_ontology,
                     )
                 };
                 if froms.is_empty() {
@@ -1088,6 +1099,7 @@ impl Tool for MemoryTool {
                         &relations,
                         include_plan,
                         &graph_kind,
+                        include_ontology,
                     );
                 }
                 if graph_kind != "memory" {
@@ -1994,6 +2006,7 @@ impl MemoryTool {
         relations: &[String],
         include_plan: bool,
         graph_kind: &str,
+        include_ontology: bool,
     ) -> Result<ToolOutput> {
         if limit == 0 {
             return Ok(ToolOutput::new("No graph paths requested."));
@@ -2017,9 +2030,14 @@ impl MemoryTool {
             for from in froms {
                 for to in tos {
                     hits.extend(
-                        store
-                            .path_between_anchors(from, to, depth, limit, &allowed)
-                            .map_err(|error| anyhow::anyhow!("engineering path query: {error}"))?,
+                        if include_ontology {
+                            store.path_between_anchors_with_ontology(
+                                from, to, depth, limit, &allowed,
+                            )
+                        } else {
+                            store.path_between_anchors(from, to, depth, limit, &allowed)
+                        }
+                        .map_err(|error| anyhow::anyhow!("engineering path query: {error}"))?,
                     );
                 }
             }
@@ -3115,6 +3133,47 @@ mod tests {
         assert!(output.output.contains("concept:api"), "{}", output.output);
         assert!(output.output.contains("defines"), "{}", output.output);
         assert!(output.output.contains("plan: confidence"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn path_action_joins_engineering_instances_through_ontology() {
+        use crate::memory_types::{EngineeringEntity, EngineeringGraph};
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new("file", "file:joined", "joined.rs"));
+        graph.insert_entity(EngineeringEntity::new("api", "api:joined", "joined api"));
+        EngineeringStore::open_default()
+            .expect("store")
+            .save_graph("ontology-join", None, &graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "include_ontology":true,
+                    "from_id":"file:joined",
+                    "to_id":"api:joined",
+                    "depth":4
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("ontology-joined engineering path");
+        assert!(
+            output.output.contains("Found 1 engineering path(s)"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("concept:file"), "{}", output.output);
+        assert!(output.output.contains("concept:api"), "{}", output.output);
+        assert!(output.output.contains("instance_of"), "{}", output.output);
+        assert!(output.output.contains("has_instance"), "{}", output.output);
     }
 
     #[tokio::test]
