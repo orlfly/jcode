@@ -153,6 +153,65 @@ fn quality_debt_opens_persists_and_resolves() {
 }
 
 #[test]
+fn quality_report_includes_query_audit_metrics() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/query-audit-quality");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "audit alpha"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "audit beta"));
+        graph.link_memories(&a, &b, 0.9);
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let missing = manager
+            .paths_between_anchors(
+                &["audit missing".to_string()],
+                &[b.clone()],
+                4,
+                3,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("missing query");
+        assert!(missing.paths.is_empty());
+        let success = manager
+            .paths_between_anchors(
+                &[a],
+                &[b],
+                4,
+                3,
+                MemoryScope::Project,
+                &[],
+            )
+            .expect("success query");
+        assert_eq!(success.paths.len(), 1);
+
+        let report = manager
+            .graph_quality(MemoryScope::Project)
+            .expect("quality report");
+        assert_eq!(report.query_metrics.total_queries, 2, "{report:?}");
+        assert_eq!(report.query_metrics.successful_queries, 1);
+        assert_eq!(report.query_metrics.no_path_queries, 1);
+        assert_eq!(report.query_metrics.path_success_rate, 0.5);
+        assert!(
+            report
+                .query_metrics
+                .diagnosis_counts
+                .get("E01")
+                .is_some_and(|count| *count >= 1),
+            "{report:?}"
+        );
+        assert!(
+            report.findings.iter().any(|finding| finding.code == "Q08"),
+            "{report:?}"
+        );
+        assert!(
+            report.debt.iter().any(|item| item.code == "Q08"),
+            "{report:?}"
+        );
+    });
+}
+
+#[test]
 fn jev_project_write_without_scope_fails_instead_of_silently_losing_memory() {
     with_temp_home(|_| {
         let manager = MemoryManager::new();

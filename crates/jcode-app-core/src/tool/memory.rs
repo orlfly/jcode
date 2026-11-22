@@ -1155,6 +1155,7 @@ impl Tool for MemoryTool {
                     auto_ground_anchors: auto_ground,
                     query_budget_ms,
                     semantic_min_score,
+                    suppress_audit: false,
                 };
                 let outcome = if waypoints.is_empty() {
                     manager.paths_between_anchors_with_options(
@@ -3429,6 +3430,7 @@ mod tests {
         assert!(output.contains("\"provenance_coverage\""), "{output}");
         assert!(output.contains("\"findings\""), "{output}");
         assert!(output.contains("\"debt\""), "{output}");
+        assert!(output.contains("\"query_metrics\""), "{output}");
         assert!(output.contains("\"sla_days\": 7"), "{output}");
         assert!(output.contains("\"status\": \"open\""), "{output}");
         assert!(output.contains("Q01"), "{output}");

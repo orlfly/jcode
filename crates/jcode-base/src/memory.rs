@@ -59,7 +59,7 @@ pub use activity::{
 };
 pub use quality::{
     GraphQualityReport, QualityDebtItem, QualityDebtStatus, QualityFinding, QualitySeverity,
-    StoreQuality,
+    QueryAuditEntry, QueryAuditMetrics, StoreQuality,
 };
 use cache::{cache_graph, cached_graph};
 pub use jcode_memory_types::{
@@ -368,6 +368,8 @@ pub struct MemoryPathQueryOptions {
     /// Minimum score for auto-grounding an unresolved anchor. Defaults to 0.8
     /// when auto-grounding is enabled.
     pub semantic_min_score: Option<f32>,
+    /// Internal flag for nested legs so only the outer query is audited.
+    pub suppress_audit: bool,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -8544,7 +8546,11 @@ impl MemoryManager {
         if budget_exhausted() && !outcome.diagnosis.iter().any(|code| code == "E07") {
             outcome.diagnosis.push("E07".to_string());
         }
-        Ok(finalize_path_outcome(outcome))
+        let outcome = finalize_path_outcome(outcome);
+        if !options.suppress_audit {
+            self.record_query_audit("memory", effective_scope, &outcome);
+        }
+        Ok(outcome)
     }
 
     /// Compute deterministic graph-quality metrics for the requested scope.
@@ -8558,6 +8564,13 @@ impl MemoryManager {
             .list_shadow_edges_scoped(Some(ShadowEdgeStatus::Pending), scope)?
             .len();
         let mut report = quality::aggregate(scope_label(scope), stores, pending);
+        report.query_metrics =
+            quality::summarize_queries(&self.load_query_audit()?, &report.scope);
+        let query_findings = quality::query_diagnose(&report.query_metrics);
+        if !query_findings.is_empty() {
+            report.findings.extend(query_findings);
+            report.healthy = false;
+        }
         self.sync_quality_debt(&mut report)?;
         Ok(report)
     }
@@ -8582,6 +8595,87 @@ impl MemoryManager {
 
     fn save_quality_debt(&self, items: &[QualityDebtItem]) -> Result<()> {
         storage::write_json(&self.quality_debt_store_path()?, &items)
+    }
+
+    fn query_audit_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("query_audit.jsonl"))
+    }
+
+    fn load_query_audit(&self) -> Result<Vec<QueryAuditEntry>> {
+        let path = self.query_audit_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(path)?;
+        let mut entries: Vec<QueryAuditEntry> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if entries.len() > 5_000 {
+            entries.drain(..entries.len() - 5_000);
+        }
+        Ok(entries)
+    }
+
+    fn append_query_audit(&self, entry: &QueryAuditEntry) -> Result<()> {
+        use std::io::Write as _;
+
+        let path = self.query_audit_store_path()?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(entry)?)?;
+        file.flush()?;
+        drop(file);
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 1_000_000) {
+            let text = std::fs::read_to_string(&path)?;
+            let mut lines: Vec<&str> = text.lines().rev().take(2_000).collect();
+            lines.reverse();
+            let mut compacted = lines.join("\n");
+            compacted.push('\n');
+            std::fs::write(&path, compacted)?;
+        }
+        Ok(())
+    }
+
+    fn record_query_audit(
+        &self,
+        kind: &str,
+        scope: MemoryScope,
+        outcome: &MemoryPathQueryOutcome,
+    ) {
+        let edge_count: usize = outcome.paths.iter().map(|path| path.edges.len()).sum();
+        let hypothesized_edges = outcome
+            .paths
+            .iter()
+            .flat_map(|path| &path.edges)
+            .filter(|edge| {
+                matches!(
+                    edge.kind,
+                    crate::memory_graph::EdgeKind::Hypothesized { .. }
+                )
+            })
+            .count();
+        let entry = QueryAuditEntry {
+            scope: scope_label(scope).to_string(),
+            kind: kind.to_string(),
+            success: !outcome.paths.is_empty(),
+            path_count: outcome.paths.len(),
+            edge_count,
+            hypothesized_edges,
+            stores_searched: outcome.stores_searched,
+            depth: outcome.depth,
+            diagnosis: outcome.diagnosis.clone(),
+            relaxations: outcome.relaxations.clone(),
+        };
+        let _ = self.append_query_audit(&entry);
     }
 
     /// Persist threshold findings, reopen regressed items, and resolve items
@@ -8758,6 +8852,8 @@ impl MemoryManager {
             cache.insert(key, Some(path.clone()));
             return Ok(Some(path));
         }
+        let mut leg_options = options.clone();
+        leg_options.suppress_audit = true;
         let leg = self.paths_between_anchors_with_options(
             &[from_anchor.to_string()],
             &[to_anchor.to_string()],
@@ -8765,7 +8861,7 @@ impl MemoryManager {
             1,
             scope,
             relations,
-            options.clone(),
+            leg_options,
         )?;
         let path = leg.paths.first().cloned();
         if path.is_none() && failure.is_none() {
@@ -8949,7 +9045,11 @@ impl MemoryManager {
             stores_searched: if scope == MemoryScope::All { 2 } else { 1 },
             ..MemoryPathQueryOutcome::default()
         };
-        Ok(finalize_path_outcome(outcome))
+        let outcome = finalize_path_outcome(outcome);
+        if !options.suppress_audit {
+            self.record_query_audit("waypoints", scope, &outcome);
+        }
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -1,11 +1,9 @@
 //! Deterministic graph-quality metrics for the memory stores.
 //!
-//! These are the query-independent half of design section 4.6: structural
-//! richness, connectivity, evidence coverage, alignment, hypotheses, and stale
-//! nodes. Query-derived terms such as no-path rate remain in the query outcome
-//! and are not invented here.
+//! These cover design section 4.6's structural richness, connectivity, evidence
+//! coverage, alignment, hypotheses, stale nodes, and audited query outcomes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +23,12 @@ pub const MAX_HYPOTHESIZED_RATIO: f32 = 0.10;
 pub const MAX_STALE_RATIO: f32 = 0.25;
 /// Maximum tolerated hub ratio.
 pub const MAX_HUB_RATIO: f32 = 0.05;
+/// Minimum tolerated path success rate (PSR).
+pub const MIN_PATH_SUCCESS_RATE: f32 = 0.85;
+/// Minimum tolerated cross-graph query success rate (XSR).
+pub const MIN_CROSS_GRAPH_SUCCESS_RATE: f32 = 0.90;
+/// Maximum tolerated completion debt from hypothesized edges.
+pub const MAX_COMPLETION_DEBT: f32 = 0.10;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +80,63 @@ pub struct QualityDebtItem {
     pub resolved_at: Option<DateTime<Utc>>,
 }
 
+/// One path-query audit record used to derive online quality metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryAuditEntry {
+    pub scope: String,
+    pub kind: String,
+    pub success: bool,
+    #[serde(default)]
+    pub path_count: usize,
+    #[serde(default)]
+    pub edge_count: usize,
+    #[serde(default)]
+    pub hypothesized_edges: usize,
+    #[serde(default)]
+    pub stores_searched: usize,
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default)]
+    pub diagnosis: Vec<String>,
+    #[serde(default)]
+    pub relaxations: Vec<String>,
+}
+
+/// Query-derived quality metrics for one governance scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryAuditMetrics {
+    pub total_queries: u64,
+    pub successful_queries: u64,
+    pub no_path_queries: u64,
+    pub path_success_rate: f32,
+    pub total_edges: u64,
+    pub hypothesized_edges: u64,
+    pub completion_debt: f32,
+    pub cross_graph_queries: u64,
+    pub cross_graph_success: u64,
+    pub cross_graph_success_rate: f32,
+    #[serde(default)]
+    pub diagnosis_counts: BTreeMap<String, u64>,
+}
+
+impl Default for QueryAuditMetrics {
+    fn default() -> Self {
+        Self {
+            total_queries: 0,
+            successful_queries: 0,
+            no_path_queries: 0,
+            path_success_rate: 1.0,
+            total_edges: 0,
+            hypothesized_edges: 0,
+            completion_debt: 0.0,
+            cross_graph_queries: 0,
+            cross_graph_success: 0,
+            cross_graph_success_rate: 1.0,
+            diagnosis_counts: BTreeMap::new(),
+        }
+    }
+}
+
 /// Per-store quality counts. Ratios are computed by the caller so multiple
 /// stores can be aggregated without losing the raw denominators.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -114,6 +175,9 @@ pub struct GraphQualityReport {
     /// Persisted debt items for the requested scope.
     #[serde(default)]
     pub debt: Vec<QualityDebtItem>,
+    /// Online path-query success, diagnosis and completion-debt metrics.
+    #[serde(default)]
+    pub query_metrics: QueryAuditMetrics,
     /// True when no threshold is breached.
     #[serde(default)]
     pub healthy: bool,
@@ -262,6 +326,7 @@ pub fn aggregate(
         pending_shadow_edges,
         findings: Vec::new(),
         debt: Vec::new(),
+        query_metrics: QueryAuditMetrics::default(),
         healthy: true,
         stores,
     };
@@ -286,6 +351,88 @@ fn finding(
         threshold,
         action: action.to_string(),
     }
+}
+
+/// Aggregate audited path queries for one governance scope.
+pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAuditMetrics {
+    let mut metrics = QueryAuditMetrics::default();
+    for entry in entries
+        .iter()
+        .filter(|entry| scope == "all" || entry.scope == scope)
+    {
+        metrics.total_queries += 1;
+        if entry.success {
+            metrics.successful_queries += 1;
+        }
+        metrics.total_edges += entry.edge_count as u64;
+        metrics.hypothesized_edges += entry.hypothesized_edges as u64;
+        if entry.stores_searched > 1 {
+            metrics.cross_graph_queries += 1;
+            if entry.success {
+                metrics.cross_graph_success += 1;
+            }
+        }
+        for code in &entry.diagnosis {
+            *metrics.diagnosis_counts.entry(code.clone()).or_default() += 1;
+        }
+    }
+    metrics.no_path_queries = metrics
+        .total_queries
+        .saturating_sub(metrics.successful_queries);
+    metrics.path_success_rate = if metrics.total_queries == 0 {
+        1.0
+    } else {
+        metrics.successful_queries as f32 / metrics.total_queries as f32
+    };
+    metrics.completion_debt = if metrics.total_edges == 0 {
+        0.0
+    } else {
+        metrics.hypothesized_edges as f32 / metrics.total_edges as f32
+    };
+    metrics.cross_graph_success_rate = if metrics.cross_graph_queries == 0 {
+        1.0
+    } else {
+        metrics.cross_graph_success as f32 / metrics.cross_graph_queries as f32
+    };
+    metrics
+}
+
+/// Derive query-layer findings from audited outcomes.
+pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
+    let mut findings = Vec::new();
+    if metrics.total_queries > 0 && metrics.path_success_rate < MIN_PATH_SUCCESS_RATE {
+        findings.push(finding(
+            "Q08",
+            QualitySeverity::Warning,
+            "path_success_rate",
+            metrics.path_success_rate,
+            MIN_PATH_SUCCESS_RATE,
+            "route no-path queries through diagnosis-specific repair",
+        ));
+    }
+    if metrics.cross_graph_queries > 0
+        && metrics.cross_graph_success_rate < MIN_CROSS_GRAPH_SUCCESS_RATE
+    {
+        findings.push(finding(
+            "Q09",
+            QualitySeverity::Warning,
+            "cross_graph_success_rate",
+            metrics.cross_graph_success_rate,
+            MIN_CROSS_GRAPH_SUCCESS_RATE,
+            "repair cross-store alignment or bridge coverage",
+        ));
+    }
+    if metrics.completion_debt > MAX_COMPLETION_DEBT {
+        findings.push(finding(
+            "Q10",
+            QualitySeverity::Critical,
+            "completion_debt",
+            metrics.completion_debt,
+            MAX_COMPLETION_DEBT,
+            "promote or reject hypothesized edges used by decisions",
+        ));
+    }
+    findings
 }
 
 /// Derive deterministic governance findings from one report.
@@ -406,5 +553,68 @@ mod tests {
         assert_eq!(report.largest_component_ratio, 0.0);
         assert_eq!(report.provenance_coverage, 0.0);
         assert!(report.healthy);
+    }
+
+    #[test]
+    fn summarizes_query_audit_rates_and_completion_debt() {
+        let entries = vec![
+            QueryAuditEntry {
+                scope: "project".to_string(),
+                kind: "memory".to_string(),
+                success: true,
+                path_count: 1,
+                edge_count: 4,
+                hypothesized_edges: 1,
+                stores_searched: 2,
+                depth: 3,
+                diagnosis: Vec::new(),
+                relaxations: Vec::new(),
+            },
+            QueryAuditEntry {
+                scope: "project".to_string(),
+                kind: "memory".to_string(),
+                success: false,
+                path_count: 0,
+                edge_count: 0,
+                hypothesized_edges: 0,
+                stores_searched: 2,
+                depth: 3,
+                diagnosis: vec!["E03".to_string()],
+                relaxations: Vec::new(),
+            },
+        ];
+        let metrics = summarize_queries(&entries, "project");
+        assert_eq!(metrics.total_queries, 2);
+        assert_eq!(metrics.successful_queries, 1);
+        assert_eq!(metrics.no_path_queries, 1);
+        assert_eq!(metrics.path_success_rate, 0.5);
+        assert_eq!(metrics.total_edges, 4);
+        assert_eq!(metrics.hypothesized_edges, 1);
+        assert_eq!(metrics.completion_debt, 0.25);
+        assert_eq!(metrics.cross_graph_queries, 2);
+        assert_eq!(metrics.cross_graph_success, 1);
+        assert_eq!(metrics.cross_graph_success_rate, 0.5);
+        assert_eq!(metrics.diagnosis_counts.get("E03"), Some(&1));
+    }
+
+    #[test]
+    fn query_findings_flag_success_alignment_and_debt() {
+        let metrics = QueryAuditMetrics {
+            total_queries: 4,
+            successful_queries: 2,
+            no_path_queries: 2,
+            path_success_rate: 0.5,
+            total_edges: 8,
+            hypothesized_edges: 2,
+            completion_debt: 0.25,
+            cross_graph_queries: 2,
+            cross_graph_success: 1,
+            cross_graph_success_rate: 0.5,
+            diagnosis_counts: BTreeMap::new(),
+        };
+        let findings = query_diagnose(&metrics);
+        assert!(findings.iter().any(|finding| finding.code == "Q08"));
+        assert!(findings.iter().any(|finding| finding.code == "Q09"));
+        assert!(findings.iter().any(|finding| finding.code == "Q10"));
     }
 }
