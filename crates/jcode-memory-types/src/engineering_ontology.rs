@@ -98,6 +98,9 @@ pub const REL_SUBCLASS_OF: &str = "subclass_of";
 /// Wildcard used by permissive relations such as `evidenced_by`.
 pub const CLASS_WILDCARD: &str = "*";
 
+const MAX_TRANSITIVE_DEPTH: usize = 6;
+const MAX_TRANSITIVE_INFERRED_EDGES: usize = 1024;
+
 /// Stable node id for an ontology class in a concept-query graph.
 pub fn concept_node_id(class_id: &str) -> String {
     format!("concept:{}", class_id.trim())
@@ -191,6 +194,10 @@ pub struct EngineeringClassDef {
     pub properties: Vec<EngineeringPropertyDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concerns: Vec<String>,
+    /// Classes this class is disjoint with. A class may not inherit from two
+    /// disjoint classes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disjoint_with: Vec<String>,
 }
 
 impl EngineeringClassDef {
@@ -203,6 +210,7 @@ impl EngineeringClassDef {
             parent: None,
             properties: Vec::new(),
             concerns: Vec::new(),
+            disjoint_with: Vec::new(),
         }
     }
 
@@ -223,6 +231,11 @@ impl EngineeringClassDef {
 
     pub fn with_concern(mut self, concern: impl Into<String>) -> Self {
         self.concerns.push(concern.into());
+        self
+    }
+
+    pub fn with_disjoint_class(mut self, class: impl Into<String>) -> Self {
+        self.disjoint_with.push(class.into());
         self
     }
 }
@@ -252,6 +265,12 @@ pub struct EngineeringRelationDef {
     /// admits this relation as a virtual parent edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_property_of: Option<String>,
+    /// Symmetric relations admit a virtual reverse edge.
+    #[serde(default)]
+    pub symmetric: bool,
+    /// Transitive relations admit a virtual edge for each reachable pair.
+    #[serde(default)]
+    pub transitive: bool,
 }
 
 fn default_true() -> bool {
@@ -276,6 +295,8 @@ impl EngineeringRelationDef {
             concerns: Vec::new(),
             inverse_of: None,
             sub_property_of: None,
+            symmetric: false,
+            transitive: false,
         }
     }
 
@@ -296,6 +317,16 @@ impl EngineeringRelationDef {
 
     pub fn with_sub_property_of(mut self, relation: impl Into<String>) -> Self {
         self.sub_property_of = Some(relation.into());
+        self
+    }
+
+    pub fn with_symmetric(mut self, symmetric: bool) -> Self {
+        self.symmetric = symmetric;
+        self
+    }
+
+    pub fn with_transitive(mut self, transitive: bool) -> Self {
+        self.transitive = transitive;
         self
     }
 
@@ -495,6 +526,34 @@ impl EngineeringOntology {
                     ));
                 }
             }
+            for other in &class.disjoint_with {
+                if !self.classes.contains_key(other) {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO15",
+                        format!(
+                            "class '{}' is disjoint with unknown class '{other}'",
+                            class.id
+                        ),
+                        Some(class.id.clone()),
+                    ));
+                }
+                if other == &class.id {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO16",
+                        format!("class '{}' is disjoint with itself", class.id),
+                        Some(class.id.clone()),
+                    ));
+                } else if self.is_subclass_or_same(&class.id, other) {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO17",
+                        format!(
+                            "class '{}' inherits from disjoint class '{other}'",
+                            class.id
+                        ),
+                        Some(class.id.clone()),
+                    ));
+                }
+            }
             if let Some(cycle) = self.class_cycle(class) {
                 issues.push(EngineeringValidationIssue::error(
                     "EO14",
@@ -505,6 +564,57 @@ impl EngineeringOntology {
         }
 
         for relation in self.relations.values() {
+            if let Some(inverse) = relation
+                .inverse_of
+                .as_deref()
+                .filter(|inverse| !inverse.trim().is_empty())
+            {
+                if inverse == relation.id {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO24",
+                        format!("relation '{}' is its own inverse", relation.id),
+                        Some(relation.id.clone()),
+                    ));
+                } else if !self.relations.contains_key(inverse) {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO23",
+                        format!(
+                            "relation '{}' has unknown inverse '{inverse}'",
+                            relation.id
+                        ),
+                        Some(relation.id.clone()),
+                    ));
+                }
+            }
+            if let Some(parent) = relation
+                .sub_property_of
+                .as_deref()
+                .filter(|parent| !parent.trim().is_empty())
+            {
+                if parent == relation.id {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO26",
+                        format!("relation '{}' is its own sub-property", relation.id),
+                        Some(relation.id.clone()),
+                    ));
+                } else if !self.relations.contains_key(parent) {
+                    issues.push(EngineeringValidationIssue::error(
+                        "EO25",
+                        format!(
+                            "relation '{}' has unknown parent property '{parent}'",
+                            relation.id
+                        ),
+                        Some(relation.id.clone()),
+                    ));
+                }
+            }
+            if let Some(cycle) = self.relation_cycle(relation) {
+                issues.push(EngineeringValidationIssue::error(
+                    "EO27",
+                    format!("sub-property cycle: {cycle}"),
+                    Some(relation.id.clone()),
+                ));
+            }
             for class in relation.domain.iter().chain(relation.range.iter()) {
                 if class != CLASS_WILDCARD && !self.classes.contains_key(class) {
                     issues.push(EngineeringValidationIssue::error(
@@ -559,6 +669,59 @@ impl EngineeringOntology {
         }
 
         EngineeringValidationReport { issues }
+    }
+
+    fn relation_cycle(&self, start: &EngineeringRelationDef) -> Option<String> {
+        let mut seen = BTreeSet::new();
+        let mut current = Some(start);
+        let mut chain = Vec::new();
+        while let Some(relation) = current {
+            if !seen.insert(relation.id.clone()) {
+                chain.push(relation.id.clone());
+                return Some(chain.join(" -> "));
+            }
+            chain.push(relation.id.clone());
+            current = relation
+                .sub_property_of
+                .as_deref()
+                .and_then(|parent| self.relations.get(parent));
+        }
+        None
+    }
+
+    /// Whether `class` is `ancestor` or inherits from it.
+    pub fn is_subclass_or_same(&self, class: &str, ancestor: &str) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut current = Some(class);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            if !seen.insert(id.to_string()) {
+                break;
+            }
+            current = self
+                .classes
+                .get(id)
+                .and_then(|definition| definition.parent.as_deref());
+        }
+        false
+    }
+
+    /// Return the first disjoint pair that `class` satisfies through
+    /// inheritance, if any.
+    pub fn disjoint_conflict(&self, class: &str) -> Option<(String, String)> {
+        for definition in self.classes.values() {
+            if !self.is_subclass_or_same(class, &definition.id) {
+                continue;
+            }
+            for other in &definition.disjoint_with {
+                if self.is_subclass_or_same(class, other) {
+                    return Some((definition.id.clone(), other.clone()));
+                }
+            }
+        }
+        None
     }
 
     fn class_cycle(&self, start: &EngineeringClassDef) -> Option<String> {
@@ -1039,7 +1202,7 @@ impl EngineeringGraph {
             .filter(|relation| relation.is_effective_at(now))
             .cloned()
             .collect();
-        for relation in sources {
+        for relation in &sources {
             let Some(definition) = ontology.relations.get(&relation.relation) else {
                 continue;
             };
@@ -1078,6 +1241,113 @@ impl EngineeringGraph {
                             .with_locator(relation.id.clone())
                             .with_confidence(confidence);
                     inferred.relations.insert(edge.id.clone(), edge);
+                }
+            }
+            if definition.symmetric {
+                let id = format!("inferred:symmetric:{}", relation.id);
+                if !inferred.relations.contains_key(&id) {
+                    let confidence = (relation.confidence * 0.95).clamp(0.0, 1.0);
+                    let mut edge = EngineeringRelation::new(
+                        &relation.to,
+                        &relation.relation,
+                        &relation.from,
+                    );
+                    edge.id = id;
+                    edge.confidence = confidence;
+                    edge.provenance =
+                        EngineeringProvenance::new(format!("inferred:symmetric:{}", relation.id))
+                            .with_locator(relation.id.clone())
+                            .with_confidence(confidence);
+                    inferred.relations.insert(edge.id.clone(), edge);
+                }
+            }
+        }
+        let mut signatures: HashSet<(String, String, String)> = self
+            .relations
+            .values()
+            .map(|relation| {
+                (
+                    relation.from.clone(),
+                    relation.relation.clone(),
+                    relation.to.clone(),
+                )
+            })
+            .collect();
+        let mut transitive_edges = 0usize;
+        'transitive: for definition in ontology.relations.values().filter(|def| def.transitive) {
+            let mut adjacency: BTreeMap<String, Vec<(String, f32, String)>> = BTreeMap::new();
+            for relation in sources.iter().filter(|rel| rel.relation == definition.id) {
+                let confidence = relation.confidence.clamp(0.0, 1.0);
+                adjacency
+                    .entry(relation.from.clone())
+                    .or_default()
+                    .push((relation.to.clone(), confidence, relation.id.clone()));
+                if definition.symmetric {
+                    adjacency
+                        .entry(relation.to.clone())
+                        .or_default()
+                        .push((relation.from.clone(), confidence, relation.id.clone()));
+                }
+            }
+            for neighbors in adjacency.values_mut() {
+                neighbors.sort_by(|left, right| {
+                    left.0
+                        .cmp(&right.0)
+                        .then_with(|| right.1.total_cmp(&left.1))
+                        .then_with(|| left.2.cmp(&right.2))
+                });
+                neighbors.dedup_by(|left, right| left.0 == right.0);
+            }
+            let starts: Vec<String> = adjacency.keys().cloned().collect();
+            for start in starts {
+                let mut queue = VecDeque::from([(start.clone(), 0usize, 1.0f32)]);
+                let mut seen = HashSet::from([start.clone()]);
+                while let Some((node, hops, path_confidence)) = queue.pop_front() {
+                    if hops >= MAX_TRANSITIVE_DEPTH {
+                        continue;
+                    }
+                    let Some(neighbors) = adjacency.get(&node) else {
+                        continue;
+                    };
+                    for (next, edge_confidence, source_id) in neighbors {
+                        if !seen.insert(next.clone()) {
+                            continue;
+                        }
+                        let next_hops = hops + 1;
+                        let next_confidence = path_confidence.min(*edge_confidence);
+                        if next != &start {
+                            let signature =
+                                (start.clone(), definition.id.clone(), next.clone());
+                            let id = format!(
+                                "inferred:transitive:{}:{start}:{next}",
+                                definition.id
+                            );
+                            if !signatures.contains(&signature)
+                                && !inferred.relations.contains_key(&id)
+                            {
+                                if transitive_edges >= MAX_TRANSITIVE_INFERRED_EDGES {
+                                    break 'transitive;
+                                }
+                                let confidence = (next_confidence
+                                    * 0.95f32.powi(next_hops as i32))
+                                .clamp(0.0, 1.0);
+                                let mut edge =
+                                    EngineeringRelation::new(&start, &definition.id, next);
+                                edge.id = id;
+                                edge.confidence = confidence;
+                                edge.provenance = EngineeringProvenance::new(format!(
+                                    "inferred:transitive:{}",
+                                    definition.id
+                                ))
+                                .with_locator(source_id.clone())
+                                .with_confidence(confidence);
+                                inferred.relations.insert(edge.id.clone(), edge);
+                                signatures.insert(signature);
+                                transitive_edges += 1;
+                            }
+                        }
+                        queue.push_back((next.clone(), next_hops, next_confidence));
+                    }
                 }
             }
         }
@@ -1386,6 +1656,16 @@ impl EngineeringGraph {
                 ));
                 continue;
             };
+            if let Some((left, right)) = ontology.disjoint_conflict(&entity.class) {
+                issues.push(EngineeringValidationIssue::error(
+                    "EG13",
+                    format!(
+                        "entity '{}' class '{}' satisfies disjoint classes '{left}' and '{right}'",
+                        entity.id, entity.class
+                    ),
+                    Some(entity.id.clone()),
+                ));
+            }
             let _ = class;
             let properties = ontology.effective_properties(&entity.class);
             let known: HashSet<&str> = properties.iter().map(|p| p.id.as_str()).collect();
@@ -2114,6 +2394,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
             ],
         )
         .with_inverse_of(REL_PART_OF)
+        .with_transitive(true)
         .with_concern(CONCERN_ENGINEERING_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_PART_OF,
@@ -2135,6 +2416,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
             ],
         )
         .with_inverse_of(REL_CONTAINS)
+        .with_transitive(true)
         .with_concern(CONCERN_ENGINEERING_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_DEPENDS_ON,
@@ -2154,6 +2436,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
                 CLASS_CHANGE,
             ],
         )
+        .with_transitive(true)
         .with_concern(CONCERN_ENGINEERING_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_IMPORTS,
@@ -2246,6 +2529,7 @@ fn default_relations() -> Vec<EngineeringRelationDef> {
             &[CLASS_DECISION, CLASS_CONVENTION, CLASS_CHANGE, CLASS_COMMIT],
             &[CLASS_DECISION, CLASS_CONVENTION, CLASS_CHANGE, CLASS_COMMIT],
         )
+        .with_transitive(true)
         .with_concern(CONCERN_CONFIGURATION_MANAGEMENT),
         EngineeringRelationDef::new(
             REL_BLOCKED_BY,
@@ -2480,6 +2764,99 @@ mod tests {
             .relation(&relation_id)
             .expect("virtual subproperty relation");
         assert_eq!(relation.relation, REL_DEPENDS_ON);
+    }
+
+    #[test]
+    fn default_ontology_has_consistent_axioms() {
+        let report = default_engineering_ontology().validate();
+        assert!(report.errors().is_empty(), "{report:?}");
+        assert!(
+            default_engineering_ontology()
+                .relations
+                .values()
+                .any(|relation| relation.transitive)
+        );
+    }
+
+    #[test]
+    fn transitive_inference_adds_reachable_depends_on_edge() {
+        let mut graph = EngineeringGraph::new();
+        for id in ["task:t1", "task:t2", "task:t3"] {
+            graph.insert_entity(EngineeringEntity::new(CLASS_TASK, id, id));
+        }
+        graph.insert_relation(EngineeringRelation::new("task:t1", REL_DEPENDS_ON, "task:t2"));
+        graph.insert_relation(EngineeringRelation::new("task:t2", REL_DEPENDS_ON, "task:t3"));
+
+        let inferred = graph.infer_relations(&default_engineering_ontology());
+        let path = inferred
+            .shortest_path("task:t1", "task:t3", 1, &[REL_DEPENDS_ON])
+            .expect("transitive depends_on path");
+        assert_eq!(path, vec!["task:t1", "task:t3"]);
+        let edge = inferred
+            .relation("inferred:transitive:depends_on:task:t1:task:t3")
+            .expect("transitive relation");
+        assert_eq!(edge.relation, REL_DEPENDS_ON);
+        assert!(edge.provenance.source.starts_with("inferred:transitive:"));
+        assert!(edge.confidence < 0.8);
+        assert!(
+            inferred
+                .relations
+                .values()
+                .all(|relation| relation.from != relation.to)
+        );
+    }
+
+    #[test]
+    fn symmetric_inference_adds_reverse_edge() {
+        let ontology = EngineeringOntology::new("test", 1, "test").with_relation(
+            EngineeringRelationDef::new("peer_of", "Peer Of", &[CLASS_TASK], &[CLASS_TASK])
+                .with_symmetric(true),
+        );
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:a", "a"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:b", "b"));
+        graph.insert_relation(EngineeringRelation::new("task:a", "peer_of", "task:b"));
+
+        let inferred = graph.infer_relations(&ontology);
+        assert!(
+            inferred
+                .shortest_path("task:b", "task:a", 1, &["peer_of"])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn disjoint_classes_reject_inheritance_conflicts() {
+        let ontology = EngineeringOntology::new("test", 1, "test")
+            .with_class(
+                EngineeringClassDef::new("a", "A", BfoCategory::IndependentContinuant)
+                    .with_parent("b")
+                    .with_disjoint_class("b"),
+            )
+            .with_class(EngineeringClassDef::new("b", "B", BfoCategory::IndependentContinuant));
+        let report = ontology.validate();
+        assert!(report.errors().iter().any(|issue| issue.code == "EO17"));
+
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new("a", "entity:a", "a"));
+        let report = graph.validate(&ontology);
+        assert!(report.errors().iter().any(|issue| issue.code == "EG13"));
+    }
+
+    #[test]
+    fn validates_relation_axiom_references_and_cycles() {
+        let ontology = EngineeringOntology::new("test", 1, "test")
+            .with_relation(
+                EngineeringRelationDef::new("a", "A", &[], &[])
+                    .with_inverse_of("missing")
+                    .with_sub_property_of("b"),
+            )
+            .with_relation(
+                EngineeringRelationDef::new("b", "B", &[], &[]).with_sub_property_of("a"),
+            );
+        let report = ontology.validate();
+        assert!(report.errors().iter().any(|issue| issue.code == "EO23"));
+        assert!(report.errors().iter().any(|issue| issue.code == "EO27"));
     }
 
     #[test]
