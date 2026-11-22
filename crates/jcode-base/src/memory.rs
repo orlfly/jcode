@@ -562,6 +562,37 @@ fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
     out
 }
 
+fn waypoint_permutations(waypoints: &[String]) -> Vec<Vec<String>> {
+    fn walk(
+        waypoints: &[String],
+        used: &mut [bool],
+        current: &mut Vec<String>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        if current.len() == waypoints.len() {
+            out.push(current.clone());
+            return;
+        }
+        for (index, waypoint) in waypoints.iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            used[index] = true;
+            current.push(waypoint.clone());
+            walk(waypoints, used, current, out);
+            current.pop();
+            used[index] = false;
+        }
+    }
+    if waypoints.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    let mut used = vec![false; waypoints.len()];
+    walk(waypoints, &mut used, &mut Vec::new(), &mut out);
+    out
+}
+
 fn scope_label(scope: MemoryScope) -> &'static str {
     match scope {
         MemoryScope::Project => "project",
@@ -8698,9 +8729,55 @@ impl MemoryManager {
         Ok(paths.into_iter().next())
     }
 
-    /// Query a start -> waypoint... -> goal chain by computing one best leg at
-    /// a time. This is intentionally not a globally optimal k-waypoint search;
-    /// each returned path is marked `stitched_path` for downstream verification.
+    #[allow(clippy::too_many_arguments)]
+    fn waypoint_leg_path(
+        &self,
+        graphs: &[(&str, MemoryGraph)],
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        scope: MemoryScope,
+        relations: &[String],
+        allowed: &[&str],
+        options: &MemoryPathQueryOptions,
+        cache: &mut std::collections::HashMap<(String, String), Option<MemoryPath>>,
+        failure: &mut Option<MemoryPathQueryOutcome>,
+    ) -> Result<Option<MemoryPath>> {
+        let key = (from_anchor.to_string(), to_anchor.to_string());
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+        if let Some(path) = self.best_path_from_loaded_graphs(
+            graphs,
+            from_anchor,
+            to_anchor,
+            depth,
+            allowed,
+            options,
+        )? {
+            cache.insert(key, Some(path.clone()));
+            return Ok(Some(path));
+        }
+        let leg = self.paths_between_anchors_with_options(
+            &[from_anchor.to_string()],
+            &[to_anchor.to_string()],
+            depth,
+            1,
+            scope,
+            relations,
+            options.clone(),
+        )?;
+        let path = leg.paths.first().cloned();
+        if path.is_none() && failure.is_none() {
+            *failure = Some(leg);
+        }
+        cache.insert(key, path.clone());
+        Ok(path)
+    }
+
+    /// Query a start -> waypoint... -> goal chain. Up to three waypoints are
+    /// tried in every order and the globally cheapest complete chain wins.
+    /// Each returned path is marked `stitched_path` for downstream verification.
     pub fn paths_via_waypoints(
         &self,
         from_anchors: &[String],
@@ -8717,6 +8794,7 @@ impl MemoryManager {
             .map(|anchor| anchor.trim().to_string())
             .filter(|anchor| !anchor.is_empty())
             .collect();
+        let waypoints = normalize_path_anchors(&waypoints);
         if waypoints.is_empty() {
             return self.paths_between_anchors_with_options(
                 from_anchors,
@@ -8752,65 +8830,82 @@ impl MemoryManager {
             );
         }
         let allowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
-        let mut paths = Vec::new();
+        let permutations = waypoint_permutations(&waypoints);
+        let permutation_count = permutations.len();
+        let mut paths: Vec<(MemoryPath, Vec<String>)> = Vec::new();
         let mut failure = None;
+        let mut leg_cache = std::collections::HashMap::new();
         for from in &froms {
             for to in &tos {
-                let mut leg_from = from.clone();
-                let mut nodes = Vec::new();
-                let mut edges = Vec::new();
-                let mut cost = 0.0f32;
-                let mut confidence = 1.0f32;
-                let mut complete = true;
-                for (index, target) in waypoints.iter().chain(std::iter::once(to)).enumerate() {
-                    let fast = self.best_path_from_loaded_graphs(
-                        &graphs,
-                        &leg_from,
-                        target,
-                        depth,
-                        &allowed,
-                        &options,
-                    )?;
-                    let path = if let Some(path) = fast {
-                        path
-                    } else {
-                        // Preserve diagnosis, auto-grounding and relaxation on
-                        // a failed leg, but do not pay the full graph reload on
-                        // the common successful path.
-                        let leg = self.paths_between_anchors_with_options(
-                            &[leg_from.clone()],
-                            &[target.clone()],
+                let mut best: Option<(f32, f32, MemoryPath, Vec<String>)> = None;
+                for order in &permutations {
+                    let mut sequence = Vec::with_capacity(order.len() + 2);
+                    sequence.push(from.clone());
+                    sequence.extend(order.iter().cloned());
+                    sequence.push(to.clone());
+                    let mut nodes = Vec::new();
+                    let mut edges = Vec::new();
+                    let mut cost = 0.0f32;
+                    let mut confidence = 1.0f32;
+                    let mut complete = true;
+                    for pair in sequence.windows(2) {
+                        let Some(path) = self.waypoint_leg_path(
+                            &graphs,
+                            &pair[0],
+                            &pair[1],
                             depth,
-                            1,
                             scope,
                             relations,
-                            options.clone(),
-                        )?;
-                        if let Some(path) = leg.paths.first() {
-                            path.clone()
-                        } else {
-                            failure = Some(leg);
+                            &allowed,
+                            &options,
+                            &mut leg_cache,
+                            &mut failure,
+                        )?
+                        else {
                             complete = false;
                             break;
+                        };
+                        if nodes.is_empty() {
+                            nodes.extend(path.nodes.iter().cloned());
+                        } else {
+                            nodes.extend(path.nodes.iter().skip(1).cloned());
                         }
-                    };
-                    if index == 0 {
-                        nodes.extend(path.nodes.iter().cloned());
-                    } else {
-                        nodes.extend(path.nodes.iter().skip(1).cloned());
+                        edges.extend(path.edges.iter().cloned());
+                        cost += path.cost;
+                        confidence = confidence.min(path.confidence);
                     }
-                    edges.extend(path.edges.iter().cloned());
-                    cost += path.cost;
-                    confidence = confidence.min(path.confidence);
-                    leg_from = target.clone();
-                }
-                if complete && !nodes.is_empty() {
-                    paths.push(MemoryPath {
+                    if !complete || nodes.is_empty() {
+                        continue;
+                    }
+                    let candidate = MemoryPath {
                         nodes,
                         edges,
                         cost,
                         confidence,
-                    });
+                    };
+                    let better = match &best {
+                        None => true,
+                        Some((best_cost, best_confidence, _, _)) => {
+                            if options.objective
+                                == Some(jcode_memory_types::PathObjective::MaxConfidence)
+                            {
+                                confidence
+                                    .total_cmp(best_confidence)
+                                    .then_with(|| best_cost.total_cmp(&cost))
+                                    == std::cmp::Ordering::Greater
+                            } else {
+                                cost.total_cmp(best_cost)
+                                    .then_with(|| confidence.total_cmp(best_confidence))
+                                    == std::cmp::Ordering::Less
+                            }
+                        }
+                    };
+                    if better {
+                        best = Some((cost, confidence, candidate, order.clone()));
+                    }
+                }
+                if let Some((_, _, path, order)) = best {
+                    paths.push((path, order));
                 }
             }
         }
@@ -8824,25 +8919,29 @@ impl MemoryManager {
             }));
         }
 
-        paths.sort_by(|left, right| {
+        paths.sort_by(|(left, _), (right, _)| {
             left.cost
                 .total_cmp(&right.cost)
                 .then_with(|| left.nodes.cmp(&right.nodes))
         });
         let mut seen = std::collections::HashSet::new();
-        paths.retain(|path| seen.insert(path.nodes.clone()));
+        paths.retain(|(path, _)| seen.insert(path.nodes.clone()));
         paths.truncate(limit.min(20));
         let quality = paths
             .iter()
-            .map(|_| {
+            .map(|(_, order)| {
                 let mut quality = PathQuality::default();
                 quality.push(
                     jcode_memory_types::PathQualityFlag::StitchedPath,
-                    "waypoint chain is stitched from sequential best legs",
+                    format!(
+                        "global waypoint order {} selected from {permutation_count} permutation(s)",
+                        order.join(" -> ")
+                    ),
                 );
                 quality
             })
             .collect();
+        let paths: Vec<MemoryPath> = paths.into_iter().map(|(path, _)| path).collect();
         let outcome = MemoryPathQueryOutcome {
             paths,
             quality,

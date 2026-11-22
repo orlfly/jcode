@@ -5276,6 +5276,46 @@ fn path_query_chains_waypoints() {
 }
 
 #[test]
+fn path_query_optimizes_waypoint_order_globally() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-waypoint-order");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global start"));
+        let w1 = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global waypoint one"));
+        let w2 = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global waypoint two"));
+        let d = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "global goal"));
+        graph.link_memories(&a, &w1, 0.1);
+        graph.link_memories(&w1, &w2, 0.95);
+        graph.link_memories(&w2, &d, 0.1);
+        graph.link_memories(&a, &w2, 0.95);
+        graph.link_memories(&w1, &d, 0.95);
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let outcome = manager
+            .paths_via_waypoints(
+                &[a.clone()],
+                &[d.clone()],
+                &[w1.clone(), w2.clone()],
+                4,
+                5,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions::default(),
+            )
+            .expect("globally ordered waypoint path");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.paths[0].nodes, vec![a, w2, w1, d]);
+        assert!(
+            outcome.quality[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("global waypoint order")),
+            "{outcome:?}"
+        );
+    });
+}
+
+#[test]
 #[ignore = "benchmark: run with --ignored --nocapture"]
 fn bench_waypoint_query_reuses_loaded_graphs() {
     with_temp_home(|_| {
