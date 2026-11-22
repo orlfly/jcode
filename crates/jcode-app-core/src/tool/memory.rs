@@ -248,7 +248,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "compile", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "compile", "quality", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -1469,6 +1469,15 @@ impl Tool for MemoryTool {
                         "unknown review action: {other}; use list, accept, reject or defer"
                     )),
                 }
+            }
+            "quality" => {
+                let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                let report = manager.graph_quality(scope)?;
+                Ok(ToolOutput::new(format!(
+                    "Graph quality ({}):\n{}",
+                    report.scope,
+                    serde_json::to_string_pretty(&report)?
+                )))
             }
             "compile" => {
                 let text = input
@@ -3357,6 +3366,47 @@ mod tests {
             .expect("budgeted path")
             .output;
         assert!(output.contains("E07"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn quality_action_reports_graph_metrics() {
+        use crate::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality one"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality two"));
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality orphan"));
+        graph.add_edge(
+            &a,
+            &b,
+            crate::memory_graph::EdgeKind::SameAs,
+        );
+        tool.manager
+            .save_project_graph(&graph)
+            .expect("save quality graph");
+
+        let output = tool
+            .execute(
+                json!({"action":"quality","scope":"project"}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("quality report")
+            .output;
+        assert!(output.contains("Graph quality (project)"), "{output}");
+        assert!(output.contains("\"memories\": 3"), "{output}");
+        assert!(output.contains("\"alignment_edges\": 1"), "{output}");
+        assert!(output.contains("\"orphan_ratio\""), "{output}");
+        assert!(output.contains("\"provenance_coverage\""), "{output}");
     }
 
     #[tokio::test]

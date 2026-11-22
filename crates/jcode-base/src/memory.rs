@@ -34,6 +34,8 @@ mod cache;
 mod ontology_registry;
 #[path = "memory/pending.rs"]
 mod pending;
+#[path = "memory/quality.rs"]
+mod quality;
 #[path = "memory_prompt.rs"]
 mod prompt_support;
 #[path = "memory/reextract.rs"]
@@ -55,6 +57,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
+pub use quality::{GraphQualityReport, StoreQuality};
 use cache::{cache_graph, cached_graph};
 pub use jcode_memory_types::{
     AdmissionTier, ChangeLevel, ConfirmationGate, MemoryReviewItem, MemoryReviewState,
@@ -370,8 +373,8 @@ fn finalize_path_outcome(mut outcome: MemoryPathQueryOutcome) -> MemoryPathQuery
     outcome
 }
 
-const STALE_EDGE_DAYS: i64 = 30;
-const HIGH_DEGREE_HUB: usize = 64;
+pub(crate) const STALE_EDGE_DAYS: i64 = 30;
+pub(crate) const HIGH_DEGREE_HUB: usize = 64;
 
 fn assess_path_quality(
     path: &MemoryPath,
@@ -8476,6 +8479,19 @@ impl MemoryManager {
             outcome.diagnosis.push("E07".to_string());
         }
         Ok(finalize_path_outcome(outcome))
+    }
+
+    /// Compute deterministic graph-quality metrics for the requested scope.
+    pub fn graph_quality(&self, scope: MemoryScope) -> Result<GraphQualityReport> {
+        let graphs = self.load_path_graphs(scope)?;
+        let stores = graphs
+            .iter()
+            .map(|(label, graph)| quality::analyze_store(label, graph))
+            .collect();
+        let pending = self
+            .list_shadow_edges_scoped(Some(ShadowEdgeStatus::Pending), scope)?
+            .len();
+        Ok(quality::aggregate(scope_label(scope), stores, pending))
     }
 
     /// Load the graphs for one query so multi-leg searches do not reload and
