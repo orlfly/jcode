@@ -192,6 +192,8 @@ fn quality_report_includes_query_audit_metrics() {
         assert_eq!(report.query_metrics.successful_queries, 1);
         assert_eq!(report.query_metrics.no_path_queries, 1);
         assert_eq!(report.query_metrics.path_success_rate, 0.5);
+        assert_eq!(report.query_metrics.total_paths, 1);
+        assert_eq!(report.query_metrics.evidence_coverage, 0.0);
         assert!(
             report
                 .query_metrics
@@ -202,6 +204,10 @@ fn quality_report_includes_query_audit_metrics() {
         );
         assert!(
             report.findings.iter().any(|finding| finding.code == "Q08"),
+            "{report:?}"
+        );
+        assert!(
+            report.findings.iter().any(|finding| finding.code == "Q11"),
             "{report:?}"
         );
         assert!(

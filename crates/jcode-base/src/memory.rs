@@ -8694,6 +8694,18 @@ impl MemoryManager {
                 )
             })
             .count();
+        let low_provenance_paths = outcome
+            .quality
+            .iter()
+            .filter(|quality| {
+                quality.has(jcode_memory_types::PathQualityFlag::LowProvenance)
+            })
+            .count();
+        let hub_paths = outcome
+            .quality
+            .iter()
+            .filter(|quality| quality.has(jcode_memory_types::PathQualityFlag::HighDegreeHub))
+            .count();
         let entry = QueryAuditEntry {
             scope: scope_label(scope).to_string(),
             kind: kind.to_string(),
@@ -8705,6 +8717,8 @@ impl MemoryManager {
             depth: outcome.depth,
             diagnosis: outcome.diagnosis.clone(),
             relaxations: outcome.relaxations.clone(),
+            low_provenance_paths,
+            hub_paths,
         };
         let _ = self.append_query_audit(&entry);
     }

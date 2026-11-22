@@ -29,6 +29,10 @@ pub const MIN_PATH_SUCCESS_RATE: f32 = 0.85;
 pub const MIN_CROSS_GRAPH_SUCCESS_RATE: f32 = 0.90;
 /// Maximum tolerated completion debt from hypothesized edges.
 pub const MAX_COMPLETION_DEBT: f32 = 0.10;
+/// Minimum tolerated evidence coverage on returned paths.
+pub const MIN_EVIDENCE_COVERAGE: f32 = 0.95;
+/// Maximum tolerated share of paths crossing high-degree hubs.
+pub const MAX_HUB_PATH_RATIO: f32 = 0.20;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +104,10 @@ pub struct QueryAuditEntry {
     pub diagnosis: Vec<String>,
     #[serde(default)]
     pub relaxations: Vec<String>,
+    #[serde(default)]
+    pub low_provenance_paths: usize,
+    #[serde(default)]
+    pub hub_paths: usize,
 }
 
 /// Query-derived quality metrics for one governance scope.
@@ -110,8 +118,18 @@ pub struct QueryAuditMetrics {
     pub no_path_queries: u64,
     pub path_success_rate: f32,
     pub total_edges: u64,
+    #[serde(default)]
+    pub total_paths: u64,
     pub hypothesized_edges: u64,
     pub completion_debt: f32,
+    #[serde(default)]
+    pub low_provenance_paths: u64,
+    #[serde(default)]
+    pub hub_paths: u64,
+    #[serde(default = "default_rate")]
+    pub evidence_coverage: f32,
+    #[serde(default)]
+    pub hub_path_ratio: f32,
     pub cross_graph_queries: u64,
     pub cross_graph_success: u64,
     pub cross_graph_success_rate: f32,
@@ -127,8 +145,13 @@ impl Default for QueryAuditMetrics {
             no_path_queries: 0,
             path_success_rate: 1.0,
             total_edges: 0,
+            total_paths: 0,
             hypothesized_edges: 0,
             completion_debt: 0.0,
+            low_provenance_paths: 0,
+            hub_paths: 0,
+            evidence_coverage: 1.0,
+            hub_path_ratio: 0.0,
             cross_graph_queries: 0,
             cross_graph_success: 0,
             cross_graph_success_rate: 1.0,
@@ -145,6 +168,7 @@ pub struct StoreQuality {
     pub memories: usize,
     pub memory_edges: usize,
     pub alignment_edges: usize,
+    pub aligned_nodes: usize,
     pub hypothesized_edges: usize,
     pub orphan_nodes: usize,
     pub hub_nodes: usize,
@@ -166,6 +190,8 @@ pub struct GraphQualityReport {
     pub hub_ratio: f32,
     pub provenance_coverage: f32,
     pub alignment_rate: f32,
+    #[serde(default)]
+    pub alignment_coverage: f32,
     pub hypothesized_ratio: f32,
     pub stale_ratio: f32,
     pub pending_shadow_edges: usize,
@@ -190,6 +216,10 @@ fn ratio(numerator: usize, denominator: usize) -> f32 {
     } else {
         numerator as f32 / denominator as f32
     }
+}
+
+fn default_rate() -> f32 {
+    1.0
 }
 
 fn largest_component_size(nodes: &HashSet<&str>, adjacency: &HashMap<&str, Vec<&str>>) -> usize {
@@ -223,6 +253,7 @@ pub fn analyze_store(store: &str, graph: &MemoryGraph) -> StoreQuality {
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut memory_edges = 0;
     let mut alignment_edges = 0;
+    let mut aligned_nodes = HashSet::new();
     let mut hypothesized_edges = 0;
 
     for (from, edges) in &graph.edges {
@@ -235,7 +266,11 @@ pub fn analyze_store(store: &str, graph: &MemoryGraph) -> StoreQuality {
             }
             memory_edges += 1;
             match edge.kind {
-                EdgeKind::Bridge | EdgeKind::SameAs => alignment_edges += 1,
+                EdgeKind::Bridge | EdgeKind::SameAs => {
+                    alignment_edges += 1;
+                    aligned_nodes.insert(from.as_str());
+                    aligned_nodes.insert(edge.target.as_str());
+                }
                 EdgeKind::Hypothesized { .. } => hypothesized_edges += 1,
                 _ => {}
             }
@@ -279,6 +314,7 @@ pub fn analyze_store(store: &str, graph: &MemoryGraph) -> StoreQuality {
         memories: active.len(),
         memory_edges,
         alignment_edges,
+        aligned_nodes: aligned_nodes.len(),
         hypothesized_edges,
         orphan_nodes,
         hub_nodes,
@@ -297,6 +333,7 @@ pub fn aggregate(
     let memories = stores.iter().map(|store| store.memories).sum();
     let memory_edges = stores.iter().map(|store| store.memory_edges).sum();
     let alignment_edges = stores.iter().map(|store| store.alignment_edges).sum();
+    let aligned_nodes = stores.iter().map(|store| store.aligned_nodes).sum();
     let hypothesized_edges = stores.iter().map(|store| store.hypothesized_edges).sum();
     let orphan_nodes = stores.iter().map(|store| store.orphan_nodes).sum();
     let hub_nodes = stores.iter().map(|store| store.hub_nodes).sum();
@@ -321,6 +358,7 @@ pub fn aggregate(
         hub_ratio: ratio(hub_nodes, memories),
         provenance_coverage: ratio(provenance_nodes, memories),
         alignment_rate: ratio(alignment_edges, memories),
+        alignment_coverage: ratio(aligned_nodes, memories),
         hypothesized_ratio: ratio(hypothesized_edges, memory_edges),
         stale_ratio: ratio(stale_nodes, memories),
         pending_shadow_edges,
@@ -365,7 +403,10 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
             metrics.successful_queries += 1;
         }
         metrics.total_edges += entry.edge_count as u64;
+        metrics.total_paths += entry.path_count as u64;
         metrics.hypothesized_edges += entry.hypothesized_edges as u64;
+        metrics.low_provenance_paths += entry.low_provenance_paths as u64;
+        metrics.hub_paths += entry.hub_paths as u64;
         if entry.stores_searched > 1 {
             metrics.cross_graph_queries += 1;
             if entry.success {
@@ -388,6 +429,16 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         0.0
     } else {
         metrics.hypothesized_edges as f32 / metrics.total_edges as f32
+    };
+    metrics.evidence_coverage = if metrics.total_paths == 0 {
+        1.0
+    } else {
+        1.0 - metrics.low_provenance_paths as f32 / metrics.total_paths as f32
+    };
+    metrics.hub_path_ratio = if metrics.total_paths == 0 {
+        0.0
+    } else {
+        metrics.hub_paths as f32 / metrics.total_paths as f32
     };
     metrics.cross_graph_success_rate = if metrics.cross_graph_queries == 0 {
         1.0
@@ -430,6 +481,26 @@ pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
             metrics.completion_debt,
             MAX_COMPLETION_DEBT,
             "promote or reject hypothesized edges used by decisions",
+        ));
+    }
+    if metrics.total_paths > 0 && metrics.evidence_coverage < MIN_EVIDENCE_COVERAGE {
+        findings.push(finding(
+            "Q11",
+            QualitySeverity::Critical,
+            "evidence_coverage",
+            metrics.evidence_coverage,
+            MIN_EVIDENCE_COVERAGE,
+            "backfill provenance locators on paths used for decisions",
+        ));
+    }
+    if metrics.hub_path_ratio > MAX_HUB_PATH_RATIO {
+        findings.push(finding(
+            "Q12",
+            QualitySeverity::Warning,
+            "hub_path_ratio",
+            metrics.hub_path_ratio,
+            MAX_HUB_PATH_RATIO,
+            "add waypoints or split high-degree hubs used by paths",
         ));
     }
     findings
@@ -530,10 +601,12 @@ mod tests {
         assert_eq!(quality.memories, 3);
         assert_eq!(quality.memory_edges, 1);
         assert_eq!(quality.alignment_edges, 1);
+        assert_eq!(quality.aligned_nodes, 2);
         assert_eq!(quality.orphan_nodes, 1);
         assert_eq!(quality.largest_component, 2);
         let report = aggregate("project", vec![quality], 0);
         assert!((report.alignment_rate - 1.0 / 3.0).abs() < 0.001);
+        assert!((report.alignment_coverage - 2.0 / 3.0).abs() < 0.001);
         assert!((report.orphan_ratio - 1.0 / 3.0).abs() < 0.001);
         assert!(!report.healthy);
         assert!(report.findings.iter().any(|finding| finding.code == "Q01"));
@@ -552,6 +625,7 @@ mod tests {
         assert_eq!(report.average_degree, 0.0);
         assert_eq!(report.largest_component_ratio, 0.0);
         assert_eq!(report.provenance_coverage, 0.0);
+        assert_eq!(report.alignment_coverage, 0.0);
         assert!(report.healthy);
     }
 
@@ -569,6 +643,8 @@ mod tests {
                 depth: 3,
                 diagnosis: Vec::new(),
                 relaxations: Vec::new(),
+                low_provenance_paths: 1,
+                hub_paths: 0,
             },
             QueryAuditEntry {
                 scope: "project".to_string(),
@@ -581,6 +657,8 @@ mod tests {
                 depth: 3,
                 diagnosis: vec!["E03".to_string()],
                 relaxations: Vec::new(),
+                low_provenance_paths: 0,
+                hub_paths: 0,
             },
         ];
         let metrics = summarize_queries(&entries, "project");
@@ -591,6 +669,11 @@ mod tests {
         assert_eq!(metrics.total_edges, 4);
         assert_eq!(metrics.hypothesized_edges, 1);
         assert_eq!(metrics.completion_debt, 0.25);
+        assert_eq!(metrics.total_paths, 1);
+        assert_eq!(metrics.low_provenance_paths, 1);
+        assert_eq!(metrics.evidence_coverage, 0.0);
+        assert_eq!(metrics.hub_paths, 0);
+        assert_eq!(metrics.hub_path_ratio, 0.0);
         assert_eq!(metrics.cross_graph_queries, 2);
         assert_eq!(metrics.cross_graph_success, 1);
         assert_eq!(metrics.cross_graph_success_rate, 0.5);
@@ -605,8 +688,13 @@ mod tests {
             no_path_queries: 2,
             path_success_rate: 0.5,
             total_edges: 8,
+            total_paths: 8,
             hypothesized_edges: 2,
             completion_debt: 0.25,
+            low_provenance_paths: 2,
+            hub_paths: 2,
+            evidence_coverage: 0.75,
+            hub_path_ratio: 0.25,
             cross_graph_queries: 2,
             cross_graph_success: 1,
             cross_graph_success_rate: 0.5,
@@ -616,5 +704,7 @@ mod tests {
         assert!(findings.iter().any(|finding| finding.code == "Q08"));
         assert!(findings.iter().any(|finding| finding.code == "Q09"));
         assert!(findings.iter().any(|finding| finding.code == "Q10"));
+        assert!(findings.iter().any(|finding| finding.code == "Q11"));
+        assert!(findings.iter().any(|finding| finding.code == "Q12"));
     }
 }

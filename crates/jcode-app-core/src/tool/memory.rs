@@ -3492,6 +3492,8 @@ mod tests {
         assert!(output.contains("\"findings\""), "{output}");
         assert!(output.contains("\"debt\""), "{output}");
         assert!(output.contains("\"query_metrics\""), "{output}");
+        assert!(output.contains("\"evidence_coverage\""), "{output}");
+        assert!(output.contains("\"alignment_coverage\""), "{output}");
         assert!(output.contains("\"sla_days\": 7"), "{output}");
         assert!(output.contains("\"status\": \"open\""), "{output}");
         assert!(output.contains("Q01"), "{output}");
