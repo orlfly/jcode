@@ -357,6 +357,8 @@ pub struct MemoryPathQueryOptions {
     pub objective: Option<jcode_memory_types::PathObjective>,
     /// Retry once with high-confidence suggestions for unresolved anchors.
     pub auto_ground_anchors: bool,
+    /// Wall-clock budget for the query and its deterministic L0 retries.
+    pub query_budget_ms: Option<u64>,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -8288,6 +8290,12 @@ impl MemoryManager {
         let tos = normalize_path_anchors(to_anchors);
         let depth = depth.clamp(1, MAX_INITIAL_PATH_DEPTH);
         let limit = limit.min(20);
+        let started = Instant::now();
+        let budget_exhausted = || {
+            options
+                .query_budget_ms
+                .is_some_and(|budget| started.elapsed().as_millis() as u64 >= budget)
+        };
 
         let mut allowed_owned = Vec::new();
         let mut unknown_relations = Vec::new();
@@ -8326,6 +8334,7 @@ impl MemoryManager {
         if outcome.paths.is_empty()
             && scope != MemoryScope::All
             && outcome.diagnosis.iter().any(|code| code == "E08")
+            && !budget_exhausted()
         {
             let relaxation = format!("scope {} -> all", scope_label(scope));
             if !scope.includes_project() {
@@ -8357,6 +8366,7 @@ impl MemoryManager {
         if outcome.paths.is_empty()
             && outcome.diagnosis.iter().any(|code| code == "E05")
             && depth < MAX_RELAXED_PATH_DEPTH
+            && !budget_exhausted()
         {
             let relaxed_depth = MAX_RELAXED_PATH_DEPTH;
             let relaxation = format!("depth {depth} -> {relaxed_depth}");
@@ -8390,6 +8400,7 @@ impl MemoryManager {
             && unknown_relations.is_empty()
             && outcome.unresolved_from.is_empty()
             && outcome.unresolved_to.is_empty()
+            && !budget_exhausted()
         {
             let mut applied = outcome.relaxations.clone();
             if !allowed.is_empty() {
@@ -8425,7 +8436,7 @@ impl MemoryManager {
                 outcome = relaxed;
             }
         }
-        if outcome.paths.is_empty() && options.auto_ground_anchors {
+        if outcome.paths.is_empty() && options.auto_ground_anchors && !budget_exhausted() {
             let replacements =
                 select_grounding_replacements(&outcome.anchor_suggestions, &froms, &tos);
             if !replacements.is_empty() {
@@ -8461,7 +8472,10 @@ impl MemoryManager {
                 outcome = grounded;
             }
         }
-        Ok(outcome)
+        if budget_exhausted() && !outcome.diagnosis.iter().any(|code| code == "E07") {
+            outcome.diagnosis.push("E07".to_string());
+        }
+        Ok(finalize_path_outcome(outcome))
     }
 
     /// Load the graphs for one query so multi-leg searches do not reload and

@@ -6043,3 +6043,50 @@ fn path_query_relaxes_over_pruning_filters_and_reports_e04() {
         );
     });
 }
+
+#[test]
+fn path_query_reports_e07_when_budget_is_exhausted() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/e07-budget");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "budget source note",
+        ));
+        let b = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "budget target note",
+        ));
+        graph.add_edge(
+            &a,
+            &b,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let outcome = manager
+            .paths_between_anchors_with_options(
+                &[a],
+                &[b],
+                2,
+                2,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    query_budget_ms: Some(0),
+                    ..Default::default()
+                },
+            )
+            .expect("budgeted path query");
+        assert!(outcome.diagnosis.iter().any(|code| code == "E07"));
+        assert_eq!(
+            outcome
+                .missing_classes
+                .iter()
+                .filter(|class| class.as_str() == "query_side")
+                .count(),
+            1,
+            "{outcome:?}"
+        );
+    });
+}

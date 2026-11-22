@@ -104,6 +104,9 @@ pub struct PathQueryConstraints {
     /// For engineering paths: join the ontology concept layer at query time.
     #[serde(default)]
     pub include_ontology: bool,
+    /// Wall-clock budget for the path query and its L0 retries.
+    #[serde(default)]
+    pub query_budget_ms: Option<u64>,
     #[serde(default)]
     pub auto_ground: bool,
     #[serde(default)]
@@ -209,7 +212,7 @@ impl PathQuery {
     }
 }
 
-const QUERY_KEYS: [&str; 10] = [
+const QUERY_KEYS: [&str; 11] = [
     "from",
     "to",
     "via",
@@ -220,6 +223,7 @@ const QUERY_KEYS: [&str; 10] = [
     "depth",
     "limit",
     "objective",
+    "budget_ms",
 ];
 
 fn query_tokens(text: &str) -> Vec<String> {
@@ -305,6 +309,7 @@ pub fn compile_path_query_text(
     let mut depth = None;
     let mut limit = None;
     let mut objective = None;
+    let mut query_budget_ms = None;
     let mut errors = Vec::new();
 
     let mut index = 0;
@@ -387,6 +392,10 @@ pub fn compile_path_query_text(
                 }
                 other => errors.push(format!("invalid objective: {other}")),
             },
+            "budget_ms" => match values[0].parse::<u64>() {
+                Ok(value) => query_budget_ms = Some(value),
+                Err(_) => errors.push(format!("invalid budget_ms: {}", values[0])),
+            },
             _ => {}
         }
     }
@@ -418,6 +427,7 @@ pub fn compile_path_query_text(
             limit,
             scope,
             objective,
+            query_budget_ms,
             ..PathQueryConstraints::default()
         },
     };
@@ -525,7 +535,7 @@ mod tests {
     fn compiles_engineering_template_with_quoted_anchors() {
         let query = compile_path_query_text(
             "find from \"file:src/lib.rs\" to `api:/task` graph engineering \
-             relations defines implements depth 3 limit 2",
+             relations defines implements depth 3 limit 2 budget_ms 50",
             &["defines", "implements"],
         )
         .expect("compile");
@@ -535,6 +545,7 @@ mod tests {
         assert_eq!(query.constraints.relations, vec!["defines", "implements"]);
         assert_eq!(query.constraints.depth, Some(3));
         assert_eq!(query.constraints.limit, Some(2));
+        assert_eq!(query.constraints.query_budget_ms, Some(50));
     }
 
     #[test]

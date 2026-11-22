@@ -100,6 +100,9 @@ struct MemoryInput {
     /// For engineering paths: join the ontology concept layer.
     #[serde(default)]
     include_ontology: Option<bool>,
+    /// For action=path: wall-clock budget for the query and L0 retries.
+    #[serde(default)]
+    query_budget_ms: Option<u64>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -307,6 +310,10 @@ impl Tool for MemoryTool {
                 "include_ontology": {
                     "type": "boolean",
                     "description": "For engineering path: join ontology concept layer."
+                },
+                "query_budget_ms": {
+                    "type": "integer",
+                    "description": "For path: wall-clock query budget in milliseconds."
                 },
                 "shadow_action": {
                     "type": "string",
@@ -1010,6 +1017,7 @@ impl Tool for MemoryTool {
                     include_plan,
                     include_hypotheses,
                     include_ontology,
+                    query_budget_ms,
                 ) = if let Some(query) = input.path_query.clone() {
                     query.validate().map_err(|errors| {
                         anyhow::anyhow!("invalid path_query: {}", errors.join("; "))
@@ -1043,6 +1051,7 @@ impl Tool for MemoryTool {
                         query.constraints.plan,
                         query.constraints.include_hypotheses,
                         query.constraints.include_ontology,
+                        query.constraints.query_budget_ms,
                     )
                 } else {
                     let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
@@ -1061,6 +1070,7 @@ impl Tool for MemoryTool {
                     let include_plan = input.plan.unwrap_or(false);
                     let include_hypotheses = input.include_hypotheses.unwrap_or(false);
                     let include_ontology = input.include_ontology.unwrap_or(false);
+                    let query_budget_ms = input.query_budget_ms;
                     (
                         scope,
                         depth,
@@ -1073,6 +1083,7 @@ impl Tool for MemoryTool {
                         include_plan,
                         include_hypotheses,
                         include_ontology,
+                        query_budget_ms,
                     )
                 };
                 if froms.is_empty() {
@@ -1125,6 +1136,7 @@ impl Tool for MemoryTool {
                     min_confidence: query_filters.as_ref().and_then(|filters| filters.1),
                     objective: query_filters.as_ref().and_then(|filters| filters.2),
                     auto_ground_anchors: auto_ground,
+                    query_budget_ms,
                 };
                 let outcome = if waypoints.is_empty() {
                     manager.paths_between_anchors_with_options(
@@ -3302,6 +3314,49 @@ mod tests {
         assert!(output.output.contains("api:/task"), "{}", output.output);
         assert!(output.output.contains("\"defines\""), "{}", output.output);
         assert!(output.output.contains("\"depth\": 3"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn path_action_reports_e07_when_budget_is_exhausted() {
+        use crate::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "budget one"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "budget two"));
+        graph.add_edge(
+            &a,
+            &b,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        tool.manager
+            .save_project_graph(&graph)
+            .expect("save budget graph");
+
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":a,
+                    "to_id":b,
+                    "scope":"project",
+                    "depth":2,
+                    "query_budget_ms":0
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("budgeted path")
+            .output;
+        assert!(output.contains("E07"), "{output}");
     }
 
     #[tokio::test]
