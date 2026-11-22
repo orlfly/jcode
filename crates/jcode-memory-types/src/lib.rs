@@ -2,8 +2,9 @@ pub mod engineering_ontology;
 pub use engineering_ontology::{
     AlphaDef, AlphaStateDef, BfoCategory, ConcernDef, EngineeringClassDef, EngineeringEntity,
     EngineeringGraph, EngineeringOntology, EngineeringPath, EngineeringPropertyDef,
-    EngineeringProvenance, EngineeringRelation, EngineeringRelationDef, EngineeringValidationIssue,
-    EngineeringValidationReport, EntityStatus, PropertyValueKind, default_engineering_ontology,
+    EngineeringProvenance, EngineeringRelation, EngineeringRelationDef, EngineeringReleaseGate,
+    EngineeringStructureMetrics, EngineeringValidationIssue, EngineeringValidationReport,
+    EntityStatus, PropertyValueKind, default_engineering_ontology,
 };
 
 pub mod path_plan;

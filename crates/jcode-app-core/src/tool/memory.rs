@@ -347,7 +347,7 @@ impl Tool for MemoryTool {
                 },
                 "ontology_action": {
                     "type": "string",
-                    "enum": ["show", "propose", "validate", "gate", "apply", "history", "rollback"],
+                    "enum": ["show", "release", "propose", "validate", "gate", "apply", "history", "rollback"],
                     "description": "For action=ontology. Review sessions may show/validate/propose only."
                 },
                 "gate": {
@@ -1846,6 +1846,35 @@ impl Tool for MemoryTool {
                                 .join(", ")
                         )))
                     }
+                    "release" => {
+                        let ontology =
+                            crate::memory_types::engineering_ontology::default_engineering_ontology();
+                        let gate = ontology.release_gate();
+                        let metrics = gate.metrics;
+                        Ok(ToolOutput::new(format!(
+                            "Engineering ontology release gate: {}\nprofile: {}\nclasses: {}\nrelations: {}\nconcerns: {}\nalphas: {}\nsignature_completeness: {:.3}\nproperty_coverage: {:.3}\ninverse_coverage: {:.3}\nmax_hierarchy_depth: {}\nisolated_classes: {}\nweak_components: {}\ndisjoint_pairs: {}\ntransitive_relations: {}\nsymmetric_relations: {}\nblockers: {}",
+                            if gate.pass { "pass" } else { "fail" },
+                            ontology.id,
+                            metrics.classes,
+                            metrics.relations,
+                            metrics.concerns,
+                            metrics.alphas,
+                            metrics.signature_completeness,
+                            metrics.property_coverage,
+                            metrics.inverse_coverage,
+                            metrics.max_hierarchy_depth,
+                            metrics.isolated_classes,
+                            metrics.weak_components,
+                            metrics.disjoint_pairs,
+                            metrics.transitive_relations,
+                            metrics.symmetric_relations,
+                            if gate.blockers.is_empty() {
+                                "none".to_string()
+                            } else {
+                                gate.blockers.join("; ")
+                            }
+                        )))
+                    }
                     "propose" | "validate" => {
                         let patch = patch.ok_or_else(|| {
                             anyhow::anyhow!(
@@ -1988,7 +2017,7 @@ impl Tool for MemoryTool {
                         )))
                     }
                     other => Err(anyhow::anyhow!(
-                        "Unknown ontology action: {}. Use show, propose, validate, apply, history or rollback",
+                        "Unknown ontology action: {}. Use show, release, propose, validate, apply, history or rollback",
                         other
                     )),
                 }
@@ -4027,6 +4056,26 @@ mod tests {
             .await
             .unwrap();
         assert!(show.output.contains("jcode/default/v1"), "{}", show.output);
+
+        let release = tool
+            .execute(
+                json!({"action":"ontology","ontology_action":"release","scope":"project"}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            release
+                .output
+                .contains("Engineering ontology release gate: pass"),
+            "{}",
+            release.output
+        );
+        assert!(
+            release.output.contains("signature_completeness: 1.000"),
+            "{}",
+            release.output
+        );
 
         let patch = json!({
             "base_id": "jcode/default/v1",

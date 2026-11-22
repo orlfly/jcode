@@ -671,6 +671,171 @@ impl EngineeringOntology {
         EngineeringValidationReport { issues }
     }
 
+    /// Compute the nine structural health dimensions used by governance.
+    pub fn structure_metrics(&self) -> EngineeringStructureMetrics {
+        let classes = self.classes.len();
+        let relations = self.relations.len();
+        let classes_with_properties = self
+            .classes
+            .values()
+            .filter(|class| !class.properties.is_empty())
+            .count();
+        let relations_with_signature = self
+            .relations
+            .values()
+            .filter(|relation| !relation.domain.is_empty() && !relation.range.is_empty())
+            .count();
+        let inverse_relations = self
+            .relations
+            .values()
+            .filter(|relation| relation.inverse_of.is_some())
+            .count();
+        let transitive_relations = self
+            .relations
+            .values()
+            .filter(|relation| relation.transitive)
+            .count();
+        let symmetric_relations = self
+            .relations
+            .values()
+            .filter(|relation| relation.symmetric)
+            .count();
+        let mut disjoint_pairs = BTreeSet::new();
+        for class in self.classes.values() {
+            for other in &class.disjoint_with {
+                let pair = if class.id <= *other {
+                    (class.id.clone(), other.clone())
+                } else {
+                    (other.clone(), class.id.clone())
+                };
+                disjoint_pairs.insert(pair);
+            }
+        }
+        let mut adjacency: HashMap<String, Vec<String>> = self
+            .classes
+            .keys()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect();
+        let mut connect = |left: &str, right: &str| {
+            if !self.classes.contains_key(left) || !self.classes.contains_key(right) {
+                return;
+            }
+            adjacency
+                .entry(left.to_string())
+                .or_default()
+                .push(right.to_string());
+            adjacency
+                .entry(right.to_string())
+                .or_default()
+                .push(left.to_string());
+        };
+        for class in self.classes.values() {
+            if let Some(parent) = class.parent.as_deref() {
+                connect(&class.id, parent);
+            }
+        }
+        for relation in self.relations.values() {
+            for left in relation
+                .domain
+                .iter()
+                .filter(|class| class.as_str() != CLASS_WILDCARD)
+            {
+                for right in relation
+                    .range
+                    .iter()
+                    .filter(|class| class.as_str() != CLASS_WILDCARD)
+                {
+                    connect(left, right);
+                }
+            }
+        }
+        let isolated_classes = self
+            .classes
+            .keys()
+            .filter(|id| adjacency.get(*id).is_none_or(Vec::is_empty))
+            .count();
+        let mut seen = HashSet::new();
+        let mut weak_components = 0;
+        for class in self.classes.keys() {
+            if !seen.insert(class.clone()) {
+                continue;
+            }
+            weak_components += 1;
+            let mut queue = VecDeque::from([class.clone()]);
+            while let Some(node) = queue.pop_front() {
+                for neighbor in adjacency.get(&node).into_iter().flatten() {
+                    if seen.insert(neighbor.clone()) {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+        let max_hierarchy_depth = self
+            .classes
+            .keys()
+            .map(|id| {
+                let mut depth = 0usize;
+                let mut seen = BTreeSet::new();
+                let mut current = self.classes.get(id);
+                while let Some(parent) = current.and_then(|class| class.parent.as_deref()) {
+                    if !seen.insert(parent.to_string()) {
+                        break;
+                    }
+                    depth += 1;
+                    current = self.classes.get(parent);
+                }
+                depth
+            })
+            .max()
+            .unwrap_or(0);
+        EngineeringStructureMetrics {
+            classes,
+            relations,
+            concerns: self.concerns.len(),
+            alphas: self.alphas.len(),
+            classes_with_properties,
+            relations_with_signature,
+            inverse_relations,
+            transitive_relations,
+            symmetric_relations,
+            disjoint_pairs: disjoint_pairs.len(),
+            max_hierarchy_depth,
+            isolated_classes,
+            weak_components,
+            signature_completeness: ratio(relations_with_signature, relations),
+            property_coverage: ratio(classes_with_properties, classes),
+            inverse_coverage: ratio(inverse_relations, relations),
+        }
+    }
+
+    /// Block release when validation errors or core signature coverage fail.
+    pub fn release_gate(&self) -> EngineeringReleaseGate {
+        let metrics = self.structure_metrics();
+        let mut blockers: Vec<String> = self
+            .validate()
+            .errors()
+            .into_iter()
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect();
+        if metrics.classes == 0 {
+            blockers.push("ontology has no classes".to_string());
+        }
+        if metrics.relations == 0 {
+            blockers.push("ontology has no relations".to_string());
+        }
+        if metrics.signature_completeness < 0.98 {
+            blockers.push(format!(
+                "relation signature completeness {:.3} below 0.980",
+                metrics.signature_completeness
+            ));
+        }
+        EngineeringReleaseGate {
+            pass: blockers.is_empty(),
+            metrics,
+            blockers,
+        }
+    }
+
     fn relation_cycle(&self, start: &EngineeringRelationDef) -> Option<String> {
         let mut seen = BTreeSet::new();
         let mut current = Some(start);
@@ -1934,6 +2099,44 @@ impl EngineeringValidationReport {
     }
 }
 
+/// Structural metrics used by the ontology release gate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineeringStructureMetrics {
+    pub classes: usize,
+    pub relations: usize,
+    pub concerns: usize,
+    pub alphas: usize,
+    pub classes_with_properties: usize,
+    pub relations_with_signature: usize,
+    pub inverse_relations: usize,
+    pub transitive_relations: usize,
+    pub symmetric_relations: usize,
+    pub disjoint_pairs: usize,
+    pub max_hierarchy_depth: usize,
+    pub isolated_classes: usize,
+    pub weak_components: usize,
+    pub signature_completeness: f32,
+    pub property_coverage: f32,
+    pub inverse_coverage: f32,
+}
+
+/// Deterministic release decision for one ontology profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineeringReleaseGate {
+    pub pass: bool,
+    pub metrics: EngineeringStructureMetrics,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f32 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f32 / denominator as f32
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Default profile
 // ---------------------------------------------------------------------------
@@ -2776,6 +2979,25 @@ mod tests {
                 .values()
                 .any(|relation| relation.transitive)
         );
+    }
+
+    #[test]
+    fn default_ontology_release_gate_passes() {
+        let gate = default_engineering_ontology().release_gate();
+        assert!(gate.pass, "{gate:?}");
+        assert!(gate.metrics.classes > 0);
+        assert!(gate.metrics.relations > 0);
+        assert!(gate.metrics.transitive_relations > 0);
+        assert_eq!(gate.metrics.signature_completeness, 1.0);
+        assert!(gate.metrics.weak_components >= 1);
+    }
+
+    #[test]
+    fn empty_ontology_release_gate_blocks() {
+        let gate = EngineeringOntology::new("empty", 1, "empty").release_gate();
+        assert!(!gate.pass);
+        assert!(gate.blockers.iter().any(|reason| reason.contains("no classes")));
+        assert!(gate.blockers.iter().any(|reason| reason.contains("no relations")));
     }
 
     #[test]
