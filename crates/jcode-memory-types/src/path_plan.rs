@@ -7,7 +7,7 @@
 //! from the path itself, never invents missing world-state preconditions, and
 //! never executes anything.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +184,106 @@ fn parallel_groups(tasks: &[PathPlanTask]) -> (Vec<Vec<String>>, bool) {
     (groups, true)
 }
 
+const MAX_PLAN_TASKS: usize = 20;
+const MAX_PRECONDITION_DEPTH: usize = 2;
+
+fn is_precondition_relation(relation: &str) -> bool {
+    matches!(relation, REL_DEPENDS_ON | REL_BLOCKED_BY | "requires")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_precondition_tasks(
+    graph: &EngineeringGraph,
+    path_edges: &HashSet<&str>,
+    node: &str,
+    remaining_depth: usize,
+    main_task_count: usize,
+    tasks: &mut Vec<PathPlanTask>,
+    created: &mut BTreeMap<String, String>,
+    verification_queries: &mut Vec<PlanVerificationQuery>,
+    truncated: &mut bool,
+) -> Vec<String> {
+    if remaining_depth == 0 {
+        return Vec::new();
+    }
+    let mut dependencies = Vec::new();
+    for relation in graph.incoming(node) {
+        if path_edges.contains(relation.id.as_str())
+            || !is_precondition_relation(&relation.relation)
+        {
+            continue;
+        }
+        if let Some(id) = created.get(&relation.id) {
+            dependencies.push(id.clone());
+            continue;
+        }
+        if main_task_count + tasks.len() >= MAX_PLAN_TASKS {
+            *truncated = true;
+            break;
+        }
+        let depends_on = collect_precondition_tasks(
+            graph,
+            path_edges,
+            &relation.from,
+            remaining_depth - 1,
+            main_task_count,
+            tasks,
+            created,
+            verification_queries,
+            truncated,
+        );
+        if main_task_count + tasks.len() >= MAX_PLAN_TASKS {
+            *truncated = true;
+            break;
+        }
+        let id = format!("P{}", tasks.len() + 1);
+        let (_, _, success_check) = template(&relation.relation);
+        let from_label = graph
+            .entity(&relation.from)
+            .map(|entity| entity.name.clone())
+            .unwrap_or_else(|| relation.from.clone());
+        let to_label = graph
+            .entity(&relation.to)
+            .map(|entity| entity.name.clone())
+            .unwrap_or_else(|| relation.to.clone());
+        let confidence = if relation.confidence.is_finite() {
+            relation.confidence.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let evidence_ref = format!("path/precondition/{}", relation.id);
+        tasks.push(PathPlanTask {
+            id: id.clone(),
+            action_type: PlanActionType::Verify,
+            title: format!(
+                "Verify prerequisite {to_label} via {} from {from_label}",
+                relation.relation
+            ),
+            relation: relation.relation.clone(),
+            from: relation.from.clone(),
+            to: relation.to.clone(),
+            depends_on,
+            success_check: success_check.to_string(),
+            evidence_ref: evidence_ref.clone(),
+            risk: PlanRisk::Low,
+            approval: false,
+            confidence,
+            preconditions: vec![format!("{from_label} exists")],
+            postconditions: vec![format!("{to_label} satisfies '{success_check}'")],
+        });
+        verification_queries.push(PlanVerificationQuery {
+            id: format!("VQ-{id}"),
+            task_id: id.clone(),
+            query_ref: format!("path/precondition/{}/verify", relation.id),
+            expr: success_check.to_string(),
+            evidence_ref,
+        });
+        created.insert(relation.id.clone(), id.clone());
+        dependencies.push(id);
+    }
+    dependencies
+}
+
 fn template(relation: &str) -> (PlanActionType, PlanRisk, &'static str) {
     match relation {
         REL_DEPENDS_ON => (
@@ -275,10 +375,14 @@ fn task_title(
 /// exposes independent stages so callers can schedule them concurrently.
 pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> PathPlan {
     let mut tasks = Vec::with_capacity(path.relations.len());
+    let mut precondition_tasks = Vec::new();
     let mut verification_queries = Vec::with_capacity(path.relations.len());
     let mut rollback = Vec::new();
     let mut confidence = path.confidence;
     let mut previous: Option<String> = None;
+    let path_edges: HashSet<&str> = path.relations.iter().map(String::as_str).collect();
+    let mut created_preconditions = BTreeMap::new();
+    let mut closure_truncated = false;
     let source_path_id = format!(
         "PATH-{}",
         stable_plan_hash(
@@ -314,7 +418,18 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             .and_then(|id| graph.entity(id))
             .map(|entity| entity.name.clone())
             .unwrap_or_else(|| path.nodes.get(index + 1).cloned().unwrap_or_default());
-        let depends_on = previous.iter().cloned().collect();
+        let mut depends_on: Vec<String> = previous.iter().cloned().collect();
+        depends_on.extend(collect_precondition_tasks(
+            graph,
+            &path_edges,
+            &path.nodes[index],
+            MAX_PRECONDITION_DEPTH,
+            path.relations.len(),
+            &mut precondition_tasks,
+            &mut created_preconditions,
+            &mut verification_queries,
+            &mut closure_truncated,
+        ));
         let approval = action.has_side_effects() && risk != PlanRisk::Low;
         let from_class = graph
             .entity(&path.nodes[index])
@@ -355,6 +470,10 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
         }
         previous = Some(id);
     }
+    tasks.extend(precondition_tasks);
+    confidence = tasks
+        .iter()
+        .fold(confidence, |current, task| current.min(task.confidence));
 
     let mut warnings = Vec::new();
     if tasks.len() > 20 {
@@ -372,6 +491,11 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
                 task.approval = true;
             }
         }
+    }
+    if closure_truncated {
+        warnings.push(format!(
+            "precondition closure truncated at {MAX_PLAN_TASKS} tasks; split before execution"
+        ));
     }
     let (groups, acyclic) = parallel_groups(&tasks);
     if !acyclic {
@@ -449,6 +573,64 @@ mod tests {
         assert_eq!(plan.rollback.len(), 1);
         assert!(!plan.tasks[0].preconditions.is_empty());
         assert!(!plan.tasks[0].postconditions.is_empty());
+    }
+
+    #[test]
+    fn precondition_closure_adds_parallel_verify_tasks() {
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t0", "Prepare"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "Fix build"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        graph.insert_relation(EngineeringRelation::new("task:t0", REL_DEPENDS_ON, "task:t1"));
+        graph.insert_relation(EngineeringRelation::new("task:t1", REL_BLOCKED_BY, "error:e1"));
+        graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
+        let path = graph
+            .weighted_shortest_path("task:t1", "change:c1", 3, &[])
+            .expect("path");
+        let plan = build_path_plan(&graph, &path);
+
+        assert_eq!(plan.tasks.len(), 3, "{plan:?}");
+        let precondition = plan
+            .tasks
+            .iter()
+            .find(|task| task.id.starts_with('P'))
+            .expect("precondition task");
+        assert_eq!(precondition.action_type, PlanActionType::Verify);
+        assert_eq!(precondition.relation, REL_DEPENDS_ON);
+        assert_eq!(plan.verification_queries.len(), 3);
+        assert!(
+            plan.task("T1")
+                .expect("T1")
+                .depends_on
+                .contains(&precondition.id)
+        );
+        assert!(plan.parallel_groups[0].contains(&precondition.id));
+    }
+
+    #[test]
+    fn precondition_closure_stops_at_task_budget() {
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "Fix build"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        for index in 0..25 {
+            let id = format!("task:p{index}");
+            graph.insert_entity(EngineeringEntity::new(CLASS_TASK, &id, &id));
+            graph.insert_relation(EngineeringRelation::new(&id, REL_DEPENDS_ON, "task:t1"));
+        }
+        graph.insert_relation(EngineeringRelation::new("task:t1", REL_BLOCKED_BY, "error:e1"));
+        graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
+        let path = graph
+            .weighted_shortest_path("task:t1", "change:c1", 3, &[])
+            .expect("path");
+        let plan = build_path_plan(&graph, &path);
+        assert_eq!(plan.tasks.len(), MAX_PLAN_TASKS);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("precondition closure truncated"))
+        );
     }
 
     #[test]
