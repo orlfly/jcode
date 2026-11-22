@@ -5153,7 +5153,15 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
                 },
             )
             .expect("denied relation query");
-        assert!(denied.paths.is_empty(), "{denied:?}");
+        assert_eq!(denied.paths.len(), 1, "{denied:?}");
+        assert!(denied.diagnosis.iter().any(|code| code == "E04"), "{denied:?}");
+        assert!(
+            denied
+                .relaxations
+                .iter()
+                .any(|relaxation| relaxation == "deny_relations -> none"),
+            "{denied:?}"
+        );
 
         let missing = manager
             .paths_between_anchors(
@@ -5168,6 +5176,15 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
         assert!(missing.paths.is_empty(), "{missing:?}");
         assert_eq!(missing.unresolved_from, vec!["missing-anchor"]);
         assert_eq!(missing.diagnosis, vec!["E01"]);
+        let gap = missing.knowledge_gap.as_ref().expect("knowledge gap");
+        assert_eq!(gap.status, "no_path");
+        assert_eq!(gap.missing.entities, vec!["missing-anchor"]);
+        assert_eq!(gap.attempted_levels, vec!["L2"]);
+        assert!(
+            gap.suggested_sources
+                .iter()
+                .any(|source| source == "entity resolver")
+        );
 
         let suggested = manager
             .paths_between_anchors(

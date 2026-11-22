@@ -290,6 +290,10 @@ pub struct MemoryPathQueryOutcome {
     /// L1 grounding suggestions for anchors that did not resolve.
     #[serde(default)]
     pub anchor_suggestions: Vec<AnchorSuggestion>,
+    /// Structured no-path report with missing facts, attempted levels and
+    /// recommended sources. Present only when no path was found.
+    #[serde(default)]
+    pub knowledge_gap: Option<jcode_memory_types::KnowledgeGap>,
     pub stores_searched: usize,
     pub depth: usize,
 }
@@ -378,6 +382,33 @@ const MAX_RELAXED_PATH_DEPTH: usize = 16;
 fn finalize_path_outcome(mut outcome: MemoryPathQueryOutcome) -> MemoryPathQueryOutcome {
     outcome.missing_classes = jcode_memory_types::missing_classes_for(&outcome.diagnosis);
     outcome.next_actions = jcode_memory_types::next_actions_for(&outcome.diagnosis);
+    if outcome.paths.is_empty() {
+        let mut entities = Vec::new();
+        for anchor in outcome
+            .unresolved_from
+            .iter()
+            .chain(outcome.unresolved_to.iter())
+        {
+            if !entities.iter().any(|seen| seen == anchor) {
+                entities.push(anchor.clone());
+            }
+        }
+        let alignments: Vec<String> = outcome
+            .alignment_candidates
+            .iter()
+            .map(|candidate| format!("{} same_as {}", candidate.from_id, candidate.to_id))
+            .collect();
+        let has_candidates = !outcome.anchor_suggestions.is_empty() || !alignments.is_empty();
+        outcome.knowledge_gap = Some(jcode_memory_types::KnowledgeGap::build(
+            outcome.diagnosis.clone(),
+            entities,
+            outcome.unknown_relations.clone(),
+            alignments,
+            has_candidates,
+        ));
+    } else {
+        outcome.knowledge_gap = None;
+    }
     outcome
 }
 

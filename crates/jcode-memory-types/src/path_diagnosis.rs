@@ -4,6 +4,8 @@
 //! module owns the stable code-to-class-to-first-repair mapping so callers do
 //! not have to re-implement the ladder per surface.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Whether a missing path is the graph's fault or the query's fault.
@@ -13,6 +15,106 @@ pub enum PathMissingClass {
     OntologySilence,
     SemanticGap,
     QuerySide,
+}
+
+/// Concrete missing facts attached to a no-path result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeGapMissing {
+    #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default)]
+    pub relations: Vec<String>,
+    #[serde(default)]
+    pub alignments: Vec<String>,
+}
+
+/// Structured report returned when L0-L5 cannot produce a path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeGap {
+    pub status: String,
+    pub diagnosis: Vec<String>,
+    #[serde(default)]
+    pub missing_class: BTreeMap<String, String>,
+    pub missing: KnowledgeGapMissing,
+    #[serde(default)]
+    pub attempted_levels: Vec<String>,
+    #[serde(default)]
+    pub suggested_sources: Vec<String>,
+    pub degraded_answer: String,
+    pub confidence: f32,
+}
+
+impl KnowledgeGap {
+    /// Build a deterministic gap report from query diagnostics and candidates.
+    pub fn build(
+        diagnosis: Vec<String>,
+        unresolved_entities: Vec<String>,
+        missing_relations: Vec<String>,
+        missing_alignments: Vec<String>,
+        has_candidates: bool,
+    ) -> Self {
+        let mut missing_class = BTreeMap::new();
+        let mut attempted_levels = Vec::new();
+        let mut suggested_sources = Vec::new();
+        for code in &diagnosis {
+            let Some(parsed) = PathDiagnosisCode::parse(code) else {
+                continue;
+            };
+            missing_class.insert(
+                parsed.as_str().to_string(),
+                parsed.missing_class().as_str().to_string(),
+            );
+            let level = match parsed {
+                PathDiagnosisCode::E04
+                | PathDiagnosisCode::E05
+                | PathDiagnosisCode::E06
+                | PathDiagnosisCode::E07
+                | PathDiagnosisCode::E08 => "L0",
+                PathDiagnosisCode::E10 => "L1",
+                PathDiagnosisCode::E01
+                | PathDiagnosisCode::E02
+                | PathDiagnosisCode::E09 => "L2",
+                PathDiagnosisCode::E03 => "L3",
+            };
+            if !attempted_levels.iter().any(|seen| seen == level) {
+                attempted_levels.push(level.to_string());
+            }
+            for source in match parsed {
+                PathDiagnosisCode::E01 => vec!["entity resolver"],
+                PathDiagnosisCode::E02 | PathDiagnosisCode::E10 => vec!["ontology registry"],
+                PathDiagnosisCode::E03 => vec!["document or evidence extraction"],
+                PathDiagnosisCode::E09 => vec!["alignment registry"],
+                _ => Vec::new(),
+            } {
+                if !suggested_sources.iter().any(|seen| seen == source) {
+                    suggested_sources.push(source.to_string());
+                }
+            }
+        }
+        if suggested_sources.is_empty() {
+            suggested_sources.push("memory graph".to_string());
+        }
+        KnowledgeGap {
+            status: "no_path".to_string(),
+            diagnosis,
+            missing_class,
+            missing: KnowledgeGapMissing {
+                entities: unresolved_entities,
+                relations: missing_relations,
+                alignments: missing_alignments,
+            },
+            attempted_levels,
+            suggested_sources,
+            degraded_answer: if has_candidates {
+                "No confirmed path; review candidate anchors or alignments before answering."
+                    .to_string()
+            } else {
+                "No path found; answer only with an explicit missing-knowledge disclosure."
+                    .to_string()
+            },
+            confidence: if has_candidates { 0.35 } else { 0.2 },
+        }
+    }
 }
 
 impl PathMissingClass {
@@ -178,5 +280,29 @@ mod tests {
             missing_classes_for(&codes),
             vec!["query_side".to_string(), "semantic_gap".to_string()]
         );
+    }
+
+    #[test]
+    fn knowledge_gap_maps_levels_missing_facts_and_sources() {
+        let gap = KnowledgeGap::build(
+            vec!["E01".to_string(), "E03".to_string()],
+            vec!["missing:anchor".to_string()],
+            vec!["supplies".to_string()],
+            vec!["a same_as b".to_string()],
+            true,
+        );
+        assert_eq!(gap.status, "no_path");
+        assert_eq!(gap.diagnosis.len(), 2);
+        assert_eq!(
+            gap.missing_class.get("E01").map(String::as_str),
+            Some("semantic_gap")
+        );
+        assert_eq!(gap.missing.entities, vec!["missing:anchor"]);
+        assert_eq!(gap.missing.relations, vec!["supplies"]);
+        assert_eq!(gap.missing.alignments, vec!["a same_as b"]);
+        assert_eq!(gap.attempted_levels, vec!["L2", "L3"]);
+        assert!(gap.suggested_sources.iter().any(|source| source == "entity resolver"));
+        assert_eq!(gap.confidence, 0.35);
+        assert!(gap.degraded_answer.contains("candidate"));
     }
 }

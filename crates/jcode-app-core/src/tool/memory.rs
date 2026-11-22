@@ -1234,6 +1234,19 @@ impl Tool for MemoryTool {
                         outcome.missing_classes.join(", ")
                     ));
                 }
+                if let Some(gap) = &outcome.knowledge_gap {
+                    diagnostics.push(format!(
+                        "knowledge gap: status {}; entities [{}]; relations [{}]; alignments [{}]; levels [{}]; sources [{}]; confidence {:.2}; {}",
+                        gap.status,
+                        gap.missing.entities.join(", "),
+                        gap.missing.relations.join(", "),
+                        gap.missing.alignments.join(", "),
+                        gap.attempted_levels.join(", "),
+                        gap.suggested_sources.join(", "),
+                        gap.confidence,
+                        gap.degraded_answer
+                    ));
+                }
                 for action in &outcome.next_actions {
                     diagnostics.push(format!("next action: {action}"));
                 }
@@ -2628,11 +2641,30 @@ mod tests {
             .await
             .expect("deny relation query")
             .output;
-        assert!(denied.contains("No memory path found"), "{denied}");
+        assert!(denied.contains("Found 1 memory path(s)"), "{denied}");
+        assert!(denied.contains("diagnosis: E04"), "{denied}");
         assert!(
-            denied.contains("query constraints excluded all candidate paths"),
+            denied.contains("relaxation: deny_relations -> none"),
             "{denied}"
         );
+
+        let gap = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":"missing:anchor",
+                    "to_id":"mem_path_b",
+                    "scope":"project",
+                    "depth":3
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("knowledge gap query")
+            .output;
+        assert!(gap.contains("knowledge gap: status no_path"), "{gap}");
+        assert!(gap.contains("entities [missing:anchor]"), "{gap}");
+        assert!(gap.contains("levels [L2]"), "{gap}");
 
         let invalid = tool
             .execute(
