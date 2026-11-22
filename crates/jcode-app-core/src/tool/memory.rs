@@ -245,7 +245,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "compile", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -1457,6 +1457,46 @@ impl Tool for MemoryTool {
                         "unknown review action: {other}; use list, accept, reject or defer"
                     )),
                 }
+            }
+            "compile" => {
+                let text = input
+                    .query
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("query required for compile"))?;
+                let graph_kind = input.graph.as_deref().unwrap_or("memory");
+                if !matches!(graph_kind, "memory" | "engineering" | "ontology") {
+                    return Err(anyhow::anyhow!(
+                        "Unknown compile graph: {graph_kind}. Use memory, engineering, or ontology"
+                    ));
+                }
+                // Always offer the engineering vocabulary so a `graph
+                // engineering` token inside the text can validate even when the
+                // caller left the separate `graph` field at its default.
+                let allowed: Vec<String> =
+                    crate::memory_types::engineering_ontology::default_engineering_ontology()
+                        .relations
+                        .keys()
+                        .cloned()
+                        .collect();
+                let allowed_refs: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                let compile_text = if graph_kind != "memory"
+                    && !text.to_ascii_lowercase().contains("graph")
+                {
+                    format!("{text} graph {graph_kind}")
+                } else {
+                    text.to_string()
+                };
+                let query = crate::memory_types::path_query::compile_path_query_text(
+                    &compile_text,
+                    &allowed_refs,
+                )
+                .map_err(|errors| {
+                    anyhow::anyhow!("path query compile failed: {}", errors.join("; "))
+                })?;
+                Ok(ToolOutput::new(format!(
+                    "Compiled PathQuery:\n{}",
+                    serde_json::to_string_pretty(&query)?
+                )))
             }
             "belief" => {
                 let raw = input
@@ -3174,6 +3214,30 @@ mod tests {
         assert!(output.output.contains("concept:api"), "{}", output.output);
         assert!(output.output.contains("instance_of"), "{}", output.output);
         assert!(output.output.contains("has_instance"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn compile_action_returns_structured_path_query() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "query":"from \"file:src/lib.rs\" to \"api:/task\" graph engineering relations defines implements depth 3 limit 2"
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("compile");
+        assert!(output.output.contains("Compiled PathQuery"), "{}", output.output);
+        assert!(output.output.contains("\"engineering\""), "{}", output.output);
+        assert!(output.output.contains("file:src/lib.rs"), "{}", output.output);
+        assert!(output.output.contains("api:/task"), "{}", output.output);
+        assert!(output.output.contains("\"defines\""), "{}", output.output);
+        assert!(output.output.contains("\"depth\": 3"), "{}", output.output);
     }
 
     #[tokio::test]

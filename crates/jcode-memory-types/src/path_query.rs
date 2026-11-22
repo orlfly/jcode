@@ -209,6 +209,228 @@ impl PathQuery {
     }
 }
 
+const QUERY_KEYS: [&str; 10] = [
+    "from",
+    "to",
+    "via",
+    "graph",
+    "relations",
+    "deny_relations",
+    "scope",
+    "depth",
+    "limit",
+    "objective",
+];
+
+fn query_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' | '`' => {
+                while let Some(inner) = chars.next() {
+                    if inner == ch {
+                        break;
+                    }
+                    current.push(inner);
+                }
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            '[' => {
+                while let Some(inner) = chars.next() {
+                    if inner == ']' {
+                        break;
+                    }
+                    current.push(inner);
+                }
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            ch if ch.is_whitespace() || ch == ',' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_query_key(token: &str) -> bool {
+    QUERY_KEYS
+        .iter()
+        .any(|key| token.trim_end_matches('=').eq_ignore_ascii_case(key))
+}
+
+fn normalize_key(token: &str) -> String {
+    token
+        .trim_end_matches('=')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Compile a compact text form into the structured [`PathQuery`] IR.
+///
+/// This is the deterministic template stage of NL -> PathQuery, not an LLM
+/// parser. It accepts `key value` pairs such as:
+///
+/// ```text
+/// from "file:src/lib.rs" to "api:/task" graph engineering \
+///   relations defines,implements depth 3 limit 2
+/// ```
+///
+/// Unknown prose is ignored, relation names are checked against the supplied
+/// allow-list (or the memory [`EdgeKind`] registry for memory graphs), and the
+/// final query still goes through [`PathQuery::validate`].
+pub fn compile_path_query_text(
+    text: &str,
+    allowed_relations: &[&str],
+) -> Result<PathQuery, Vec<String>> {
+    let tokens = query_tokens(text);
+    let mut start = Vec::new();
+    let mut goal = Vec::new();
+    let mut waypoints = Vec::new();
+    let mut relations = Vec::new();
+    let mut deny_relations = Vec::new();
+    let mut graph = None;
+    let mut scope = None;
+    let mut depth = None;
+    let mut limit = None;
+    let mut objective = None;
+    let mut errors = Vec::new();
+
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if !is_query_key(token) {
+            index += 1;
+            continue;
+        }
+        let key = normalize_key(token);
+        index += 1;
+        let mut values = Vec::new();
+        while index < tokens.len() && !is_query_key(&tokens[index]) {
+            let value = tokens[index].trim();
+            if value.is_empty() {
+                index += 1;
+                continue;
+            }
+            if matches!(value, "and" | "with" | "using") {
+                index += 1;
+                continue;
+            }
+            values.push(value.to_string());
+            index += 1;
+            if !matches!(
+                key.as_str(),
+                "from" | "to" | "via" | "relations" | "deny_relations"
+            ) {
+                break;
+            }
+        }
+        if values.is_empty() {
+            errors.push(format!("{key} requires a value"));
+            continue;
+        }
+        match key.as_str() {
+            "from" => start.extend(values),
+            "to" => goal.extend(values),
+            "via" => waypoints.extend(values),
+            "relations" => {
+                relations.extend(values.into_iter().flat_map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                }));
+            }
+            "deny_relations" => {
+                deny_relations.extend(values.into_iter().flat_map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                }));
+            }
+            "graph" => match PathGraphKind::parse(&values[0]) {
+                Some(value) => graph = Some(value),
+                None => errors.push(format!("invalid graph: {}", values[0])),
+            },
+            "scope" => match PathQueryScope::parse(&values[0]) {
+                Some(value) => scope = Some(value),
+                None => errors.push(format!("invalid scope: {}", values[0])),
+            },
+            "depth" => match values[0].parse::<usize>() {
+                Ok(value) => depth = Some(value),
+                Err(_) => errors.push(format!("invalid depth: {}", values[0])),
+            },
+            "limit" => match values[0].parse::<usize>() {
+                Ok(value) => limit = Some(value),
+                Err(_) => errors.push(format!("invalid limit: {}", values[0])),
+            },
+            "objective" => match values[0].to_ascii_lowercase().as_str() {
+                "min_cost" | "cost" => objective = Some(PathObjective::MinCost),
+                "max_confidence" | "confidence" => {
+                    objective = Some(PathObjective::MaxConfidence)
+                }
+                other => errors.push(format!("invalid objective: {other}")),
+            },
+            _ => {}
+        }
+    }
+
+    let graph_kind = graph.unwrap_or(PathGraphKind::Memory);
+    for relation in relations.iter().chain(deny_relations.iter()) {
+        let known = match graph_kind {
+            PathGraphKind::Memory => EdgeKind::parse(relation).is_some(),
+            PathGraphKind::Engineering | PathGraphKind::Ontology => {
+                allowed_relations
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(relation))
+            }
+        };
+        if !known {
+            errors.push(format!("unknown relation: {relation}"));
+        }
+    }
+
+    let query = PathQuery {
+        start,
+        goal,
+        waypoints,
+        graph,
+        constraints: PathQueryConstraints {
+            relations,
+            deny_relations,
+            depth,
+            limit,
+            scope,
+            objective,
+            ..PathQueryConstraints::default()
+        },
+    };
+    if let Err(validation) = query.validate() {
+        errors.extend(validation);
+    }
+    if errors.is_empty() {
+        Ok(query)
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +519,53 @@ mod tests {
         };
         assert_eq!(query.graph_kind(), PathGraphKind::Ontology);
         assert!(query.validate().is_ok());
+    }
+
+    #[test]
+    fn compiles_engineering_template_with_quoted_anchors() {
+        let query = compile_path_query_text(
+            "find from \"file:src/lib.rs\" to `api:/task` graph engineering \
+             relations defines implements depth 3 limit 2",
+            &["defines", "implements"],
+        )
+        .expect("compile");
+        assert_eq!(query.graph_kind(), PathGraphKind::Engineering);
+        assert_eq!(query.start, vec!["file:src/lib.rs"]);
+        assert_eq!(query.goal, vec!["api:/task"]);
+        assert_eq!(query.constraints.relations, vec!["defines", "implements"]);
+        assert_eq!(query.constraints.depth, Some(3));
+        assert_eq!(query.constraints.limit, Some(2));
+    }
+
+    #[test]
+    fn compile_rejects_unknown_relations_and_missing_goal() {
+        let errors = compile_path_query_text(
+            "from a graph engineering relations teleports to b",
+            &["defines"],
+        )
+        .expect_err("unknown relation");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown relation: teleports")),
+            "{errors:?}"
+        );
+
+        let errors = compile_path_query_text("from a depth 2", &[]).expect_err("missing goal");
+        assert!(
+            errors.iter().any(|error| error.contains("goal")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn compiles_memory_template_with_known_edge_kind() {
+        let query = compile_path_query_text(
+            "from mem:one to mem:two relations relates_to depth 2",
+            &[],
+        )
+        .expect("compile");
+        assert_eq!(query.graph_kind(), PathGraphKind::Memory);
+        assert_eq!(query.constraints.relations, vec!["relates_to"]);
     }
 }
