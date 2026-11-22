@@ -3407,6 +3407,9 @@ mod tests {
         assert!(output.contains("\"alignment_edges\": 1"), "{output}");
         assert!(output.contains("\"orphan_ratio\""), "{output}");
         assert!(output.contains("\"provenance_coverage\""), "{output}");
+        assert!(output.contains("\"findings\""), "{output}");
+        assert!(output.contains("Q01"), "{output}");
+        assert!(output.contains("\"healthy\": false"), "{output}");
     }
 
     #[tokio::test]

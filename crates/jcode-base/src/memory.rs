@@ -57,7 +57,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-pub use quality::{GraphQualityReport, StoreQuality};
+pub use quality::{GraphQualityReport, QualityFinding, QualitySeverity, StoreQuality};
 use cache::{cache_graph, cached_graph};
 pub use jcode_memory_types::{
     AdmissionTier, ChangeLevel, ConfirmationGate, MemoryReviewItem, MemoryReviewState,

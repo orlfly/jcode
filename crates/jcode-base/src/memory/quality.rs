@@ -13,6 +13,38 @@ use serde::{Deserialize, Serialize};
 use super::{HIGH_DEGREE_HUB, STALE_EDGE_DAYS};
 use crate::memory_graph::{EdgeKind, MemoryGraph};
 
+/// Maximum tolerated orphan ratio before a governance finding is emitted.
+pub const MAX_ORPHAN_RATIO: f32 = 0.30;
+/// Minimum tolerated provenance coverage.
+pub const MIN_PROVENANCE_COVERAGE: f32 = 0.50;
+/// Minimum tolerated largest-component ratio.
+pub const MIN_LARGEST_COMPONENT_RATIO: f32 = 0.80;
+/// Maximum tolerated pending-hypothesis edge ratio.
+pub const MAX_HYPOTHESIZED_RATIO: f32 = 0.10;
+/// Maximum tolerated stale-node ratio.
+pub const MAX_STALE_RATIO: f32 = 0.25;
+/// Maximum tolerated hub ratio.
+pub const MAX_HUB_RATIO: f32 = 0.05;
+
+/// Severity of one governance finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualitySeverity {
+    Warning,
+    Critical,
+}
+
+/// One actionable quality-threshold breach.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualityFinding {
+    pub code: String,
+    pub severity: QualitySeverity,
+    pub metric: String,
+    pub value: f32,
+    pub threshold: f32,
+    pub action: String,
+}
+
 /// Per-store quality counts. Ratios are computed by the caller so multiple
 /// stores can be aggregated without losing the raw denominators.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -45,6 +77,12 @@ pub struct GraphQualityReport {
     pub hypothesized_ratio: f32,
     pub stale_ratio: f32,
     pub pending_shadow_edges: usize,
+    /// Threshold breaches with deterministic repair suggestions.
+    #[serde(default)]
+    pub findings: Vec<QualityFinding>,
+    /// True when no threshold is breached.
+    #[serde(default)]
+    pub healthy: bool,
     pub stores: Vec<StoreQuality>,
 }
 
@@ -174,7 +212,7 @@ pub fn aggregate(
         .map(|store| ratio(store.largest_component, store.memories))
         .fold(0.0f32, f32::max);
 
-    GraphQualityReport {
+    let mut report = GraphQualityReport {
         scope: scope.to_string(),
         memories,
         memory_edges,
@@ -191,8 +229,110 @@ pub fn aggregate(
         hypothesized_ratio: ratio(hypothesized_edges, memory_edges),
         stale_ratio: ratio(stale_nodes, memories),
         pending_shadow_edges,
+        findings: Vec::new(),
+        healthy: true,
         stores,
+    };
+    report.findings = diagnose(&report);
+    report.healthy = report.findings.is_empty();
+    report
+}
+
+fn finding(
+    code: &str,
+    severity: QualitySeverity,
+    metric: &str,
+    value: f32,
+    threshold: f32,
+    action: &str,
+) -> QualityFinding {
+    QualityFinding {
+        code: code.to_string(),
+        severity,
+        metric: metric.to_string(),
+        value,
+        threshold,
+        action: action.to_string(),
     }
+}
+
+/// Derive deterministic governance findings from one report.
+pub fn diagnose(report: &GraphQualityReport) -> Vec<QualityFinding> {
+    if report.memories == 0 {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    if report.largest_component_ratio < MIN_LARGEST_COMPONENT_RATIO {
+        findings.push(finding(
+            "Q01",
+            QualitySeverity::Critical,
+            "largest_component_ratio",
+            report.largest_component_ratio,
+            MIN_LARGEST_COMPONENT_RATIO,
+            "connect or archive disconnected memory components",
+        ));
+    }
+    if report.orphan_ratio > MAX_ORPHAN_RATIO {
+        findings.push(finding(
+            "Q02",
+            QualitySeverity::Warning,
+            "orphan_ratio",
+            report.orphan_ratio,
+            MAX_ORPHAN_RATIO,
+            "link orphan memories to a subject or archive them",
+        ));
+    }
+    if report.provenance_coverage < MIN_PROVENANCE_COVERAGE {
+        findings.push(finding(
+            "Q03",
+            QualitySeverity::Critical,
+            "provenance_coverage",
+            report.provenance_coverage,
+            MIN_PROVENANCE_COVERAGE,
+            "backfill source locators before using these paths as evidence",
+        ));
+    }
+    if report.hypothesized_ratio > MAX_HYPOTHESIZED_RATIO {
+        findings.push(finding(
+            "Q04",
+            QualitySeverity::Critical,
+            "hypothesized_ratio",
+            report.hypothesized_ratio,
+            MAX_HYPOTHESIZED_RATIO,
+            "promote or reject pending hypothesis edges before planning",
+        ));
+    }
+    if report.pending_shadow_edges > 0 {
+        findings.push(finding(
+            "Q05",
+            QualitySeverity::Warning,
+            "pending_shadow_edges",
+            report.pending_shadow_edges as f32,
+            0.0,
+            "review the pending shadow-edge queue",
+        ));
+    }
+    if report.stale_ratio > MAX_STALE_RATIO {
+        findings.push(finding(
+            "Q06",
+            QualitySeverity::Warning,
+            "stale_ratio",
+            report.stale_ratio,
+            MAX_STALE_RATIO,
+            "refresh or expire stale memories",
+        ));
+    }
+    if report.hub_ratio > MAX_HUB_RATIO {
+        findings.push(finding(
+            "Q07",
+            QualitySeverity::Warning,
+            "hub_ratio",
+            report.hub_ratio,
+            MAX_HUB_RATIO,
+            "split high-degree hubs or add selective waypoints",
+        ));
+    }
+    findings
 }
 
 #[cfg(test)]
@@ -216,6 +356,9 @@ mod tests {
         let report = aggregate("project", vec![quality], 0);
         assert!((report.alignment_rate - 1.0 / 3.0).abs() < 0.001);
         assert!((report.orphan_ratio - 1.0 / 3.0).abs() < 0.001);
+        assert!(!report.healthy);
+        assert!(report.findings.iter().any(|finding| finding.code == "Q01"));
+        assert!(report.findings.iter().any(|finding| finding.code == "Q03"));
         assert!(c != a);
     }
 
@@ -230,5 +373,6 @@ mod tests {
         assert_eq!(report.average_degree, 0.0);
         assert_eq!(report.largest_component_ratio, 0.0);
         assert_eq!(report.provenance_coverage, 0.0);
+        assert!(report.healthy);
     }
 }
