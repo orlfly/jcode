@@ -85,10 +85,10 @@ struct MemoryInput {
     /// For path action: canonical EdgeKind names to allow. Empty means all.
     #[serde(default)]
     relation_allow: Option<Vec<String>>,
-    /// For path action: memory (default) or engineering.
+    /// For path action: memory (default), engineering, or ontology.
     #[serde(default)]
     graph: Option<String>,
-    /// For engineering paths: include the deterministic PathPlan.
+    /// For engineering or ontology paths: include the deterministic PathPlan.
     #[serde(default)]
     plan: Option<bool>,
     /// For action=path: structured PathQuery IR.
@@ -286,12 +286,12 @@ impl Tool for MemoryTool {
                 },
                 "graph": {
                     "type": "string",
-                    "enum": ["memory", "engineering"],
-                    "description": "For path: memory (default) or engineering graph."
+                    "enum": ["memory", "engineering", "ontology"],
+                    "description": "For path: memory, engineering, or ontology graph."
                 },
                 "plan": {
                     "type": "boolean",
-                    "description": "For engineering path: include deterministic PathPlan."
+                    "description": "For engineering/ontology path: include PathPlan."
                 },
                 "path_query": {
                     "type": "object",
@@ -1074,7 +1074,7 @@ impl Tool for MemoryTool {
                         "to_id, to_anchors, or path_query.goal required for path"
                     ));
                 }
-                if graph_kind == "engineering" {
+                if graph_kind == "engineering" || graph_kind == "ontology" {
                     if query_filters.is_some() {
                         return Err(anyhow::anyhow!(
                             "path_query deny_relations/min_confidence/objective are only supported for the memory graph"
@@ -1087,11 +1087,12 @@ impl Tool for MemoryTool {
                         limit,
                         &relations,
                         include_plan,
+                        &graph_kind,
                     );
                 }
                 if graph_kind != "memory" {
                     return Err(anyhow::anyhow!(
-                        "Unknown path graph: {graph_kind}. Use memory or engineering"
+                        "Unknown path graph: {graph_kind}. Use memory, engineering, or ontology"
                     ));
                 }
 
@@ -1992,21 +1993,35 @@ impl MemoryTool {
         limit: usize,
         relations: &[String],
         include_plan: bool,
+        graph_kind: &str,
     ) -> Result<ToolOutput> {
         if limit == 0 {
-            return Ok(ToolOutput::new("No engineering paths requested."));
+            return Ok(ToolOutput::new("No graph paths requested."));
         }
-        let store = EngineeringStore::open_default()
-            .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
         let allowed: Vec<&str> = relations.iter().map(String::as_str).collect();
         let mut hits = Vec::new();
-        for from in froms {
-            for to in tos {
-                hits.extend(
-                    store
-                        .path_between_anchors(from, to, depth, limit, &allowed)
-                        .map_err(|error| anyhow::anyhow!("engineering path query: {error}"))?,
-                );
+        if graph_kind == "ontology" {
+            for from in froms {
+                for to in tos {
+                    hits.extend(
+                        EngineeringStore::ontology_path_between_anchors(
+                            from, to, depth, limit, &allowed,
+                        )
+                        .map_err(|error| anyhow::anyhow!("ontology path query: {error}"))?,
+                    );
+                }
+            }
+        } else {
+            let store = EngineeringStore::open_default()
+                .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+            for from in froms {
+                for to in tos {
+                    hits.extend(
+                        store
+                            .path_between_anchors(from, to, depth, limit, &allowed)
+                            .map_err(|error| anyhow::anyhow!("engineering path query: {error}"))?,
+                    );
+                }
             }
         }
         hits.sort_by(|left, right| {
@@ -2021,8 +2036,13 @@ impl MemoryTool {
         hits.truncate(limit);
 
         if hits.is_empty() {
+            let layer = if graph_kind == "ontology" {
+                "ontology concept"
+            } else {
+                "engineering"
+            };
             let mut out = format!(
-                "No engineering path found from [{}] to [{}] within depth {}.",
+                "No {layer} path found from [{}] to [{}] within depth {}.",
                 froms.join(", "),
                 tos.join(", "),
                 depth.clamp(1, 16)
@@ -2036,8 +2056,13 @@ impl MemoryTool {
             return Ok(ToolOutput::new(out));
         }
 
+        let layer = if graph_kind == "ontology" {
+            "ontology concept"
+        } else {
+            "engineering"
+        };
         let mut out = format!(
-            "Found {} engineering path(s) from [{}] to [{}] (depth {}):\n",
+            "Found {} {layer} path(s) from [{}] to [{}] (depth {}):\n",
             hits.len(),
             froms.join(", "),
             tos.join(", "),
@@ -2045,7 +2070,9 @@ impl MemoryTool {
         );
         let mut current_session = None;
         for (index, hit) in hits.iter().enumerate() {
-            if current_session.as_deref() != Some(hit.session_id.as_str()) {
+            if graph_kind != "ontology"
+                && current_session.as_deref() != Some(hit.session_id.as_str())
+            {
                 out.push_str(&format!("\n## session {}\n", hit.session_id));
                 if let Some(working_dir) = hit.working_dir.as_deref() {
                     out.push_str(&format!("working_dir: {working_dir}\n"));
@@ -3056,6 +3083,38 @@ mod tests {
         assert!(output.output.contains("plan: confidence"), "{}", output.output);
         assert!(output.output.contains("success:"), "{}", output.output);
         assert!(output.output.contains("evidence:"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn path_action_queries_ontology_concept_layer() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"ontology",
+                    "from_id":"File",
+                    "to_id":"API",
+                    "relation_allow":["defines"],
+                    "plan":true,
+                    "depth":2
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("ontology path");
+        assert!(
+            output.output.contains("Found 1 ontology concept path(s)"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("concept:file"), "{}", output.output);
+        assert!(output.output.contains("concept:api"), "{}", output.output);
+        assert!(output.output.contains("defines"), "{}", output.output);
+        assert!(output.output.contains("plan: confidence"), "{}", output.output);
     }
 
     #[tokio::test]

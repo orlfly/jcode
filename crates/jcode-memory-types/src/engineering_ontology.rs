@@ -88,9 +88,20 @@ pub const REL_SUPERSEDES: &str = "supersedes";
 pub const REL_TESTS: &str = "tests";
 pub const REL_USES: &str = "uses";
 pub const REL_VERIFIES: &str = "verifies";
+/// Concept-layer edge from an entity to its declared ontology class.
+pub const REL_INSTANCE_OF: &str = "instance_of";
+/// Query-time inverse of `instance_of`, from a class to its instances.
+pub const REL_HAS_INSTANCE: &str = "has_instance";
+/// Concept-layer edge from a subclass to its parent class.
+pub const REL_SUBCLASS_OF: &str = "subclass_of";
 
 /// Wildcard used by permissive relations such as `evidenced_by`.
 pub const CLASS_WILDCARD: &str = "*";
+
+/// Stable node id for an ontology class in a concept-query graph.
+pub fn concept_node_id(class_id: &str) -> String {
+    format!("concept:{}", class_id.trim())
+}
 
 // ---------------------------------------------------------------------------
 // Schema value types
@@ -829,6 +840,146 @@ fn scaled_cost(cost: f64) -> u64 {
 impl EngineeringGraph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Project an ontology's classes and relation signatures into a queryable
+    /// concept graph.
+    ///
+    /// Class nodes use `concept:<class-id>` ids. Every declared domain/range
+    /// pair becomes one relation edge, so the result can be searched by the
+    /// same Dijkstra/Yen engine as an instance graph. Wildcard signatures are
+    /// skipped because they do not name a concrete pair of concepts.
+    pub fn concept_graph(ontology: &EngineeringOntology) -> Self {
+        let mut graph = Self::new();
+        for class in ontology.classes.values() {
+            let mut entity = EngineeringEntity::new(
+                class.id.clone(),
+                concept_node_id(&class.id),
+                class.display_name.clone(),
+            )
+            .with_property("concept", Value::Bool(true))
+            .with_property("class_id", Value::String(class.id.clone()))
+            .with_provenance(EngineeringProvenance::new("ontology:concept"))
+            .with_confidence(1.0);
+            entity.status = EntityStatus::Active;
+            graph.insert_entity(entity);
+        }
+        for class in ontology.classes.values() {
+            let Some(parent) = class.parent.as_deref() else {
+                continue;
+            };
+            if !ontology.classes.contains_key(parent) {
+                continue;
+            }
+            let mut relation = EngineeringRelation::new(
+                concept_node_id(&class.id),
+                REL_SUBCLASS_OF,
+                concept_node_id(parent),
+            )
+            .with_id(format!(
+                "ontology-subclass:{}:{}",
+                class.id, parent
+            ))
+            .with_provenance(EngineeringProvenance::new("ontology:subclass"))
+            .with_confidence(1.0);
+            relation.status = EntityStatus::Active;
+            graph.insert_relation(relation);
+        }
+        for definition in ontology.relations.values() {
+            for domain in &definition.domain {
+                if domain == CLASS_WILDCARD || !ontology.classes.contains_key(domain) {
+                    continue;
+                }
+                for range in &definition.range {
+                    if range == CLASS_WILDCARD || !ontology.classes.contains_key(range) {
+                        continue;
+                    }
+                    let from = concept_node_id(domain);
+                    let to = concept_node_id(range);
+                    let mut relation = EngineeringRelation::new(
+                        from,
+                        definition.id.clone(),
+                        to,
+                    )
+                    .with_id(format!(
+                        "ontology-signature:{}:{}:{}",
+                        definition.id, domain, range
+                    ))
+                    .with_property("domain", Value::String(domain.clone()))
+                    .with_property("range", Value::String(range.clone()))
+                    .with_provenance(EngineeringProvenance::new(format!(
+                        "ontology:signature:{}",
+                        definition.id
+                    )))
+                    .with_confidence(1.0);
+                    relation.status = EntityStatus::Active;
+                    graph.insert_relation(relation);
+                }
+            }
+        }
+        graph
+    }
+
+    /// Resolve a concept anchor by node id, class id, or display name.
+    pub fn resolve_concept_anchor(&self, anchor: &str) -> Option<String> {
+        let anchor = anchor.trim();
+        if anchor.is_empty() {
+            return None;
+        }
+        if self.entities.contains_key(anchor) {
+            return Some(anchor.to_string());
+        }
+        let prefixed = concept_node_id(anchor);
+        if self.entities.contains_key(&prefixed) {
+            return Some(prefixed);
+        }
+        self.entities
+            .values()
+            .find(|entity| entity.name.eq_ignore_ascii_case(anchor))
+            .map(|entity| entity.id.clone())
+    }
+
+    /// Return a query-time graph that joins this instance graph to the
+    /// ontology concept layer.
+    ///
+    /// The stored graph is not modified. Each entity gains
+    /// `entity -instance_of-> concept:<class>` and the reverse
+    /// `concept:<class> -has_instance-> entity` edge, so an instance-to-instance
+    /// search can use concept signatures as an intermediate layer.
+    pub fn with_ontology_layer(&self, ontology: &EngineeringOntology) -> Self {
+        let mut graph = self.clone();
+        graph.merge(&Self::concept_graph(ontology));
+        for entity in self.entities.values() {
+            if !ontology.classes.contains_key(&entity.class) {
+                continue;
+            }
+            let concept = concept_node_id(&entity.class);
+            if !graph.entities.contains_key(&concept) {
+                continue;
+            }
+            let mut to_concept = EngineeringRelation::new(
+                entity.id.clone(),
+                REL_INSTANCE_OF,
+                concept.clone(),
+            )
+            .with_id(format!("instance-of:{}:{}", entity.id, entity.class))
+            .with_provenance(entity.provenance.clone())
+            .with_confidence(entity.confidence);
+            to_concept.status = entity.status;
+            graph.insert_relation(to_concept);
+
+            let mut from_concept = EngineeringRelation::new(
+                concept,
+                REL_HAS_INSTANCE,
+                entity.id.clone(),
+            )
+            .with_id(format!("has-instance:{}:{}", entity.class, entity.id))
+            .with_provenance(entity.provenance.clone())
+            .with_confidence(entity.confidence);
+            from_concept.status = entity.status;
+            graph.insert_relation(from_concept);
+        }
+        graph
     }
 
     pub fn insert_entity(&mut self, entity: EngineeringEntity) -> Option<EngineeringEntity> {
@@ -2429,5 +2580,62 @@ mod tests {
         assert_eq!(graph.entities["f1"].name, "kept");
         assert!(graph.entities.contains_key("test1"));
         assert_eq!(graph.relations.len(), 1);
+    }
+
+    #[test]
+    fn concept_graph_projects_relation_signatures_and_resolves_anchors() {
+        let ontology = default_engineering_ontology();
+        let graph = EngineeringGraph::concept_graph(&ontology);
+        assert!(graph.entities.contains_key(&concept_node_id(CLASS_FILE)));
+        assert!(graph.entities.contains_key(&concept_node_id(CLASS_API)));
+        assert_eq!(
+            graph.resolve_concept_anchor("File").as_deref(),
+            Some(concept_node_id(CLASS_FILE).as_str())
+        );
+        assert_eq!(
+            graph.resolve_concept_anchor(CLASS_API).as_deref(),
+            Some(concept_node_id(CLASS_API).as_str())
+        );
+
+        let paths = graph.k_shortest_paths(
+            &concept_node_id(CLASS_FILE),
+            &concept_node_id(CLASS_API),
+            2,
+            &[REL_DEFINES],
+            1,
+        );
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(paths[0].hop_count(), 1);
+        assert_eq!(
+            graph.relation(&paths[0].relations[0]).map(|rel| rel.relation.as_str()),
+            Some(REL_DEFINES)
+        );
+    }
+
+    #[test]
+    fn ontology_layer_joins_instances_through_concept_signatures() {
+        let ontology = default_engineering_ontology();
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(file("f1"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_API, "api:1", "api:1"));
+
+        let joined = graph.with_ontology_layer(&ontology);
+        let paths = joined.k_shortest_paths(
+            "f1",
+            "api:1",
+            4,
+            &[REL_INSTANCE_OF, REL_DEFINES, REL_HAS_INSTANCE],
+            1,
+        );
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(
+            paths[0].nodes,
+            vec!["f1", "concept:file", "concept:api", "api:1"]
+        );
+
+        // The join is query-time only; the source graph must stay untouched.
+        assert_eq!(graph.entities.len(), 2);
+        assert!(graph.relations.is_empty());
+        assert_eq!(joined.entities.len(), graph.entities.len() + ontology.classes.len());
     }
 }

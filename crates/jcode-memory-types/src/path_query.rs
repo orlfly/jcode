@@ -15,6 +15,7 @@ use crate::graph::EdgeKind;
 pub enum PathGraphKind {
     Memory,
     Engineering,
+    Ontology,
 }
 
 impl PathGraphKind {
@@ -22,6 +23,7 @@ impl PathGraphKind {
         match self {
             Self::Memory => "memory",
             Self::Engineering => "engineering",
+            Self::Ontology => "ontology",
         }
     }
 
@@ -29,6 +31,7 @@ impl PathGraphKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "memory" => Some(Self::Memory),
             "engineering" => Some(Self::Engineering),
+            "ontology" => Some(Self::Ontology),
             _ => None,
         }
     }
@@ -273,6 +276,23 @@ mod tests {
                 ..PathQueryConstraints::default()
             },
         };
+        assert!(query.validate().is_ok());
+    }
+
+    #[test]
+    fn ontology_graph_kind_round_trips() {
+        assert_eq!(PathGraphKind::parse("ontology"), Some(PathGraphKind::Ontology));
+        let query = PathQuery {
+            start: vec!["File".to_string()],
+            goal: vec!["API".to_string()],
+            waypoints: Vec::new(),
+            graph: Some(PathGraphKind::Ontology),
+            constraints: PathQueryConstraints {
+                relations: vec!["defines".to_string()],
+                ..PathQueryConstraints::default()
+            },
+        };
+        assert_eq!(query.graph_kind(), PathGraphKind::Ontology);
         assert!(query.validate().is_ok());
     }
 }

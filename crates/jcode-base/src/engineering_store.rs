@@ -736,6 +736,67 @@ impl EngineeringStore {
         hits.truncate(limit);
         Ok(hits)
     }
+
+    /// Query the ontology concept layer (`G_o`) without touching session stores.
+    ///
+    /// Concept anchors resolve by `concept:<class>`, bare class id, or display
+    /// name. Returns the same [`EngineeringPathHit`] shape as instance paths so
+    /// callers can render and plan both layers uniformly.
+    pub fn ontology_path_between_anchors(
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+        limit: usize,
+        allowed_relations: &[&str],
+    ) -> Result<Vec<EngineeringPathHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ontology = default_engineering_ontology();
+        let graph = EngineeringGraph::concept_graph(&ontology);
+        let Some(from) = graph.resolve_concept_anchor(from_anchor) else {
+            return Ok(Vec::new());
+        };
+        let Some(to) = graph.resolve_concept_anchor(to_anchor) else {
+            return Ok(Vec::new());
+        };
+        let depth = depth.clamp(1, 16);
+        let limit = limit.min(20);
+        let mut hits = Vec::new();
+        for path in graph.k_shortest_paths(&from, &to, depth, allowed_relations, limit) {
+            let node_labels = path
+                .nodes
+                .iter()
+                .map(|id| {
+                    graph
+                        .entity(id)
+                        .map(|entity| entity.name.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            let relation_labels = path
+                .relations
+                .iter()
+                .map(|id| {
+                    graph
+                        .relation(id)
+                        .map(|relation| relation.relation.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            let plan = build_path_plan(&graph, &path);
+            hits.push(EngineeringPathHit {
+                session_id: "ontology".to_string(),
+                working_dir: None,
+                path,
+                node_labels,
+                relation_labels,
+                plan,
+            });
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
 }
 
 fn configure_connection(connection: &Connection) -> Result<()> {
@@ -845,6 +906,7 @@ mod tests {
     use super::*;
     use jcode_memory_types::engineering_ontology::{
         CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, EngineeringProvenance, REL_CAUSES, REL_MODIFIES,
+        REL_DEFINES,
     };
     use serde_json::json;
 
@@ -1170,5 +1232,22 @@ mod tests {
         assert!(store.load_graph("empty").expect("load empty").is_none());
         assert!(store.load_graph("old").expect("load old").is_none());
         assert!(store.load_graph("new-a").expect("load new").is_some());
+    }
+
+    #[test]
+    fn ontology_path_queries_concept_layer_without_session_data() {
+        let hits = EngineeringStore::ontology_path_between_anchors(
+            "File",
+            "API",
+            2,
+            3,
+            &[REL_DEFINES],
+        )
+        .expect("ontology path");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].session_id, "ontology");
+        assert_eq!(hits[0].node_labels, vec!["File", "API"]);
+        assert_eq!(hits[0].relation_labels, vec![REL_DEFINES]);
+        assert_eq!(hits[0].plan.tasks.len(), 1);
     }
 }
