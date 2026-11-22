@@ -8378,6 +8378,53 @@ impl MemoryManager {
             relaxed.depth = relaxed_depth;
             outcome = relaxed;
         }
+        // L0 constraint relaxation: when relation/staleness filters remove
+        // every candidate, retry once without those filters. The returned paths
+        // carry the widened-query flag, and E04 records that the original
+        // constraints were over-pruning rather than the graph being empty.
+        let has_filters = !allowed.is_empty()
+            || !options.deny_relations.is_empty()
+            || options.min_confidence.is_some();
+        if outcome.paths.is_empty()
+            && has_filters
+            && unknown_relations.is_empty()
+            && outcome.unresolved_from.is_empty()
+            && outcome.unresolved_to.is_empty()
+        {
+            let mut applied = outcome.relaxations.clone();
+            if !allowed.is_empty() {
+                applied.push("relations allow-list -> all".to_string());
+            }
+            if !options.deny_relations.is_empty() {
+                applied.push("deny_relations -> none".to_string());
+            }
+            if let Some(min_confidence) = options.min_confidence {
+                applied.push(format!("min_confidence {min_confidence:.2} -> none"));
+            }
+            let mut relaxed_options = options.clone();
+            relaxed_options.deny_relations.clear();
+            relaxed_options.min_confidence = None;
+            relaxed_options.auto_ground_anchors = false;
+            let mut relaxed = self.paths_between_anchors_inner(
+                &froms,
+                &tos,
+                outcome.depth,
+                limit,
+                effective_scope,
+                &[],
+                &[],
+                &applied,
+                &mut graphs,
+                &relaxed_options,
+            )?;
+            relaxed.relaxations = applied;
+            if !relaxed.paths.is_empty() {
+                if !relaxed.diagnosis.iter().any(|code| code == "E04") {
+                    relaxed.diagnosis.push("E04".to_string());
+                }
+                outcome = relaxed;
+            }
+        }
         if outcome.paths.is_empty() && options.auto_ground_anchors {
             let replacements =
                 select_grounding_replacements(&outcome.anchor_suggestions, &froms, &tos);

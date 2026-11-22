@@ -5994,3 +5994,52 @@ fn promote_alignment_adds_traversable_symmetric_same_as_edge() {
         );
     });
 }
+
+#[test]
+fn path_query_relaxes_over_pruning_filters_and_reports_e04() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/e04-relaxation");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "relaxation source note",
+        ));
+        let b = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "relaxation target note",
+        ));
+        graph.add_edge(
+            &a,
+            &b,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let outcome = manager
+            .paths_between_anchors_with_options(
+                &[a.clone()],
+                &[b.clone()],
+                2,
+                2,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions {
+                    deny_relations: vec!["relates_to".to_string()],
+                    ..Default::default()
+                },
+            )
+            .expect("relaxed path query");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert!(outcome.diagnosis.iter().any(|code| code == "E04"));
+        assert!(
+            outcome
+                .relaxations
+                .iter()
+                .any(|label| label.contains("deny_relations"))
+        );
+        assert!(
+            outcome.quality[0].has(jcode_memory_types::PathQualityFlag::RelaxedQuery),
+            "{outcome:?}"
+        );
+    });
+}
