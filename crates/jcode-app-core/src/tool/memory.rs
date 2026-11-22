@@ -232,7 +232,7 @@ impl Tool for MemoryTool {
         // Keep this under the registry's description token cap (tool/tests.rs).
         // Full scope-gate rules live in `remember`'s implementation and the
         // memory scope enum docs; a longer description bloats every request.
-        "Memory CRUD, links/paths, belief/decision/domain facts. Default: project."
+        "Memory CRUD, links/paths, alignment, belief/decision/domain. Default: project."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -242,7 +242,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "shadow", "related", "path", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -795,6 +795,49 @@ impl Tool for MemoryTool {
                     bridge.id,
                     bridge.weight,
                     bridge.confidence
+                )))
+            }
+            "align" => {
+                if input.confirm != Some(true) {
+                    return Err(anyhow::anyhow!(
+                        "alignment promotion requires confirm=true after reviewing the candidate"
+                    ));
+                }
+                let from_id = input
+                    .from_id
+                    .ok_or_else(|| anyhow::anyhow!("from_id required"))?;
+                let to_id = input
+                    .to_id
+                    .ok_or_else(|| anyhow::anyhow!("to_id required"))?;
+                let relation = input.relation.as_deref().unwrap_or("same_as");
+                let score = input
+                    .confidence
+                    .or(input.weight)
+                    .ok_or_else(|| anyhow::anyhow!("confidence (reviewed score) required"))?;
+                let evidence = input
+                    .note
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("note (promotion evidence) required"))?;
+                memory::set_state(MemoryState::ToolAction {
+                    action: "align".into(),
+                    detail: format!(
+                        "{} -> {}",
+                        truncate_for_widget(&from_id, 15),
+                        truncate_for_widget(&to_id, 15)
+                    ),
+                });
+                let promotion = manager.promote_alignment(
+                    &from_id, &to_id, relation, score, evidence,
+                )?;
+                memory::set_state(MemoryState::Idle);
+                Ok(ToolOutput::new(format!(
+                    "Promoted alignment {} -> {} as {} in {} (score {:.2}). Evidence: {}",
+                    promotion.from_id,
+                    promotion.to_id,
+                    promotion.edge,
+                    promotion.scope,
+                    promotion.score,
+                    promotion.evidence
                 )))
             }
             "unbridge" => {
@@ -2213,6 +2256,7 @@ fn memory_edge_label(kind: &crate::memory_graph::EdgeKind) -> String {
         EdgeKind::Contains => "contains".to_string(),
         EdgeKind::NextStep => "next_step".to_string(),
         EdgeKind::Bridge => "bridge".to_string(),
+        EdgeKind::SameAs => "same_as".to_string(),
         EdgeKind::Hypothesized { relation, .. } => format!("hypothesized:{relation}"),
     }
 }
@@ -2685,6 +2729,83 @@ mod tests {
             .unwrap()
             .output;
         assert!(path.contains("Found 1 memory path(s)"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn align_action_promotes_reviewed_same_as_edge() {
+        use jcode_base::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+        let ctx = test_ctx(Some(project.path().to_path_buf()));
+
+        let mut graph = MemoryGraph::new();
+        let mut a = MemoryEntry::new(MemoryCategory::Fact, "invoice export job owner");
+        a.id = "mem_align_a".to_string();
+        graph.add_memory(a);
+        let mut b = MemoryEntry::new(MemoryCategory::Fact, "invoice export worker owner");
+        b.id = "mem_align_b".to_string();
+        graph.add_memory(b);
+        tool.manager
+            .save_project_graph(&graph)
+            .expect("save align graph");
+
+        let blocked = tool
+            .execute(
+                json!({
+                    "action":"align",
+                    "from_id":"mem_align_a",
+                    "to_id":"mem_align_b",
+                    "confidence":0.93,
+                    "note":"shared invoice export ownership in runbook"
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect_err("confirm is required");
+        assert!(blocked.to_string().contains("confirm=true"), "{blocked}");
+
+        let promoted = tool
+            .execute(
+                json!({
+                    "action":"align",
+                    "from_id":"mem_align_a",
+                    "to_id":"mem_align_b",
+                    "confidence":0.93,
+                    "note":"shared invoice export ownership in runbook",
+                    "confirm":true
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("align")
+            .output;
+        assert!(promoted.contains("Promoted alignment"), "{promoted}");
+        assert!(promoted.contains("same_as"), "{promoted}");
+
+        let path = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":"mem_align_a",
+                    "to_id":"mem_align_b",
+                    "scope":"project",
+                    "depth":2,
+                    "limit":1
+                }),
+                ctx,
+            )
+            .await
+            .expect("same_as path")
+            .output;
+        assert!(path.contains("same_as"), "{path}");
     }
 
     #[tokio::test]

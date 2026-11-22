@@ -125,6 +125,11 @@ pub enum EdgeKind {
         weight: f32,
         confidence: f32,
     },
+    /// Verified entity alignment between two memory ids in the same store.
+    ///
+    /// Promotion requires an explicit evidence-bearing review. Cross-store
+    /// alignment still uses the bridge registry so neither store is rewritten.
+    SameAs,
 }
 
 /// One hop in a weighted memory-graph path.
@@ -191,6 +196,7 @@ impl EdgeKind {
             Self::Contains => "contains",
             Self::NextStep => "next_step",
             Self::Bridge => "bridge",
+            Self::SameAs => "same_as",
             Self::Hypothesized { relation, .. } => relation,
         }
     }
@@ -207,6 +213,7 @@ impl EdgeKind {
             EdgeKind::Contains => "contains",
             EdgeKind::NextStep => "next_step",
             EdgeKind::Bridge => "bridge",
+            EdgeKind::SameAs => "same_as",
             EdgeKind::Hypothesized { .. } => "hypothesized",
         }
     }
@@ -224,6 +231,7 @@ impl EdgeKind {
             "contains" => EdgeKind::Contains,
             "next_step" => EdgeKind::NextStep,
             "bridge" => EdgeKind::Bridge,
+            "same_as" => EdgeKind::SameAs,
             "hypothesized" => EdgeKind::Hypothesized {
                 relation: "relates_to".to_string(),
                 weight: 0.5,
@@ -245,6 +253,7 @@ impl EdgeKind {
             EdgeKind::Contains => 0.9,
             EdgeKind::NextStep => 0.8,
             EdgeKind::Bridge => 0.9,
+            EdgeKind::SameAs => 1.0,
             EdgeKind::Hypothesized { weight, .. } => *weight,
         }
     }
@@ -1109,6 +1118,7 @@ impl MemoryGraph {
                     | EdgeKind::RelatesTo { .. }
                     | EdgeKind::Contradicts
                     | EdgeKind::Bridge
+                    | EdgeKind::SameAs
                     | EdgeKind::Hypothesized { .. }
             ) && relation_allowed(&edge.kind, allowed_relations)
             {
@@ -1137,6 +1147,7 @@ impl MemoryGraph {
             EdgeKind::Contains => 0.2,
             EdgeKind::NextStep => 0.2,
             EdgeKind::Bridge => 0.25,
+            EdgeKind::SameAs => 0.05,
             EdgeKind::Hypothesized { confidence, .. } => {
                 2.0 + 0.5 * (1.0 - confidence.clamp(0.0, 1.0))
             }

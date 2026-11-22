@@ -5869,3 +5869,128 @@ fn shadow_edge_is_hidden_until_accepted() {
         );
     });
 }
+
+#[test]
+fn promote_alignment_rejects_weak_or_contradictory_candidates() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/alignment-gate");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "billing api claim handler",
+        ));
+        let b = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "billing api claim service",
+        ));
+        manager.save_project_graph(&graph).expect("save graph");
+
+        assert!(
+            manager
+                .promote_alignment(&a, &b, "same_as", 0.5, "same claim handler")
+                .is_err(),
+            "low score must be rejected"
+        );
+        assert!(
+            manager
+                .promote_alignment(&a, &b, "same_as", 0.95, "short")
+                .is_err(),
+            "short evidence must be rejected"
+        );
+        assert!(
+            manager
+                .promote_alignment(&a, &b, "relates_to", 0.95, "same claim handler")
+                .is_err(),
+            "non-alignment relation must be rejected"
+        );
+
+        graph.add_edge(&a, &b, crate::memory_graph::EdgeKind::Contradicts);
+        manager
+            .save_project_graph(&graph)
+            .expect("save contradiction");
+        assert!(
+            manager
+                .promote_alignment(&a, &b, "same_as", 0.95, "same claim handler")
+                .is_err(),
+            "contradictory pair must be rejected"
+        );
+    });
+}
+
+#[test]
+fn promote_alignment_adds_traversable_symmetric_same_as_edge() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/alignment-promote");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "account export job owner",
+        ));
+        let b = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "account export worker owner",
+        ));
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let promotion = manager
+            .promote_alignment(
+                &b,
+                &a,
+                "same_as",
+                0.93,
+                "shared account export ownership in runbook",
+            )
+            .expect("promote alignment");
+        assert_eq!(promotion.scope, "project");
+        assert_eq!(promotion.edge, "same_as");
+
+        let saved = manager.load_project_graph().expect("load promoted graph");
+        assert!(saved.get_edges(&a).iter().any(|edge| {
+            edge.target == b && matches!(edge.kind, crate::memory_graph::EdgeKind::SameAs)
+        }));
+        assert!(saved.get_edges(&b).iter().any(|edge| {
+            edge.target == a && matches!(edge.kind, crate::memory_graph::EdgeKind::SameAs)
+        }));
+
+        let path = manager
+            .paths_between_anchors(&[a.clone()], &[b.clone()], 2, 2, MemoryScope::Project, &[])
+            .expect("same_as path");
+        assert_eq!(path.paths.len(), 1, "{path:?}");
+        assert!(
+            matches!(
+                path.paths[0].edges[0].kind,
+                crate::memory_graph::EdgeKind::SameAs
+            ),
+            "{path:?}"
+        );
+        let filtered = manager
+            .paths_between_anchors(
+                &[b.clone()],
+                &[a.clone()],
+                2,
+                2,
+                MemoryScope::Project,
+                &["same_as".to_string()],
+            )
+            .expect("same_as filter");
+        assert_eq!(filtered.paths.len(), 1, "{filtered:?}");
+
+        let mut saved = manager.load_project_graph().expect("reload graph");
+        let mut c = MemoryEntry::new(MemoryCategory::Fact, "account export audit owner");
+        c.id = "mem_alignment_conflict".to_string();
+        saved.add_memory(c);
+        manager.save_project_graph(&saved).expect("save third node");
+        assert!(
+            manager
+                .promote_alignment(
+                    &a,
+                    "mem_alignment_conflict",
+                    "same_as",
+                    0.95,
+                    "conflicting second alignment claim",
+                )
+                .is_err(),
+            "one endpoint must not map to two entities"
+        );
+    });
+}

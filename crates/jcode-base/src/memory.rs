@@ -467,6 +467,24 @@ pub struct MemoryBridge {
     pub created_at: DateTime<Utc>,
 }
 
+/// Minimum reviewed similarity required to promote an alignment candidate.
+///
+/// Matches the design threshold for using `same_as` in path bridging.
+pub const ALIGNMENT_PROMOTION_MIN_SCORE: f32 = 0.85;
+
+/// Result of promoting a reviewed `same_as` alignment candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlignmentPromotion {
+    pub from_id: String,
+    pub to_id: String,
+    /// `project`, `global`, or `bridge` for a cross-store promotion.
+    pub scope: String,
+    /// Persisted relation: `same_as` or `bridge`.
+    pub edge: String,
+    pub score: f32,
+    pub evidence: String,
+}
+
 /// Lifecycle of a shadow edge proposed by an extractor or model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -7722,6 +7740,178 @@ impl MemoryManager {
         bridges.sort_by(|left, right| left.id.cmp(&right.id));
         self.save_bridges(&bridges)?;
         Ok(bridge)
+    }
+
+    /// Promote a reviewed `same_as` alignment candidate into a real edge.
+    ///
+    /// Gate: the relation must be `same_as`, both endpoints must be active in
+    /// the same store or in project/global respectively, the reviewed score
+    /// must reach [`ALIGNMENT_PROMOTION_MIN_SCORE`], evidence must be supplied,
+    /// no `Contradicts` edge may already join the pair, and neither endpoint
+    /// may already be aligned to a different entity. Same-store pairs get a
+    /// symmetric `SameAs` edge; cross-store pairs keep the bridge registry so
+    /// neither graph file is rewritten.
+    pub fn promote_alignment(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        relation: &str,
+        score: f32,
+        evidence: &str,
+    ) -> Result<AlignmentPromotion> {
+        let relation = relation.trim().to_ascii_lowercase();
+        if relation != "same_as" {
+            anyhow::bail!("alignment promotion only accepts relation `same_as`");
+        }
+        let from_id = from_id.trim();
+        let to_id = to_id.trim();
+        if from_id.is_empty() || to_id.is_empty() {
+            anyhow::bail!("alignment promotion requires both from_id and to_id");
+        }
+        if from_id == to_id {
+            anyhow::bail!("alignment promotion requires two distinct ids");
+        }
+        if !score.is_finite() || score < ALIGNMENT_PROMOTION_MIN_SCORE {
+            anyhow::bail!(
+                "alignment score {score:.3} is below the promotion threshold {ALIGNMENT_PROMOTION_MIN_SCORE:.3}"
+            );
+        }
+        let evidence = evidence.trim();
+        if evidence.chars().count() < 6 {
+            anyhow::bail!("alignment promotion requires at least 6 characters of evidence");
+        }
+
+        let project = match self.get_project_dir() {
+            Some(_) => Some(self.load_project_graph()?),
+            None => None,
+        };
+        let global = self.load_global_graph()?;
+
+        let entry_is_live = |graph: &MemoryGraph, id: &str| {
+            graph
+                .get_memory(id)
+                .is_some_and(|entry| entry.active && entry.lifecycle.status.is_retrievable())
+        };
+        let contradictions = |graph: &MemoryGraph| {
+            graph.get_edges(from_id).iter().any(|edge| {
+                edge.target == to_id
+                    && matches!(edge.kind, jcode_memory_types::EdgeKind::Contradicts)
+            }) || graph.get_edges(to_id).iter().any(|edge| {
+                edge.target == from_id
+                    && matches!(edge.kind, jcode_memory_types::EdgeKind::Contradicts)
+            })
+        };
+        let existing_alignment = |graph: &MemoryGraph| {
+            graph
+                .get_edges(from_id)
+                .iter()
+                .find(|edge| {
+                    edge.target != to_id
+                        && matches!(edge.kind, jcode_memory_types::EdgeKind::SameAs)
+                })
+                .map(|edge| edge.target.clone())
+                .or_else(|| {
+                    graph
+                        .get_edges(to_id)
+                        .iter()
+                        .find(|edge| {
+                            edge.target != from_id
+                                && matches!(edge.kind, jcode_memory_types::EdgeKind::SameAs)
+                        })
+                        .map(|edge| edge.target.clone())
+                })
+        };
+
+        let same_project = project
+            .as_ref()
+            .is_some_and(|graph| entry_is_live(graph, from_id) && entry_is_live(graph, to_id));
+        let same_global = entry_is_live(&global, from_id) && entry_is_live(&global, to_id);
+
+        if same_project {
+            let mut graph = project.expect("checked above");
+            if contradictions(&graph) {
+                anyhow::bail!("cannot align contradictory memories");
+            }
+            if let Some(other) = existing_alignment(&graph) {
+                anyhow::bail!("entity is already aligned to {other}; resolve the conflict first");
+            }
+            graph.add_edge(from_id, to_id, jcode_memory_types::EdgeKind::SameAs);
+            graph.add_edge(to_id, from_id, jcode_memory_types::EdgeKind::SameAs);
+            self.save_project_graph(&graph)?;
+            return Ok(AlignmentPromotion {
+                from_id: from_id.to_string(),
+                to_id: to_id.to_string(),
+                scope: "project".to_string(),
+                edge: "same_as".to_string(),
+                score,
+                evidence: evidence.to_string(),
+            });
+        }
+
+        if same_global {
+            let mut graph = global;
+            if contradictions(&graph) {
+                anyhow::bail!("cannot align contradictory memories");
+            }
+            if let Some(other) = existing_alignment(&graph) {
+                anyhow::bail!("entity is already aligned to {other}; resolve the conflict first");
+            }
+            graph.add_edge(from_id, to_id, jcode_memory_types::EdgeKind::SameAs);
+            graph.add_edge(to_id, from_id, jcode_memory_types::EdgeKind::SameAs);
+            self.save_global_graph(&graph)?;
+            return Ok(AlignmentPromotion {
+                from_id: from_id.to_string(),
+                to_id: to_id.to_string(),
+                scope: "global".to_string(),
+                edge: "same_as".to_string(),
+                score,
+                evidence: evidence.to_string(),
+            });
+        }
+
+        let (project_id, global_id) = {
+            let project_has_from = project
+                .as_ref()
+                .is_some_and(|graph| entry_is_live(graph, from_id));
+            let project_has_to = project
+                .as_ref()
+                .is_some_and(|graph| entry_is_live(graph, to_id));
+            let global_has_from = entry_is_live(&global, from_id);
+            let global_has_to = entry_is_live(&global, to_id);
+            if project_has_from && global_has_to {
+                (from_id, to_id)
+            } else if project_has_to && global_has_from {
+                (to_id, from_id)
+            } else {
+                anyhow::bail!(
+                    "alignment endpoints must both be active in one store or split across project and global"
+                );
+            }
+        };
+
+        if project.as_ref().is_some_and(contradictions) || contradictions(&global) {
+            anyhow::bail!("cannot align contradictory memories");
+        }
+        let bridges = self.list_bridges()?;
+        if let Some(conflict) = bridges.iter().find(|bridge| {
+            (bridge.project_id == project_id && bridge.global_id != global_id)
+                || (bridge.global_id == global_id && bridge.project_id != project_id)
+        }) {
+            anyhow::bail!(
+                "entity is already bridged to {} / {}; resolve the conflict first",
+                conflict.project_id,
+                conflict.global_id
+            );
+        }
+        self.link_bridge(project_id, global_id, score, evidence)?;
+        Ok(AlignmentPromotion {
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            scope: "bridge".to_string(),
+            edge: "bridge".to_string(),
+            score,
+            evidence: evidence.to_string(),
+        })
     }
 
     /// Remove a bridge by id. Returns whether a row was removed.
