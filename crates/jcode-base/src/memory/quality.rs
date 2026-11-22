@@ -33,6 +33,8 @@ pub const MAX_COMPLETION_DEBT: f32 = 0.10;
 pub const MIN_EVIDENCE_COVERAGE: f32 = 0.95;
 /// Maximum tolerated share of paths crossing high-degree hubs.
 pub const MAX_HUB_PATH_RATIO: f32 = 0.20;
+/// Minimum tolerated PathQuery compile success rate (QCS).
+pub const MIN_COMPILE_SUCCESS_RATE: f32 = 0.98;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +132,12 @@ pub struct QueryAuditMetrics {
     pub evidence_coverage: f32,
     #[serde(default)]
     pub hub_path_ratio: f32,
+    #[serde(default)]
+    pub compile_attempts: u64,
+    #[serde(default)]
+    pub compile_successes: u64,
+    #[serde(default = "default_rate")]
+    pub compile_success_rate: f32,
     pub cross_graph_queries: u64,
     pub cross_graph_success: u64,
     pub cross_graph_success_rate: f32,
@@ -152,6 +160,9 @@ impl Default for QueryAuditMetrics {
             hub_paths: 0,
             evidence_coverage: 1.0,
             hub_path_ratio: 0.0,
+            compile_attempts: 0,
+            compile_successes: 0,
+            compile_success_rate: 1.0,
             cross_graph_queries: 0,
             cross_graph_success: 0,
             cross_graph_success_rate: 1.0,
@@ -398,6 +409,16 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         .iter()
         .filter(|entry| scope == "all" || entry.scope == scope)
     {
+        if entry.kind == "compile" {
+            metrics.compile_attempts += 1;
+            if entry.success {
+                metrics.compile_successes += 1;
+            }
+            for code in &entry.diagnosis {
+                *metrics.diagnosis_counts.entry(code.clone()).or_default() += 1;
+            }
+            continue;
+        }
         metrics.total_queries += 1;
         if entry.success {
             metrics.successful_queries += 1;
@@ -439,6 +460,11 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         0.0
     } else {
         metrics.hub_paths as f32 / metrics.total_paths as f32
+    };
+    metrics.compile_success_rate = if metrics.compile_attempts == 0 {
+        1.0
+    } else {
+        metrics.compile_successes as f32 / metrics.compile_attempts as f32
     };
     metrics.cross_graph_success_rate = if metrics.cross_graph_queries == 0 {
         1.0
@@ -501,6 +527,16 @@ pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
             metrics.hub_path_ratio,
             MAX_HUB_PATH_RATIO,
             "add waypoints or split high-degree hubs used by paths",
+        ));
+    }
+    if metrics.compile_attempts > 0 && metrics.compile_success_rate < MIN_COMPILE_SUCCESS_RATE {
+        findings.push(finding(
+            "Q13",
+            QualitySeverity::Warning,
+            "compile_success_rate",
+            metrics.compile_success_rate,
+            MIN_COMPILE_SUCCESS_RATE,
+            "fix PathQuery IR templates or the compile whitelist",
         ));
     }
     findings
@@ -660,6 +696,20 @@ mod tests {
                 low_provenance_paths: 0,
                 hub_paths: 0,
             },
+            QueryAuditEntry {
+                scope: "project".to_string(),
+                kind: "compile".to_string(),
+                success: true,
+                path_count: 0,
+                edge_count: 0,
+                hypothesized_edges: 0,
+                stores_searched: 0,
+                depth: 0,
+                diagnosis: Vec::new(),
+                relaxations: Vec::new(),
+                low_provenance_paths: 0,
+                hub_paths: 0,
+            },
         ];
         let metrics = summarize_queries(&entries, "project");
         assert_eq!(metrics.total_queries, 2);
@@ -678,6 +728,9 @@ mod tests {
         assert_eq!(metrics.cross_graph_success, 1);
         assert_eq!(metrics.cross_graph_success_rate, 0.5);
         assert_eq!(metrics.diagnosis_counts.get("E03"), Some(&1));
+        assert_eq!(metrics.compile_attempts, 1);
+        assert_eq!(metrics.compile_successes, 1);
+        assert_eq!(metrics.compile_success_rate, 1.0);
     }
 
     #[test]
@@ -695,6 +748,9 @@ mod tests {
             hub_paths: 2,
             evidence_coverage: 0.75,
             hub_path_ratio: 0.25,
+            compile_attempts: 4,
+            compile_successes: 3,
+            compile_success_rate: 0.75,
             cross_graph_queries: 2,
             cross_graph_success: 1,
             cross_graph_success_rate: 0.5,
@@ -706,5 +762,6 @@ mod tests {
         assert!(findings.iter().any(|finding| finding.code == "Q10"));
         assert!(findings.iter().any(|finding| finding.code == "Q11"));
         assert!(findings.iter().any(|finding| finding.code == "Q12"));
+        assert!(findings.iter().any(|finding| finding.code == "Q13"));
     }
 }

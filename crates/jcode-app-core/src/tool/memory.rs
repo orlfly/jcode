@@ -1517,6 +1517,7 @@ impl Tool for MemoryTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("query required for compile"))?;
                 let graph_kind = input.graph.as_deref().unwrap_or("memory");
+                let audit_scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
                 if !matches!(graph_kind, "memory" | "engineering" | "ontology") {
                     return Err(anyhow::anyhow!(
                         "Unknown compile graph: {graph_kind}. Use memory, engineering, or ontology"
@@ -1539,13 +1540,22 @@ impl Tool for MemoryTool {
                 } else {
                     text.to_string()
                 };
-                let query = crate::memory_types::path_query::compile_path_query_text(
+                let query = match crate::memory_types::path_query::compile_path_query_text(
                     &compile_text,
                     &allowed_refs,
-                )
-                .map_err(|errors| {
-                    anyhow::anyhow!("path query compile failed: {}", errors.join("; "))
-                })?;
+                ) {
+                    Ok(query) => {
+                        manager.record_compile_audit(audit_scope, true, Vec::new());
+                        query
+                    }
+                    Err(errors) => {
+                        manager.record_compile_audit(audit_scope, false, errors.clone());
+                        return Err(anyhow::anyhow!(
+                            "path query compile failed: {}",
+                            errors.join("; ")
+                        ));
+                    }
+                };
                 Ok(ToolOutput::new(format!(
                     "Compiled PathQuery:\n{}",
                     serde_json::to_string_pretty(&query)?
@@ -3405,6 +3415,27 @@ mod tests {
         assert!(output.output.contains("api:/task"), "{}", output.output);
         assert!(output.output.contains("\"defines\""), "{}", output.output);
         assert!(output.output.contains("\"depth\": 3"), "{}", output.output);
+
+        let failed = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "query":"from a to b relations invented_relation"
+                }),
+                test_ctx(None),
+            )
+            .await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let quality = tool
+            .execute(json!({"action":"quality","scope":"all"}), test_ctx(None))
+            .await
+            .expect("quality after compile")
+            .output;
+        assert!(quality.contains("\"compile_attempts\": 2"), "{quality}");
+        assert!(quality.contains("\"compile_successes\": 1"), "{quality}");
+        assert!(quality.contains("\"compile_success_rate\": 0.5"), "{quality}");
+        assert!(quality.contains("Q13"), "{quality}");
     }
 
     #[tokio::test]

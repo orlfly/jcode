@@ -8723,6 +8723,30 @@ impl MemoryManager {
         let _ = self.append_query_audit(&entry);
     }
 
+    /// Record one PathQuery compile attempt for query-layer quality metrics.
+    pub fn record_compile_audit(
+        &self,
+        scope: MemoryScope,
+        success: bool,
+        errors: Vec<String>,
+    ) {
+        let entry = QueryAuditEntry {
+            scope: scope_label(scope).to_string(),
+            kind: "compile".to_string(),
+            success,
+            path_count: 0,
+            edge_count: 0,
+            hypothesized_edges: 0,
+            stores_searched: 0,
+            depth: 0,
+            diagnosis: errors,
+            relaxations: Vec::new(),
+            low_provenance_paths: 0,
+            hub_paths: 0,
+        };
+        let _ = self.append_query_audit(&entry);
+    }
+
     /// Persist threshold findings, reopen regressed items, and resolve items
     /// whose finding disappeared from the current report.
     fn sync_quality_debt(&self, report: &mut GraphQualityReport) -> Result<()> {
