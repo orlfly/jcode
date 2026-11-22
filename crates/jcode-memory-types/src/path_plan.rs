@@ -106,6 +106,63 @@ pub struct PlanVerificationQuery {
     pub evidence_ref: String,
 }
 
+/// Observed outcome for one plan task.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTaskOutcome {
+    Succeeded,
+    Failed,
+    Blocked,
+    Skipped,
+}
+
+/// Current execution state for one plan task.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTaskState {
+    Pending,
+    Succeeded,
+    Failed,
+    Blocked,
+    Skipped,
+}
+
+impl PlanTaskState {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, PlanTaskState::Pending)
+    }
+}
+
+/// One execution observation fed back into a plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanTaskObservation {
+    pub task_id: String,
+    pub outcome: PlanTaskOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Deterministic replay of observations against a plan DAG.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanExecutionReport {
+    pub plan_id: String,
+    pub states: BTreeMap<String, PlanTaskState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ready_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    pub recovery_tasks: Vec<PathPlanTask>,
+    #[serde(default)]
+    pub rollback: Vec<String>,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub done: bool,
+    pub blocked: bool,
+}
+
 /// A deterministic plan for one engineering path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathPlan {
@@ -136,6 +193,10 @@ impl PathPlan {
 
     pub fn stage_count(&self) -> usize {
         self.parallel_groups.len()
+    }
+
+    pub fn apply_feedback(&self, observations: &[PlanTaskObservation]) -> PlanExecutionReport {
+        apply_plan_feedback(self, observations)
     }
 }
 
@@ -182,6 +243,178 @@ fn parallel_groups(tasks: &[PathPlanTask]) -> (Vec<Vec<String>>, bool) {
         groups.push(ready);
     }
     (groups, true)
+}
+
+/// Replay observed task outcomes against a plan DAG.
+///
+/// This is deterministic feedback, not autonomous execution: it blocks
+/// downstream tasks, exposes the next runnable stages, and emits recovery
+/// tasks for the caller to approve or dispatch.
+pub fn apply_plan_feedback(
+    plan: &PathPlan,
+    observations: &[PlanTaskObservation],
+) -> PlanExecutionReport {
+    let tasks: BTreeMap<&str, &PathPlanTask> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect();
+    let mut states: BTreeMap<String, PlanTaskState> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.id.clone(), PlanTaskState::Pending))
+        .collect();
+    let mut notes = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for observation in observations {
+        if !tasks.contains_key(observation.task_id.as_str()) {
+            warnings.push(format!("unknown plan task '{}'", observation.task_id));
+            continue;
+        }
+        let state = match observation.outcome {
+            PlanTaskOutcome::Succeeded => PlanTaskState::Succeeded,
+            PlanTaskOutcome::Failed => PlanTaskState::Failed,
+            PlanTaskOutcome::Blocked => PlanTaskState::Blocked,
+            PlanTaskOutcome::Skipped => PlanTaskState::Skipped,
+        };
+        states.insert(observation.task_id.clone(), state);
+        if let Some(note) = &observation.note {
+            notes.insert(observation.task_id.clone(), note.clone());
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for task in &plan.tasks {
+            if states.get(&task.id) != Some(&PlanTaskState::Pending) {
+                continue;
+            }
+            let blocker = task.depends_on.iter().find(|dependency| {
+                matches!(
+                    states.get(*dependency),
+                    Some(PlanTaskState::Failed | PlanTaskState::Blocked | PlanTaskState::Skipped)
+                )
+            });
+            if let Some(blocker) = blocker {
+                states.insert(task.id.clone(), PlanTaskState::Blocked);
+                notes.insert(
+                    task.id.clone(),
+                    format!("blocked by unfinished dependency {blocker}"),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut schedulable: HashSet<String> = states
+        .iter()
+        .filter(|(_, state)| matches!(state, PlanTaskState::Succeeded | PlanTaskState::Skipped))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut ready_groups = Vec::new();
+    loop {
+        let ready: Vec<String> = plan
+            .tasks
+            .iter()
+            .filter(|task| {
+                states.get(&task.id) == Some(&PlanTaskState::Pending)
+                    && !schedulable.contains(&task.id)
+                    && task.depends_on.iter().all(|dependency| {
+                        schedulable.contains(dependency) || !states.contains_key(dependency)
+                    })
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        for id in &ready {
+            schedulable.insert(id.clone());
+        }
+        ready_groups.push(ready);
+    }
+    if plan
+        .tasks
+        .iter()
+        .any(|task| states.get(&task.id) == Some(&PlanTaskState::Pending))
+        && ready_groups.is_empty()
+    {
+        warnings.push("no runnable tasks; plan dependency cycle or all tasks blocked".to_string());
+    }
+
+    let mut recovery_tasks = Vec::new();
+    let mut recommendations = Vec::new();
+    for task in &plan.tasks {
+        if states.get(&task.id) != Some(&PlanTaskState::Failed) {
+            continue;
+        }
+        let mut recovery = task.clone();
+        recovery.id = format!("R{}", task.id);
+        recovery.depends_on = task.depends_on.clone();
+        recovery.confidence = (task.confidence * 0.9).clamp(0.0, 1.0);
+        if task.action_type == PlanActionType::Verify {
+            recovery.title = format!("Retry: {}", task.title);
+            recovery.action_type = PlanActionType::Verify;
+            recovery.risk = PlanRisk::Low;
+            recovery.approval = false;
+            recommendations.push(format!(
+                "retry verification {} with a fresh observation",
+                task.id
+            ));
+        } else {
+            recovery.title = format!("Resolve failed task: {}", task.title);
+            recovery.action_type = PlanActionType::AwaitHuman;
+            recovery.risk = PlanRisk::High;
+            recovery.approval = false;
+            recommendations.push(format!(
+                "request human decision before retrying {}",
+                task.id
+            ));
+        }
+        recovery_tasks.push(recovery);
+    }
+
+    let rollback: Vec<String> = plan
+        .rollback
+        .iter()
+        .filter(|entry| {
+            entry
+                .split_once(':')
+                .map(|(id, _)| id.trim())
+                .is_some_and(|id| {
+                    matches!(
+                        states.get(id),
+                        Some(PlanTaskState::Failed | PlanTaskState::Blocked)
+                    )
+                })
+        })
+        .cloned()
+        .collect();
+    let blocked = states.values().any(|state| {
+        matches!(
+            state,
+            PlanTaskState::Failed | PlanTaskState::Blocked
+        )
+    });
+    let done = !plan.tasks.is_empty()
+        && states
+            .values()
+            .all(|state| matches!(state, PlanTaskState::Succeeded | PlanTaskState::Skipped));
+    PlanExecutionReport {
+        plan_id: plan.plan_id.clone(),
+        states,
+        notes,
+        ready_groups,
+        recovery_tasks,
+        rollback,
+        recommendations,
+        warnings,
+        done,
+        blocked,
+    }
 }
 
 const MAX_PLAN_TASKS: usize = 20;
@@ -705,5 +938,104 @@ mod tests {
         );
         let (_, acyclic) = parallel_groups(&[task("T1", &["T2"]), task("T2", &["T1"])]);
         assert!(!acyclic);
+    }
+
+    #[test]
+    fn feedback_blocks_downstream_and_emits_recovery_task() {
+        let (graph, path) = chain();
+        let plan = build_path_plan(&graph, &path);
+        let report = plan.apply_feedback(&[PlanTaskObservation {
+            task_id: "T1".to_string(),
+            outcome: PlanTaskOutcome::Failed,
+            note: Some("blocker still open".to_string()),
+        }]);
+        assert_eq!(report.states["T1"], PlanTaskState::Failed);
+        assert_eq!(report.states["T2"], PlanTaskState::Blocked);
+        assert!(report.blocked);
+        assert!(!report.done);
+        assert!(report.ready_groups.is_empty());
+        assert_eq!(report.recovery_tasks.len(), 1);
+        assert_eq!(report.recovery_tasks[0].id, "RT1");
+        assert_eq!(
+            report.recovery_tasks[0].action_type,
+            PlanActionType::Verify
+        );
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|action| action.contains("retry verification T1"))
+        );
+        assert_eq!(
+            report.notes.get("T1").map(String::as_str),
+            Some("blocker still open")
+        );
+    }
+
+    #[test]
+    fn feedback_requests_human_and_rollback_for_failed_side_effect() {
+        let (graph, path) = chain();
+        let plan = build_path_plan(&graph, &path);
+        let report = plan.apply_feedback(&[
+            PlanTaskObservation {
+                task_id: "T1".to_string(),
+                outcome: PlanTaskOutcome::Succeeded,
+                note: None,
+            },
+            PlanTaskObservation {
+                task_id: "T2".to_string(),
+                outcome: PlanTaskOutcome::Failed,
+                note: None,
+            },
+        ]);
+        assert_eq!(report.recovery_tasks[0].action_type, PlanActionType::AwaitHuman);
+        assert_eq!(report.rollback.len(), 1);
+        assert!(report.rollback[0].starts_with("T2:"));
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|action| action.contains("human decision"))
+        );
+    }
+
+    #[test]
+    fn feedback_reports_ready_stage_and_completion() {
+        let (graph, path) = chain();
+        let plan = build_path_plan(&graph, &path);
+        let partial = plan.apply_feedback(&[PlanTaskObservation {
+            task_id: "T1".to_string(),
+            outcome: PlanTaskOutcome::Succeeded,
+            note: None,
+        }]);
+        assert_eq!(partial.ready_groups, vec![vec!["T2".to_string()]]);
+        assert!(!partial.done);
+
+        let finished = plan.apply_feedback(&[
+            PlanTaskObservation {
+                task_id: "T1".to_string(),
+                outcome: PlanTaskOutcome::Succeeded,
+                note: None,
+            },
+            PlanTaskObservation {
+                task_id: "T2".to_string(),
+                outcome: PlanTaskOutcome::Skipped,
+                note: None,
+            },
+            PlanTaskObservation {
+                task_id: "missing".to_string(),
+                outcome: PlanTaskOutcome::Succeeded,
+                note: None,
+            },
+        ]);
+        assert!(finished.done);
+        assert!(!finished.blocked);
+        assert!(finished.ready_groups.is_empty());
+        assert!(
+            finished
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unknown plan task"))
+        );
     }
 }
