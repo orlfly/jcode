@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{HIGH_DEGREE_HUB, STALE_EDGE_DAYS};
@@ -45,6 +45,37 @@ pub struct QualityFinding {
     pub action: String,
 }
 
+/// Lifecycle of one persisted quality-debt item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityDebtStatus {
+    Open,
+    Resolved,
+}
+
+/// One persisted governance finding with ownership and SLA metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualityDebtItem {
+    pub id: String,
+    pub code: String,
+    pub scope: String,
+    pub severity: QualitySeverity,
+    pub metric: String,
+    pub value: f32,
+    /// Value when the item was first opened, kept for regression comparison.
+    pub baseline_value: f32,
+    pub threshold: f32,
+    pub action: String,
+    pub status: QualityDebtStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub sla_days: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
 /// Per-store quality counts. Ratios are computed by the caller so multiple
 /// stores can be aggregated without losing the raw denominators.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -80,6 +111,9 @@ pub struct GraphQualityReport {
     /// Threshold breaches with deterministic repair suggestions.
     #[serde(default)]
     pub findings: Vec<QualityFinding>,
+    /// Persisted debt items for the requested scope.
+    #[serde(default)]
+    pub debt: Vec<QualityDebtItem>,
     /// True when no threshold is breached.
     #[serde(default)]
     pub healthy: bool,
@@ -94,10 +128,7 @@ fn ratio(numerator: usize, denominator: usize) -> f32 {
     }
 }
 
-fn largest_component_size(
-    nodes: &HashSet<&str>,
-    adjacency: &HashMap<&str, Vec<&str>>,
-) -> usize {
+fn largest_component_size(nodes: &HashSet<&str>, adjacency: &HashMap<&str, Vec<&str>>) -> usize {
     let mut seen = HashSet::new();
     let mut largest = 0;
     for start in nodes {
@@ -230,6 +261,7 @@ pub fn aggregate(
         stale_ratio: ratio(stale_nodes, memories),
         pending_shadow_edges,
         findings: Vec::new(),
+        debt: Vec::new(),
         healthy: true,
         stores,
     };

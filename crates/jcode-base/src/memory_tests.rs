@@ -69,6 +69,90 @@ fn jev_storage_preserves_code_spelling_and_scope_without_embeddings() {
 }
 
 #[test]
+fn quality_debt_opens_persists_and_resolves() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/quality-debt");
+        let mut graph = MemoryGraph::new();
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "debt one"));
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "debt two"));
+        graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "debt three"));
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let first = manager
+            .graph_quality(MemoryScope::Project)
+            .expect("first quality report");
+        assert!(!first.healthy, "{first:?}");
+        let open = |code: &str| {
+            first
+                .debt
+                .iter()
+                .find(|item| item.code == code)
+                .expect("debt item")
+        };
+        assert_eq!(open("Q01").status, QualityDebtStatus::Open);
+        assert_eq!(open("Q01").sla_days, 7);
+        assert_eq!(open("Q03").status, QualityDebtStatus::Open);
+        assert!(open("Q03").owner.is_none());
+        let baseline = open("Q03").baseline_value;
+
+        let mut fixed = MemoryGraph::new();
+        let mut ids = Vec::new();
+        for content in ["fixed one", "fixed two", "fixed three"] {
+            let mut entry = MemoryEntry::new(MemoryCategory::Fact, content);
+            entry.provenance = Some(ProvenanceRecord {
+                source: "test".to_string(),
+                locator: Some("line:1".to_string()),
+                method: ExtractionMethod::UserStated,
+                extracted_at: Utc::now(),
+                confidence: 0.9,
+                confirmed_by: None,
+                confirmed_at: None,
+            });
+            ids.push(fixed.add_memory(entry));
+        }
+        fixed.add_edge(
+            &ids[0],
+            &ids[1],
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.8 },
+        );
+        fixed.add_edge(
+            &ids[1],
+            &ids[2],
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.8 },
+        );
+        fixed.add_edge(
+            &ids[2],
+            &ids[0],
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.8 },
+        );
+        manager.save_project_graph(&fixed).expect("save fixed graph");
+
+        let second = manager
+            .graph_quality(MemoryScope::Project)
+            .expect("second quality report");
+        assert!(second.healthy, "{second:?}");
+        for code in ["Q01", "Q02", "Q03"] {
+            let item = second
+                .debt
+                .iter()
+                .find(|item| item.code == code)
+                .expect("resolved debt item");
+            assert_eq!(item.status, QualityDebtStatus::Resolved, "{code}");
+            assert!(item.resolved_at.is_some(), "{code}");
+        }
+        assert_eq!(
+            second
+                .debt
+                .iter()
+                .find(|item| item.code == "Q03")
+                .expect("q03")
+                .baseline_value,
+            baseline
+        );
+    });
+}
+
+#[test]
 fn jev_project_write_without_scope_fails_instead_of_silently_losing_memory() {
     with_temp_home(|_| {
         let manager = MemoryManager::new();

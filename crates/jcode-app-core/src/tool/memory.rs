@@ -3408,6 +3408,9 @@ mod tests {
         assert!(output.contains("\"orphan_ratio\""), "{output}");
         assert!(output.contains("\"provenance_coverage\""), "{output}");
         assert!(output.contains("\"findings\""), "{output}");
+        assert!(output.contains("\"debt\""), "{output}");
+        assert!(output.contains("\"sla_days\": 7"), "{output}");
+        assert!(output.contains("\"status\": \"open\""), "{output}");
         assert!(output.contains("Q01"), "{output}");
         assert!(output.contains("\"healthy\": false"), "{output}");
     }

@@ -57,7 +57,10 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-pub use quality::{GraphQualityReport, QualityFinding, QualitySeverity, StoreQuality};
+pub use quality::{
+    GraphQualityReport, QualityDebtItem, QualityDebtStatus, QualityFinding, QualitySeverity,
+    StoreQuality,
+};
 use cache::{cache_graph, cached_graph};
 pub use jcode_memory_types::{
     AdmissionTier, ChangeLevel, ConfirmationGate, MemoryReviewItem, MemoryReviewState,
@@ -8491,7 +8494,99 @@ impl MemoryManager {
         let pending = self
             .list_shadow_edges_scoped(Some(ShadowEdgeStatus::Pending), scope)?
             .len();
-        Ok(quality::aggregate(scope_label(scope), stores, pending))
+        let mut report = quality::aggregate(scope_label(scope), stores, pending);
+        self.sync_quality_debt(&mut report)?;
+        Ok(report)
+    }
+
+    fn quality_debt_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("quality_debt.json"))
+    }
+
+    fn load_quality_debt(&self) -> Result<Vec<QualityDebtItem>> {
+        let path = self.quality_debt_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        storage::read_json(&path)
+    }
+
+    fn save_quality_debt(&self, items: &[QualityDebtItem]) -> Result<()> {
+        storage::write_json(&self.quality_debt_store_path()?, &items)
+    }
+
+    /// Persist threshold findings, reopen regressed items, and resolve items
+    /// whose finding disappeared from the current report.
+    fn sync_quality_debt(&self, report: &mut GraphQualityReport) -> Result<()> {
+        let mut items = self.load_quality_debt()?;
+        let now = Utc::now();
+        for item in items.iter_mut().filter(|item| {
+            item.scope == report.scope && item.status == QualityDebtStatus::Open
+        }) {
+            if !report
+                .findings
+                .iter()
+                .any(|finding| finding.code == item.code)
+            {
+                item.status = QualityDebtStatus::Resolved;
+                item.resolved_at = Some(now);
+                item.updated_at = now;
+            }
+        }
+        for finding in &report.findings {
+            if let Some(item) = items
+                .iter_mut()
+                .find(|item| item.scope == report.scope && item.code == finding.code)
+            {
+                item.status = QualityDebtStatus::Open;
+                item.resolved_at = None;
+                item.updated_at = now;
+                item.severity = finding.severity;
+                item.metric = finding.metric.clone();
+                item.value = finding.value;
+                item.threshold = finding.threshold;
+                item.action = finding.action.clone();
+                continue;
+            }
+            let sla_days = match finding.severity {
+                QualitySeverity::Critical => 7,
+                QualitySeverity::Warning => 30,
+            };
+            items.push(QualityDebtItem {
+                id: format!("quality:{}:{}", report.scope, finding.code),
+                code: finding.code.clone(),
+                scope: report.scope.clone(),
+                severity: finding.severity,
+                metric: finding.metric.clone(),
+                value: finding.value,
+                baseline_value: finding.value,
+                threshold: finding.threshold,
+                action: finding.action.clone(),
+                status: QualityDebtStatus::Open,
+                owner: None,
+                sla_days,
+                created_at: now,
+                updated_at: now,
+                resolved_at: None,
+            });
+        }
+        items.sort_by(|left, right| {
+            left.scope
+                .cmp(&right.scope)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        self.save_quality_debt(&items)?;
+        report.debt = items
+            .into_iter()
+            .filter(|item| item.scope == report.scope)
+            .collect();
+        Ok(())
     }
 
     /// Load the graphs for one query so multi-leg searches do not reload and
