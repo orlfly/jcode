@@ -2111,6 +2111,29 @@ impl MemoryTool {
                     relations.join(", ")
                 ));
             }
+            if graph_kind == "ontology" {
+                let ontology =
+                    crate::memory_types::engineering_ontology::default_engineering_ontology();
+                let graph = crate::memory_types::EngineeringGraph::concept_graph(&ontology);
+                let from_resolved = froms
+                    .iter()
+                    .all(|anchor| graph.resolve_concept_anchor(anchor).is_some());
+                let to_resolved = tos
+                    .iter()
+                    .all(|anchor| graph.resolve_concept_anchor(anchor).is_some());
+                let (code, reason) = if !from_resolved || !to_resolved {
+                    (
+                        "E01",
+                        "one or more concept anchors are not declared in the ontology",
+                    )
+                } else {
+                    (
+                        "E02",
+                        "concept anchors exist but no relation-signature path connects them",
+                    )
+                };
+                out.push_str(&format!("\n- {code}: {reason}"));
+            }
             return Ok(ToolOutput::new(out));
         }
 
@@ -3173,6 +3196,47 @@ mod tests {
         assert!(output.output.contains("concept:api"), "{}", output.output);
         assert!(output.output.contains("defines"), "{}", output.output);
         assert!(output.output.contains("plan: confidence"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn ontology_path_reports_e01_and_e02() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+
+        let e02 = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"ontology",
+                    "from_id":"Agent",
+                    "to_id":"File",
+                    "depth":3
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("e02 query")
+            .output;
+        assert!(e02.contains("E02"), "{e02}");
+        assert!(e02.contains("relation-signature path"), "{e02}");
+
+        let e01 = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"ontology",
+                    "from_id":"File",
+                    "to_id":"NotAClass",
+                    "depth":3
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("e01 query")
+            .output;
+        assert!(e01.contains("E01"), "{e01}");
     }
 
     #[tokio::test]
