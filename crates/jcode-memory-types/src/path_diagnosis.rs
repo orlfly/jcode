@@ -28,6 +28,48 @@ pub struct KnowledgeGapMissing {
     pub alignments: Vec<String>,
 }
 
+/// One step in the deterministic L0-L5 completion ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompletionLevel {
+    L0,
+    L1,
+    L2,
+    L3,
+    L4,
+    L5,
+}
+
+impl CompletionLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::L0 => "L0",
+            Self::L1 => "L1",
+            Self::L2 => "L2",
+            Self::L3 => "L3",
+            Self::L4 => "L4",
+            Self::L5 => "L5",
+        }
+    }
+
+    pub fn uses_llm(self) -> bool {
+        matches!(self, Self::L2 | Self::L3 | Self::L5)
+    }
+
+    pub fn writes_graph(self) -> bool {
+        matches!(self, Self::L2 | Self::L3 | Self::L5)
+    }
+}
+
+/// One executable repair step derived from diagnosis codes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionStep {
+    pub level: CompletionLevel,
+    pub action: String,
+    pub llm_role: String,
+    pub verification: String,
+    pub write_policy: String,
+}
+
 /// Structured report returned when L0-L5 cannot produce a path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeGap {
@@ -40,6 +82,10 @@ pub struct KnowledgeGap {
     pub attempted_levels: Vec<String>,
     #[serde(default)]
     pub suggested_sources: Vec<String>,
+    /// Ordered L0-L5 repair plan derived from the diagnosis codes. This is a
+    /// plan, not a claim that every level was already executed.
+    #[serde(default)]
+    pub completion_plan: Vec<CompletionStep>,
     pub degraded_answer: String,
     pub confidence: f32,
 }
@@ -94,6 +140,7 @@ impl KnowledgeGap {
         if suggested_sources.is_empty() {
             suggested_sources.push("memory graph".to_string());
         }
+        let plan = completion_plan(&diagnosis);
         KnowledgeGap {
             status: "no_path".to_string(),
             diagnosis,
@@ -105,6 +152,7 @@ impl KnowledgeGap {
             },
             attempted_levels,
             suggested_sources,
+            completion_plan: plan,
             degraded_answer: if has_candidates {
                 "No confirmed path; review candidate anchors or alignments before answering."
                     .to_string()
@@ -114,6 +162,94 @@ impl KnowledgeGap {
             },
             confidence: if has_candidates { 0.35 } else { 0.2 },
         }
+    }
+}
+
+/// Build the ordered L0-L5 repair plan for one no-path diagnosis.
+pub fn completion_plan(codes: &[String]) -> Vec<CompletionStep> {
+    let mut needed = [false; 6];
+    for code in codes {
+        match PathDiagnosisCode::parse(code) {
+            Some(
+                PathDiagnosisCode::E04
+                | PathDiagnosisCode::E05
+                | PathDiagnosisCode::E06
+                | PathDiagnosisCode::E07
+                | PathDiagnosisCode::E08,
+            ) => needed[0] = true,
+            Some(PathDiagnosisCode::E10) => needed[1] = true,
+            Some(PathDiagnosisCode::E01 | PathDiagnosisCode::E02 | PathDiagnosisCode::E09) => {
+                needed[2] = true;
+            }
+            Some(PathDiagnosisCode::E03) => needed[3] = true,
+            None => {}
+        }
+    }
+    // Path stitching and external clarification are the final fallbacks for
+    // any unresolved no-path, regardless of the first diagnosis code.
+    needed[4] = true;
+    needed[5] = true;
+    let levels = [
+        CompletionLevel::L0,
+        CompletionLevel::L1,
+        CompletionLevel::L2,
+        CompletionLevel::L3,
+        CompletionLevel::L4,
+        CompletionLevel::L5,
+    ];
+    levels
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| needed[*index])
+        .map(|(_, level)| completion_step(level))
+        .collect()
+}
+
+fn completion_step(level: CompletionLevel) -> CompletionStep {
+    let (action, llm_role, verification, write_policy) = match level {
+        CompletionLevel::L0 => (
+            "relax depth, threshold, relation allow-list, direction, or scope one parameter at a time",
+            "none; deterministic reparameterization",
+            "record each relaxation and require endpoint binding plus hard-constraint checks",
+            "no graph write",
+        ),
+        CompletionLevel::L1 => (
+            "apply transitive closure, inverse relations, sub-properties, and ontology rules",
+            "none; ontology and rule layer derive the result",
+            "every inferred edge must be recomputable from a named rule",
+            "optional derived edge",
+        ),
+        CompletionLevel::L2 => (
+            "resolve entities and add same_as, instance_of, or cross-store bridge candidates",
+            "propose candidate pairs only",
+            "signature compatibility plus conflict check; conflicts go to human arbitration",
+            "requires review",
+        ),
+        CompletionLevel::L3 => (
+            "propose missing edges from embeddings, relation classification, or document extraction",
+            "propose edges with verifiable evidence locators",
+            "independent per-edge signature, evidence, and calibrated-score checks",
+            "shadow graph only",
+        ),
+        CompletionLevel::L4 => (
+            "stitch disjoint components through shared neighbors or nearest anchor pairs",
+            "none; offline ANN recall rather than online LLM",
+            "mark stitched and gaps, apply bridge penalty, and verify both segment endpoints",
+            "query time only",
+        ),
+        CompletionLevel::L5 => (
+            "ask the user or fetch an external API or document to supply the missing fact",
+            "draft clarification questions and retrieval strategy",
+            "user or external facts pass the normal admission gate",
+            "normal write gate",
+        ),
+    };
+    CompletionStep {
+        level,
+        action: action.to_string(),
+        llm_role: llm_role.to_string(),
+        verification: verification.to_string(),
+        write_policy: write_policy.to_string(),
     }
 }
 
@@ -301,8 +437,25 @@ mod tests {
         assert_eq!(gap.missing.relations, vec!["supplies"]);
         assert_eq!(gap.missing.alignments, vec!["a same_as b"]);
         assert_eq!(gap.attempted_levels, vec!["L2", "L3"]);
+        let plan_levels: Vec<&str> = gap
+            .completion_plan
+            .iter()
+            .map(|step| step.level.as_str())
+            .collect();
+        assert_eq!(plan_levels, vec!["L2", "L3", "L4", "L5"]);
         assert!(gap.suggested_sources.iter().any(|source| source == "entity resolver"));
         assert_eq!(gap.confidence, 0.35);
         assert!(gap.degraded_answer.contains("candidate"));
+    }
+
+    #[test]
+    fn query_side_plan_starts_at_l0_and_skips_llm_levels() {
+        let plan = completion_plan(&["E04".to_string()]);
+        let levels: Vec<&str> = plan.iter().map(|step| step.level.as_str()).collect();
+        assert_eq!(levels, vec!["L0", "L4", "L5"]);
+        assert!(!plan[0].level.uses_llm());
+        assert!(!plan[0].level.writes_graph());
+        assert!(plan[2].level.uses_llm());
+        assert!(plan[2].level.writes_graph());
     }
 }

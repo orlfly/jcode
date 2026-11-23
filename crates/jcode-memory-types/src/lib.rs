@@ -15,8 +15,8 @@ pub use path_plan::{
 
 pub mod path_diagnosis;
 pub use path_diagnosis::{
-    KnowledgeGap, KnowledgeGapMissing, PathDiagnosisCode, PathMissingClass, missing_classes_for,
-    next_actions_for,
+    CompletionLevel, CompletionStep, KnowledgeGap, KnowledgeGapMissing, PathDiagnosisCode,
+    PathMissingClass, completion_plan, missing_classes_for, next_actions_for,
 };
 
 pub mod path_quality;

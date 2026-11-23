@@ -296,6 +296,14 @@ pub struct MemoryPathQueryOutcome {
     pub knowledge_gap: Option<jcode_memory_types::KnowledgeGap>,
     pub stores_searched: usize,
     pub depth: usize,
+    /// True when the first attempt failed with a gap that the L1-L5 ladder can
+    /// repair (ontology silence, semantic gap, or alignment gap).
+    #[serde(default)]
+    pub recoverable_no_path: bool,
+    /// True when the initial recoverable no-path was resolved by a later
+    /// completion step in the same query.
+    #[serde(default)]
+    pub recovered_no_path: bool,
 }
 
 impl MemoryPathQueryOutcome {
@@ -593,6 +601,10 @@ fn normalize_path_anchors(anchors: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn is_completion_recoverable_code(code: &str) -> bool {
+    matches!(code, "E01" | "E02" | "E09" | "E10")
 }
 
 fn waypoint_permutations(waypoints: &[String]) -> Vec<Vec<String>> {
@@ -8401,6 +8413,11 @@ impl MemoryManager {
             &mut graphs,
             &options,
         )?;
+        let initial_recoverable_no_path = outcome.paths.is_empty()
+            && outcome
+                .diagnosis
+                .iter()
+                .any(|code| is_completion_recoverable_code(code));
 
         // L0 scope relaxation: E08 means an anchor exists only in the omitted
         // store. Retry once across all stores.
@@ -8577,6 +8594,8 @@ impl MemoryManager {
         if budget_exhausted() && !outcome.diagnosis.iter().any(|code| code == "E07") {
             outcome.diagnosis.push("E07".to_string());
         }
+        outcome.recoverable_no_path = initial_recoverable_no_path;
+        outcome.recovered_no_path = initial_recoverable_no_path && !outcome.paths.is_empty();
         let outcome = finalize_path_outcome(outcome);
         if !options.suppress_audit {
             self.record_query_audit("memory", effective_scope, &outcome);
@@ -8728,6 +8747,8 @@ impl MemoryManager {
             relaxations: outcome.relaxations.clone(),
             low_provenance_paths,
             hub_paths,
+            recoverable_no_path: outcome.recoverable_no_path,
+            recovered_no_path: outcome.recovered_no_path,
         };
         let _ = self.append_query_audit(&entry);
     }
@@ -8752,6 +8773,8 @@ impl MemoryManager {
             relaxations: Vec::new(),
             low_provenance_paths: 0,
             hub_paths: 0,
+            recoverable_no_path: false,
+            recovered_no_path: false,
         };
         let _ = self.append_query_audit(&entry);
     }

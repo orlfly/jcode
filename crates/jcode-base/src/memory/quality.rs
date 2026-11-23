@@ -39,6 +39,8 @@ pub const MIN_COMPILE_SUCCESS_RATE: f32 = 0.98;
 pub const MAX_RELAXATION_RATE: f32 = 0.10;
 /// Minimum tolerated precision of reviewed completion proposals (CPR).
 pub const MIN_COMPLETION_PRECISION: f32 = 0.80;
+/// Minimum tolerated recall of recoverable no-path queries (CRR).
+pub const MIN_COMPLETION_RECALL: f32 = 0.60;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +116,10 @@ pub struct QueryAuditEntry {
     pub low_provenance_paths: usize,
     #[serde(default)]
     pub hub_paths: usize,
+    #[serde(default)]
+    pub recoverable_no_path: bool,
+    #[serde(default)]
+    pub recovered_no_path: bool,
 }
 
 /// Query-derived quality metrics for one governance scope.
@@ -146,6 +152,12 @@ pub struct QueryAuditMetrics {
     pub relaxed_queries: u64,
     #[serde(default)]
     pub relaxation_rate: f32,
+    #[serde(default)]
+    pub recoverable_no_path_queries: u64,
+    #[serde(default)]
+    pub recovered_no_path_queries: u64,
+    #[serde(default = "default_rate")]
+    pub completion_recall: f32,
     pub cross_graph_queries: u64,
     pub cross_graph_success: u64,
     pub cross_graph_success_rate: f32,
@@ -173,6 +185,9 @@ impl Default for QueryAuditMetrics {
             compile_success_rate: 1.0,
             relaxed_queries: 0,
             relaxation_rate: 0.0,
+            recoverable_no_path_queries: 0,
+            recovered_no_path_queries: 0,
+            completion_recall: 1.0,
             cross_graph_queries: 0,
             cross_graph_success: 0,
             cross_graph_success_rate: 1.0,
@@ -471,6 +486,12 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         if !entry.relaxations.is_empty() {
             metrics.relaxed_queries += 1;
         }
+        if entry.recoverable_no_path {
+            metrics.recoverable_no_path_queries += 1;
+            if entry.recovered_no_path {
+                metrics.recovered_no_path_queries += 1;
+            }
+        }
         if entry.stores_searched > 1 {
             metrics.cross_graph_queries += 1;
             if entry.success {
@@ -513,6 +534,12 @@ pub fn summarize_queries(entries: &[QueryAuditEntry], scope: &str) -> QueryAudit
         0.0
     } else {
         metrics.relaxed_queries as f32 / metrics.total_queries as f32
+    };
+    metrics.completion_recall = if metrics.recoverable_no_path_queries == 0 {
+        1.0
+    } else {
+        metrics.recovered_no_path_queries as f32
+            / metrics.recoverable_no_path_queries as f32
     };
     metrics.cross_graph_success_rate = if metrics.cross_graph_queries == 0 {
         1.0
@@ -595,6 +622,18 @@ pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
             metrics.relaxation_rate,
             MAX_RELAXATION_RATE,
             "loosen default filters or add missing graph coverage",
+        ));
+    }
+    if metrics.recoverable_no_path_queries > 0
+        && metrics.completion_recall < MIN_COMPLETION_RECALL
+    {
+        findings.push(finding(
+            "Q16",
+            QualitySeverity::Warning,
+            "completion_recall",
+            metrics.completion_recall,
+            MIN_COMPLETION_RECALL,
+            "extend the completion ladder or add missing data sources",
         ));
     }
     findings
@@ -793,6 +832,8 @@ mod tests {
                 relaxations: vec!["E04".to_string()],
                 low_provenance_paths: 1,
                 hub_paths: 0,
+                recoverable_no_path: true,
+                recovered_no_path: true,
             },
             QueryAuditEntry {
                 scope: "project".to_string(),
@@ -807,6 +848,8 @@ mod tests {
                 relaxations: Vec::new(),
                 low_provenance_paths: 0,
                 hub_paths: 0,
+                recoverable_no_path: true,
+                recovered_no_path: false,
             },
             QueryAuditEntry {
                 scope: "project".to_string(),
@@ -821,6 +864,8 @@ mod tests {
                 relaxations: Vec::new(),
                 low_provenance_paths: 0,
                 hub_paths: 0,
+                recoverable_no_path: false,
+                recovered_no_path: false,
             },
         ];
         let metrics = summarize_queries(&entries, "project");
@@ -845,6 +890,9 @@ mod tests {
         assert_eq!(metrics.compile_success_rate, 1.0);
         assert_eq!(metrics.relaxed_queries, 1);
         assert_eq!(metrics.relaxation_rate, 0.5);
+        assert_eq!(metrics.recoverable_no_path_queries, 2);
+        assert_eq!(metrics.recovered_no_path_queries, 1);
+        assert_eq!(metrics.completion_recall, 0.5);
     }
 
     #[test]
@@ -867,6 +915,9 @@ mod tests {
             compile_success_rate: 0.75,
             relaxed_queries: 1,
             relaxation_rate: 0.5,
+            recoverable_no_path_queries: 2,
+            recovered_no_path_queries: 1,
+            completion_recall: 0.5,
             cross_graph_queries: 2,
             cross_graph_success: 1,
             cross_graph_success_rate: 0.5,
@@ -880,5 +931,6 @@ mod tests {
         assert!(findings.iter().any(|finding| finding.code == "Q12"));
         assert!(findings.iter().any(|finding| finding.code == "Q13"));
         assert!(findings.iter().any(|finding| finding.code == "Q14"));
+        assert!(findings.iter().any(|finding| finding.code == "Q16"));
     }
 }

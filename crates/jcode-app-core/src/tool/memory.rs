@@ -1246,6 +1246,15 @@ impl Tool for MemoryTool {
                         gap.confidence,
                         gap.degraded_answer
                     ));
+                    for step in &gap.completion_plan {
+                        diagnostics.push(format!(
+                            "completion plan {}: {}; verify: {}; write: {}",
+                            step.level.as_str(),
+                            step.action,
+                            step.verification,
+                            step.write_policy
+                        ));
+                    }
                 }
                 for action in &outcome.next_actions {
                     diagnostics.push(format!("next action: {action}"));
@@ -2675,6 +2684,9 @@ mod tests {
         assert!(gap.contains("knowledge gap: status no_path"), "{gap}");
         assert!(gap.contains("entities [missing:anchor]"), "{gap}");
         assert!(gap.contains("levels [L2]"), "{gap}");
+        assert!(gap.contains("completion plan L2:"), "{gap}");
+        assert!(gap.contains("completion plan L4:"), "{gap}");
+        assert!(gap.contains("completion plan L5:"), "{gap}");
 
         let invalid = tool
             .execute(

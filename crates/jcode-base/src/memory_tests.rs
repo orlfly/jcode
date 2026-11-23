@@ -194,6 +194,9 @@ fn quality_report_includes_query_audit_metrics() {
         assert_eq!(report.query_metrics.path_success_rate, 0.5);
         assert_eq!(report.query_metrics.total_paths, 1);
         assert_eq!(report.query_metrics.evidence_coverage, 0.0);
+        assert_eq!(report.query_metrics.recoverable_no_path_queries, 1);
+        assert_eq!(report.query_metrics.recovered_no_path_queries, 0);
+        assert_eq!(report.query_metrics.completion_recall, 0.0);
         assert!(
             report
                 .query_metrics
@@ -212,6 +215,10 @@ fn quality_report_includes_query_audit_metrics() {
         );
         assert!(
             report.debt.iter().any(|item| item.code == "Q08"),
+            "{report:?}"
+        );
+        assert!(
+            report.findings.iter().any(|finding| finding.code == "Q16"),
             "{report:?}"
         );
     });
@@ -5252,6 +5259,8 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
             )
             .expect("missing anchor query");
         assert!(missing.paths.is_empty(), "{missing:?}");
+        assert!(missing.recoverable_no_path, "{missing:?}");
+        assert!(!missing.recovered_no_path, "{missing:?}");
         assert_eq!(missing.unresolved_from, vec!["missing-anchor"]);
         assert_eq!(missing.diagnosis, vec!["E01"]);
         let gap = missing.knowledge_gap.as_ref().expect("knowledge gap");
@@ -5295,6 +5304,8 @@ fn paths_between_anchor_sets_filter_relations_and_report_diagnostics() {
             )
             .expect("auto grounded query");
         assert_eq!(grounded.paths.len(), 1, "{grounded:?}");
+        assert!(grounded.recoverable_no_path, "{grounded:?}");
+        assert!(grounded.recovered_no_path, "{grounded:?}");
         assert!(
             grounded
                 .relaxations

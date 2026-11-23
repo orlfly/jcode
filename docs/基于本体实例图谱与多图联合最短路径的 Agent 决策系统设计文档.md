@@ -2000,6 +2000,8 @@ def complete_path(q, budget):
 
 verify 至少检查：端点绑定匹配、硬约束满足、关系类型合法或已显式记录放宽、路径置信度达标、假设边数量不超过阈值、无禁止节点与环。LLM 提议的候选边在 verify 之外还要逐边过签名兼容检查，任一边被拒则整条候选路径丢弃，不做部分采纳。
 
+**实现口径（v1.x）**：no-path 结果中的 `knowledge_gap.completion_plan` 按本次诊断码生成有序 `L0-L5` 步骤，每步返回动作、`llm_role`、验证要求和 `write_policy`。`L4` 与 `L5` 作为剩余缺口的兜底始终排在末尾；`L2/L3/L5` 的 `llm_role` 非 `none` 且 `write_policy` 不是 `no graph write`，下游执行器必须走评审或正常入库门禁，不能把计划当成已执行事实。
+
 #### 4.4.4 补全边打分与置信度传播
 
 候选边的可信度由语义相似、链接预测、类型兼容、外部证据和共现频率共同决定：
@@ -2329,9 +2331,9 @@ HPD 用中位数而非均值，避免少数超长路径拉偏；HCR 与 4.2 的�
 | 补全精确率 CPR | 验证为真的补全边 / 提出的补全边 | ≥0.80 | 提高 τ_link、加证据 |
 | 补全召回率 CRR | 成功恢复的 no-path / 可恢复 no-path | ≥0.60 | 扩展补全层级与数据源 |
 
-**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，RLR 对应 `relaxation_rate`，ALR 对应 `alignment_coverage`。CPR 对应 `completion.precision`，分子是已接受的影子边，分母是已裁决（接受或拒绝）的影子边，pending 只计数不计入分母，避免未审核候选被当成误报。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值越过内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS）、`Q14`（RLR）、`Q15`（CPR），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
+**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，RLR 对应 `relaxation_rate`，ALR 对应 `alignment_coverage`。CPR 对应 `completion.precision`，分子是已接受的影子边，分母是已裁决（接受或拒绝）的影子边，pending 只计数不计入分母，避免未审核候选被当成误报。CRR 对应 `completion_recall`，分母是首次查询即失败且诊断属于 `E01/E02/E09/E10` 的可恢复 no-path，分子是同一次查询经 L1-L5 阶梯恢复出路径的数量；纯查询侧放宽（E03+E04/E06）不计入分母，避免把参数松弛误算成语义补全。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值越过内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS）、`Q14`（RLR）、`Q15`（CPR）、`Q16`（CRR），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
 
-ECE 衡量“说 0.8 置信度时是否真的有 80% 正确”，比单纯准确率更适合决策场景。CPR 可由影子边的接受/拒绝记录在线派生；CRR 仍需要人工标注“可恢复 no-path”集合，建议每季度更新一次。
+ECE 衡量“说 0.8 置信度时是否真的有 80% 正确”，比单纯准确率更适合决策场景。CPR 可由影子边的接受/拒绝记录在线派生；CRR 由查询审计的首次失败与最终恢复状态在线派生，人工标注集仍建议每季度加入回归，防止诊断码漂移。
 
 #### 4.6.5 综合质量分与阈值
 
