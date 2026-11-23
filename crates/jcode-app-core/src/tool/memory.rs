@@ -106,6 +106,9 @@ struct MemoryInput {
     /// For action=path: minimum score for auto-grounding unresolved anchors.
     #[serde(default)]
     semantic_min_score: Option<f32>,
+    /// For action=path: propose L4 stitched gaps as pending shadow edges.
+    #[serde(default)]
+    auto_propose: Option<bool>,
     /// For link action: relationship weight (0.0-1.0)
     #[serde(default)]
     weight: Option<f32>,
@@ -321,6 +324,10 @@ impl Tool for MemoryTool {
                 "semantic_min_score": {
                     "type": "number",
                     "description": "For path: minimum anchor grounding score (0.0-1.0)."
+                },
+                "auto_propose": {
+                    "type": "boolean",
+                    "description": "For path: propose stitched gaps as pending shadow edges."
                 },
                 "shadow_action": {
                     "type": "string",
@@ -1007,6 +1014,7 @@ impl Tool for MemoryTool {
             }
             "path" => {
                 let mut auto_ground = false;
+                let mut auto_propose = false;
                 let mut semantic_min_score = None;
                 let mut query_filters: Option<(
                     Vec<String>,
@@ -1026,6 +1034,7 @@ impl Tool for MemoryTool {
                     include_hypotheses,
                     include_ontology,
                     query_budget_ms,
+                    auto_propose,
                 ) = if let Some(query) = input.path_query.clone() {
                     query.validate().map_err(|errors| {
                         anyhow::anyhow!("invalid path_query: {}", errors.join("; "))
@@ -1046,6 +1055,7 @@ impl Tool for MemoryTool {
                         ));
                     }
                     auto_ground = query.constraints.auto_ground;
+                    auto_propose = query.constraints.auto_propose;
                     semantic_min_score = query.constraints.semantic_min_score;
                     let graph_kind = query.graph_kind().as_str().to_string();
                     (
@@ -1061,6 +1071,7 @@ impl Tool for MemoryTool {
                         query.constraints.include_hypotheses,
                         query.constraints.include_ontology,
                         query.constraints.query_budget_ms,
+                        auto_propose,
                     )
                 } else {
                     let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
@@ -1080,6 +1091,7 @@ impl Tool for MemoryTool {
                     let include_hypotheses = input.include_hypotheses.unwrap_or(false);
                     let include_ontology = input.include_ontology.unwrap_or(false);
                     let query_budget_ms = input.query_budget_ms;
+                    auto_propose = input.auto_propose.unwrap_or(false);
                     semantic_min_score = input.semantic_min_score;
                     (
                         scope,
@@ -1094,6 +1106,7 @@ impl Tool for MemoryTool {
                         include_hypotheses,
                         include_ontology,
                         query_budget_ms,
+                        auto_propose,
                     )
                 };
                 if froms.is_empty() {
@@ -1156,6 +1169,7 @@ impl Tool for MemoryTool {
                     query_budget_ms,
                     semantic_min_score,
                     suppress_audit: false,
+                    auto_propose_shadow: auto_propose,
                 };
                 let outcome = if waypoints.is_empty() {
                     manager.paths_between_anchors_with_options(
@@ -1255,6 +1269,11 @@ impl Tool for MemoryTool {
                             step.write_policy
                         ));
                     }
+                }
+                for id in &outcome.proposed_shadow_edges {
+                    diagnostics.push(format!(
+                        "proposed shadow edge: {id} (pending review, not in main graph)"
+                    ));
                 }
                 for action in &outcome.next_actions {
                     diagnostics.push(format!("next action: {action}"));
@@ -3491,6 +3510,74 @@ mod tests {
             .expect("budgeted path")
             .output;
         assert!(output.contains("E07"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn path_action_auto_proposes_stitched_gap_shadow_edge() {
+        use crate::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+
+        let mut graph = MemoryGraph::new();
+        let start = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "start node"));
+        let left = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared bridge concept alpha",
+        ));
+        let right = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared bridge concept beta",
+        ));
+        let goal = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "goal node"));
+        graph.add_edge(
+            &start,
+            &left,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        graph.add_edge(
+            &right,
+            &goal,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        tool.manager
+            .save_project_graph(&graph)
+            .expect("save stitched graph");
+
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":start,
+                    "to_id":goal,
+                    "scope":"project",
+                    "depth":4,
+                    "auto_propose":true
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("auto propose path")
+            .output;
+        assert!(output.contains("Found 1 memory path(s)"), "{output}");
+        assert!(output.contains("proposed shadow edge:"), "{output}");
+        assert!(output.contains("pending review, not in main graph"), "{output}");
+        let pending = tool
+            .manager
+            .list_shadow_edges_scoped(
+                Some(crate::memory::ShadowEdgeStatus::Pending),
+                MemoryScope::Project,
+            )
+            .expect("pending proposal");
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].source, "completion_l4");
     }
 
     #[tokio::test]

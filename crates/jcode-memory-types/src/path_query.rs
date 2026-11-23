@@ -113,6 +113,10 @@ pub struct PathQueryConstraints {
     pub semantic_min_score: Option<f32>,
     #[serde(default)]
     pub auto_ground: bool,
+    /// Propose L4 stitched-path gaps as pending shadow edges. Pending edges
+    /// never enter the stored graph until reviewed.
+    #[serde(default)]
+    pub auto_propose: bool,
     #[serde(default)]
     pub plan: bool,
 }

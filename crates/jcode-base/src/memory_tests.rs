@@ -5403,13 +5403,20 @@ fn path_query_stitches_disjoint_components_at_similar_anchors() {
                 3,
                 MemoryScope::Project,
                 &[],
-                crate::memory::MemoryPathQueryOptions::default(),
+                crate::memory::MemoryPathQueryOptions {
+                    auto_propose_shadow: true,
+                    ..Default::default()
+                },
             )
             .expect("stitched query");
         assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
         assert!(outcome.knowledge_gap.is_none(), "{outcome:?}");
         let path = &outcome.paths[0];
-        assert_eq!(path.nodes, vec![start, left, right, goal], "{path:?}");
+        assert_eq!(
+            path.nodes,
+            vec![start.clone(), left.clone(), right.clone(), goal.clone()],
+            "{path:?}"
+        );
         assert!(
             path.edges.iter().any(|edge| matches!(
                 &edge.kind,
@@ -5426,6 +5433,23 @@ fn path_query_stitches_disjoint_components_at_similar_anchors() {
         assert!(
             quality.has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
             "{quality:?}"
+        );
+        assert_eq!(outcome.proposed_shadow_edges.len(), 1, "{outcome:?}");
+        let pending = manager
+            .list_shadow_edges_scoped(
+                Some(crate::memory::ShadowEdgeStatus::Pending),
+                MemoryScope::Project,
+            )
+            .expect("pending shadow edges");
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].relation, "same_as");
+        assert_eq!(pending[0].source, "completion_l4");
+        let stored = manager.load_project_graph().expect("stored graph");
+        assert!(
+            !stored.get_edges(&left).iter().any(|edge| {
+                edge.target == right && matches!(edge.kind, crate::memory_graph::EdgeKind::SameAs)
+            }),
+            "pending proposal must not enter the stored graph"
         );
     });
 }

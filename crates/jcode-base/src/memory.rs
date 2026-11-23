@@ -304,6 +304,10 @@ pub struct MemoryPathQueryOutcome {
     /// completion step in the same query.
     #[serde(default)]
     pub recovered_no_path: bool,
+    /// Pending shadow-edge ids created from stitched-path gaps during this
+    /// query. Empty unless auto-proposal was requested.
+    #[serde(default)]
+    pub proposed_shadow_edges: Vec<String>,
 }
 
 impl MemoryPathQueryOutcome {
@@ -382,6 +386,9 @@ pub struct MemoryPathQueryOptions {
     pub semantic_min_score: Option<f32>,
     /// Internal flag for nested legs so only the outer query is audited.
     pub suppress_audit: bool,
+    /// Propose L4 gap candidates as pending shadow edges after a stitched
+    /// path is returned. Pending edges never enter the stored graph.
+    pub auto_propose_shadow: bool,
 }
 
 const MAX_INITIAL_PATH_DEPTH: usize = 8;
@@ -8265,6 +8272,71 @@ impl MemoryManager {
         storage::write_json(&self.shadow_store_path()?, &edges)
     }
 
+    /// Turn L4 stitched-path gaps into pending `same_as` shadow proposals.
+    ///
+    /// Cross-store candidates are skipped because bridges become immediately
+    /// traversable; they still require explicit review through `bridge`.
+    pub fn propose_stitch_hypotheses(
+        &self,
+        outcome: &MemoryPathQueryOutcome,
+        scope: MemoryScope,
+    ) -> Vec<String> {
+        let project = if scope.includes_project() {
+            self.load_project_graph().ok()
+        } else {
+            None
+        };
+        let global = if scope.includes_global() {
+            self.load_global_graph().ok()
+        } else {
+            None
+        };
+        let mut ids = Vec::new();
+        for edge in outcome.paths.iter().flat_map(|path| &path.edges) {
+            let jcode_memory_types::EdgeKind::Hypothesized {
+                relation,
+                weight,
+                confidence,
+            } = &edge.kind
+            else {
+                continue;
+            };
+            if !relation.eq_ignore_ascii_case("same_as_candidate") {
+                continue;
+            }
+            let in_project = project.as_ref().is_some_and(|graph| {
+                graph.get_memory(&edge.from).is_some() && graph.get_memory(&edge.to).is_some()
+            });
+            let in_global = global.as_ref().is_some_and(|graph| {
+                graph.get_memory(&edge.from).is_some() && graph.get_memory(&edge.to).is_some()
+            });
+            let candidate_scope = if in_project {
+                MemoryScope::Project
+            } else if in_global {
+                MemoryScope::Global
+            } else {
+                continue;
+            };
+            let Ok(proposal) = self.propose_shadow_edge(
+                &edge.from,
+                &edge.to,
+                "same_as",
+                *weight,
+                *confidence,
+                Some("L4 stitched path candidate; verify before promotion"),
+                "completion_l4",
+                candidate_scope,
+            ) else {
+                continue;
+            };
+            if !ids.contains(&proposal.id) {
+                ids.push(proposal.id);
+            }
+        }
+        ids.sort();
+        ids
+    }
+
     /// Propose a candidate edge without touching the main graph.
     #[allow(clippy::too_many_arguments)]
     pub fn propose_shadow_edge(
@@ -8796,7 +8868,11 @@ impl MemoryManager {
         }
         outcome.recoverable_no_path = initial_recoverable_no_path;
         outcome.recovered_no_path = initial_recoverable_no_path && !outcome.paths.is_empty();
-        let outcome = finalize_path_outcome(outcome);
+        let mut outcome = finalize_path_outcome(outcome);
+        if options.auto_propose_shadow && !options.suppress_audit {
+            outcome.proposed_shadow_edges =
+                self.propose_stitch_hypotheses(&outcome, effective_scope);
+        }
         if !options.suppress_audit {
             self.record_query_audit("memory", effective_scope, &outcome);
         }

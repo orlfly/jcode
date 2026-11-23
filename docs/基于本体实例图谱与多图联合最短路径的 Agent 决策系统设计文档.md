@@ -1984,6 +1984,8 @@ L3 中 LLM 文档抽取的证据必须携带可验证定位（source、页码/�
 
 **实现口径（v1.x）**：L4 在常规搜索与跨库 bridge 拼接都无路径时触发，只在起终点全部解析成功且未被过滤时执行。它从两端各做半径 2、上限 64 个节点的双向邻域遍历，用嵌入余弦与词项 Jaccard 的较大值给邻域锚点对打分，取分数 ≥0.55 的前 3 对候选；每个候选只在两段路径无重叠节点时合成一条路径，并插入 `hypothesized(relation=same_as_candidate)` 虚拟边，桥代价为 `3.0 + 2.0 × (1 − score)`，不写主图。合成路径同时带 `stitched_path` 与 `hypothesized_edge` 质量标志，下游必须先验证 gap 才能执行副作用动作。
 
+当查询显式设置 `auto_propose=true` 时，L4 gap 会被写成 `same_as` 影子边，`status=pending`、`source=completion_l4`，返回 `proposed_shadow_edges` 列表；pending 不进入主图，也不参与未开启 `include_hypotheses` 的查询。跨 store 候选不自动写成 bridge，因为 bridge 注册后立即可遍历，仍走人工 `bridge` 审核，避免把未验证对齐变成事实。
+
 ```python
 def complete_path(q, budget):
     diag = diagnose(q)   # 确定性探针 + 语义探针（可退化）
