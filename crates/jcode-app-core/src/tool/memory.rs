@@ -124,6 +124,12 @@ struct MemoryInput {
     /// For action=bridge: link | candidates | accept_candidate | reject_candidate.
     #[serde(default)]
     bridge_action: Option<String>,
+    /// For batch review: explicit candidate ids. Empty means all pending.
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    /// For batch review: accept (`true`) or reject (`false`).
+    #[serde(default)]
+    accept: Option<bool>,
     /// For related action: traversal depth (default: 2). For path: max hops
     /// (default: 4, capped at 8).
     #[serde(default)]
@@ -339,8 +345,17 @@ impl Tool for MemoryTool {
                 },
                 "bridge_action": {
                     "type": "string",
-                    "enum": ["link", "candidates", "accept_candidate", "reject_candidate"],
-                    "description": "For action=bridge: link or review pending cross-store candidates."
+                    "enum": ["link", "candidates", "accept_candidate", "reject_candidate", "batch_review"],
+                    "description": "For action=bridge: link or review pending candidates."
+                },
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For batch_review: candidate ids. Empty means all pending."
+                },
+                "accept": {
+                    "type": "boolean",
+                    "description": "For batch_review: true accepts, false rejects."
                 },
                 "relation": {
                     "type": "string",
@@ -818,6 +833,71 @@ impl Tool for MemoryTool {
                         serde_json::to_string_pretty(&candidates)?
                     )));
                 }
+                if bridge_action == "batch_review" {
+                    let accept = input
+                        .accept
+                        .ok_or_else(|| anyhow::anyhow!("accept required for batch_review"))?;
+                    let dry_run = input.dry_run.unwrap_or(true);
+                    let wanted: std::collections::HashSet<&str> = input
+                        .ids
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    let candidates: Vec<_> = manager
+                        .list_bridge_candidates(Some(
+                            crate::memory::PendingBridgeStatus::Pending,
+                        ))?
+                        .into_iter()
+                        .filter(|candidate| {
+                            wanted.is_empty() || wanted.contains(candidate.id.as_str())
+                        })
+                        .collect();
+                    if candidates.is_empty() {
+                        return Ok(ToolOutput::new(
+                            "No pending bridge candidates matched the request.".to_string(),
+                        ));
+                    }
+                    if dry_run {
+                        let ids: Vec<&str> =
+                            candidates.iter().map(|candidate| candidate.id.as_str()).collect();
+                        return Ok(ToolOutput::new(format!(
+                            "Dry run: would {} {} pending bridge candidate(s).\nids: {}\nApply with dry_run=false confirm=true.",
+                            if accept { "accept" } else { "reject" },
+                            candidates.len(),
+                            ids.join(", ")
+                        )));
+                    }
+                    if input.confirm != Some(true) {
+                        return Err(anyhow::anyhow!(
+                            "batch bridge review requires confirm=true after reviewing a dry run"
+                        ));
+                    }
+                    let mut lines = Vec::new();
+                    let mut applied = 0;
+                    for candidate in &candidates {
+                        match manager.review_bridge_candidate(&candidate.id, accept) {
+                            Ok(reviewed) => {
+                                applied += 1;
+                                lines.push(format!(
+                                    "- {}: {}",
+                                    reviewed.id,
+                                    reviewed.status.as_str()
+                                ));
+                            }
+                            Err(error) => {
+                                lines.push(format!("- {}: failed ({error})", candidate.id));
+                            }
+                        }
+                    }
+                    return Ok(ToolOutput::new(format!(
+                        "Applied batch bridge review: {} of {} candidate(s).\n{}",
+                        applied,
+                        candidates.len(),
+                        lines.join("\n")
+                    )));
+                }
                 if matches!(
                     bridge_action,
                     "accept_candidate" | "reject_candidate"
@@ -840,7 +920,7 @@ impl Tool for MemoryTool {
                 }
                 if bridge_action != "link" {
                     return Err(anyhow::anyhow!(
-                        "Unknown bridge_action: {bridge_action}. Use link, candidates, accept_candidate, or reject_candidate"
+                        "Unknown bridge_action: {bridge_action}. Use link, candidates, accept_candidate, reject_candidate, or batch_review"
                     ));
                 }
                 let project_id = input
@@ -3705,6 +3785,93 @@ mod tests {
             .output;
         assert!(accepted.contains("Accepted bridge candidate"), "{accepted}");
         assert_eq!(tool.manager.list_bridges().expect("bridges").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_bridge_review_requires_dry_run_then_confirmation() {
+        use crate::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+
+        let mut project_graph = MemoryGraph::new();
+        let p1 = project_graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "batch project anchor one",
+        ));
+        let p2 = project_graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "batch project anchor two",
+        ));
+        tool.manager
+            .save_project_graph(&project_graph)
+            .expect("save project");
+        let mut global = MemoryGraph::new();
+        let g1 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "batch global anchor one",
+        ));
+        let g2 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "batch global anchor two",
+        ));
+        tool.manager
+            .save_global_graph(&global)
+            .expect("save global");
+        tool.manager
+            .propose_bridge_candidate(&p1, &g1, 0.9, "same_as", "evidence one", "test")
+            .expect("candidate one");
+        tool.manager
+            .propose_bridge_candidate(&p2, &g2, 0.9, "same_as", "evidence two", "test")
+            .expect("candidate two");
+
+        let dry = tool
+            .execute(
+                json!({"action":"bridge","bridge_action":"batch_review","accept":true}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("dry run")
+            .output;
+        assert!(dry.contains("Dry run: would accept 2"), "{dry}");
+        assert!(tool.manager.list_bridges().expect("bridges").is_empty());
+
+        let blocked = tool
+            .execute(
+                json!({
+                    "action":"bridge",
+                    "bridge_action":"batch_review",
+                    "accept":true,
+                    "dry_run":false
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await;
+        assert!(blocked.is_err(), "{blocked:?}");
+
+        let applied = tool
+            .execute(
+                json!({
+                    "action":"bridge",
+                    "bridge_action":"batch_review",
+                    "accept":true,
+                    "dry_run":false,
+                    "confirm":true
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("apply batch review")
+            .output;
+        assert!(applied.contains("Applied batch bridge review: 2 of 2"), "{applied}");
+        assert_eq!(tool.manager.list_bridges().expect("bridges").len(), 2);
     }
 
     #[tokio::test]
