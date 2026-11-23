@@ -218,6 +218,78 @@ fn quality_report_includes_query_audit_metrics() {
 }
 
 #[test]
+fn quality_report_derives_completion_precision_from_reviews() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/completion-quality");
+        let mut graph = MemoryGraph::new();
+        let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "completion alpha"));
+        let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "completion beta"));
+        let c = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "completion gamma"));
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let accepted = manager
+            .propose_shadow_edge(
+                &a,
+                &b,
+                "relates_to",
+                0.9,
+                0.9,
+                Some("verified external locator"),
+                "test",
+                MemoryScope::Project,
+            )
+            .expect("propose accepted edge");
+        manager
+            .review_shadow_edge(&accepted.id, true)
+            .expect("accept edge");
+        let rejected = manager
+            .propose_shadow_edge(
+                &a,
+                &c,
+                "relates_to",
+                0.4,
+                0.4,
+                None,
+                "test",
+                MemoryScope::Project,
+            )
+            .expect("propose rejected edge");
+        manager
+            .review_shadow_edge(&rejected.id, false)
+            .expect("reject edge");
+        manager
+            .propose_shadow_edge(
+                &b,
+                &c,
+                "relates_to",
+                0.6,
+                0.6,
+                None,
+                "test",
+                MemoryScope::Project,
+            )
+            .expect("propose pending edge");
+
+        let report = manager
+            .graph_quality(MemoryScope::Project)
+            .expect("quality report");
+        assert_eq!(report.completion.proposed, 3, "{report:?}");
+        assert_eq!(report.completion.verified, 1);
+        assert_eq!(report.completion.rejected, 1);
+        assert_eq!(report.completion.pending, 1);
+        assert_eq!(report.completion.precision, 0.5);
+        assert!(
+            report.findings.iter().any(|finding| finding.code == "Q15"),
+            "{report:?}"
+        );
+        assert!(
+            report.debt.iter().any(|item| item.code == "Q15"),
+            "{report:?}"
+        );
+    });
+}
+
+#[test]
 fn jev_project_write_without_scope_fails_instead_of_silently_losing_memory() {
     with_temp_home(|_| {
         let manager = MemoryManager::new();

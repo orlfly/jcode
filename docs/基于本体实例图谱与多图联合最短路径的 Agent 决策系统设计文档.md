@@ -2329,9 +2329,9 @@ HPD 用中位数而非均值，避免少数超长路径拉偏；HCR 与 4.2 的�
 | 补全精确率 CPR | 验证为真的补全边 / 提出的补全边 | ≥0.80 | 提高 τ_link、加证据 |
 | 补全召回率 CRR | 成功恢复的 no-path / 可恢复 no-path | ≥0.60 | 扩展补全层级与数据源 |
 
-**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，RLR 对应 `relaxation_rate`，ALR 对应 `alignment_coverage`。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值越过内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS）、`Q14`（RLR），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
+**实现映射（v1.x）**：`action=quality` 的 `query_metrics` 已落地上表可在线计算的部分。PSR 对应 `success_rate`，XSR 对应 `cross_graph_success_rate`，ECR 对应 `evidence_coverage`，HCR 对应 `hub_path_ratio`，QCS 对应 `compile_success_rate`，RLR 对应 `relaxation_rate`，ALR 对应 `alignment_coverage`。CPR 对应 `completion.precision`，分子是已接受的影子边，分母是已裁决（接受或拒绝）的影子边，pending 只计数不计入分母，避免未审核候选被当成误报。编译尝试由 `action=compile` 在成功或失败时写入同一条 `query_audit.jsonl`（`kind=compile`，失败时携带诊断信息），不混入路径查询总数；阈值越过内置门限时分别生成 `Q08`（PSR）、`Q09`（XSR）、`Q11`（ECR）、`Q12`（HCR）、`Q13`（QCS）、`Q14`（RLR）、`Q15`（CPR），并进入同一份 `quality_debt.json` 债务队列，供责任人、SLA 与回归验证复用。
 
-ECE 衡量“说 0.8 置信度时是否真的有 80% 正确”，比单纯准确率更适合决策场景。CPR 与 CRR 需要人工标注的补全边集合，建议每季度更新一次。
+ECE 衡量“说 0.8 置信度时是否真的有 80% 正确”，比单纯准确率更适合决策场景。CPR 可由影子边的接受/拒绝记录在线派生；CRR 仍需要人工标注“可恢复 no-path”集合，建议每季度更新一次。
 
 #### 4.6.5 综合质量分与阈值
 

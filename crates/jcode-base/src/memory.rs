@@ -8595,11 +8595,20 @@ impl MemoryManager {
             .list_shadow_edges_scoped(Some(ShadowEdgeStatus::Pending), scope)?
             .len();
         let mut report = quality::aggregate(scope_label(scope), stores, pending);
+        let shadow_edges = self.list_shadow_edges_scoped(None, scope)?;
+        report.completion = quality::completion_quality(
+            shadow_edges.iter().map(|edge| edge.status.as_str()),
+        );
         report.query_metrics =
             quality::summarize_queries(&self.load_query_audit()?, &report.scope);
         let query_findings = quality::query_diagnose(&report.query_metrics);
         if !query_findings.is_empty() {
             report.findings.extend(query_findings);
+            report.healthy = false;
+        }
+        let completion_findings = quality::completion_diagnose(&report.completion);
+        if !completion_findings.is_empty() {
+            report.findings.extend(completion_findings);
             report.healthy = false;
         }
         self.sync_quality_debt(&mut report)?;

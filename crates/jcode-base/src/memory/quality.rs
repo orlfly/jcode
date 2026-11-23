@@ -37,6 +37,8 @@ pub const MAX_HUB_PATH_RATIO: f32 = 0.20;
 pub const MIN_COMPILE_SUCCESS_RATE: f32 = 0.98;
 /// Maximum tolerated share of path queries that needed relaxation.
 pub const MAX_RELAXATION_RATE: f32 = 0.10;
+/// Minimum tolerated precision of reviewed completion proposals (CPR).
+pub const MIN_COMPLETION_PRECISION: f32 = 0.80;
 
 /// Severity of one governance finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +198,32 @@ pub struct StoreQuality {
     pub largest_component: usize,
 }
 
+/// Review-derived precision of proposed completion edges.
+///
+/// Pending proposals are tracked but excluded from the precision denominator,
+/// so unreviewed candidates do not look like false positives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompletionQuality {
+    pub proposed: usize,
+    pub verified: usize,
+    pub rejected: usize,
+    pub pending: usize,
+    #[serde(default = "default_rate")]
+    pub precision: f32,
+}
+
+impl Default for CompletionQuality {
+    fn default() -> Self {
+        Self {
+            proposed: 0,
+            verified: 0,
+            rejected: 0,
+            pending: 0,
+            precision: 1.0,
+        }
+    }
+}
+
 /// Aggregated quality report for one or more memory stores.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GraphQualityReport {
@@ -223,6 +251,9 @@ pub struct GraphQualityReport {
     /// Online path-query success, diagnosis and completion-debt metrics.
     #[serde(default)]
     pub query_metrics: QueryAuditMetrics,
+    /// Precision of reviewed completion proposals (CPR).
+    #[serde(default)]
+    pub completion: CompletionQuality,
     /// True when no threshold is breached.
     #[serde(default)]
     pub healthy: bool,
@@ -384,6 +415,7 @@ pub fn aggregate(
         findings: Vec::new(),
         debt: Vec::new(),
         query_metrics: QueryAuditMetrics::default(),
+        completion: CompletionQuality::default(),
         healthy: true,
         stores,
     };
@@ -568,6 +600,44 @@ pub fn query_diagnose(metrics: &QueryAuditMetrics) -> Vec<QualityFinding> {
     findings
 }
 
+/// Aggregate reviewed shadow-edge statuses into completion precision (CPR).
+pub fn completion_quality<'a>(statuses: impl IntoIterator<Item = &'a str>) -> CompletionQuality {
+    let mut quality = CompletionQuality::default();
+    for status in statuses {
+        quality.proposed += 1;
+        match status {
+            "accepted" => quality.verified += 1,
+            "rejected" => quality.rejected += 1,
+            _ => quality.pending += 1,
+        }
+    }
+    let adjudicated = quality.verified + quality.rejected;
+    quality.precision = if adjudicated == 0 {
+        1.0
+    } else {
+        quality.verified as f32 / adjudicated as f32
+    };
+    quality
+}
+
+/// Derive completion-precision findings from reviewed proposals.
+pub fn completion_diagnose(completion: &CompletionQuality) -> Vec<QualityFinding> {
+    let mut findings = Vec::new();
+    if completion.verified + completion.rejected > 0
+        && completion.precision < MIN_COMPLETION_PRECISION
+    {
+        findings.push(finding(
+            "Q15",
+            QualitySeverity::Warning,
+            "completion_precision",
+            completion.precision,
+            MIN_COMPLETION_PRECISION,
+            "raise the link-prediction threshold or require stronger evidence",
+        ));
+    }
+    findings
+}
+
 /// Derive deterministic governance findings from one report.
 pub fn diagnose(report: &GraphQualityReport) -> Vec<QualityFinding> {
     if report.memories == 0 {
@@ -689,6 +759,22 @@ mod tests {
         assert_eq!(report.provenance_coverage, 0.0);
         assert_eq!(report.alignment_coverage, 0.0);
         assert!(report.healthy);
+    }
+
+    #[test]
+    fn completion_precision_uses_only_reviewed_proposals() {
+        let quality = completion_quality(["accepted", "rejected", "pending"]);
+        assert_eq!(quality.proposed, 3);
+        assert_eq!(quality.verified, 1);
+        assert_eq!(quality.rejected, 1);
+        assert_eq!(quality.pending, 1);
+        assert_eq!(quality.precision, 0.5);
+        let findings = completion_diagnose(&quality);
+        assert!(findings.iter().any(|finding| finding.code == "Q15"));
+
+        let pending_only = completion_quality(["pending", "pending"]);
+        assert_eq!(pending_only.precision, 1.0);
+        assert!(completion_diagnose(&pending_only).is_empty());
     }
 
     #[test]
