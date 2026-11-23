@@ -308,6 +308,9 @@ pub struct MemoryPathQueryOutcome {
     /// query. Empty unless auto-proposal was requested.
     #[serde(default)]
     pub proposed_shadow_edges: Vec<String>,
+    /// Pending cross-store bridge-candidate ids created during this query.
+    #[serde(default)]
+    pub proposed_bridge_candidates: Vec<String>,
 }
 
 impl MemoryPathQueryOutcome {
@@ -536,6 +539,50 @@ pub struct MemoryBridge {
     pub confidence: f32,
     pub source: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// Lifecycle of a cross-store bridge candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingBridgeStatus {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+impl PendingBridgeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// Cross-store alignment candidate that is not traversable until reviewed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingBridgeCandidate {
+    pub id: String,
+    pub project_id: String,
+    pub global_id: String,
+    pub score: f32,
+    pub relation: String,
+    pub evidence: String,
+    pub source: String,
+    pub status: PendingBridgeStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime<Utc>>,
 }
 
 /// Minimum reviewed similarity required to promote an alignment candidate.
@@ -7803,6 +7850,135 @@ impl MemoryManager {
         storage::write_json(&self.bridge_store_path()?, &bridges)
     }
 
+    fn bridge_candidate_store_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("bridge_candidates.json"))
+    }
+
+    pub fn list_bridge_candidates(
+        &self,
+        status: Option<PendingBridgeStatus>,
+    ) -> Result<Vec<PendingBridgeCandidate>> {
+        let path = self.bridge_candidate_store_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut candidates: Vec<PendingBridgeCandidate> = storage::read_json(&path)?;
+        if let Some(status) = status {
+            candidates.retain(|candidate| candidate.status == status);
+        }
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(candidates)
+    }
+
+    fn save_bridge_candidates(&self, candidates: &[PendingBridgeCandidate]) -> Result<()> {
+        storage::write_json(&self.bridge_candidate_store_path()?, candidates)
+    }
+
+    /// Queue one cross-store alignment candidate without making it traversable.
+    pub fn propose_bridge_candidate(
+        &self,
+        project_id: &str,
+        global_id: &str,
+        score: f32,
+        relation: &str,
+        evidence: &str,
+        source: &str,
+    ) -> Result<PendingBridgeCandidate> {
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            anyhow::bail!("bridge candidate score must be between 0.0 and 1.0");
+        }
+        let project = self.load_project_graph()?;
+        anyhow::ensure!(
+            project.get_memory(project_id).is_some(),
+            "project memory not found: {project_id}"
+        );
+        let global = self.load_global_graph()?;
+        anyhow::ensure!(
+            global.get_memory(global_id).is_some(),
+            "global memory not found: {global_id}"
+        );
+        let relation = relation.trim().to_ascii_lowercase();
+        if relation != "same_as" {
+            anyhow::bail!("bridge candidate relation must be `same_as`");
+        }
+        let existing_bridges = self.list_bridges()?;
+        if let Some(conflict) = existing_bridges.iter().find(|bridge| {
+            (bridge.project_id == project_id && bridge.global_id != global_id)
+                || (bridge.global_id == global_id && bridge.project_id != project_id)
+        }) {
+            anyhow::bail!(
+                "endpoint is already bridged through {}; resolve the conflict first",
+                conflict.id
+            );
+        }
+        let candidate = PendingBridgeCandidate {
+            id: format!("bridge-candidate:{project_id}:{global_id}"),
+            project_id: project_id.to_string(),
+            global_id: global_id.to_string(),
+            score,
+            relation,
+            evidence: evidence.trim().to_string(),
+            source: source.to_string(),
+            status: PendingBridgeStatus::Pending,
+            created_at: Utc::now(),
+            reviewed_at: None,
+        };
+        let mut candidates = self.list_bridge_candidates(None)?;
+        if let Some(existing) = candidates.iter().find(|row| row.id == candidate.id) {
+            if existing.status != PendingBridgeStatus::Pending {
+                return Ok(existing.clone());
+            }
+        }
+        candidates.retain(|row| row.id != candidate.id);
+        candidates.push(candidate.clone());
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_bridge_candidates(&candidates)?;
+        Ok(candidate)
+    }
+
+    /// Accept or reject one pending bridge candidate.
+    pub fn review_bridge_candidate(
+        &self,
+        id: &str,
+        accept: bool,
+    ) -> Result<PendingBridgeCandidate> {
+        let mut candidates = self.list_bridge_candidates(None)?;
+        let index = candidates
+            .iter()
+            .position(|candidate| candidate.id == id)
+            .ok_or_else(|| anyhow::anyhow!("bridge candidate not found: {id}"))?;
+        anyhow::ensure!(
+            candidates[index].status == PendingBridgeStatus::Pending,
+            "bridge candidate {id} is already {}",
+            candidates[index].status.as_str()
+        );
+        let mut candidate = candidates.remove(index);
+        if accept {
+            self.link_bridge(
+                &candidate.project_id,
+                &candidate.global_id,
+                candidate.score,
+                "reviewed_bridge_candidate",
+            )?;
+        }
+        candidate.status = if accept {
+            PendingBridgeStatus::Accepted
+        } else {
+            PendingBridgeStatus::Rejected
+        };
+        candidate.reviewed_at = Some(Utc::now());
+        candidates.push(candidate.clone());
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        self.save_bridge_candidates(&candidates)?;
+        Ok(candidate)
+    }
+
     fn decision_trace_store_path(&self) -> Result<PathBuf> {
         let base = if self.test_mode {
             storage::jcode_dir()?.join("memory").join("test")
@@ -8326,6 +8502,44 @@ impl MemoryManager {
                 Some("L4 stitched path candidate; verify before promotion"),
                 "completion_l4",
                 candidate_scope,
+            ) else {
+                continue;
+            };
+            if !ids.contains(&proposal.id) {
+                ids.push(proposal.id);
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Queue E09 cross-store alignment candidates for explicit bridge review.
+    pub fn propose_completion_bridge_candidates(
+        &self,
+        outcome: &MemoryPathQueryOutcome,
+        scope: MemoryScope,
+    ) -> Vec<String> {
+        if !scope.includes_project() || !scope.includes_global() || self.get_project_dir().is_none()
+        {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        for candidate in &outcome.alignment_candidates {
+            let (project_id, global_id) = match (
+                candidate.from_store.as_str(),
+                candidate.to_store.as_str(),
+            ) {
+                ("project", "global") => (&candidate.from_id, &candidate.to_id),
+                ("global", "project") => (&candidate.to_id, &candidate.from_id),
+                _ => continue,
+            };
+            let Ok(proposal) = self.propose_bridge_candidate(
+                project_id,
+                global_id,
+                candidate.score,
+                "same_as",
+                &candidate.reason,
+                "completion_e09",
             ) else {
                 continue;
             };
@@ -8872,6 +9086,8 @@ impl MemoryManager {
         if options.auto_propose_shadow && !options.suppress_audit {
             outcome.proposed_shadow_edges =
                 self.propose_stitch_hypotheses(&outcome, effective_scope);
+            outcome.proposed_bridge_candidates =
+                self.propose_completion_bridge_candidates(&outcome, effective_scope);
         }
         if !options.suppress_audit {
             self.record_query_audit("memory", effective_scope, &outcome);

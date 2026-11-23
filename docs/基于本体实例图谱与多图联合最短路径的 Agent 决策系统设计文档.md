@@ -1986,6 +1986,8 @@ L3 中 LLM 文档抽取的证据必须携带可验证定位（source、页码/�
 
 当查询显式设置 `auto_propose=true` 时，L4 gap 会被写成 `same_as` 影子边，`status=pending`、`source=completion_l4`，返回 `proposed_shadow_edges` 列表；pending 不进入主图，也不参与未开启 `include_hypotheses` 的查询。跨 store 候选不自动写成 bridge，因为 bridge 注册后立即可遍历，仍走人工 `bridge` 审核，避免把未验证对齐变成事实。
 
+E09 的跨 store 对齐候选写入独立的 `bridge_candidates.json`：`status=pending`、`source=completion_e09`，不进入 `bridges.json`，因此不会参与任何路径遍历。审核入口为 `action=bridge bridge_action=candidates|accept_candidate|reject_candidate`；只有接受时才调用 `link_bridge` 生成可遍历 bridge，拒绝只记录状态。这样补全召回率的分母包含 E09，但精确率与可遍历性仍由显式审核控制。
+
 ```python
 def complete_path(q, budget):
     diag = diagnose(q)   # 确定性探针 + 语义探针（可退化）

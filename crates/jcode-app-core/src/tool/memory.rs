@@ -121,6 +121,9 @@ struct MemoryInput {
     /// For action=shadow: list | propose | accept | reject.
     #[serde(default)]
     shadow_action: Option<String>,
+    /// For action=bridge: link | candidates | accept_candidate | reject_candidate.
+    #[serde(default)]
+    bridge_action: Option<String>,
     /// For related action: traversal depth (default: 2). For path: max hops
     /// (default: 4, capped at 8).
     #[serde(default)]
@@ -333,6 +336,11 @@ impl Tool for MemoryTool {
                     "type": "string",
                     "enum": ["list", "propose", "accept", "reject"],
                     "description": "For action=shadow: list, propose, accept, reject."
+                },
+                "bridge_action": {
+                    "type": "string",
+                    "enum": ["link", "candidates", "accept_candidate", "reject_candidate"],
+                    "description": "For action=bridge: link or review pending cross-store candidates."
                 },
                 "relation": {
                     "type": "string",
@@ -799,6 +807,42 @@ impl Tool for MemoryTool {
                 )))
             }
             "bridge" => {
+                let bridge_action = input.bridge_action.as_deref().unwrap_or("link");
+                if bridge_action == "candidates" {
+                    let candidates = manager.list_bridge_candidates(Some(
+                        crate::memory::PendingBridgeStatus::Pending,
+                    ))?;
+                    return Ok(ToolOutput::new(format!(
+                        "{} pending bridge candidate(s)\n\n{}",
+                        candidates.len(),
+                        serde_json::to_string_pretty(&candidates)?
+                    )));
+                }
+                if matches!(
+                    bridge_action,
+                    "accept_candidate" | "reject_candidate"
+                ) {
+                    let id = input
+                        .id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("id required for {bridge_action}"))?;
+                    let accept = bridge_action == "accept_candidate";
+                    let candidate = manager.review_bridge_candidate(id, accept)?;
+                    return Ok(ToolOutput::new(format!(
+                        "{} bridge candidate {} ({} <-> {}, score {:.2}, status {}).",
+                        if accept { "Accepted" } else { "Rejected" },
+                        candidate.id,
+                        candidate.project_id,
+                        candidate.global_id,
+                        candidate.score,
+                        candidate.status.as_str()
+                    )));
+                }
+                if bridge_action != "link" {
+                    return Err(anyhow::anyhow!(
+                        "Unknown bridge_action: {bridge_action}. Use link, candidates, accept_candidate, or reject_candidate"
+                    ));
+                }
                 let project_id = input
                     .from_id
                     .ok_or_else(|| anyhow::anyhow!("from_id (project memory) required"))?;
@@ -1273,6 +1317,11 @@ impl Tool for MemoryTool {
                 for id in &outcome.proposed_shadow_edges {
                     diagnostics.push(format!(
                         "proposed shadow edge: {id} (pending review, not in main graph)"
+                    ));
+                }
+                for id in &outcome.proposed_bridge_candidates {
+                    diagnostics.push(format!(
+                        "proposed bridge candidate: {id} (pending review, not traversable)"
                     ));
                 }
                 for action in &outcome.next_actions {
@@ -3578,6 +3627,84 @@ mod tests {
             .expect("pending proposal");
         assert_eq!(pending.len(), 1, "{pending:?}");
         assert_eq!(pending[0].source, "completion_l4");
+    }
+
+    #[tokio::test]
+    async fn bridge_action_lists_and_accepts_pending_candidates() {
+        use crate::memory_graph::MemoryGraph;
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = MemoryTool::new();
+        tool.manager = tool
+            .manager
+            .clone()
+            .with_project_dir(project.path().to_path_buf());
+
+        let mut project_graph = MemoryGraph::new();
+        let project_id = project_graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared deployment target primary database",
+        ));
+        tool.manager
+            .save_project_graph(&project_graph)
+            .expect("save project graph");
+        let mut global = MemoryGraph::new();
+        let global_id = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared deployment target primary database server",
+        ));
+        tool.manager
+            .save_global_graph(&global)
+            .expect("save global graph");
+
+        let path = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "from_id":project_id,
+                    "to_id":global_id,
+                    "scope":"all",
+                    "depth":4,
+                    "auto_propose":true
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("alignment path")
+            .output;
+        assert!(path.contains("proposed bridge candidate:"), "{path}");
+
+        let listed = tool
+            .execute(
+                json!({"action":"bridge","bridge_action":"candidates"}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("list bridge candidates")
+            .output;
+        assert!(listed.contains("1 pending bridge candidate(s)"), "{listed}");
+        let pending = tool
+            .manager
+            .list_bridge_candidates(Some(crate::memory::PendingBridgeStatus::Pending))
+            .expect("pending candidates");
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        let accepted = tool
+            .execute(
+                json!({
+                    "action":"bridge",
+                    "bridge_action":"accept_candidate",
+                    "id":pending[0].id
+                }),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("accept bridge candidate")
+            .output;
+        assert!(accepted.contains("Accepted bridge candidate"), "{accepted}");
+        assert_eq!(tool.manager.list_bridges().expect("bridges").len(), 1);
     }
 
     #[tokio::test]

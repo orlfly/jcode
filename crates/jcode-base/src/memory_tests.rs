@@ -6080,13 +6080,17 @@ fn path_query_suggests_same_as_candidates_for_e09() {
         manager.save_global_graph(&global).expect("save global graph");
 
         let outcome = manager
-            .paths_between_anchors(
+            .paths_between_anchors_with_options(
                 &[project_id.clone()],
                 &[global_id.clone()],
                 4,
                 5,
                 MemoryScope::All,
                 &[],
+                crate::memory::MemoryPathQueryOptions {
+                    auto_propose_shadow: true,
+                    ..Default::default()
+                },
             )
             .expect("alignment candidate query");
         assert!(outcome.paths.is_empty(), "{outcome:?}");
@@ -6099,6 +6103,21 @@ fn path_query_suggests_same_as_candidates_for_e09() {
         assert_eq!(candidate.to_store, "global");
         assert_eq!(candidate.relation, "same_as");
         assert!(candidate.score >= 0.5, "{outcome:?}");
+        assert_eq!(outcome.proposed_bridge_candidates.len(), 1, "{outcome:?}");
+        let pending = manager
+            .list_bridge_candidates(Some(crate::memory::PendingBridgeStatus::Pending))
+            .expect("pending bridge candidates");
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].source, "completion_e09");
+        assert!(
+            manager.list_bridges().expect("bridges").is_empty(),
+            "pending candidate must not create a traversable bridge"
+        );
+        let accepted = manager
+            .review_bridge_candidate(&pending[0].id, true)
+            .expect("accept bridge candidate");
+        assert_eq!(accepted.status.as_str(), "accepted");
+        assert_eq!(manager.list_bridges().expect("bridges").len(), 1);
     });
 }
 
