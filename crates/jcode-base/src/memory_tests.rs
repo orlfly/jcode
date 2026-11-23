@@ -6230,6 +6230,14 @@ fn bridge_candidate_report_calibrates_threshold_from_reviews() {
         assert!((report.calibration.best_f1 - 1.0).abs() < 0.0001);
         assert_eq!(report.recent_calibrations.len(), 1, "{report:?}");
         assert!(report.previous_threshold.is_none(), "{report:?}");
+        assert!(
+            (report.precision_ci_low - 0.095).abs() < 0.05,
+            "{report:?}"
+        );
+        assert!(
+            (report.precision_ci_high - 0.905).abs() < 0.05,
+            "{report:?}"
+        );
 
         let duplicate = manager.bridge_candidate_report().expect("repeat report");
         assert_eq!(
@@ -6258,7 +6266,33 @@ fn bridge_candidate_report_calibrates_threshold_from_reviews() {
         assert_eq!(trend.recent_calibrations.len(), 2, "{trend:?}");
         assert_eq!(trend.previous_threshold, Some(0.9), "{trend:?}");
         assert_eq!(trend.threshold_delta, Some(0.0), "{trend:?}");
+        assert!(trend.trend_alert.is_none(), "{trend:?}");
     });
+}
+
+#[test]
+fn bridge_calibration_trend_alert_flags_f1_regression() {
+    let previous = BridgeCalibrationSnapshot {
+        recorded_at: Utc::now() - chrono::Duration::days(1),
+        accepted: 2,
+        rejected: 1,
+        pending: 0,
+        expired: 0,
+        suggested_threshold: Some(0.8),
+        best_f1: 0.9,
+    };
+    let current = BridgeCalibrationSnapshot {
+        recorded_at: Utc::now(),
+        accepted: 2,
+        rejected: 4,
+        pending: 0,
+        expired: 0,
+        suggested_threshold: Some(0.8),
+        best_f1: 0.5,
+    };
+    let alert = calibration_trend_alert(Some(&previous), &current)
+        .expect("regression alert");
+    assert!(alert.contains("best_f1 dropped"), "{alert}");
 }
 
 #[test]

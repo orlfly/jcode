@@ -619,6 +619,12 @@ pub struct BridgeCandidateReport {
     pub threshold_delta: Option<f32>,
     #[serde(default)]
     pub recent_calibrations: Vec<BridgeCalibrationSnapshot>,
+    #[serde(default)]
+    pub precision_ci_low: f32,
+    #[serde(default)]
+    pub precision_ci_high: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trend_alert: Option<String>,
 }
 
 /// One persisted threshold-calibration observation for trend comparison.
@@ -714,7 +720,50 @@ fn build_bridge_candidate_report(
             PendingBridgeStatus::Expired => report.expired += 1,
         }
     }
+    let reviewed = report.accepted + report.rejected;
+    let (low, high) = wilson_interval(report.accepted, reviewed);
+    report.precision_ci_low = low;
+    report.precision_ci_high = high;
     report
+}
+
+fn wilson_interval(success: usize, total: usize) -> (f32, f32) {
+    if total == 0 {
+        return (0.0, 1.0);
+    }
+    let n = total as f64;
+    let p = success as f64 / n;
+    let z = 1.96;
+    let denominator = 1.0 + z * z / n;
+    let center = (p + z * z / (2.0 * n)) / denominator;
+    let margin =
+        z * ((p * (1.0 - p) / n) + z * z / (4.0 * n * n)).sqrt() / denominator;
+    (
+        (center - margin).clamp(0.0, 1.0) as f32,
+        (center + margin).clamp(0.0, 1.0) as f32,
+    )
+}
+
+fn calibration_trend_alert(
+    previous: Option<&BridgeCalibrationSnapshot>,
+    current: &BridgeCalibrationSnapshot,
+) -> Option<String> {
+    let previous = previous?;
+    if current.best_f1 + 0.05 < previous.best_f1 {
+        return Some(format!(
+            "best_f1 dropped from {:.3} to {:.3}",
+            previous.best_f1, current.best_f1
+        ));
+    }
+    if let (Some(previous), Some(current_threshold)) =
+        (previous.suggested_threshold, current.suggested_threshold)
+        && (current_threshold - previous).abs() > 0.10
+    {
+        return Some(format!(
+            "suggested threshold shifted from {previous:.2} to {current_threshold:.2}"
+        ));
+    }
+    None
 }
 
 /// Minimum reviewed similarity required to promote an alignment candidate.
@@ -8101,6 +8150,10 @@ impl MemoryManager {
             {
                 report.threshold_delta = Some(current - previous);
             }
+            report.trend_alert = calibration_trend_alert(
+                history.get(history.len() - 2),
+                &history[history.len() - 1],
+            );
         }
         report.recent_calibrations = history.iter().rev().take(5).cloned().collect();
         report.recent_calibrations.reverse();

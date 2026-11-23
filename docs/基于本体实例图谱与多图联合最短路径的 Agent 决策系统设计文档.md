@@ -1986,7 +1986,7 @@ L3 中 LLM 文档抽取的证据必须携带可验证定位（source、页码/�
 
 当查询显式设置 `auto_propose=true` 时，L4 gap 会被写成 `same_as` 影子边，`status=pending`、`source=completion_l4`，返回 `proposed_shadow_edges` 列表；pending 不进入主图，也不参与未开启 `include_hypotheses` 的查询。跨 store 候选不自动写成 bridge，因为 bridge 注册后立即可遍历，仍走人工 `bridge` 审核，避免把未验证对齐变成事实。
 
-E09 的跨 store 对齐候选写入独立的 `bridge_candidates.json`：`status=pending`、`source=completion_e09`，不进入 `bridges.json`，因此不会参与任何路径遍历。审核入口为 `action=bridge bridge_action=candidates|cleanup|accept_candidate|reject_candidate`；只有接受时才调用 `link_bridge` 生成可遍历 bridge，拒绝只记录状态。批量评审用 `batch_review`：默认 `dry_run=true` 只返回将影响的候选列表，真正应用必须同时传 `dry_run=false` 与 `confirm=true`，并支持 `ids` 限定范围。`cleanup` 返回各状态计数、最老 pending 天数和阈值校准建议；校准只用已接受/已拒绝样本，在候选分数上网格搜索 F1，输出 `suggested_threshold` 与 `best_f1`，不自动改线上阈值。指标变化时写入 `bridge_calibration_history.jsonl`，最多保留 200 条；报告返回 `previous_threshold`、`threshold_delta` 与最近 5 次快照，重复指标不重复记录。pending 超过 30 天自动转为 `expired`，过期候选不可再接受。这样补全召回率的分母包含 E09，但精确率与可遍历性仍由显式审核控制。
+E09 的跨 store 对齐候选写入独立的 `bridge_candidates.json`：`status=pending`、`source=completion_e09`，不进入 `bridges.json`，因此不会参与任何路径遍历。审核入口为 `action=bridge bridge_action=candidates|cleanup|accept_candidate|reject_candidate`；只有接受时才调用 `link_bridge` 生成可遍历 bridge，拒绝只记录状态。批量评审用 `batch_review`：默认 `dry_run=true` 只返回将影响的候选列表，真正应用必须同时传 `dry_run=false` 与 `confirm=true`，并支持 `ids` 限定范围。`cleanup` 返回各状态计数、最老 pending 天数和阈值校准建议；校准只用已接受/已拒绝样本，在候选分数上网格搜索 F1，输出 `suggested_threshold` 与 `best_f1`，并给出精度 Wilson 95% 区间，不自动改线上阈值。指标变化时写入 `bridge_calibration_history.jsonl`，最多保留 200 条；报告返回 `previous_threshold`、`threshold_delta` 与最近 5 次快照，重复指标不重复记录。`best_f1` 下降超过 0.05 或建议阈值移动超过 0.10 时写入 `trend_alert`，供回归排查。pending 超过 30 天自动转为 `expired`，过期候选不可再接受。这样补全召回率的分母包含 E09，但精确率与可遍历性仍由显式审核控制。
 
 ```python
 def complete_path(q, budget):
