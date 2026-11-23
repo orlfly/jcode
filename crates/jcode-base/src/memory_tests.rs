@@ -6228,6 +6228,36 @@ fn bridge_candidate_report_calibrates_threshold_from_reviews() {
         assert_eq!(report.calibration.rejected, 1);
         assert_eq!(report.calibration.suggested_threshold, Some(0.9));
         assert!((report.calibration.best_f1 - 1.0).abs() < 0.0001);
+        assert_eq!(report.recent_calibrations.len(), 1, "{report:?}");
+        assert!(report.previous_threshold.is_none(), "{report:?}");
+
+        let duplicate = manager.bridge_candidate_report().expect("repeat report");
+        assert_eq!(
+            duplicate.recent_calibrations.len(),
+            1,
+            "unchanged metrics must not append a snapshot"
+        );
+
+        let p3 = project.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration project three",
+        ));
+        let g3 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration global three",
+        ));
+        manager.save_project_graph(&project).expect("save project");
+        manager.save_global_graph(&global).expect("save global");
+        let extra = manager
+            .propose_bridge_candidate(&p3, &g3, 0.55, "same_as", "medium candidate", "test")
+            .expect("medium candidate");
+        manager
+            .review_bridge_candidate(&extra.id, false)
+            .expect("reject medium");
+        let trend = manager.bridge_candidate_report().expect("trend report");
+        assert_eq!(trend.recent_calibrations.len(), 2, "{trend:?}");
+        assert_eq!(trend.previous_threshold, Some(0.9), "{trend:?}");
+        assert_eq!(trend.threshold_delta, Some(0.0), "{trend:?}");
     });
 }
 

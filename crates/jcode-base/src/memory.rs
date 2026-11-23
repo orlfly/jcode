@@ -613,6 +613,25 @@ pub struct BridgeCandidateReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_days: Option<i64>,
     pub calibration: BridgeThresholdCalibration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_delta: Option<f32>,
+    #[serde(default)]
+    pub recent_calibrations: Vec<BridgeCalibrationSnapshot>,
+}
+
+/// One persisted threshold-calibration observation for trend comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BridgeCalibrationSnapshot {
+    pub recorded_at: DateTime<Utc>,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub pending: usize,
+    pub expired: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_threshold: Option<f32>,
+    pub best_f1: f32,
 }
 
 fn calibrate_bridge_threshold(
@@ -8009,10 +8028,83 @@ impl MemoryManager {
         storage::write_json(&self.bridge_candidate_store_path()?, candidates)
     }
 
+    fn bridge_calibration_history_path(&self) -> Result<PathBuf> {
+        let base = if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test")
+        } else {
+            storage::jcode_dir()?.join("memory")
+        };
+        std::fs::create_dir_all(&base)?;
+        Ok(base.join("bridge_calibration_history.jsonl"))
+    }
+
+    fn load_bridge_calibration_history(&self) -> Result<Vec<BridgeCalibrationSnapshot>> {
+        let path = self.bridge_calibration_history_path()?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(path)?;
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    }
+
+    fn save_bridge_calibration_history(
+        &self,
+        history: &[BridgeCalibrationSnapshot],
+    ) -> Result<()> {
+        let mut text = String::new();
+        for snapshot in history {
+            text.push_str(&serde_json::to_string(snapshot)?);
+            text.push('\n');
+        }
+        std::fs::write(self.bridge_calibration_history_path()?, text)?;
+        Ok(())
+    }
+
     /// Counts, oldest pending age, and threshold calibration for the queue.
     pub fn bridge_candidate_report(&self) -> Result<BridgeCandidateReport> {
         let candidates = self.list_bridge_candidates(None)?;
-        Ok(build_bridge_candidate_report(&candidates, Utc::now()))
+        let mut report = build_bridge_candidate_report(&candidates, Utc::now());
+        let mut history = self.load_bridge_calibration_history()?;
+        if report.calibration.accepted > 0 && report.calibration.rejected > 0 {
+            let snapshot = BridgeCalibrationSnapshot {
+                recorded_at: Utc::now(),
+                accepted: report.calibration.accepted,
+                rejected: report.calibration.rejected,
+                pending: report.pending,
+                expired: report.expired,
+                suggested_threshold: report.calibration.suggested_threshold,
+                best_f1: report.calibration.best_f1,
+            };
+            let changed = history.last().is_none_or(|last| {
+                last.accepted != snapshot.accepted
+                    || last.rejected != snapshot.rejected
+                    || last.pending != snapshot.pending
+                    || last.expired != snapshot.expired
+                    || last.suggested_threshold != snapshot.suggested_threshold
+                    || (last.best_f1 - snapshot.best_f1).abs() > 0.0001
+            });
+            if changed {
+                history.push(snapshot);
+                if history.len() > 200 {
+                    history.drain(..history.len() - 200);
+                }
+                self.save_bridge_calibration_history(&history)?;
+            }
+        }
+        if history.len() >= 2 {
+            report.previous_threshold = history[history.len() - 2].suggested_threshold;
+            if let (Some(previous), Some(current)) =
+                (report.previous_threshold, report.calibration.suggested_threshold)
+            {
+                report.threshold_delta = Some(current - previous);
+            }
+        }
+        report.recent_calibrations = history.iter().rev().take(5).cloned().collect();
+        report.recent_calibrations.reverse();
+        Ok(report)
     }
 
     /// Queue one cross-store alignment candidate without making it traversable.
