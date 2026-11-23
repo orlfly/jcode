@@ -5369,6 +5369,68 @@ fn path_query_lowers_semantic_threshold_and_reports_e06() {
 }
 
 #[test]
+fn path_query_stitches_disjoint_components_at_similar_anchors() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/path-l4-stitch");
+        let mut graph = MemoryGraph::new();
+        let start = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "start node"));
+        let left = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared bridge concept alpha",
+        ));
+        let right = graph.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "shared bridge concept beta",
+        ));
+        let goal = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "goal node"));
+        graph.add_edge(
+            &start,
+            &left,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        graph.add_edge(
+            &right,
+            &goal,
+            crate::memory_graph::EdgeKind::RelatesTo { weight: 0.9 },
+        );
+        manager.save_project_graph(&graph).expect("save graph");
+
+        let outcome = manager
+            .paths_between_anchors_with_options(
+                &["start node".to_string()],
+                &["goal node".to_string()],
+                4,
+                3,
+                MemoryScope::Project,
+                &[],
+                crate::memory::MemoryPathQueryOptions::default(),
+            )
+            .expect("stitched query");
+        assert_eq!(outcome.paths.len(), 1, "{outcome:?}");
+        assert!(outcome.knowledge_gap.is_none(), "{outcome:?}");
+        let path = &outcome.paths[0];
+        assert_eq!(path.nodes, vec![start, left, right, goal], "{path:?}");
+        assert!(
+            path.edges.iter().any(|edge| matches!(
+                &edge.kind,
+                crate::memory_graph::EdgeKind::Hypothesized { relation, .. }
+                    if relation == "same_as_candidate"
+            )),
+            "{path:?}"
+        );
+        let quality = &outcome.quality[0];
+        assert!(
+            quality.has(jcode_memory_types::PathQualityFlag::StitchedPath),
+            "{quality:?}"
+        );
+        assert!(
+            quality.has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
+            "{quality:?}"
+        );
+    });
+}
+
+#[test]
 fn path_query_relaxes_depth_once_and_records_it() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/path-depth-relax");

@@ -469,6 +469,18 @@ fn assess_path_quality(
             "path crosses an explicit cross-store bridge".to_string(),
         );
     }
+    if path.edges.iter().any(|edge| {
+        matches!(
+            &edge.kind,
+            jcode_memory_types::EdgeKind::Hypothesized { relation, .. }
+                if relation.eq_ignore_ascii_case("same_as_candidate")
+        )
+    }) {
+        quality.push(
+            PathQualityFlag::StitchedPath,
+            "path joins disjoint components at a candidate alignment gap".to_string(),
+        );
+    }
     if path
         .edges
         .iter()
@@ -796,6 +808,194 @@ fn stitch_paths_with_bridge(
         cost: left.cost + bridge_cost + right.cost,
         confidence: left.confidence.min(bridge_confidence).min(right.confidence),
     })
+}
+
+/// Collect memory nodes within `radius` hops of `start`, in both directions.
+fn bounded_neighborhood(
+    graph: &MemoryGraph,
+    start: &str,
+    radius: usize,
+    limit: usize,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([(start.to_string(), 0usize)]);
+    let mut out = Vec::new();
+    seen.insert(start.to_string());
+    while let Some((node, distance)) = queue.pop_front() {
+        if graph.get_memory(&node).is_some() {
+            out.push(node.clone());
+            if out.len() >= limit {
+                break;
+            }
+        }
+        if distance >= radius {
+            continue;
+        }
+        for edge in graph.get_edges(&node) {
+            if seen.insert(edge.target.clone()) {
+                queue.push_back((edge.target.clone(), distance + 1));
+            }
+        }
+        for source in graph.get_incoming(&node) {
+            if seen.insert(source.to_string()) {
+                queue.push_back((source.to_string(), distance + 1));
+            }
+        }
+    }
+    out
+}
+
+fn lexical_overlap(left: &str, right: &str) -> f32 {
+    let tokens = |text: &str| -> std::collections::HashSet<String> {
+        text.split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| token.len() >= 3)
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let shared = left.intersection(&right).count();
+    shared as f32 / left.union(&right).count() as f32
+}
+
+fn node_similarity(graph: &MemoryGraph, left: &str, right: &str) -> f32 {
+    let left_entry = graph.get_memory(left);
+    let right_entry = graph.get_memory(right);
+    let embedding_score = match (
+        left_entry.and_then(|entry| entry.embedding.as_deref()),
+        right_entry.and_then(|entry| entry.embedding.as_deref()),
+    ) {
+        (Some(left), Some(right)) if !left.is_empty() && left.len() == right.len() => {
+            crate::embedding::cosine_similarity(left, right).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    };
+    let lexical_score = match (left_entry, right_entry) {
+        (Some(left), Some(right)) => {
+            lexical_overlap(&left.searchable_text(), &right.searchable_text())
+        }
+        _ => 0.0,
+    };
+    embedding_score.max(lexical_score)
+}
+
+fn nodes_connected(graph: &MemoryGraph, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut seen = std::collections::HashSet::from([from.to_string()]);
+    let mut queue = std::collections::VecDeque::from([from.to_string()]);
+    while let Some(node) = queue.pop_front() {
+        for edge in graph.get_edges(&node) {
+            if edge.target == to {
+                return true;
+            }
+            if seen.insert(edge.target.clone()) {
+                queue.push_back(edge.target.clone());
+            }
+        }
+        for source in graph.get_incoming(&node) {
+            if source == to {
+                return true;
+            }
+            if seen.insert(source.to_string()) {
+                queue.push_back(source.to_string());
+            }
+        }
+    }
+    false
+}
+
+/// Query-time L4 stitching: join two disjoint components through the most
+/// similar anchor pair within a bounded neighborhood.
+fn stitch_nearest_anchors(
+    graph: &MemoryGraph,
+    from: &str,
+    to: &str,
+    depth: usize,
+    allowed_relations: &[&str],
+) -> Option<MemoryPath> {
+    const MIN_STITCH_SCORE: f32 = 0.55;
+    const MAX_CANDIDATES: usize = 3;
+    const RADIUS: usize = 2;
+
+    // Same-component misses are depth, budget, or constraint problems. They
+    // must go through L0 relaxation, not a fabricated bridge shortcut.
+    if nodes_connected(graph, from, to) {
+        return None;
+    }
+    let left_nodes = bounded_neighborhood(graph, from, RADIUS, 64);
+    let right_nodes = bounded_neighborhood(graph, to, RADIUS, 64);
+    let mut candidates = Vec::new();
+    for left in &left_nodes {
+        for right in &right_nodes {
+            if left == right {
+                continue;
+            }
+            let score = node_similarity(graph, left, right);
+            if score >= MIN_STITCH_SCORE {
+                candidates.push((score, left.clone(), right.clone()));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates.truncate(MAX_CANDIDATES);
+    for (score, left_anchor, right_anchor) in candidates {
+        let Some(left_path) = graph.weighted_shortest_path_with_relations(
+            from,
+            &left_anchor,
+            depth,
+            allowed_relations,
+        ) else {
+            continue;
+        };
+        let Some(right_path) = graph.weighted_shortest_path_with_relations(
+            &right_anchor,
+            to,
+            depth,
+            allowed_relations,
+        ) else {
+            continue;
+        };
+        if left_path
+            .nodes
+            .iter()
+            .any(|node| right_path.nodes.contains(node))
+        {
+            continue;
+        }
+        let mut nodes = left_path.nodes.clone();
+        nodes.extend(right_path.nodes.iter().cloned());
+        let mut edges = left_path.edges.clone();
+        let bridge_cost = 3.0 + 2.0 * (1.0 - score);
+        edges.push(jcode_memory_types::MemoryPathEdge {
+            from: left_anchor,
+            to: right_anchor,
+            kind: jcode_memory_types::EdgeKind::Hypothesized {
+                relation: "same_as_candidate".to_string(),
+                weight: score,
+                confidence: score,
+            },
+            cost: bridge_cost,
+        });
+        edges.extend(right_path.edges.iter().cloned());
+        return Some(jcode_memory_types::MemoryPath {
+            nodes,
+            edges,
+            cost: left_path.cost + bridge_cost + right_path.cost,
+            confidence: left_path.confidence.min(right_path.confidence).min(score),
+        });
+    }
+    None
 }
 
 /// Resolve a path endpoint without requiring the caller to know an internal id.
@@ -9319,6 +9519,42 @@ impl MemoryManager {
             paths.extend(
                 self.stitched_bridge_paths(project, global, froms, tos, depth, limit, &allowed)?,
             );
+        }
+        // L4 path stitching: when endpoints exist but sit in disjoint
+        // components, join the most similar bounded-neighborhood anchors with
+        // a query-time virtual edge. Nothing is written to the stored graph.
+        if paths.is_empty()
+            && outcome.unresolved_from.is_empty()
+            && outcome.unresolved_to.is_empty()
+        {
+            for (_, graph) in graphs.iter() {
+                let from_nodes: Vec<String> = froms
+                    .iter()
+                    .filter_map(|anchor| resolve_path_anchor(graph, anchor))
+                    .collect();
+                let to_nodes: Vec<String> = tos
+                    .iter()
+                    .filter_map(|anchor| resolve_path_anchor(graph, anchor))
+                    .collect();
+                for from in &from_nodes {
+                    for to in &to_nodes {
+                        if let Some(path) =
+                            stitch_nearest_anchors(graph, from, to, depth, &allowed)
+                        {
+                            paths.push(path);
+                            if paths.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    if paths.len() >= limit {
+                        break;
+                    }
+                }
+                if !paths.is_empty() {
+                    break;
+                }
+            }
         }
         paths.sort_by(|left, right| {
             left.cost
