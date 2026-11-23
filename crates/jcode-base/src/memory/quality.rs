@@ -233,6 +233,8 @@ pub struct CompletionQuality {
     pub bridge_pending: usize,
     #[serde(default = "default_rate")]
     pub bridge_precision: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_trend_alert: Option<String>,
 }
 
 impl Default for CompletionQuality {
@@ -247,6 +249,7 @@ impl Default for CompletionQuality {
             bridge_rejected: 0,
             bridge_pending: 0,
             bridge_precision: 1.0,
+            bridge_trend_alert: None,
         }
     }
 }
@@ -698,6 +701,16 @@ pub fn completion_diagnose(completion: &CompletionQuality) -> Vec<QualityFinding
             "tighten cross-store alignment scoring or require stronger evidence",
         ));
     }
+    if let Some(alert) = &completion.bridge_trend_alert {
+        findings.push(finding(
+            "Q18",
+            QualitySeverity::Warning,
+            "bridge_trend_alert",
+            1.0,
+            0.0,
+            alert,
+        ));
+    }
     findings
 }
 
@@ -884,6 +897,14 @@ mod tests {
             completion_diagnose(&completion)
                 .iter()
                 .all(|finding| finding.code != "Q17")
+        );
+        completion.bridge_trend_alert = Some("best_f1 dropped from 0.900 to 0.500".to_string());
+        let findings = completion_diagnose(&completion);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.code == "Q18"
+                    && finding.action.contains("best_f1 dropped"))
         );
     }
 

@@ -9391,16 +9391,18 @@ impl MemoryManager {
         report.completion = quality::completion_quality(
             shadow_edges.iter().map(|edge| edge.status.as_str()),
         );
-        let bridge_candidates = self.list_bridge_candidates(None)?;
-        let (verified, rejected, pending, precision) = quality::bridge_completion_quality(
-            bridge_candidates
-                .iter()
-                .map(|candidate| candidate.status.as_str()),
-        );
-        report.completion.bridge_verified = verified;
-        report.completion.bridge_rejected = rejected;
-        report.completion.bridge_pending = pending;
-        report.completion.bridge_precision = precision;
+        let bridge_report = self.bridge_candidate_report()?;
+        let reviewed_bridges =
+            bridge_report.calibration.accepted + bridge_report.calibration.rejected;
+        report.completion.bridge_verified = bridge_report.accepted;
+        report.completion.bridge_rejected = bridge_report.rejected;
+        report.completion.bridge_pending = bridge_report.pending + bridge_report.expired;
+        report.completion.bridge_precision = if reviewed_bridges == 0 {
+            1.0
+        } else {
+            bridge_report.calibration.accepted as f32 / reviewed_bridges as f32
+        };
+        report.completion.bridge_trend_alert = bridge_report.trend_alert;
         report.query_metrics =
             quality::summarize_queries(&self.load_query_audit()?, &report.scope);
         let query_findings = quality::query_diagnose(&report.query_metrics);
