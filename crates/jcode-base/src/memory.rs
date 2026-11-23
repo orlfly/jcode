@@ -591,6 +591,113 @@ pub struct PendingBridgeCandidate {
     pub reviewed_at: Option<DateTime<Utc>>,
 }
 
+/// Calibration suggestion derived from reviewed bridge candidates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BridgeThresholdCalibration {
+    pub accepted: usize,
+    pub rejected: usize,
+    pub current_threshold: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_threshold: Option<f32>,
+    pub best_f1: f32,
+}
+
+/// Cleanup and review-status report for cross-store candidate queues.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BridgeCandidateReport {
+    pub total: usize,
+    pub pending: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub expired: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_days: Option<i64>,
+    pub calibration: BridgeThresholdCalibration,
+}
+
+fn calibrate_bridge_threshold(
+    candidates: &[PendingBridgeCandidate],
+) -> BridgeThresholdCalibration {
+    let accepted: Vec<f32> = candidates
+        .iter()
+        .filter(|candidate| candidate.status == PendingBridgeStatus::Accepted)
+        .map(|candidate| candidate.score)
+        .collect();
+    let rejected: Vec<f32> = candidates
+        .iter()
+        .filter(|candidate| candidate.status == PendingBridgeStatus::Rejected)
+        .map(|candidate| candidate.score)
+        .collect();
+    let mut calibration = BridgeThresholdCalibration {
+        accepted: accepted.len(),
+        rejected: rejected.len(),
+        current_threshold: ALIGNMENT_PROMOTION_MIN_SCORE,
+        suggested_threshold: None,
+        best_f1: 0.0,
+    };
+    if accepted.is_empty() || rejected.is_empty() {
+        return calibration;
+    }
+    let mut thresholds: Vec<f32> = accepted.iter().chain(rejected.iter()).copied().collect();
+    thresholds.sort_by(f32::total_cmp);
+    thresholds.dedup_by(|left, right| (*left - *right).abs() < 0.0001);
+    let mut best: Option<(f32, f32)> = None;
+    for threshold in thresholds {
+        let true_positive = accepted.iter().filter(|score| **score >= threshold).count();
+        if true_positive == 0 {
+            continue;
+        }
+        let false_positive = rejected.iter().filter(|score| **score >= threshold).count();
+        let precision = true_positive as f32 / (true_positive + false_positive) as f32;
+        let recall = true_positive as f32 / accepted.len() as f32;
+        let f1 = if precision + recall == 0.0 {
+            0.0
+        } else {
+            2.0 * precision * recall / (precision + recall)
+        };
+        let replace = match best {
+            None => true,
+            Some((best_f1, best_threshold)) => {
+                f1 > best_f1 + 0.0001
+                    || ((f1 - best_f1).abs() <= 0.0001 && threshold > best_threshold)
+            }
+        };
+        if replace {
+            best = Some((f1, threshold));
+        }
+    }
+    if let Some((f1, threshold)) = best {
+        calibration.suggested_threshold = Some(threshold.clamp(0.0, 1.0));
+        calibration.best_f1 = f1;
+    }
+    calibration
+}
+
+fn build_bridge_candidate_report(
+    candidates: &[PendingBridgeCandidate],
+    now: DateTime<Utc>,
+) -> BridgeCandidateReport {
+    let mut report = BridgeCandidateReport {
+        total: candidates.len(),
+        calibration: calibrate_bridge_threshold(candidates),
+        ..BridgeCandidateReport::default()
+    };
+    for candidate in candidates {
+        match candidate.status {
+            PendingBridgeStatus::Pending => {
+                report.pending += 1;
+                let age = now.signed_duration_since(candidate.created_at).num_days().max(0);
+                report.oldest_pending_days =
+                    Some(report.oldest_pending_days.map_or(age, |oldest| oldest.max(age)));
+            }
+            PendingBridgeStatus::Accepted => report.accepted += 1,
+            PendingBridgeStatus::Rejected => report.rejected += 1,
+            PendingBridgeStatus::Expired => report.expired += 1,
+        }
+    }
+    report
+}
+
 /// Minimum reviewed similarity required to promote an alignment candidate.
 ///
 /// Matches the design threshold for using `same_as` in path bridging.
@@ -7900,6 +8007,12 @@ impl MemoryManager {
 
     fn save_bridge_candidates(&self, candidates: &[PendingBridgeCandidate]) -> Result<()> {
         storage::write_json(&self.bridge_candidate_store_path()?, candidates)
+    }
+
+    /// Counts, oldest pending age, and threshold calibration for the queue.
+    pub fn bridge_candidate_report(&self) -> Result<BridgeCandidateReport> {
+        let candidates = self.list_bridge_candidates(None)?;
+        Ok(build_bridge_candidate_report(&candidates, Utc::now()))
     }
 
     /// Queue one cross-store alignment candidate without making it traversable.

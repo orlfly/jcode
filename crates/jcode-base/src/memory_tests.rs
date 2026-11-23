@@ -6182,6 +6182,56 @@ fn bridge_candidate_expires_after_ttl_and_cannot_be_reviewed() {
 }
 
 #[test]
+fn bridge_candidate_report_calibrates_threshold_from_reviews() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/bridge-candidate-report");
+        let mut project = MemoryGraph::new();
+        let p1 = project.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration project one",
+        ));
+        let p2 = project.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration project two",
+        ));
+        manager.save_project_graph(&project).expect("save project");
+        let mut global = MemoryGraph::new();
+        let g1 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration global one",
+        ));
+        let g2 = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "calibration global two",
+        ));
+        manager.save_global_graph(&global).expect("save global");
+
+        let accepted = manager
+            .propose_bridge_candidate(&p1, &g1, 0.9, "same_as", "strong candidate", "test")
+            .expect("strong candidate");
+        let rejected = manager
+            .propose_bridge_candidate(&p2, &g2, 0.4, "same_as", "weak candidate", "test")
+            .expect("weak candidate");
+        manager
+            .review_bridge_candidate(&accepted.id, true)
+            .expect("accept strong");
+        manager
+            .review_bridge_candidate(&rejected.id, false)
+            .expect("reject weak");
+
+        let report = manager.bridge_candidate_report().expect("candidate report");
+        assert_eq!(report.total, 2);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.pending, 0);
+        assert_eq!(report.calibration.accepted, 1);
+        assert_eq!(report.calibration.rejected, 1);
+        assert_eq!(report.calibration.suggested_threshold, Some(0.9));
+        assert!((report.calibration.best_f1 - 1.0).abs() < 0.0001);
+    });
+}
+
+#[test]
 fn explicit_bridge_stitches_project_and_global_paths() {
     with_temp_home(|_| {
         let manager = MemoryManager::new().with_project_dir("/bridge-path");

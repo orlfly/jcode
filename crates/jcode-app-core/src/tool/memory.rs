@@ -345,7 +345,7 @@ impl Tool for MemoryTool {
                 },
                 "bridge_action": {
                     "type": "string",
-                    "enum": ["link", "candidates", "accept_candidate", "reject_candidate", "batch_review"],
+                    "enum": ["link", "candidates", "cleanup", "accept_candidate", "reject_candidate", "batch_review"],
                     "description": "For action=bridge: link or review pending candidates."
                 },
                 "ids": {
@@ -823,6 +823,13 @@ impl Tool for MemoryTool {
             }
             "bridge" => {
                 let bridge_action = input.bridge_action.as_deref().unwrap_or("link");
+                if bridge_action == "cleanup" {
+                    let report = manager.bridge_candidate_report()?;
+                    return Ok(ToolOutput::new(format!(
+                        "Bridge candidate cleanup report:\n{}",
+                        serde_json::to_string_pretty(&report)?
+                    )));
+                }
                 if bridge_action == "candidates" {
                     let candidates = manager.list_bridge_candidates(Some(
                         crate::memory::PendingBridgeStatus::Pending,
@@ -920,7 +927,7 @@ impl Tool for MemoryTool {
                 }
                 if bridge_action != "link" {
                     return Err(anyhow::anyhow!(
-                        "Unknown bridge_action: {bridge_action}. Use link, candidates, accept_candidate, reject_candidate, or batch_review"
+                        "Unknown bridge_action: {bridge_action}. Use link, candidates, cleanup, accept_candidate, reject_candidate, or batch_review"
                     ));
                 }
                 let project_id = input
@@ -3872,6 +3879,16 @@ mod tests {
             .output;
         assert!(applied.contains("Applied batch bridge review: 2 of 2"), "{applied}");
         assert_eq!(tool.manager.list_bridges().expect("bridges").len(), 2);
+        let cleanup = tool
+            .execute(
+                json!({"action":"bridge","bridge_action":"cleanup"}),
+                test_ctx(Some(project.path().to_path_buf())),
+            )
+            .await
+            .expect("cleanup report")
+            .output;
+        assert!(cleanup.contains("Bridge candidate cleanup report"), "{cleanup}");
+        assert!(cleanup.contains("\"accepted\": 2"), "{cleanup}");
     }
 
     #[tokio::test]
