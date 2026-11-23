@@ -548,6 +548,7 @@ pub enum PendingBridgeStatus {
     Pending,
     Accepted,
     Rejected,
+    Expired,
 }
 
 impl PendingBridgeStatus {
@@ -556,6 +557,7 @@ impl PendingBridgeStatus {
             Self::Pending => "pending",
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
+            Self::Expired => "expired",
         }
     }
 
@@ -564,6 +566,7 @@ impl PendingBridgeStatus {
             "pending" => Some(Self::Pending),
             "accepted" => Some(Self::Accepted),
             "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -581,6 +584,9 @@ pub struct PendingBridgeCandidate {
     pub source: String,
     pub status: PendingBridgeStatus,
     pub created_at: DateTime<Utc>,
+    /// Pending candidates expire after [`BRIDGE_CANDIDATE_TTL_DAYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<DateTime<Utc>>,
 }
@@ -589,6 +595,8 @@ pub struct PendingBridgeCandidate {
 ///
 /// Matches the design threshold for using `same_as` in path bridging.
 pub const ALIGNMENT_PROMOTION_MIN_SCORE: f32 = 0.85;
+/// Unreviewed bridge candidates expire after this many days.
+pub const BRIDGE_CANDIDATE_TTL_DAYS: i64 = 30;
 
 /// Result of promoting a reviewed `same_as` alignment candidate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -7869,6 +7877,20 @@ impl MemoryManager {
             return Ok(Vec::new());
         }
         let mut candidates: Vec<PendingBridgeCandidate> = storage::read_json(&path)?;
+        let now = Utc::now();
+        let mut changed = false;
+        for candidate in &mut candidates {
+            if candidate.status == PendingBridgeStatus::Pending
+                && candidate.expires_at.is_some_and(|expires| expires <= now)
+            {
+                candidate.status = PendingBridgeStatus::Expired;
+                candidate.reviewed_at = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_bridge_candidates(&candidates)?;
+        }
         if let Some(status) = status {
             candidates.retain(|candidate| candidate.status == status);
         }
@@ -7927,6 +7949,7 @@ impl MemoryManager {
             source: source.to_string(),
             status: PendingBridgeStatus::Pending,
             created_at: Utc::now(),
+            expires_at: Some(Utc::now() + chrono::Duration::days(BRIDGE_CANDIDATE_TTL_DAYS)),
             reviewed_at: None,
         };
         let mut candidates = self.list_bridge_candidates(None)?;
@@ -9110,6 +9133,16 @@ impl MemoryManager {
         report.completion = quality::completion_quality(
             shadow_edges.iter().map(|edge| edge.status.as_str()),
         );
+        let bridge_candidates = self.list_bridge_candidates(None)?;
+        let (verified, rejected, pending, precision) = quality::bridge_completion_quality(
+            bridge_candidates
+                .iter()
+                .map(|candidate| candidate.status.as_str()),
+        );
+        report.completion.bridge_verified = verified;
+        report.completion.bridge_rejected = rejected;
+        report.completion.bridge_pending = pending;
+        report.completion.bridge_precision = precision;
         report.query_metrics =
             quality::summarize_queries(&self.load_query_audit()?, &report.scope);
         let query_findings = quality::query_diagnose(&report.query_metrics);

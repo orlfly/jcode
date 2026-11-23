@@ -6118,6 +6118,66 @@ fn path_query_suggests_same_as_candidates_for_e09() {
             .expect("accept bridge candidate");
         assert_eq!(accepted.status.as_str(), "accepted");
         assert_eq!(manager.list_bridges().expect("bridges").len(), 1);
+        let report = manager
+            .graph_quality(MemoryScope::All)
+            .expect("quality after bridge review");
+        assert_eq!(report.completion.bridge_verified, 1, "{report:?}");
+        assert_eq!(report.completion.bridge_pending, 0, "{report:?}");
+        assert_eq!(report.completion.bridge_precision, 1.0, "{report:?}");
+    });
+}
+
+#[test]
+fn bridge_candidate_expires_after_ttl_and_cannot_be_reviewed() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/bridge-candidate-ttl");
+        let mut project = MemoryGraph::new();
+        let project_id = project.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "project expiry anchor",
+        ));
+        manager.save_project_graph(&project).expect("save project");
+        let mut global = MemoryGraph::new();
+        let global_id = global.add_memory(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "global expiry anchor",
+        ));
+        manager.save_global_graph(&global).expect("save global");
+
+        let mut candidate = manager
+            .propose_bridge_candidate(
+                &project_id,
+                &global_id,
+                0.8,
+                "same_as",
+                "expiry test candidate",
+                "test",
+            )
+            .expect("propose candidate");
+        candidate.expires_at = Some(Utc::now() - chrono::Duration::days(1));
+        let path = crate::storage::jcode_dir()
+            .expect("home")
+            .join("memory")
+            .join("bridge_candidates.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create memory dir");
+        fs::write(&path, serde_json::to_vec(&vec![candidate]).expect("json")).expect("write");
+
+        assert!(
+            manager
+                .list_bridge_candidates(Some(crate::memory::PendingBridgeStatus::Pending))
+                .expect("pending")
+                .is_empty()
+        );
+        let expired = manager
+            .list_bridge_candidates(Some(crate::memory::PendingBridgeStatus::Expired))
+            .expect("expired");
+        assert_eq!(expired.len(), 1, "{expired:?}");
+        assert!(
+            manager
+                .review_bridge_candidate(&expired[0].id, true)
+                .is_err(),
+            "expired candidate must not be acceptable"
+        );
     });
 }
 

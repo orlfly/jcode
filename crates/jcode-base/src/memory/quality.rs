@@ -225,6 +225,14 @@ pub struct CompletionQuality {
     pub pending: usize,
     #[serde(default = "default_rate")]
     pub precision: f32,
+    #[serde(default)]
+    pub bridge_verified: usize,
+    #[serde(default)]
+    pub bridge_rejected: usize,
+    #[serde(default)]
+    pub bridge_pending: usize,
+    #[serde(default = "default_rate")]
+    pub bridge_precision: f32,
 }
 
 impl Default for CompletionQuality {
@@ -235,6 +243,10 @@ impl Default for CompletionQuality {
             rejected: 0,
             pending: 0,
             precision: 1.0,
+            bridge_verified: 0,
+            bridge_rejected: 0,
+            bridge_pending: 0,
+            bridge_precision: 1.0,
         }
     }
 }
@@ -674,7 +686,43 @@ pub fn completion_diagnose(completion: &CompletionQuality) -> Vec<QualityFinding
             "raise the link-prediction threshold or require stronger evidence",
         ));
     }
+    if completion.bridge_verified + completion.bridge_rejected > 0
+        && completion.bridge_precision < MIN_COMPLETION_PRECISION
+    {
+        findings.push(finding(
+            "Q17",
+            QualitySeverity::Warning,
+            "bridge_precision",
+            completion.bridge_precision,
+            MIN_COMPLETION_PRECISION,
+            "tighten cross-store alignment scoring or require stronger evidence",
+        ));
+    }
     findings
+}
+
+/// Aggregate reviewed cross-store bridge candidates.
+pub fn bridge_completion_quality<'a>(
+    statuses: impl IntoIterator<Item = &'a str>,
+) -> (usize, usize, usize, f32) {
+    let mut verified = 0;
+    let mut rejected = 0;
+    let mut pending = 0;
+    for status in statuses {
+        match status {
+            "accepted" => verified += 1,
+            "rejected" => rejected += 1,
+            "pending" | "expired" => pending += 1,
+            _ => {}
+        }
+    }
+    let adjudicated = verified + rejected;
+    let precision = if adjudicated == 0 {
+        1.0
+    } else {
+        verified as f32 / adjudicated as f32
+    };
+    (verified, rejected, pending, precision)
 }
 
 /// Derive deterministic governance findings from one report.
@@ -814,6 +862,29 @@ mod tests {
         let pending_only = completion_quality(["pending", "pending"]);
         assert_eq!(pending_only.precision, 1.0);
         assert!(completion_diagnose(&pending_only).is_empty());
+
+        let (verified, rejected, pending, precision) =
+            bridge_completion_quality(["accepted", "rejected", "expired"]);
+        assert_eq!((verified, rejected, pending), (1, 1, 1));
+        assert_eq!(precision, 0.5);
+        let mut completion = CompletionQuality {
+            bridge_verified: verified,
+            bridge_rejected: rejected,
+            bridge_pending: pending,
+            bridge_precision: precision,
+            ..CompletionQuality::default()
+        };
+        assert!(
+            completion_diagnose(&completion)
+                .iter()
+                .any(|finding| finding.code == "Q17")
+        );
+        completion.bridge_precision = 1.0;
+        assert!(
+            completion_diagnose(&completion)
+                .iter()
+                .all(|finding| finding.code != "Q17")
+        );
     }
 
     #[test]
