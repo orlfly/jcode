@@ -16,10 +16,12 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use jcode_memory_types::engineering_ontology::{
-    CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringPath, EngineeringRelation,
-    default_engineering_ontology,
+    CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringPath, EngineeringProvenance,
+    EngineeringRelation, default_engineering_ontology,
 };
-use jcode_memory_types::{PathPlan, build_path_plan};
+use jcode_memory_types::{
+    CompletionEdge, CompletionPromotionError, CompletionWriteReport, PathPlan, build_path_plan,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -356,6 +358,69 @@ impl EngineeringStore {
             .context("load engineering graph")?;
         row.map(|(json, blob)| decode_graph(&json, blob.as_deref()))
             .transpose()
+    }
+
+    /// Persist candidate edges as hypothesis edges on one session graph.
+    ///
+    /// The graph is re-encoded and saved only when at least one candidate was
+    /// accepted, so a rejected proposal never rewrites stored data.
+    pub fn write_completion_edges(
+        &self,
+        session_id: &str,
+        edges: &[CompletionEdge],
+        source_tag: &str,
+    ) -> Result<CompletionWriteReport> {
+        let mut graph = self
+            .load_graph(session_id)?
+            .with_context(|| format!("no engineering graph stored for session {session_id}"))?;
+        let report = graph.write_completion_edges(edges.iter().cloned(), source_tag);
+        if !report.accepted.is_empty() {
+            let working_dir = self.working_dir_of(session_id)?;
+            self.save_graph(session_id, working_dir.as_deref(), &graph)?;
+        }
+        Ok(report)
+    }
+
+    /// Promote one hypothesis edge with non-LLM evidence and persist the graph.
+    pub fn promote_completion_edge(
+        &self,
+        session_id: &str,
+        edge_id: &str,
+        evidence: EngineeringProvenance,
+    ) -> Result<()> {
+        let mut graph = self
+            .load_graph(session_id)?
+            .with_context(|| format!("no engineering graph stored for session {session_id}"))?;
+        graph
+            .promote_completion_edge(edge_id, evidence)
+            .map_err(|error: CompletionPromotionError| anyhow::anyhow!(error))?;
+        let working_dir = self.working_dir_of(session_id)?;
+        self.save_graph(session_id, working_dir.as_deref(), &graph)
+    }
+
+    fn working_dir_of(&self, session_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT working_dir FROM engineering_graphs WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read engineering graph working_dir")
+            .map(Option::flatten)
+    }
+
+    /// Soft-delete expired hypothesis edges on one session graph.
+    pub fn purge_expired_hypotheses(&self, session_id: &str) -> Result<usize> {
+        let Some(mut graph) = self.load_graph(session_id)? else {
+            return Ok(0);
+        };
+        let removed = graph.purge_expired_hypotheses(Utc::now());
+        if removed > 0 {
+            let working_dir = self.working_dir_of(session_id)?;
+            self.save_graph(session_id, working_dir.as_deref(), &graph)?;
+        }
+        Ok(removed)
     }
 
     /// List stored sessions, newest first.
@@ -1323,6 +1388,50 @@ mod tests {
                 .relation_labels
                 .iter()
                 .any(|label| label == "has_instance")
+        );
+    }
+
+    #[test]
+    fn completion_writeback_preserves_working_dir_and_supports_promotion() {
+        use jcode_memory_types::CompletionEdge;
+
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let graph = sample_graph();
+        store
+            .save_graph("session-completion", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let candidate = CompletionEdge::new("error:boom", REL_DEFINES, "file:src/lib.rs", 0.8)
+            .with_evidence("doc:runbook#p4")
+            .with_source("llm:proposal");
+        let report = store
+            .write_completion_edges("session-completion", &[candidate.clone()], "tool")
+            .expect("write completion");
+        assert_eq!(report.accepted.len(), 1, "{report:?}");
+        assert!(report.completion_debt > 0.0);
+
+        let sessions = store.list_sessions(5).expect("sessions");
+        assert_eq!(sessions[0].working_dir.as_deref(), Some("/repo"));
+
+        let evidence = EngineeringProvenance::new("runbook_review")
+            .with_locator("doc:runbook#p4")
+            .with_confidence(0.95);
+        store
+            .promote_completion_edge("session-completion", &report.accepted[0], evidence)
+            .expect("promote");
+        let reloaded = store
+            .load_graph("session-completion")
+            .expect("load")
+            .expect("graph");
+        let edge = reloaded.relations.get(&report.accepted[0]).expect("edge");
+        assert!(!edge.hypothesis);
+        assert_eq!(reloaded.completion_debt(), 0.0);
+
+        let missing = EngineeringProvenance::new("human:review");
+        assert!(
+            store
+                .promote_completion_edge("session-completion", &report.accepted[0], missing)
+                .is_err()
         );
     }
 }

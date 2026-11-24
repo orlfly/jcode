@@ -124,6 +124,18 @@ struct MemoryInput {
     /// For action=shadow: list | propose | accept | reject.
     #[serde(default)]
     shadow_action: Option<String>,
+    /// For action=completion: list | propose | promote | purge.
+    #[serde(default)]
+    completion_action: Option<String>,
+    /// For action=completion: target engineering session. Defaults to this session.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// For completion propose/promote: evidence locator.
+    #[serde(default)]
+    evidence: Option<String>,
+    /// For completion propose/promote: proposing or confirming source.
+    #[serde(default)]
+    source: Option<String>,
     /// For action=bridge: link | candidates | accept_candidate | reject_candidate.
     #[serde(default)]
     bridge_action: Option<String>,
@@ -266,7 +278,7 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "related", "path", "compile", "quality", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
+                    "enum": ["remember", "recall", "readback", "search", "list", "forget", "tag", "link", "bridge", "unbridge", "align", "shadow", "completion", "related", "path", "compile", "quality", "belief", "decision", "domain", "embed", "ontology", "review", "health"],
                     "description": "Action."
                 },
                 "content": { "type": "string" },
@@ -349,6 +361,23 @@ impl Tool for MemoryTool {
                     "type": "string",
                     "enum": ["list", "propose", "accept", "reject"],
                     "description": "For action=shadow: list, propose, accept, reject."
+                },
+                "completion_action": {
+                    "type": "string",
+                    "enum": ["list", "propose", "promote", "purge"],
+                    "description": "For action=completion: manage hypothesis edges."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "For action=completion: engineering session; defaults to this session."
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "For completion propose/promote: evidence locator."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "For completion propose/promote: source; LLM sources cannot promote."
                 },
                 "bridge_action": {
                     "type": "string",
@@ -1111,6 +1140,142 @@ impl Tool for MemoryTool {
                     }
                     other => Err(anyhow::anyhow!(
                         "Unknown shadow_action: {other}. Use list, propose, accept, or reject"
+                    )),
+                }
+            }
+            "completion" => {
+                use crate::memory_types::CompletionEdge;
+
+                let store = EngineeringStore::open_default()
+                    .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+                let target_session = input
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| session_id.clone());
+                let sub = input.completion_action.as_deref().unwrap_or("list");
+                match sub {
+                    "list" => {
+                        let Some(graph) = store
+                            .load_graph(&target_session)
+                            .map_err(|error| anyhow::anyhow!("load engineering graph: {error}"))?
+                        else {
+                            return Ok(ToolOutput::new(format!(
+                                "No engineering graph stored for session {target_session}."
+                            )));
+                        };
+                        let edges = graph.hypothesis_edges();
+                        let mut out = format!(
+                            "Completion debt {:.2}: {} hypothesis edge(s) of {} edge(s) in session {}.",
+                            graph.completion_debt(),
+                            edges.len(),
+                            graph.relations.len(),
+                            target_session
+                        );
+                        for edge in edges {
+                            let expires = edge
+                                .valid_to
+                                .map(|until| until.to_rfc3339())
+                                .unwrap_or_else(|| "none".to_string());
+                            out.push_str(&format!(
+                                "\n- {} {}-{}-> {} (confidence {:.2}, source {}, evidence {}, expires {expires})",
+                                edge.id,
+                                edge.from,
+                                edge.relation,
+                                edge.to,
+                                edge.confidence,
+                                edge.provenance.source,
+                                edge.provenance.locator.as_deref().unwrap_or("-")
+                            ));
+                        }
+                        Ok(ToolOutput::new(out))
+                    }
+                    "propose" => {
+                        let from = input
+                            .from_id
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("from_id required for completion propose"))?;
+                        let to = input
+                            .to_id
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("to_id required for completion propose"))?;
+                        let evidence = input
+                            .evidence
+                            .clone()
+                            .or_else(|| input.content.clone())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "evidence locator required for completion propose; model confidence is not evidence"
+                                )
+                            })?;
+                        let relation = input.relation.as_deref().unwrap_or("same_as");
+                        let edge = CompletionEdge::new(
+                            from,
+                            relation,
+                            to,
+                            input.confidence.unwrap_or(0.8),
+                        )
+                        .with_evidence(evidence)
+                        .with_source(input.source.as_deref().unwrap_or("llm:proposal"));
+                        let report = store
+                            .write_completion_edges(&target_session, &[edge], "tool")
+                            .map_err(|error| anyhow::anyhow!("write completion edge: {error}"))?;
+                        let mut out = format!(
+                            "Completion write: {} accepted, {} rejected, debt {:.2}.",
+                            report.accepted.len(),
+                            report.rejected.len(),
+                            report.completion_debt
+                        );
+                        for id in &report.accepted {
+                            out.push_str(&format!(
+                                "\n- pending {id} (expires in 30 days; promote with completion_action=promote and non-LLM evidence)"
+                            ));
+                        }
+                        for rejection in &report.rejected {
+                            out.push_str(&format!(
+                                "\n- rejected {} [{}]: {}",
+                                rejection.relation,
+                                rejection.code.as_str(),
+                                rejection.message
+                            ));
+                        }
+                        Ok(ToolOutput::new(out))
+                    }
+                    "promote" => {
+                        let id = input
+                            .id
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("id required for completion promote"))?;
+                        let source = input
+                            .source
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("source required for completion promote"))?;
+                        let mut evidence = crate::memory_types::engineering_ontology::EngineeringProvenance::new(source)
+                            .with_confidence(input.confidence.unwrap_or(0.9));
+                        if let Some(locator) = input.evidence.clone().or_else(|| input.content.clone()) {
+                            evidence = evidence.with_locator(locator);
+                        }
+                        store
+                            .promote_completion_edge(&target_session, &id, evidence)
+                            .map_err(|error| anyhow::anyhow!("promote completion edge: {error}"))?;
+                        let debt = store
+                            .load_graph(&target_session)
+                            .map_err(|error| anyhow::anyhow!("load engineering graph: {error}"))?
+                            .map(|graph| graph.completion_debt())
+                            .unwrap_or(0.0);
+                        Ok(ToolOutput::new(format!(
+                            "Promoted {id} to an asserted edge in session {target_session}; completion debt {debt:.2}."
+                        )))
+                    }
+                    "purge" => {
+                        let removed = store
+                            .purge_expired_hypotheses(&target_session)
+                            .map_err(|error| anyhow::anyhow!("purge completion edges: {error}"))?;
+                        Ok(ToolOutput::new(format!(
+                            "Purged {removed} expired hypothesis edge(s) in session {target_session}."
+                        )))
+                    }
+                    other => Err(anyhow::anyhow!(
+                        "Unknown completion_action: {other}. Use list, propose, promote, or purge"
                     )),
                 }
             }
@@ -3520,6 +3685,128 @@ mod tests {
         );
         assert!(output.output.contains("gate Q03"), "{}", output.output);
         assert!(output.output.contains("owner: -"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn completion_action_writes_lists_promotes_and_blocks_llm_promotion() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_CHANGE, CLASS_ERROR, EngineeringEntity, EngineeringGraph, EngineeringRelation,
+            REL_FIXES,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
+        store
+            .save_graph("test-session", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let missing_evidence = tool
+            .execute(
+                json!({
+                    "action":"completion",
+                    "completion_action":"propose",
+                    "from_id":"change:c1",
+                    "to_id":"error:e1",
+                    "relation":"uses",
+                    "confidence":0.82
+                }),
+                test_ctx(None),
+            )
+            .await;
+        assert!(missing_evidence.is_err());
+
+        let proposed = tool
+            .execute(
+                json!({
+                    "action":"completion",
+                    "completion_action":"propose",
+                    "from_id":"change:c1",
+                    "to_id":"error:e1",
+                    "relation":"uses",
+                    "confidence":0.82,
+                    "evidence":"doc:review#p2"
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("propose");
+        assert!(
+            proposed.output.contains("1 accepted"),
+            "{}",
+            proposed.output
+        );
+        assert!(
+            proposed.output.contains("rel:change:c1:uses:error:e1"),
+            "{}",
+            proposed.output
+        );
+
+        let listed = tool
+            .execute(
+                json!({"action":"completion","completion_action":"list"}),
+                test_ctx(None),
+            )
+            .await
+            .expect("list");
+        assert!(
+            listed.output.contains("Completion debt 0.50"),
+            "{}",
+            listed.output
+        );
+
+        let llm_promotion = tool
+            .execute(
+                json!({
+                    "action":"completion",
+                    "completion_action":"promote",
+                    "id":"rel:change:c1:uses:error:e1",
+                    "source":"llm:proposal",
+                    "confidence":0.95
+                }),
+                test_ctx(None),
+            )
+            .await;
+        assert!(llm_promotion.is_err());
+
+        let promoted = tool
+            .execute(
+                json!({
+                    "action":"completion",
+                    "completion_action":"promote",
+                    "id":"rel:change:c1:uses:error:e1",
+                    "source":"human:review",
+                    "evidence":"review#p2",
+                    "confidence":0.95
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("promote");
+        assert!(
+            promoted.output.contains("completion debt 0.00"),
+            "{}",
+            promoted.output
+        );
+
+        let reloaded = EngineeringStore::open_default()
+            .expect("reopen")
+            .load_graph("test-session")
+            .expect("load")
+            .expect("graph");
+        let edge = reloaded
+            .relations
+            .get("rel:change:c1:uses:error:e1")
+            .expect("edge");
+        assert!(!edge.hypothesis);
+        assert_eq!(edge.provenance.source, "human:review");
+        assert_eq!(reloaded.relations.len(), 2);
     }
 
     #[tokio::test]

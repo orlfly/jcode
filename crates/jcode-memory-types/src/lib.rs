@@ -21,6 +21,13 @@ pub use path_diagnosis::{
     PathMissingClass, completion_plan, missing_classes_for, next_actions_for,
 };
 
+pub mod path_completion;
+pub use path_completion::{
+    COMPLETION_MAX_NEW_EDGES, COMPLETION_MIN_CONFIDENCE, COMPLETION_TTL_DAYS, CompletionEdge,
+    CompletionPromotionError, CompletionRejection, CompletionRejectionCode, CompletionWriteReport,
+    is_llm_source,
+};
+
 pub mod path_quality;
 pub use path_quality::{PathQuality, PathQualityFlag};
 

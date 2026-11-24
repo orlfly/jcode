@@ -2058,6 +2058,15 @@ $$
 
 引入“补全债务”指标：completion_debt = 未确认假设边数 / 决策使用边总数。该指标进入 4.6 的质量看板，超过 0.1 触发治理任务。
 
+**实现（工程图层）**：`EngineeringGraph::write_completion_edges` 负责落库前的全部判定，`memory` 工具的 `action=completion` 提供 `list|propose|promote|purge`。写入契约：
+
+- 只写 `hypothesis=true` 的边，`valid_from=now`、`valid_to=now+30d`，到期由 `purge_expired_hypotheses` 软删除；断言边不可被候选覆盖（`duplicate_asserted`）。
+- 候选必须带可验证 `evidence` 定位，置信度 ≥0.7，单次最多写 5 条；缺失证据、低置信、自环、端点不存在、重复候选各有稳定拒绝码。
+- `promote` 要求非 LLM 证据（`is_llm_source` 拦截 `llm:*`/`model:*`/`completion:llm` 且证据置信度 ≥0.7），晋升后 `hypothesis=false`、TTL 清除、旧来源压入 `derived_from`。
+- `completion_debt` 与假设边清单可从 `action=completion completion_action=list` 读取；工具写入/晋升都保留 session 的 `working_dir`。
+
+**尚未实现**：自动候选生成（L3 文档抽取、L4 近邻拼接对工程图的候选产出）仍未接线，当前由调用方显式 propose；4.6 看板尚未消费 `completion_debt`。
+
 ```cypher
 MERGE (u:Entity {id: $uid})
   -[e:HYPOTHESIZED {relation: $rel}]->
