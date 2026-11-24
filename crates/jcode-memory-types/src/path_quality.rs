@@ -4,7 +4,10 @@
 //! let a planner insert verification, request disambiguation, or avoid a path
 //! with weak provenance without re-reading the whole graph.
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+
+use crate::engineering_ontology::{EngineeringGraph, EngineeringPath};
 
 /// One local path-quality concern from design table 4.6.9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,47 @@ impl PathQuality {
     }
 }
 
+/// Path-level quality signals for one engineering path.
+///
+/// A path that crosses any unconfirmed completion edge must carry
+/// `hypothesized_edge`; the plan gate and the planner both key on this flag
+/// rather than re-reading edge provenance.
+impl EngineeringGraph {
+    pub fn quality_of_path(&self, path: &EngineeringPath) -> PathQuality {
+        let now = Utc::now();
+        let mut quality = PathQuality::default();
+        for id in &path.relations {
+            let Some(relation) = self.relation(id) else {
+                quality.push(
+                    PathQualityFlag::LowProvenance,
+                    format!("relation {id} is missing from the graph"),
+                );
+                continue;
+            };
+            if relation.hypothesis {
+                quality.push(
+                    PathQualityFlag::HypothesizedEdge,
+                    format!("{} is an unconfirmed completion edge", relation.id),
+                );
+            }
+            if let Some(until) = relation.valid_to.filter(|until| *until < now) {
+                quality.push(
+                    PathQualityFlag::StaleEdge,
+                    format!("{} expired at {until}", relation.id),
+                );
+            }
+            let provenance_confidence = relation.provenance.confidence;
+            if !provenance_confidence.is_finite() || provenance_confidence < 0.5 {
+                quality.push(
+                    PathQualityFlag::LowProvenance,
+                    format!("{} has weak provenance", relation.id),
+                );
+            }
+        }
+        quality
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +125,45 @@ mod tests {
         assert_eq!(quality.flags, vec![PathQualityFlag::StitchedPath]);
         assert_eq!(quality.reasons, vec!["crosses a bridge"]);
         assert_eq!(quality.label(), "stitched_path");
+    }
+
+    #[test]
+    fn engineering_quality_marks_hypothesis_and_weak_provenance() {
+        use crate::engineering_ontology::{
+            CLASS_CHANGE, CLASS_ERROR, EngineeringEntity, EngineeringRelation, REL_FIXES,
+        };
+
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
+        graph.insert_relation(
+            EngineeringRelation::new("change:c1", "supports", "error:e1")
+                .with_hypothesis(true)
+                .with_provenance(crate::engineering_ontology::EngineeringProvenance::new(
+                    "llm:proposal",
+                )),
+        );
+        let path = graph
+            .weighted_shortest_path("change:c1", "error:e1", 2, &[])
+            .expect("path");
+        let quality = graph.quality_of_path(&path);
+        assert!(quality.has(PathQualityFlag::HypothesizedEdge));
+        assert!(
+            quality
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unconfirmed completion edge")),
+            "{:?}",
+            quality
+        );
+        // The seeded provenance has confidence 0.8, so only the hypothesis flag
+        // fires here; low provenance is a separate concern.
+        let asserted = graph.quality_of_path(
+            &graph
+                .weighted_shortest_path("error:e1", "change:c1", 2, &[])
+                .expect("asserted path"),
+        );
+        assert!(asserted.flags.is_empty(), "{:?}", asserted);
     }
 }

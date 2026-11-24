@@ -2631,6 +2631,13 @@ impl MemoryTool {
                 hit.path.confidence * 100.0,
                 hit.path.hop_count()
             ));
+            if !hit.quality.is_empty() {
+                out.push_str(&format!(
+                    "  quality: {} ({})\n",
+                    hit.quality.label(),
+                    hit.quality.reasons.join("; ")
+                ));
+            }
             for (node_index, node_id) in hit.path.nodes.iter().enumerate() {
                 let label = hit
                     .node_labels

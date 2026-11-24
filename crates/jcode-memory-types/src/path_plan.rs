@@ -934,6 +934,7 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
     let mut verification_queries = Vec::with_capacity(path.relations.len());
     let mut rollback = Vec::new();
     let mut hypothesis_downgrades = Vec::new();
+    let mut hypothesis_edges = 0;
     let mut confidence = path.confidence;
     let mut previous: Option<String> = None;
     let path_edges: HashSet<&str> = path.relations.iter().map(String::as_str).collect();
@@ -954,6 +955,9 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
         let Some(relation) = graph.relation(relation_id) else {
             continue;
         };
+        if relation.hypothesis {
+            hypothesis_edges += 1;
+        }
         let (mut action, risk, success_check) = template(&relation.relation);
         if relation.hypothesis && action.has_side_effects() {
             action = PlanActionType::Verify;
@@ -1069,6 +1073,11 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
         ));
     }
     warnings.extend(hypothesis_downgrades);
+    if hypothesis_edges > 0 {
+        warnings.push(format!(
+            "path includes {hypothesis_edges} hypothesized edge(s); verify before acting"
+        ));
+    }
     let (groups, acyclic) = parallel_groups(&tasks);
     if !acyclic {
         warnings.push("plan dependency cycle detected; split before execution".to_string());

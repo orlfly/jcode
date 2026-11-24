@@ -20,7 +20,8 @@ use jcode_memory_types::engineering_ontology::{
     EngineeringRelation, default_engineering_ontology,
 };
 use jcode_memory_types::{
-    CompletionEdge, CompletionPromotionError, CompletionWriteReport, PathPlan, build_path_plan,
+    CompletionEdge, CompletionPromotionError, CompletionWriteReport, PathPlan, PathQuality,
+    build_path_plan,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,8 @@ pub struct EngineeringPathHit {
     pub node_labels: Vec<String>,
     pub relation_labels: Vec<String>,
     pub plan: PathPlan,
+    /// Runtime quality signals (4.6.9), including hypothesized completion edges.
+    pub quality: PathQuality,
 }
 
 /// One session selected by the engineering retention policy.
@@ -832,6 +835,7 @@ impl EngineeringStore {
                     })
                     .collect();
                 let plan = build_path_plan(&graph, &path);
+                let quality = graph.quality_of_path(&path);
                 hits.push(EngineeringPathHit {
                     session_id: session_id.clone(),
                     working_dir: working_dir.clone(),
@@ -839,6 +843,7 @@ impl EngineeringStore {
                     node_labels,
                     relation_labels,
                     plan,
+                    quality,
                 });
             }
         }
@@ -901,6 +906,7 @@ impl EngineeringStore {
                 })
                 .collect();
             let plan = build_path_plan(&graph, &path);
+            let quality = graph.quality_of_path(&path);
             hits.push(EngineeringPathHit {
                 session_id: "ontology".to_string(),
                 working_dir: None,
@@ -908,6 +914,7 @@ impl EngineeringStore {
                 node_labels,
                 relation_labels,
                 plan,
+                quality,
             });
         }
         hits.truncate(limit);
@@ -1410,6 +1417,31 @@ mod tests {
         assert_eq!(report.accepted.len(), 1, "{report:?}");
         assert!(report.completion_debt > 0.0);
 
+        let hits = store
+            .path_between_anchors("error:boom", "file:src/lib.rs", 2, 3, &[REL_DEFINES])
+            .expect("hypothesis path");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0]
+                .quality
+                .has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
+            "{:?}",
+            hits[0].quality
+        );
+        assert!(
+            hits[0]
+                .plan
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("hypothesized edge(s)")),
+            "{:?}",
+            hits[0].plan.warnings
+        );
+        assert_eq!(
+            hits[0].plan.tasks[0].action_type,
+            jcode_memory_types::PlanActionType::Verify
+        );
+
         let sessions = store.list_sessions(5).expect("sessions");
         assert_eq!(sessions[0].working_dir.as_deref(), Some("/repo"));
 
@@ -1426,6 +1458,16 @@ mod tests {
         let edge = reloaded.relations.get(&report.accepted[0]).expect("edge");
         assert!(!edge.hypothesis);
         assert_eq!(reloaded.completion_debt(), 0.0);
+        let asserted_hits = store
+            .path_between_anchors("error:boom", "file:src/lib.rs", 2, 3, &[REL_DEFINES])
+            .expect("asserted path");
+        assert!(
+            !asserted_hits[0]
+                .quality
+                .has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
+            "{:?}",
+            asserted_hits[0].quality
+        );
 
         let missing = EngineeringProvenance::new("human:review");
         assert!(

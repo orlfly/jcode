@@ -2469,6 +2469,8 @@ RETURN n.id AS entity_id, n.name AS name, path_count;
 
 规划器读取这些标志后，可以自动插入验证任务、请求人工确认或选择替代路径。这样 4.6 的质量评估不只是报表，而是进入 5.2 动作选择和 4.5 计划门禁的运行时信号。
 
+**实现（工程图层）**：`EngineeringGraph::quality_of_path` 逐边生成标志并挂到 `EngineeringPathHit.quality`；`memory` 工具 `path` 输出新增 `quality:` 行。当前可判定 `hypothesized_edge`（边带 `hypothesis`）、`stale_edge`（`valid_to` 已过）、`low_provenance`（来源置信度 <0.5 或边缺失）；`high_degree_hub`、`ambiguous_entity`、`stitched_path` 尚无工程图判定依据，不产出。计划器侧同时拿到两条信号：`PathPlan.warnings` 写明假设边数量，`Q12` 在副作用任务缺少前置验证时直接阻断。
+
 #### 4.6.10 冷启动与持续运营
 
 - 金标准从 20–50 个高价值任务开始，按意图逐步扩展，不追求一次性覆盖全图。
