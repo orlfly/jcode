@@ -461,9 +461,283 @@ pub fn compile_path_query_text(
     }
 }
 
+/// Result of coercing model-filled JSON into a validated PathQuery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathQueryCompileReport {
+    pub query: PathQuery,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub dropped_fields: Vec<String>,
+}
+
+const JSON_ROOT_FIELDS: [&str; 8] = [
+    "start",
+    "from",
+    "goal",
+    "to",
+    "waypoints",
+    "via",
+    "graph",
+    "constraints",
+];
+
+const JSON_CONSTRAINT_FIELDS: [&str; 18] = [
+    "relations",
+    "allow_relations",
+    "deny_relations",
+    "min_confidence",
+    "min_conf",
+    "objective",
+    "depth",
+    "max_depth",
+    "limit",
+    "max_results",
+    "scope",
+    "include_hypotheses",
+    "include_ontology",
+    "query_budget_ms",
+    "budget_ms",
+    "semantic_min_score",
+    "semantic_min",
+    "auto_ground",
+];
+
+fn json_first<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    names
+        .iter()
+        .find_map(|name| object.get_key_value(*name).map(|(key, value)| (key.as_str(), value)))
+}
+
+fn json_anchors(
+    value: &serde_json::Value,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(text) => Some(vec![text.clone()]),
+        serde_json::Value::Array(items) => {
+            let mut anchors = Vec::new();
+            for item in items {
+                match item.as_str() {
+                    Some(anchor) => anchors.push(anchor.to_string()),
+                    None => errors.push(format!("{field} must contain only strings")),
+                }
+            }
+            Some(anchors)
+        }
+        _ => {
+            errors.push(format!("{field} must be a string or array of strings"));
+            None
+        }
+    }
+}
+
+fn json_usize(
+    value: &serde_json::Value,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Option<usize> {
+    match value.as_u64() {
+        Some(number) => usize::try_from(number).ok().or_else(|| {
+            errors.push(format!("{field} is too large"));
+            None
+        }),
+        None => {
+            errors.push(format!("{field} must be a non-negative integer"));
+            None
+        }
+    }
+}
+
+fn json_u64(value: &serde_json::Value, field: &str, errors: &mut Vec<String>) -> Option<u64> {
+    match value.as_u64() {
+        Some(number) => Some(number),
+        None => {
+            errors.push(format!("{field} must be a non-negative integer"));
+            None
+        }
+    }
+}
+
+fn json_f32(value: &serde_json::Value, field: &str, errors: &mut Vec<String>) -> Option<f32> {
+    match value.as_f64() {
+        Some(number) => Some(number as f32),
+        None => {
+            errors.push(format!("{field} must be a number"));
+            None
+        }
+    }
+}
+
+fn json_bool(value: &serde_json::Value, field: &str, errors: &mut Vec<String>) -> Option<bool> {
+    match value.as_bool() {
+        Some(flag) => Some(flag),
+        None => {
+            errors.push(format!("{field} must be a boolean"));
+            None
+        }
+    }
+}
+
+/// Coerce model-filled JSON into a validated PathQuery.
+///
+/// The model may use the documented aliases (`from`/`to`, `max_depth`,
+/// `max_results`, `min_conf`, `budget_ms`, `semantic_min`). Unsupported fields
+/// are dropped and reported. Unknown relation names are hard errors so a model
+/// cannot smuggle arbitrary traversal tokens into the engine.
+pub fn compile_path_query_json(
+    value: &serde_json::Value,
+    allowed_relations: &[&str],
+) -> Result<PathQueryCompileReport, Vec<String>> {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut dropped_fields = Vec::new();
+    let Some(root) = value.as_object() else {
+        return Err(vec!["query JSON must be an object".to_string()]);
+    };
+    let root = if root.get("start").is_none()
+        && root.get("from").is_none()
+        && root.get("query").is_some()
+    {
+        match root.get("query").and_then(serde_json::Value::as_object) {
+            Some(inner) => inner,
+            None => return Err(vec!["query wrapper must be an object".to_string()]),
+        }
+    } else {
+        root
+    };
+    for key in root.keys() {
+        if key != "query" && !JSON_ROOT_FIELDS.contains(&key.as_str()) {
+            dropped_fields.push(key.clone());
+            warnings.push(format!("dropped unsupported field: {key}"));
+        }
+    }
+    let start = json_first(root, &["start", "from"])
+        .and_then(|(_, value)| json_anchors(value, "start", &mut errors))
+        .unwrap_or_default();
+    let goal = json_first(root, &["goal", "to"])
+        .and_then(|(_, value)| json_anchors(value, "goal", &mut errors))
+        .unwrap_or_default();
+    let waypoints = json_first(root, &["waypoints", "via"])
+        .and_then(|(_, value)| json_anchors(value, "waypoints", &mut errors))
+        .unwrap_or_default();
+    let graph = match json_first(root, &["graph"]) {
+        Some((_, value)) => match value.as_str().and_then(PathGraphKind::parse) {
+            Some(graph) => graph,
+            None => {
+                errors.push("graph must be memory, engineering, or ontology".to_string());
+                PathGraphKind::Memory
+            }
+        },
+        None => PathGraphKind::Memory,
+    };
+    let mut constraints = PathQueryConstraints::default();
+    if let Some((_, value)) = json_first(root, &["constraints"]) {
+        let Some(object) = value.as_object() else {
+            return Err(vec!["constraints must be an object".to_string()]);
+        };
+        for key in object.keys() {
+            if !JSON_CONSTRAINT_FIELDS.contains(&key.as_str()) {
+                dropped_fields.push(key.clone());
+                warnings.push(format!("dropped unsupported constraint field: {key}"));
+            }
+        }
+        if let Some((_, value)) = json_first(object, &["relations", "allow_relations"]) {
+            constraints.relations =
+                json_anchors(value, "relations", &mut errors).unwrap_or_default();
+        }
+        if let Some((_, value)) = json_first(object, &["deny_relations"]) {
+            constraints.deny_relations =
+                json_anchors(value, "deny_relations", &mut errors).unwrap_or_default();
+        }
+        if let Some((key, value)) = json_first(object, &["min_confidence", "min_conf"]) {
+            constraints.min_confidence = json_f32(value, key, &mut errors);
+        }
+        if let Some((key, value)) = json_first(object, &["depth", "max_depth"]) {
+            constraints.depth = json_usize(value, key, &mut errors);
+        }
+        if let Some((key, value)) = json_first(object, &["limit", "max_results"]) {
+            constraints.limit = json_usize(value, key, &mut errors);
+        }
+        if let Some((key, value)) = json_first(object, &["query_budget_ms", "budget_ms"]) {
+            constraints.query_budget_ms = json_u64(value, key, &mut errors);
+        }
+        if let Some((key, value)) = json_first(object, &["semantic_min_score", "semantic_min"]) {
+            constraints.semantic_min_score = json_f32(value, key, &mut errors);
+        }
+        if let Some((_, value)) = json_first(object, &["scope"]) {
+            constraints.scope = value.as_str().and_then(PathQueryScope::parse);
+            if constraints.scope.is_none() {
+                errors.push("scope must be project, global, or all".to_string());
+            }
+        }
+        if let Some((_, value)) = json_first(object, &["objective"]) {
+            constraints.objective = match value.as_str().map(str::trim) {
+                Some("min_cost" | "cost") => Some(PathObjective::MinCost),
+                Some("max_confidence" | "confidence") => Some(PathObjective::MaxConfidence),
+                _ => {
+                    errors.push(
+                        "objective must be min_cost or max_confidence".to_string(),
+                    );
+                    None
+                }
+            };
+        }
+        if let Some((key, value)) = json_first(object, &["include_hypotheses"]) {
+            constraints.include_hypotheses = json_bool(value, key, &mut errors).unwrap_or(false);
+        }
+        if let Some((key, value)) = json_first(object, &["include_ontology"]) {
+            constraints.include_ontology = json_bool(value, key, &mut errors).unwrap_or(false);
+        }
+        if let Some((key, value)) = json_first(object, &["auto_ground"]) {
+            constraints.auto_ground = json_bool(value, key, &mut errors).unwrap_or(false);
+        }
+    }
+    for relation in constraints
+        .relations
+        .iter()
+        .chain(constraints.deny_relations.iter())
+    {
+        let relation = relation.trim();
+        let known = EdgeKind::parse(relation).is_some()
+            || allowed_relations
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(relation));
+        if relation.is_empty() || !known {
+            errors.push(format!("unknown relation: {relation}"));
+        }
+    }
+    let query = PathQuery {
+        start,
+        goal,
+        waypoints,
+        graph: Some(graph),
+        constraints,
+    };
+    if errors.is_empty()
+        && let Err(validation) = query.validate()
+    {
+        errors.extend(validation);
+    }
+    if errors.is_empty() {
+        Ok(PathQueryCompileReport {
+            query,
+            warnings,
+            dropped_fields,
+        })
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn validates_shape_scope_and_memory_relations() {
@@ -605,5 +879,81 @@ mod tests {
         .expect("compile");
         assert_eq!(query.graph_kind(), PathGraphKind::Memory);
         assert_eq!(query.constraints.relations, vec!["relates_to"]);
+    }
+
+    #[test]
+    fn compiles_model_json_with_aliases_and_reports_dropped_fields() {
+        let report = compile_path_query_json(
+            &json!({
+                "from": ["file:src/lib.rs"],
+                "to": "api:/task",
+                "via": ["file:src/main.rs"],
+                "graph": "engineering",
+                "constraints": {
+                    "relations": ["defines"],
+                    "max_depth": 3,
+                    "max_results": 2,
+                    "min_conf": 0.6,
+                    "budget_ms": 50,
+                    "semantic_min": 0.7,
+                    "objective": "max_confidence",
+                    "scope": "project",
+                    "auto_ground": true,
+                    "mystery": 1
+                },
+                "unexpected": true
+            }),
+            &["defines"],
+        )
+        .expect("compile model JSON");
+        assert_eq!(report.query.graph_kind(), PathGraphKind::Engineering);
+        assert_eq!(report.query.start, vec!["file:src/lib.rs"]);
+        assert_eq!(report.query.goal, vec!["api:/task"]);
+        assert_eq!(report.query.waypoints, vec!["file:src/main.rs"]);
+        assert_eq!(report.query.constraints.depth, Some(3));
+        assert_eq!(report.query.constraints.limit, Some(2));
+        assert_eq!(report.query.constraints.min_confidence, Some(0.6));
+        assert_eq!(report.query.constraints.query_budget_ms, Some(50));
+        assert_eq!(report.query.constraints.semantic_min_score, Some(0.7));
+        assert_eq!(
+            report.query.constraints.objective,
+            Some(PathObjective::MaxConfidence)
+        );
+        assert_eq!(report.query.constraints.scope, Some(PathQueryScope::Project));
+        assert!(report.query.constraints.auto_ground);
+        assert_eq!(
+            report.dropped_fields,
+            vec!["unexpected".to_string(), "mystery".to_string()]
+        );
+        assert_eq!(report.warnings.len(), 2);
+    }
+
+    #[test]
+    fn model_json_rejects_unknown_relations_and_missing_goal() {
+        let errors = compile_path_query_json(
+            &json!({
+                "start": "a",
+                "goal": "b",
+                "constraints": {"relations": ["teleports"]}
+            }),
+            &["defines"],
+        )
+        .expect_err("unknown relation");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown relation: teleports")),
+            "{errors:?}"
+        );
+
+        let errors = compile_path_query_json(
+            &json!({"start": ["a"], "graph": "memory"}),
+            &[],
+        )
+        .expect_err("missing goal");
+        assert!(
+            errors.iter().any(|error| error.contains("goal")),
+            "{errors:?}"
+        );
     }
 }

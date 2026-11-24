@@ -64,6 +64,9 @@ struct MemoryInput {
     category: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    /// For action=compile: model-filled PathQuery JSON.
+    #[serde(default)]
+    query_json: Option<serde_json::Value>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -272,6 +275,10 @@ impl Tool for MemoryTool {
                     "enum": ["fact", "preference", "entity", "correction", "env_fact", "contract", "process_rule", "observation"]
                 },
                 "query": { "type": "string" },
+                "query_json": {
+                    "type": "object",
+                    "description": "For action=compile: model-filled PathQuery JSON."
+                },
                 "id": {
                     "type": "string",
                     "description": "Unique id [A-Za-z0-9_:.-]{1,256}; omit to auto-generate."
@@ -1676,6 +1683,42 @@ impl Tool for MemoryTool {
                 )))
             }
             "compile" => {
+                if let Some(value) = input.query_json.as_ref() {
+                    let audit_scope =
+                        Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                    let allowed: Vec<String> =
+                        crate::memory_types::engineering_ontology::default_engineering_ontology()
+                            .relations
+                            .keys()
+                            .cloned()
+                            .collect();
+                    let allowed_refs: Vec<&str> =
+                        allowed.iter().map(String::as_str).collect();
+                    let report = match crate::memory_types::path_query::compile_path_query_json(
+                        value,
+                        &allowed_refs,
+                    ) {
+                        Ok(report) => {
+                            manager.record_compile_audit(audit_scope, true, Vec::new());
+                            report
+                        }
+                        Err(errors) => {
+                            manager.record_compile_audit(
+                                audit_scope,
+                                false,
+                                errors.clone(),
+                            );
+                            return Err(anyhow::anyhow!(
+                                "path query JSON compile failed: {}",
+                                errors.join("; ")
+                            ));
+                        }
+                    };
+                    return Ok(ToolOutput::new(format!(
+                        "Compiled PathQuery from JSON:\n{}",
+                        serde_json::to_string_pretty(&report)?
+                    )));
+                }
                 let text = input
                     .query
                     .as_deref()
@@ -3603,6 +3646,43 @@ mod tests {
         assert!(quality.contains("\"compile_successes\": 1"), "{quality}");
         assert!(quality.contains("\"compile_success_rate\": 0.5"), "{quality}");
         assert!(quality.contains("Q13"), "{quality}");
+    }
+
+    #[tokio::test]
+    async fn compile_action_accepts_model_json_and_reports_dropped_fields() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "query_json":{
+                        "from":["file:src/lib.rs"],
+                        "to":"api:/task",
+                        "graph":"engineering",
+                        "constraints":{
+                            "relations":["defines"],
+                            "max_depth":2,
+                            "mystery":1
+                        },
+                        "extra":true
+                    }
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("compile model JSON")
+            .output;
+        assert!(output.contains("Compiled PathQuery from JSON"), "{output}");
+        assert!(output.contains("\"depth\": 2"), "{output}");
+        assert!(output.contains("\"defines\""), "{output}");
+        assert!(output.contains("dropped unsupported field: extra"), "{output}");
+        assert!(
+            output.contains("dropped unsupported constraint field: mystery"),
+            "{output}"
+        );
     }
 
     #[tokio::test]

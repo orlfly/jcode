@@ -24,7 +24,8 @@ pub use path_quality::{PathQuality, PathQualityFlag};
 
 pub mod path_query;
 pub use path_query::{
-    PathGraphKind, PathObjective, PathQuery, PathQueryConstraints, PathQueryScope,
+    PathGraphKind, PathObjective, PathQuery, PathQueryCompileReport, PathQueryConstraints,
+    PathQueryScope, compile_path_query_json,
 };
 
 pub mod decision;

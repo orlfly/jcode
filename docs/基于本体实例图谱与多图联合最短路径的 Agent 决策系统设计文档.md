@@ -1518,6 +1518,8 @@ IR 的字段不是自由文本，而是由本体库快照生成的枚举和 JSON
 - **可执行**：物理查询通过 EXPLAIN、只读检查和成本上限。
 - **可复现**：相同输入与相同图谱快照产生相同 IR，LLM 温度固定为 0。
 
+**实现口径（v1.x）**：模型填 IR 走 `action=compile query_json=<object>`，由 `compile_path_query_json` 做受约束收口。它接受 `from/to`、`via`、`max_depth`、`max_results`、`min_conf`、`budget_ms`、`semantic_min` 等别名，统一映射到 `PathQuery`；未登记字段被丢弃并在 `dropped_fields`/`warnings` 中返回，不静默吞掉。关系名必须命中 EdgeKind 或调用方传入的本体关系白名单，否则整体拒绝；数值、布尔、枚举类型错误同样整体拒绝。通过后仍执行 `PathQuery::validate`，所以深度、数量、置信度范围与未接地锚点不会被模型绕过。
+
 #### 4.3.2 八阶段编译流水线
 
 ```text
