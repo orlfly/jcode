@@ -196,7 +196,10 @@ impl EngineeringStore {
             > 0;
         if !has_blob {
             self.connection
-                .execute("ALTER TABLE engineering_graphs ADD COLUMN graph_blob BLOB", [])
+                .execute(
+                    "ALTER TABLE engineering_graphs ADD COLUMN graph_blob BLOB",
+                    [],
+                )
                 .context("add engineering_graphs.graph_blob")?;
         }
         Ok(())
@@ -407,7 +410,9 @@ impl EngineeringStore {
                 params![session_id],
             )
             .context("delete engineering entity index")?;
-        transaction.commit().context("commit delete engineering graph")?;
+        transaction
+            .commit()
+            .context("commit delete engineering graph")?;
         Ok(removed > 0)
     }
 
@@ -738,13 +743,9 @@ impl EngineeringStore {
                 graph
             };
             let graph = graph.infer_relations(&ontology);
-            for path in graph.k_shortest_paths(
-                from_anchor,
-                to_anchor,
-                depth,
-                allowed_relations,
-                limit,
-            ) {
+            for path in
+                graph.k_shortest_paths(from_anchor, to_anchor, depth, allowed_relations, limit)
+            {
                 let node_labels = path
                     .nodes
                     .iter()
@@ -948,6 +949,7 @@ fn subgraph_around(
     Some(EngineeringGraph {
         entities,
         relations,
+        concept_layer: graph.concept_layer,
     })
 }
 
@@ -955,8 +957,8 @@ fn subgraph_around(
 mod tests {
     use super::*;
     use jcode_memory_types::engineering_ontology::{
-        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, EngineeringProvenance, REL_CAUSES, REL_MODIFIES,
-        REL_DEFINES,
+        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, EngineeringProvenance, REL_CAUSES, REL_DEFINES,
+        REL_MODIFIES,
     };
     use serde_json::json;
 
@@ -1028,13 +1030,7 @@ mod tests {
             .expect("save");
 
         let hits = store
-            .path_between_anchors(
-                "command:cargo-test",
-                "file:src/lib.rs",
-                3,
-                5,
-                &["modifies"],
-            )
+            .path_between_anchors("command:cargo-test", "file:src/lib.rs", 3, 5, &["modifies"])
             .expect("path");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "session-1");
@@ -1059,27 +1055,23 @@ mod tests {
         assert!(hits[0].working_dir.as_deref() == Some("/repo"));
 
         let filtered = store
-            .path_between_anchors(
-                "command:cargo-test",
-                "file:src/lib.rs",
-                3,
-                5,
-                &["causes"],
-            )
+            .path_between_anchors("command:cargo-test", "file:src/lib.rs", 3, 5, &["causes"])
             .expect("filtered path");
         assert!(filtered.is_empty());
     }
 
     #[test]
     fn path_query_uses_inferred_inverse_relations() {
-        use jcode_memory_types::engineering_ontology::{
-            CLASS_SESSION, REL_CONTAINS, REL_PART_OF,
-        };
+        use jcode_memory_types::engineering_ontology::{CLASS_SESSION, REL_CONTAINS, REL_PART_OF};
 
         let store = EngineeringStore::open_in_memory().expect("store");
         let mut graph = EngineeringGraph::new();
         graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
-        graph.insert_entity(EngineeringEntity::new(CLASS_SESSION, "session:s", "session"));
+        graph.insert_entity(EngineeringEntity::new(
+            CLASS_SESSION,
+            "session:s",
+            "session",
+        ));
         graph.insert_relation(EngineeringRelation::new("file:a", REL_PART_OF, "session:s"));
         store
             .save_graph("session-inverse", None, &graph)
@@ -1117,9 +1109,7 @@ mod tests {
     fn save_writes_compressed_blob_and_index() {
         let store = EngineeringStore::open_in_memory().expect("store");
         let graph = sample_graph();
-        store
-            .save_graph("session-1", None, &graph)
-            .expect("save");
+        store.save_graph("session-1", None, &graph).expect("save");
         let (json, blob_len, indexed): (String, i64, i64) = store
             .connection
             .query_row(
@@ -1286,14 +1276,9 @@ mod tests {
 
     #[test]
     fn ontology_path_queries_concept_layer_without_session_data() {
-        let hits = EngineeringStore::ontology_path_between_anchors(
-            "File",
-            "API",
-            2,
-            3,
-            &[REL_DEFINES],
-        )
-        .expect("ontology path");
+        let hits =
+            EngineeringStore::ontology_path_between_anchors("File", "API", 2, 3, &[REL_DEFINES])
+                .expect("ontology path");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].session_id, "ontology");
         assert_eq!(hits[0].node_labels, vec!["File", "API"]);

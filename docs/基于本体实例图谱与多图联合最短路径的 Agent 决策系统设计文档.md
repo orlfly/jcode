@@ -2193,6 +2193,8 @@ PathPlan 的 JSON 结构如下，任务字段与 5.2.4 的规划动作一一对�
 - 风险与审批：按副作用等级、金额、不可逆性分配审批门禁。
 - 动作发射：把 DAG 映射为 a_query、a_reason、a_execute、a_terminate 的偏序序列。
 
+**实现边界**：前置条件闭包只在实例图上展开。本体概念图里 `depends_on` 这类边是类到类的签名（例如 `Change -> File`），若按实例规则闭包，一条 `File -> API` 的概念路径会被塞进十几个同层类的“前置任务”，既不可执行也掩盖真实步骤。`EngineeringGraph::concept_layer` 标记概念层，`build_path_plan` 见到它直接跳过闭包，概念路径只保留路径边本身。
+
 ```python
 def path_to_plan(path, belief, templates):
     path = normalize(path)
@@ -2278,11 +2280,12 @@ T3 有资金与产能承诺，设为审批门禁；T4 修改资源分配，属�
 | Q09 | 依赖成环 | blocking |
 | Q10 | depends_on 指向计划外任务 | blocking |
 | Q11 | 任务 id 重复 | blocking |
+| Q12 | 副作用任务位于假设边下游且没有前置验证任务 | blocking |
 | W01 | 高风险任务建议先影子执行 | warning |
 
 编译期不臆造责任人：`build_path_plan` 只把 `owner/due` 留空，副作用计划的 `executable` 必须由调用方用 `PathPlan::assign_task(task_id, owner, due)` 显式补齐后才为 true。`Q06` 与 4.5.1 的“置信度取最小值”一致，同时检查计划级与任务级置信度。
 
-**未实现**：HYPOTHESIZED 边的“验证任务必须是下游副作用前驱”这一条。当前 `EngineeringRelation` 没有 hypothesis 标记，也没有补全边写回的 provenance 字段，无法在不臆造数据的前提下判定；补上边级 hypothesis 标记后再接入本表（预计 code `Q12`）。
+**假设边（Q12）**：`EngineeringRelation.hypothesis`（serde 默认 false，旧图读入即断言边）标记补全阶梯产出的候选边；计划任务同步复制到 `PathPlanTask.hypothesis`。编译期对假设边做保守降级：模板本会产出副作用动作时改为 `verify`，并在 `warnings` 写明降级原因，路径顺序保证它先于下游任务。`Q12` 作为第二道兜底，检查每个副作用任务的传递前驱里是否存在 `verify`/`query` 任务；手工构造或外部导入的计划绕过编译器降级时仍会被拦。生产端目前只有 API（`EngineeringRelation::with_hypothesis`）；4.4.5 的补全边写回尚未实现，所以线上还不会自动产出假设边，这一点不当作已具备能力。
 
 #### 4.5.7 执行反馈与重规划
 

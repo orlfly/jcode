@@ -578,10 +578,7 @@ impl EngineeringOntology {
                 } else if !self.relations.contains_key(inverse) {
                     issues.push(EngineeringValidationIssue::error(
                         "EO23",
-                        format!(
-                            "relation '{}' has unknown inverse '{inverse}'",
-                            relation.id
-                        ),
+                        format!("relation '{}' has unknown inverse '{inverse}'", relation.id),
                         Some(relation.id.clone()),
                     ));
                 }
@@ -1064,6 +1061,13 @@ pub struct EngineeringRelation {
     pub valid_to: Option<DateTime<Utc>>,
     #[serde(default)]
     pub status: EntityStatus,
+    /// Edge produced by the completion ladder (4.4) rather than observed.
+    ///
+    /// A hypothesized edge is a candidate, not a fact: plans must verify it
+    /// before any downstream side effect may run. Defaults to false so graphs
+    /// written before the flag existed load as asserted edges.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hypothesis: bool,
 }
 
 impl EngineeringRelation {
@@ -1086,6 +1090,7 @@ impl EngineeringRelation {
             valid_from: None,
             valid_to: None,
             status: EntityStatus::Active,
+            hypothesis: false,
         }
     }
 
@@ -1109,6 +1114,12 @@ impl EngineeringRelation {
         self
     }
 
+    /// Mark this edge as a completion-ladder hypothesis.
+    pub fn with_hypothesis(mut self, hypothesis: bool) -> Self {
+        self.hypothesis = hypothesis;
+        self
+    }
+
     pub fn is_effective_at(&self, now: DateTime<Utc>) -> bool {
         self.status == EntityStatus::Active
             && self.valid_from.is_none_or(|t| t <= now)
@@ -1123,6 +1134,13 @@ pub struct EngineeringGraph {
     pub entities: BTreeMap<String, EngineeringEntity>,
     #[serde(default)]
     pub relations: BTreeMap<String, EngineeringRelation>,
+    /// True for the ontology concept layer.
+    ///
+    /// Concept graphs carry relation *signatures* (class-to-class), not
+    /// instance facts, so plans must not expand instance precondition closures
+    /// over them. Never persisted: the flag is set by `concept_graph`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub concept_layer: bool,
 }
 
 /// A scored path through an [`EngineeringGraph`].
@@ -1204,10 +1222,7 @@ impl EngineeringGraph {
                 REL_SUBCLASS_OF,
                 concept_node_id(parent),
             )
-            .with_id(format!(
-                "ontology-subclass:{}:{}",
-                class.id, parent
-            ))
+            .with_id(format!("ontology-subclass:{}:{}", class.id, parent))
             .with_provenance(EngineeringProvenance::new("ontology:subclass"))
             .with_confidence(1.0);
             relation.status = EntityStatus::Active;
@@ -1224,27 +1239,24 @@ impl EngineeringGraph {
                     }
                     let from = concept_node_id(domain);
                     let to = concept_node_id(range);
-                    let mut relation = EngineeringRelation::new(
-                        from,
-                        definition.id.clone(),
-                        to,
-                    )
-                    .with_id(format!(
-                        "ontology-signature:{}:{}:{}",
-                        definition.id, domain, range
-                    ))
-                    .with_property("domain", Value::String(domain.clone()))
-                    .with_property("range", Value::String(range.clone()))
-                    .with_provenance(EngineeringProvenance::new(format!(
-                        "ontology:signature:{}",
-                        definition.id
-                    )))
-                    .with_confidence(1.0);
+                    let mut relation = EngineeringRelation::new(from, definition.id.clone(), to)
+                        .with_id(format!(
+                            "ontology-signature:{}:{}:{}",
+                            definition.id, domain, range
+                        ))
+                        .with_property("domain", Value::String(domain.clone()))
+                        .with_property("range", Value::String(range.clone()))
+                        .with_provenance(EngineeringProvenance::new(format!(
+                            "ontology:signature:{}",
+                            definition.id
+                        )))
+                        .with_confidence(1.0);
                     relation.status = EntityStatus::Active;
                     graph.insert_relation(relation);
                 }
             }
         }
+        graph.concept_layer = true;
         graph
     }
 
@@ -1285,25 +1297,19 @@ impl EngineeringGraph {
             if !graph.entities.contains_key(&concept) {
                 continue;
             }
-            let mut to_concept = EngineeringRelation::new(
-                entity.id.clone(),
-                REL_INSTANCE_OF,
-                concept.clone(),
-            )
-            .with_id(format!("instance-of:{}:{}", entity.id, entity.class))
-            .with_provenance(entity.provenance.clone())
-            .with_confidence(entity.confidence);
+            let mut to_concept =
+                EngineeringRelation::new(entity.id.clone(), REL_INSTANCE_OF, concept.clone())
+                    .with_id(format!("instance-of:{}:{}", entity.id, entity.class))
+                    .with_provenance(entity.provenance.clone())
+                    .with_confidence(entity.confidence);
             to_concept.status = entity.status;
             graph.insert_relation(to_concept);
 
-            let mut from_concept = EngineeringRelation::new(
-                concept,
-                REL_HAS_INSTANCE,
-                entity.id.clone(),
-            )
-            .with_id(format!("has-instance:{}:{}", entity.class, entity.id))
-            .with_provenance(entity.provenance.clone())
-            .with_confidence(entity.confidence);
+            let mut from_concept =
+                EngineeringRelation::new(concept, REL_HAS_INSTANCE, entity.id.clone())
+                    .with_id(format!("has-instance:{}:{}", entity.class, entity.id))
+                    .with_provenance(entity.provenance.clone())
+                    .with_confidence(entity.confidence);
             from_concept.status = entity.status;
             graph.insert_relation(from_concept);
         }
@@ -1397,14 +1403,15 @@ impl EngineeringGraph {
                 let id = format!("inferred:sub:{}:{}", relation.id, parent);
                 if !inferred.relations.contains_key(&id) {
                     let confidence = (relation.confidence * 0.95).clamp(0.0, 1.0);
-                    let mut edge =
-                        EngineeringRelation::new(&relation.from, parent, &relation.to);
+                    let mut edge = EngineeringRelation::new(&relation.from, parent, &relation.to);
                     edge.id = id;
                     edge.confidence = confidence;
-                    edge.provenance =
-                        EngineeringProvenance::new(format!("inferred:sub_property_of:{}", relation.id))
-                            .with_locator(relation.id.clone())
-                            .with_confidence(confidence);
+                    edge.provenance = EngineeringProvenance::new(format!(
+                        "inferred:sub_property_of:{}",
+                        relation.id
+                    ))
+                    .with_locator(relation.id.clone())
+                    .with_confidence(confidence);
                     inferred.relations.insert(edge.id.clone(), edge);
                 }
             }
@@ -1412,11 +1419,8 @@ impl EngineeringGraph {
                 let id = format!("inferred:symmetric:{}", relation.id);
                 if !inferred.relations.contains_key(&id) {
                     let confidence = (relation.confidence * 0.95).clamp(0.0, 1.0);
-                    let mut edge = EngineeringRelation::new(
-                        &relation.to,
-                        &relation.relation,
-                        &relation.from,
-                    );
+                    let mut edge =
+                        EngineeringRelation::new(&relation.to, &relation.relation, &relation.from);
                     edge.id = id;
                     edge.confidence = confidence;
                     edge.provenance =
@@ -1443,15 +1447,17 @@ impl EngineeringGraph {
             let mut adjacency: BTreeMap<String, Vec<(String, f32, String)>> = BTreeMap::new();
             for relation in sources.iter().filter(|rel| rel.relation == definition.id) {
                 let confidence = relation.confidence.clamp(0.0, 1.0);
-                adjacency
-                    .entry(relation.from.clone())
-                    .or_default()
-                    .push((relation.to.clone(), confidence, relation.id.clone()));
+                adjacency.entry(relation.from.clone()).or_default().push((
+                    relation.to.clone(),
+                    confidence,
+                    relation.id.clone(),
+                ));
                 if definition.symmetric {
-                    adjacency
-                        .entry(relation.to.clone())
-                        .or_default()
-                        .push((relation.from.clone(), confidence, relation.id.clone()));
+                    adjacency.entry(relation.to.clone()).or_default().push((
+                        relation.from.clone(),
+                        confidence,
+                        relation.id.clone(),
+                    ));
                 }
             }
             for neighbors in adjacency.values_mut() {
@@ -1481,21 +1487,17 @@ impl EngineeringGraph {
                         let next_hops = hops + 1;
                         let next_confidence = path_confidence.min(*edge_confidence);
                         if next != &start {
-                            let signature =
-                                (start.clone(), definition.id.clone(), next.clone());
-                            let id = format!(
-                                "inferred:transitive:{}:{start}:{next}",
-                                definition.id
-                            );
+                            let signature = (start.clone(), definition.id.clone(), next.clone());
+                            let id =
+                                format!("inferred:transitive:{}:{start}:{next}", definition.id);
                             if !signatures.contains(&signature)
                                 && !inferred.relations.contains_key(&id)
                             {
                                 if transitive_edges >= MAX_TRANSITIVE_INFERRED_EDGES {
                                     break 'transitive;
                                 }
-                                let confidence = (next_confidence
-                                    * 0.95f32.powi(next_hops as i32))
-                                .clamp(0.0, 1.0);
+                                let confidence = (next_confidence * 0.95f32.powi(next_hops as i32))
+                                    .clamp(0.0, 1.0);
                                 let mut edge =
                                     EngineeringRelation::new(&start, &definition.id, next);
                                 edge.id = id;
@@ -2934,7 +2936,11 @@ mod tests {
     fn inverse_relation_inference_traverses_reverse_part_of() {
         let mut graph = EngineeringGraph::new();
         graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
-        graph.insert_entity(EngineeringEntity::new(CLASS_SESSION, "session:s", "session"));
+        graph.insert_entity(EngineeringEntity::new(
+            CLASS_SESSION,
+            "session:s",
+            "session",
+        ));
         graph.insert_relation(EngineeringRelation::new("file:a", REL_PART_OF, "session:s"));
 
         let inferred = graph.infer_relations(&default_engineering_ontology());
@@ -2946,7 +2952,12 @@ mod tests {
             .relation("inferred:inverse:rel:file:a:part_of:session:s:contains")
             .expect("virtual inverse relation");
         assert_eq!(relation.relation, REL_CONTAINS);
-        assert!(relation.provenance.source.starts_with("inferred:inverse_of:"));
+        assert!(
+            relation
+                .provenance
+                .source
+                .starts_with("inferred:inverse_of:")
+        );
         assert!(relation.confidence < 0.8);
     }
 
@@ -2996,8 +3007,16 @@ mod tests {
     fn empty_ontology_release_gate_blocks() {
         let gate = EngineeringOntology::new("empty", 1, "empty").release_gate();
         assert!(!gate.pass);
-        assert!(gate.blockers.iter().any(|reason| reason.contains("no classes")));
-        assert!(gate.blockers.iter().any(|reason| reason.contains("no relations")));
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|reason| reason.contains("no classes"))
+        );
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|reason| reason.contains("no relations"))
+        );
     }
 
     #[test]
@@ -3006,8 +3025,16 @@ mod tests {
         for id in ["task:t1", "task:t2", "task:t3"] {
             graph.insert_entity(EngineeringEntity::new(CLASS_TASK, id, id));
         }
-        graph.insert_relation(EngineeringRelation::new("task:t1", REL_DEPENDS_ON, "task:t2"));
-        graph.insert_relation(EngineeringRelation::new("task:t2", REL_DEPENDS_ON, "task:t3"));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t1",
+            REL_DEPENDS_ON,
+            "task:t2",
+        ));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t2",
+            REL_DEPENDS_ON,
+            "task:t3",
+        ));
 
         let inferred = graph.infer_relations(&default_engineering_ontology());
         let path = inferred
@@ -3055,7 +3082,11 @@ mod tests {
                     .with_parent("b")
                     .with_disjoint_class("b"),
             )
-            .with_class(EngineeringClassDef::new("b", "B", BfoCategory::IndependentContinuant));
+            .with_class(EngineeringClassDef::new(
+                "b",
+                "B",
+                BfoCategory::IndependentContinuant,
+            ));
         let report = ontology.validate();
         assert!(report.errors().iter().any(|issue| issue.code == "EO17"));
 
@@ -3206,7 +3237,9 @@ mod tests {
         assert_eq!(paths.len(), 1, "{paths:?}");
         assert_eq!(paths[0].hop_count(), 1);
         assert_eq!(
-            graph.relation(&paths[0].relations[0]).map(|rel| rel.relation.as_str()),
+            graph
+                .relation(&paths[0].relations[0])
+                .map(|rel| rel.relation.as_str()),
             Some(REL_DEFINES)
         );
     }
@@ -3235,6 +3268,9 @@ mod tests {
         // The join is query-time only; the source graph must stay untouched.
         assert_eq!(graph.entities.len(), 2);
         assert!(graph.relations.is_empty());
-        assert_eq!(joined.entities.len(), graph.entities.len() + ontology.classes.len());
+        assert_eq!(
+            joined.entities.len(),
+            graph.entities.len() + ontology.classes.len()
+        );
     }
 }

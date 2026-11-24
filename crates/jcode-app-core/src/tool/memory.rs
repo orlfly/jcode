@@ -2506,8 +2506,9 @@ impl MemoryTool {
                     };
                     let owner = task.owner.as_deref().unwrap_or("-");
                     let due = task.due.as_deref().unwrap_or("-");
+                    let hypothesis = if task.hypothesis { ", hypothesis" } else { "" };
                     out.push_str(&format!(
-                        "  {} [{}] {} (depends: {depends}, risk: {}, approval: {}, owner: {owner}, due: {due})\n    success: {}\n    evidence: {}\n",
+                        "  {} [{}] {} (depends: {depends}, risk: {}, approval: {}, owner: {owner}, due: {due}{hypothesis})\n    success: {}\n    evidence: {}\n",
                         task.id,
                         task.action_type.as_str(),
                         task.title,

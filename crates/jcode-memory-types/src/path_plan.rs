@@ -90,6 +90,9 @@ pub struct PathPlanTask {
     pub risk: PlanRisk,
     pub approval: bool,
     pub confidence: f32,
+    /// Task derives from a hypothesized edge and must be verified first.
+    #[serde(default)]
+    pub hypothesis: bool,
     /// Accountable owner. Required before a side-effect task may execute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
@@ -314,9 +317,34 @@ fn push_issue(
     });
 }
 
+/// All transitive dependencies of `task`, cycle-safe.
+fn ancestor_ids<'a>(
+    task: &'a PathPlanTask,
+    by_id: &BTreeMap<&'a str, &'a PathPlanTask>,
+) -> BTreeSet<&'a str> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<&'a str> = task.depends_on.iter().map(String::as_str).collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(parent) = by_id.get(id) {
+            for dependency in &parent.depends_on {
+                stack.push(dependency.as_str());
+            }
+        }
+    }
+    seen
+}
+
 fn audit_plan_quality(plan: &PathPlan) -> PlanQualityReport {
     let mut issues = Vec::new();
     let known: HashSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    let by_id: BTreeMap<&str, &PathPlanTask> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect();
 
     if plan.tasks.is_empty() {
         push_issue(
@@ -436,6 +464,40 @@ fn audit_plan_quality(plan: &PathPlan) -> PlanQualityReport {
                 PlanGateSeverity::Warning,
                 Some(&task.id),
                 "high-risk task should run in shadow mode before real execution",
+            );
+        }
+    }
+
+    // A hypothesized edge is a candidate, not a fact. Every side effect that
+    // sits behind one must wait on a verification task, or the plan would act
+    // on an unconfirmed connection.
+    for task in &plan.tasks {
+        if !task.action_type.has_side_effects() {
+            continue;
+        }
+        let ancestors = ancestor_ids(task, &by_id);
+        let behind_hypothesis = task.hypothesis
+            || ancestors
+                .iter()
+                .any(|id| by_id.get(id).is_some_and(|parent| parent.hypothesis));
+        if !behind_hypothesis {
+            continue;
+        }
+        let verified = ancestors.iter().any(|id| {
+            by_id.get(id).is_some_and(|parent| {
+                matches!(
+                    parent.action_type,
+                    PlanActionType::Verify | PlanActionType::Query
+                )
+            })
+        });
+        if !verified {
+            push_issue(
+                &mut issues,
+                "Q12",
+                PlanGateSeverity::Blocking,
+                Some(&task.id),
+                "side-effect task sits behind a hypothesized edge without a preceding verification task",
             );
         }
     }
@@ -773,6 +835,7 @@ fn collect_precondition_tasks(
             risk: PlanRisk::Low,
             approval: false,
             confidence,
+            hypothesis: relation.hypothesis,
             owner: None,
             due: None,
             preconditions: vec![format!("{from_label} exists")],
@@ -870,6 +933,7 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
     let mut precondition_tasks = Vec::new();
     let mut verification_queries = Vec::with_capacity(path.relations.len());
     let mut rollback = Vec::new();
+    let mut hypothesis_downgrades = Vec::new();
     let mut confidence = path.confidence;
     let mut previous: Option<String> = None;
     let path_edges: HashSet<&str> = path.relations.iter().map(String::as_str).collect();
@@ -890,7 +954,14 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
         let Some(relation) = graph.relation(relation_id) else {
             continue;
         };
-        let (action, risk, success_check) = template(&relation.relation);
+        let (mut action, risk, success_check) = template(&relation.relation);
+        if relation.hypothesis && action.has_side_effects() {
+            action = PlanActionType::Verify;
+            hypothesis_downgrades.push(format!(
+                "hypothesis edge {} degraded to verification; downstream side effects wait on its result",
+                relation.id
+            ));
+        }
         let task_confidence = if relation.confidence.is_finite() {
             relation.confidence.clamp(0.0, 1.0)
         } else {
@@ -911,17 +982,22 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             .map(|entity| entity.name.clone())
             .unwrap_or_else(|| path.nodes.get(index + 1).cloned().unwrap_or_default());
         let mut depends_on: Vec<String> = previous.iter().cloned().collect();
-        depends_on.extend(collect_precondition_tasks(
-            graph,
-            &path_edges,
-            &path.nodes[index],
-            MAX_PRECONDITION_DEPTH,
-            path.relations.len(),
-            &mut precondition_tasks,
-            &mut created_preconditions,
-            &mut verification_queries,
-            &mut closure_truncated,
-        ));
+        // Concept graphs only carry relation signatures. Expanding instance
+        // preconditions there would invent sibling-class prerequisites that no
+        // concrete instance has to satisfy, so the closure is instance-only.
+        if !graph.concept_layer {
+            depends_on.extend(collect_precondition_tasks(
+                graph,
+                &path_edges,
+                &path.nodes[index],
+                MAX_PRECONDITION_DEPTH,
+                path.relations.len(),
+                &mut precondition_tasks,
+                &mut created_preconditions,
+                &mut verification_queries,
+                &mut closure_truncated,
+            ));
+        }
         let approval = action.has_side_effects() && risk != PlanRisk::Low;
         let from_class = graph
             .entity(&path.nodes[index])
@@ -947,6 +1023,7 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             risk,
             approval,
             confidence: task_confidence,
+            hypothesis: relation.hypothesis,
             owner: None,
             due: None,
             preconditions: vec![precondition],
@@ -991,6 +1068,7 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             "precondition closure truncated at {MAX_PLAN_TASKS} tasks; split before execution"
         ));
     }
+    warnings.extend(hypothesis_downgrades);
     let (groups, acyclic) = parallel_groups(&tasks);
     if !acyclic {
         warnings.push("plan dependency cycle detected; split before execution".to_string());
@@ -1198,6 +1276,7 @@ mod tests {
             risk: PlanRisk::Low,
             approval: false,
             confidence: 1.0,
+            hypothesis: false,
             owner: None,
             due: None,
             preconditions: Vec::new(),
@@ -1335,6 +1414,7 @@ mod tests {
             risk,
             approval: false,
             confidence: 0.9,
+            hypothesis: false,
             owner: None,
             due: None,
             preconditions: Vec::new(),
@@ -1491,5 +1571,72 @@ mod tests {
             "{:?}",
             plan.audit_quality().issues
         );
+    }
+
+    #[test]
+    fn hypothesis_edge_degrades_side_effects_to_verification() {
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        graph.insert_relation(
+            EngineeringRelation::new("error:e1", REL_FIXES, "change:c1")
+                .with_hypothesis(true)
+                .with_confidence(0.55),
+        );
+        let path = graph
+            .weighted_shortest_path("error:e1", "change:c1", 2, &[])
+            .expect("path");
+        let plan = build_path_plan(&graph, &path);
+        assert_eq!(plan.tasks[0].action_type, PlanActionType::Verify);
+        assert!(plan.tasks[0].hypothesis);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("hypothesis edge")),
+            "{:?}",
+            plan.warnings
+        );
+        let report = plan.audit_quality();
+        assert!(!report.has_code("Q12"), "{:?}", report.issues);
+    }
+
+    #[test]
+    fn audit_requires_verification_before_hypothesis_side_effects() {
+        let mut speculative = gate_task("T1", PlanActionType::Execute, PlanRisk::Medium, &[]);
+        speculative.hypothesis = true;
+        let downstream = gate_task("T2", PlanActionType::Execute, PlanRisk::Medium, &["T1"]);
+        let mut plan = gate_plan(vec![speculative, downstream]);
+        plan.assign_task("T1", "engineer", "2026-12-01");
+        plan.assign_task("T2", "engineer", "2026-12-02");
+
+        let report = plan.audit_quality();
+        assert!(!report.executable);
+        assert!(report.has_code("Q12"));
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.code == "Q12")
+                .count(),
+            2
+        );
+
+        plan.tasks[0].action_type = PlanActionType::Verify;
+        let report = plan.audit_quality();
+        assert!(!report.has_code("Q12"), "{:?}", report.issues);
+        assert!(report.executable, "{:?}", report.issues);
+    }
+
+    #[test]
+    fn hypothesis_flag_round_trips_and_defaults_to_asserted() {
+        let mut value =
+            serde_json::to_value(EngineeringRelation::new("a", REL_FIXES, "b")).expect("serialize");
+        assert!(value.get("hypothesis").is_none());
+        let loaded: EngineeringRelation = serde_json::from_value(value.clone()).expect("load");
+        assert!(!loaded.hypothesis);
+
+        value["hypothesis"] = serde_json::json!(true);
+        let loaded: EngineeringRelation = serde_json::from_value(value).expect("load");
+        assert!(loaded.hypothesis);
     }
 }
