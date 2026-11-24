@@ -2504,8 +2504,10 @@ impl MemoryTool {
                     } else {
                         task.depends_on.join(", ")
                     };
+                    let owner = task.owner.as_deref().unwrap_or("-");
+                    let due = task.due.as_deref().unwrap_or("-");
                     out.push_str(&format!(
-                        "  {} [{}] {} (depends: {depends}, risk: {}, approval: {})\n    success: {}\n    evidence: {}\n",
+                        "  {} [{}] {} (depends: {depends}, risk: {}, approval: {}, owner: {owner}, due: {due})\n    success: {}\n    evidence: {}\n",
                         task.id,
                         task.action_type.as_str(),
                         task.title,
@@ -2513,6 +2515,32 @@ impl MemoryTool {
                         if task.approval { "yes" } else { "no" },
                         task.success_check,
                         task.evidence_ref
+                    ));
+                }
+                let audit = hit.plan.audit_quality();
+                out.push_str(&format!(
+                    "  gates: {}, {} task(s), depth {}, confidence floor {:.2}\n",
+                    if audit.executable {
+                        "executable"
+                    } else {
+                        "blocked"
+                    },
+                    audit.task_count,
+                    audit.max_depth,
+                    audit.min_confidence
+                ));
+                for issue in &audit.issues {
+                    let target = issue
+                        .task_id
+                        .as_deref()
+                        .map(|id| format!(" {id}"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "  gate {} [{}]{}: {}\n",
+                        issue.code,
+                        issue.severity.as_str(),
+                        target,
+                        issue.message
                     ));
                 }
                 for warning in &hit.plan.warnings {
@@ -2610,10 +2638,7 @@ fn parse_checkpoint_anchors(text: &str) -> Vec<String> {
     anchors
 }
 
-fn append_decision_examples(
-    out: &mut String,
-    examples: &[crate::memory_types::DecisionStepMatch],
-) {
+fn append_decision_examples(out: &mut String, examples: &[crate::memory_types::DecisionStepMatch]) {
     if examples.is_empty() {
         return;
     }
@@ -3473,20 +3498,27 @@ mod tests {
             "{}",
             output.output
         );
-        assert!(
-            output.output.contains("session-path"),
-            "{}",
-            output.output
-        );
+        assert!(output.output.contains("session-path"), "{}", output.output);
         assert!(output.output.contains("modifies"), "{}", output.output);
         assert!(
             output.output.contains("file:src/lib.rs"),
             "{}",
             output.output
         );
-        assert!(output.output.contains("plan: confidence"), "{}", output.output);
+        assert!(
+            output.output.contains("plan: confidence"),
+            "{}",
+            output.output
+        );
         assert!(output.output.contains("success:"), "{}", output.output);
         assert!(output.output.contains("evidence:"), "{}", output.output);
+        assert!(
+            output.output.contains("gates: blocked"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("gate Q03"), "{}", output.output);
+        assert!(output.output.contains("owner: -"), "{}", output.output);
     }
 
     #[tokio::test]
@@ -3518,7 +3550,11 @@ mod tests {
         assert!(output.output.contains("concept:file"), "{}", output.output);
         assert!(output.output.contains("concept:api"), "{}", output.output);
         assert!(output.output.contains("defines"), "{}", output.output);
-        assert!(output.output.contains("plan: confidence"), "{}", output.output);
+        assert!(
+            output.output.contains("plan: confidence"),
+            "{}",
+            output.output
+        );
     }
 
     #[tokio::test]
@@ -3619,9 +3655,21 @@ mod tests {
             )
             .await
             .expect("compile");
-        assert!(output.output.contains("Compiled PathQuery"), "{}", output.output);
-        assert!(output.output.contains("\"engineering\""), "{}", output.output);
-        assert!(output.output.contains("file:src/lib.rs"), "{}", output.output);
+        assert!(
+            output.output.contains("Compiled PathQuery"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("\"engineering\""),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("file:src/lib.rs"),
+            "{}",
+            output.output
+        );
         assert!(output.output.contains("api:/task"), "{}", output.output);
         assert!(output.output.contains("\"defines\""), "{}", output.output);
         assert!(output.output.contains("\"depth\": 3"), "{}", output.output);
@@ -3644,7 +3692,10 @@ mod tests {
             .output;
         assert!(quality.contains("\"compile_attempts\": 2"), "{quality}");
         assert!(quality.contains("\"compile_successes\": 1"), "{quality}");
-        assert!(quality.contains("\"compile_success_rate\": 0.5"), "{quality}");
+        assert!(
+            quality.contains("\"compile_success_rate\": 0.5"),
+            "{quality}"
+        );
         assert!(quality.contains("Q13"), "{quality}");
     }
 
@@ -3678,7 +3729,10 @@ mod tests {
         assert!(output.contains("Compiled PathQuery from JSON"), "{output}");
         assert!(output.contains("\"depth\": 2"), "{output}");
         assert!(output.contains("\"defines\""), "{output}");
-        assert!(output.contains("dropped unsupported field: extra"), "{output}");
+        assert!(
+            output.contains("dropped unsupported field: extra"),
+            "{output}"
+        );
         assert!(
             output.contains("dropped unsupported constraint field: mystery"),
             "{output}"
@@ -3784,7 +3838,10 @@ mod tests {
             .output;
         assert!(output.contains("Found 1 memory path(s)"), "{output}");
         assert!(output.contains("proposed shadow edge:"), "{output}");
-        assert!(output.contains("pending review, not in main graph"), "{output}");
+        assert!(
+            output.contains("pending review, not in main graph"),
+            "{output}"
+        );
         let pending = tool
             .manager
             .list_shadow_edges_scoped(
@@ -3957,7 +4014,10 @@ mod tests {
             .await
             .expect("apply batch review")
             .output;
-        assert!(applied.contains("Applied batch bridge review: 2 of 2"), "{applied}");
+        assert!(
+            applied.contains("Applied batch bridge review: 2 of 2"),
+            "{applied}"
+        );
         assert_eq!(tool.manager.list_bridges().expect("bridges").len(), 2);
         let cleanup = tool
             .execute(
@@ -3967,7 +4027,10 @@ mod tests {
             .await
             .expect("cleanup report")
             .output;
-        assert!(cleanup.contains("Bridge candidate cleanup report"), "{cleanup}");
+        assert!(
+            cleanup.contains("Bridge candidate cleanup report"),
+            "{cleanup}"
+        );
         assert!(cleanup.contains("\"accepted\": 2"), "{cleanup}");
     }
 
@@ -3988,11 +4051,7 @@ mod tests {
         let a = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality one"));
         let b = graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality two"));
         graph.add_memory(MemoryEntry::new(MemoryCategory::Fact, "quality orphan"));
-        graph.add_edge(
-            &a,
-            &b,
-            crate::memory_graph::EdgeKind::SameAs,
-        );
+        graph.add_edge(&a, &b, crate::memory_graph::EdgeKind::SameAs);
         tool.manager
             .save_project_graph(&graph)
             .expect("save quality graph");
@@ -4718,10 +4777,26 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(first.output.contains("Belief step 1 / 4"), "{}", first.output);
-        assert!(first.output.contains("\"path_missing\""), "{}", first.output);
-        assert!(first.output.contains("\"action\": \"complete\""), "{}", first.output);
-        assert!(first.output.contains("\"open_diagnoses\""), "{}", first.output);
+        assert!(
+            first.output.contains("Belief step 1 / 4"),
+            "{}",
+            first.output
+        );
+        assert!(
+            first.output.contains("\"path_missing\""),
+            "{}",
+            first.output
+        );
+        assert!(
+            first.output.contains("\"action\": \"complete\""),
+            "{}",
+            first.output
+        );
+        assert!(
+            first.output.contains("\"open_diagnoses\""),
+            "{}",
+            first.output
+        );
 
         let payload_start = first.output.find("\n\n").expect("summary separator") + 2;
         let payload: Value =
@@ -4749,8 +4824,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(second.output.contains("Belief step 2 / 4"), "{}", second.output);
-        assert!(second.output.contains("\"path_found\""), "{}", second.output);
+        assert!(
+            second.output.contains("Belief step 2 / 4"),
+            "{}",
+            second.output
+        );
+        assert!(
+            second.output.contains("\"path_found\""),
+            "{}",
+            second.output
+        );
         assert!(
             second.output.contains("\"action\": \"terminate\""),
             "{}",
@@ -4808,7 +4891,10 @@ mod tests {
             + 2;
         let recorded_json: Value =
             serde_json::from_str(&recorded.output[payload_start..]).expect("decision JSON");
-        let id = recorded_json["id"].as_str().expect("decision id").to_string();
+        let id = recorded_json["id"]
+            .as_str()
+            .expect("decision id")
+            .to_string();
         assert_eq!(recorded_json["source"], "verified");
 
         let rejected = tool
@@ -4848,7 +4934,11 @@ mod tests {
             "{}",
             searched.output
         );
-        assert!(searched.output.contains("eval:parser"), "{}", searched.output);
+        assert!(
+            searched.output.contains("eval:parser"),
+            "{}",
+            searched.output
+        );
         assert!(searched.output.contains("\"score\""), "{}", searched.output);
 
         let listed = tool
@@ -4967,7 +5057,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            forgotten.output.contains("Forgot domain fact domain:billing"),
+            forgotten
+                .output
+                .contains("Forgot domain fact domain:billing"),
             "{}",
             forgotten.output
         );

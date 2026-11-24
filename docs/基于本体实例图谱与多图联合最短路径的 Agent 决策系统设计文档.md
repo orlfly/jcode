@@ -2263,6 +2263,27 @@ T3 有资金与产能承诺，设为审批门禁；T4 修改资源分配，属�
 
 这些门禁把 4.4 的补全风险与 4.5 的执行风险串起来：补全越不确定，计划越偏向验证而不是行动。
 
+**实现（`PathPlan::audit_quality`）**：门禁不是文档条款，而是可判定的返回结构 `PlanQualityReport { executable, task_count, max_depth, min_confidence, issues }`，每条 finding 带稳定 code 与 severity，`executable=false` 即任何 blocking 门禁命中。
+
+| code | 门禁 | severity |
+|----|----|----|
+| Q00 | 计划无任务 | blocking |
+| Q01 | 缺 success_check | blocking |
+| Q02 | 缺 evidence_ref | blocking |
+| Q03 / Q04 | 副作用任务缺 owner / due | blocking |
+| Q05 | 高风险副作用任务无审批门禁 | blocking |
+| Q06 | 计划或任务置信度 < 0.6 时存在副作用任务 | blocking |
+| Q07 | 任务数 > 20 | blocking |
+| Q08 | 依赖深度 > 3 | blocking |
+| Q09 | 依赖成环 | blocking |
+| Q10 | depends_on 指向计划外任务 | blocking |
+| Q11 | 任务 id 重复 | blocking |
+| W01 | 高风险任务建议先影子执行 | warning |
+
+编译期不臆造责任人：`build_path_plan` 只把 `owner/due` 留空，副作用计划的 `executable` 必须由调用方用 `PathPlan::assign_task(task_id, owner, due)` 显式补齐后才为 true。`Q06` 与 4.5.1 的“置信度取最小值”一致，同时检查计划级与任务级置信度。
+
+**未实现**：HYPOTHESIZED 边的“验证任务必须是下游副作用前驱”这一条。当前 `EngineeringRelation` 没有 hypothesis 标记，也没有补全边写回的 provenance 字段，无法在不臆造数据的前提下判定；补上边级 hypothesis 标记后再接入本表（预计 code `Q12`）。
+
 #### 4.5.7 执行反馈与重规划
 
 计划执行不是单向的。每个动作完成后，用 success_check 生成观测并更新 Belief State；失败时按以下顺序处理：

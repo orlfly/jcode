@@ -90,6 +90,13 @@ pub struct PathPlanTask {
     pub risk: PlanRisk,
     pub approval: bool,
     pub confidence: f32,
+    /// Accountable owner. Required before a side-effect task may execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Deadline in the caller's calendar. Required before a side-effect task
+    /// may execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
     #[serde(default)]
     pub preconditions: Vec<String>,
     #[serde(default)]
@@ -186,6 +193,68 @@ pub struct PathPlan {
     pub warnings: Vec<String>,
 }
 
+/// Severity of one plan quality gate finding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanGateSeverity {
+    Blocking,
+    Warning,
+}
+
+impl PlanGateSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+/// One deterministic plan quality gate finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanQualityIssue {
+    /// Stable gate code such as `Q01`, so logs and policy can key on it.
+    pub code: String,
+    pub severity: PlanGateSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub message: String,
+}
+
+/// Machine-checkable result of the path-to-plan quality gates.
+///
+/// `executable` is false when any blocking gate fires. Warnings never block but
+/// must still be surfaced: they mark plans that need shadow execution or a
+/// split before scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanQualityReport {
+    pub plan_id: String,
+    pub executable: bool,
+    pub task_count: usize,
+    pub max_depth: usize,
+    pub min_confidence: f32,
+    pub issues: Vec<PlanQualityIssue>,
+}
+
+impl PlanQualityReport {
+    pub fn blocking(&self) -> impl Iterator<Item = &PlanQualityIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == PlanGateSeverity::Blocking)
+    }
+
+    pub fn warnings(&self) -> impl Iterator<Item = &PlanQualityIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == PlanGateSeverity::Warning)
+    }
+
+    /// True when a gate with `code` fired, regardless of severity.
+    pub fn has_code(&self, code: &str) -> bool {
+        self.issues.iter().any(|issue| issue.code == code)
+    }
+}
+
 impl PathPlan {
     pub fn task(&self, id: &str) -> Option<&PathPlanTask> {
         self.tasks.iter().find(|task| task.id == id)
@@ -195,8 +264,214 @@ impl PathPlan {
         self.parallel_groups.len()
     }
 
+    /// Attach an accountable owner and deadline to one task.
+    ///
+    /// Returns false when the task id is unknown. Assignment is explicit: the
+    /// compiler never invents an owner, so side-effect gates stay closed until
+    /// the caller records who is responsible and when it is due.
+    pub fn assign_task(&mut self, task_id: &str, owner: &str, due: &str) -> bool {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return false;
+        };
+        task.owner = Some(owner.trim().to_string()).filter(|value| !value.is_empty());
+        task.due = Some(due.trim().to_string()).filter(|value| !value.is_empty());
+        true
+    }
+
     pub fn apply_feedback(&self, observations: &[PlanTaskObservation]) -> PlanExecutionReport {
         apply_plan_feedback(self, observations)
+    }
+
+    /// Evaluate the design document's 4.5.6 quality gates mechanically.
+    ///
+    /// Every finding is deterministic and code-stable. The report never
+    /// mutates the plan and never executes anything; it only decides whether
+    /// the plan may enter an execution queue and why not.
+    pub fn audit_quality(&self) -> PlanQualityReport {
+        audit_plan_quality(self)
+    }
+}
+
+/// Maximum number of tasks in one schedulable plan.
+pub const PLAN_TASK_LIMIT: usize = 20;
+/// Maximum dependency depth in one schedulable plan.
+pub const PLAN_DEPTH_LIMIT: usize = 3;
+/// Confidence floor below which only query/verify tasks may run.
+pub const PLAN_SIDE_EFFECT_CONFIDENCE_FLOOR: f32 = 0.6;
+
+fn push_issue(
+    issues: &mut Vec<PlanQualityIssue>,
+    code: &str,
+    severity: PlanGateSeverity,
+    task_id: Option<&str>,
+    message: impl Into<String>,
+) {
+    issues.push(PlanQualityIssue {
+        code: code.to_string(),
+        severity,
+        task_id: task_id.map(str::to_string),
+        message: message.into(),
+    });
+}
+
+fn audit_plan_quality(plan: &PathPlan) -> PlanQualityReport {
+    let mut issues = Vec::new();
+    let known: HashSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+
+    if plan.tasks.is_empty() {
+        push_issue(
+            &mut issues,
+            "Q00",
+            PlanGateSeverity::Blocking,
+            None,
+            "plan has no tasks; nothing to schedule",
+        );
+    }
+    if plan.tasks.len() > PLAN_TASK_LIMIT {
+        push_issue(
+            &mut issues,
+            "Q07",
+            PlanGateSeverity::Blocking,
+            None,
+            format!(
+                "plan has {} tasks; split into sub-plans of at most {PLAN_TASK_LIMIT}",
+                plan.tasks.len()
+            ),
+        );
+    }
+
+    let mut seen = HashSet::new();
+    let mut min_confidence = plan.confidence;
+    for task in &plan.tasks {
+        if !seen.insert(task.id.as_str()) {
+            push_issue(
+                &mut issues,
+                "Q11",
+                PlanGateSeverity::Blocking,
+                Some(&task.id),
+                format!("duplicate task id {}", task.id),
+            );
+        }
+        if task.confidence.is_finite() {
+            min_confidence = min_confidence.min(task.confidence);
+        }
+        if task.success_check.trim().is_empty() {
+            push_issue(
+                &mut issues,
+                "Q01",
+                PlanGateSeverity::Blocking,
+                Some(&task.id),
+                "task has no success check; add an executable verification expression",
+            );
+        }
+        if task.evidence_ref.trim().is_empty() {
+            push_issue(
+                &mut issues,
+                "Q02",
+                PlanGateSeverity::Blocking,
+                Some(&task.id),
+                "task has no evidence reference; keep the source path edge attached",
+            );
+        }
+        for dependency in &task.depends_on {
+            if !known.contains(dependency.as_str()) {
+                push_issue(
+                    &mut issues,
+                    "Q10",
+                    PlanGateSeverity::Blocking,
+                    Some(&task.id),
+                    format!("dependency {dependency} is not a task in this plan"),
+                );
+            }
+        }
+
+        let low_confidence = plan.confidence < PLAN_SIDE_EFFECT_CONFIDENCE_FLOOR
+            || task.confidence < PLAN_SIDE_EFFECT_CONFIDENCE_FLOOR;
+        if task.action_type.has_side_effects() {
+            if task
+                .owner
+                .as_deref()
+                .is_none_or(|owner| owner.trim().is_empty())
+            {
+                push_issue(
+                    &mut issues,
+                    "Q03",
+                    PlanGateSeverity::Blocking,
+                    Some(&task.id),
+                    "side-effect task has no accountable owner",
+                );
+            }
+            if task.due.as_deref().is_none_or(|due| due.trim().is_empty()) {
+                push_issue(
+                    &mut issues,
+                    "Q04",
+                    PlanGateSeverity::Blocking,
+                    Some(&task.id),
+                    "side-effect task has no due date",
+                );
+            }
+            if task.risk == PlanRisk::High && !task.approval {
+                push_issue(
+                    &mut issues,
+                    "Q05",
+                    PlanGateSeverity::Blocking,
+                    Some(&task.id),
+                    "high-risk side-effect task has no approval gate",
+                );
+            }
+            if low_confidence {
+                push_issue(
+                    &mut issues,
+                    "Q06",
+                    PlanGateSeverity::Blocking,
+                    Some(&task.id),
+                    "plan confidence is below 0.6; only query and verify tasks may run",
+                );
+            }
+        }
+        if task.risk == PlanRisk::High {
+            push_issue(
+                &mut issues,
+                "W01",
+                PlanGateSeverity::Warning,
+                Some(&task.id),
+                "high-risk task should run in shadow mode before real execution",
+            );
+        }
+    }
+
+    let (groups, acyclic) = parallel_groups(&plan.tasks);
+    let max_depth = groups.len();
+    if !acyclic {
+        push_issue(
+            &mut issues,
+            "Q09",
+            PlanGateSeverity::Blocking,
+            None,
+            "plan dependency graph has a cycle; split or reorder before execution",
+        );
+    } else if max_depth > PLAN_DEPTH_LIMIT {
+        push_issue(
+            &mut issues,
+            "Q08",
+            PlanGateSeverity::Blocking,
+            None,
+            format!(
+                "plan dependency depth {max_depth} exceeds {PLAN_DEPTH_LIMIT}; split into sub-plans"
+            ),
+        );
+    }
+
+    let executable = !issues
+        .iter()
+        .any(|issue| issue.severity == PlanGateSeverity::Blocking);
+    PlanQualityReport {
+        plan_id: plan.plan_id.clone(),
+        executable,
+        task_count: plan.tasks.len(),
+        max_depth: if acyclic { max_depth } else { 0 },
+        min_confidence,
+        issues,
     }
 }
 
@@ -393,12 +668,9 @@ pub fn apply_plan_feedback(
         })
         .cloned()
         .collect();
-    let blocked = states.values().any(|state| {
-        matches!(
-            state,
-            PlanTaskState::Failed | PlanTaskState::Blocked
-        )
-    });
+    let blocked = states
+        .values()
+        .any(|state| matches!(state, PlanTaskState::Failed | PlanTaskState::Blocked));
     let done = !plan.tasks.is_empty()
         && states
             .values()
@@ -501,6 +773,8 @@ fn collect_precondition_tasks(
             risk: PlanRisk::Low,
             approval: false,
             confidence,
+            owner: None,
+            due: None,
             preconditions: vec![format!("{from_label} exists")],
             postconditions: vec![format!("{to_label} satisfies '{success_check}'")],
         });
@@ -544,19 +818,9 @@ fn template(relation: &str) -> (PlanActionType, PlanRisk, &'static str) {
             PlanRisk::Medium,
             "change applied and verified",
         ),
-        REL_TESTS | REL_VERIFIES => {
-            (PlanActionType::Verify, PlanRisk::Low, "check passes")
-        }
-        REL_PRODUCES => (
-            PlanActionType::Execute,
-            PlanRisk::Medium,
-            "artifact exists",
-        ),
-        REL_CALLS => (
-            PlanActionType::Execute,
-            PlanRisk::Medium,
-            "call completed",
-        ),
+        REL_TESTS | REL_VERIFIES => (PlanActionType::Verify, PlanRisk::Low, "check passes"),
+        REL_PRODUCES => (PlanActionType::Execute, PlanRisk::Medium, "artifact exists"),
+        REL_CALLS => (PlanActionType::Execute, PlanRisk::Medium, "call completed"),
         "requires" => (
             PlanActionType::Acquire,
             PlanRisk::Medium,
@@ -585,12 +849,7 @@ fn template(relation: &str) -> (PlanActionType, PlanRisk, &'static str) {
     }
 }
 
-fn task_title(
-    action: PlanActionType,
-    relation: &str,
-    from_label: &str,
-    to_label: &str,
-) -> String {
+fn task_title(action: PlanActionType, relation: &str, from_label: &str, to_label: &str) -> String {
     match action {
         PlanActionType::Monitor => format!("Monitor {to_label} after {relation}"),
         PlanActionType::Verify | PlanActionType::Query => {
@@ -688,6 +947,8 @@ pub fn build_path_plan(graph: &EngineeringGraph, path: &EngineeringPath) -> Path
             risk,
             approval,
             confidence: task_confidence,
+            owner: None,
+            due: None,
             preconditions: vec![precondition],
             postconditions: vec![postcondition],
         });
@@ -771,7 +1032,11 @@ mod tests {
         graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "Fix build"));
         graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
         graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
-        graph.insert_relation(EngineeringRelation::new("task:t1", REL_BLOCKED_BY, "error:e1"));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t1",
+            REL_BLOCKED_BY,
+            "error:e1",
+        ));
         graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
         let path = graph
             .weighted_shortest_path("task:t1", "change:c1", 3, &[])
@@ -815,8 +1080,16 @@ mod tests {
         graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "Fix build"));
         graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
         graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
-        graph.insert_relation(EngineeringRelation::new("task:t0", REL_DEPENDS_ON, "task:t1"));
-        graph.insert_relation(EngineeringRelation::new("task:t1", REL_BLOCKED_BY, "error:e1"));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t0",
+            REL_DEPENDS_ON,
+            "task:t1",
+        ));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t1",
+            REL_BLOCKED_BY,
+            "error:e1",
+        ));
         graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
         let path = graph
             .weighted_shortest_path("task:t1", "change:c1", 3, &[])
@@ -852,7 +1125,11 @@ mod tests {
             graph.insert_entity(EngineeringEntity::new(CLASS_TASK, &id, &id));
             graph.insert_relation(EngineeringRelation::new(&id, REL_DEPENDS_ON, "task:t1"));
         }
-        graph.insert_relation(EngineeringRelation::new("task:t1", REL_BLOCKED_BY, "error:e1"));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t1",
+            REL_BLOCKED_BY,
+            "error:e1",
+        ));
         graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
         let path = graph
             .weighted_shortest_path("task:t1", "change:c1", 3, &[])
@@ -871,16 +1148,17 @@ mod tests {
         let mut graph = EngineeringGraph::new();
         graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "Task"));
         graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Change"));
-        graph.insert_relation(EngineeringRelation::new("task:t1", "custom_relation", "change:c1"));
+        graph.insert_relation(EngineeringRelation::new(
+            "task:t1",
+            "custom_relation",
+            "change:c1",
+        ));
         let path = graph
             .weighted_shortest_path("task:t1", "change:c1", 2, &[])
             .expect("path");
         let plan = build_path_plan(&graph, &path);
         assert_eq!(plan.tasks[0].action_type, PlanActionType::Verify);
-        assert_eq!(
-            plan.tasks[0].success_check,
-            "relation evidence confirmed"
-        );
+        assert_eq!(plan.tasks[0].success_check, "relation evidence confirmed");
         assert!(!plan.tasks[0].approval);
     }
 
@@ -920,14 +1198,13 @@ mod tests {
             risk: PlanRisk::Low,
             approval: false,
             confidence: 1.0,
+            owner: None,
+            due: None,
             preconditions: Vec::new(),
             postconditions: Vec::new(),
         };
-        let (groups, acyclic) = parallel_groups(&[
-            task("T1", &[]),
-            task("T2", &[]),
-            task("T3", &["T1", "T2"]),
-        ]);
+        let (groups, acyclic) =
+            parallel_groups(&[task("T1", &[]), task("T2", &[]), task("T3", &["T1", "T2"])]);
         assert!(acyclic);
         assert_eq!(
             groups,
@@ -956,10 +1233,7 @@ mod tests {
         assert!(report.ready_groups.is_empty());
         assert_eq!(report.recovery_tasks.len(), 1);
         assert_eq!(report.recovery_tasks[0].id, "RT1");
-        assert_eq!(
-            report.recovery_tasks[0].action_type,
-            PlanActionType::Verify
-        );
+        assert_eq!(report.recovery_tasks[0].action_type, PlanActionType::Verify);
         assert!(
             report
                 .recommendations
@@ -988,7 +1262,10 @@ mod tests {
                 note: None,
             },
         ]);
-        assert_eq!(report.recovery_tasks[0].action_type, PlanActionType::AwaitHuman);
+        assert_eq!(
+            report.recovery_tasks[0].action_type,
+            PlanActionType::AwaitHuman
+        );
         assert_eq!(report.rollback.len(), 1);
         assert!(report.rollback[0].starts_with("T2:"));
         assert!(
@@ -1036,6 +1313,183 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("unknown plan task"))
+        );
+    }
+
+    fn gate_task(
+        id: &str,
+        action: PlanActionType,
+        risk: PlanRisk,
+        depends_on: &[&str],
+    ) -> PathPlanTask {
+        PathPlanTask {
+            id: id.to_string(),
+            action_type: action,
+            title: id.to_string(),
+            relation: REL_FIXES.to_string(),
+            from: "a".to_string(),
+            to: "b".to_string(),
+            depends_on: depends_on.iter().map(|id| (*id).to_string()).collect(),
+            success_check: "ok".to_string(),
+            evidence_ref: "path/edge/0".to_string(),
+            risk,
+            approval: false,
+            confidence: 0.9,
+            owner: None,
+            due: None,
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+        }
+    }
+
+    fn gate_plan(tasks: Vec<PathPlanTask>) -> PathPlan {
+        let (parallel_groups, _) = parallel_groups(&tasks);
+        PathPlan {
+            plan_id: "PLAN-test".to_string(),
+            source_path_id: "PATH-test".to_string(),
+            goal: "test".to_string(),
+            tasks,
+            verification_queries: Vec::new(),
+            parallel_groups,
+            rollback: Vec::new(),
+            confidence: 0.9,
+            approval_gates: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn audit_passes_clean_verification_only_plan() {
+        let plan = gate_plan(vec![gate_task(
+            "T1",
+            PlanActionType::Verify,
+            PlanRisk::Low,
+            &[],
+        )]);
+        let report = plan.audit_quality();
+        assert!(report.executable, "{:?}", report.issues);
+        assert!(report.issues.is_empty());
+        assert_eq!(report.task_count, 1);
+        assert_eq!(report.max_depth, 1);
+    }
+
+    #[test]
+    fn audit_blocks_side_effect_without_owner_or_due_then_clears() {
+        let mut plan = gate_plan(vec![
+            gate_task("T1", PlanActionType::Verify, PlanRisk::Low, &[]),
+            gate_task("T2", PlanActionType::Execute, PlanRisk::Medium, &["T1"]),
+        ]);
+        let report = plan.audit_quality();
+        assert!(!report.executable);
+        assert!(report.has_code("Q03"));
+        assert!(report.has_code("Q04"));
+        assert_eq!(report.blocking().count(), 2);
+
+        assert!(plan.assign_task("T2", "procurement", "2026-12-01"));
+        assert!(!plan.assign_task("T9", "nobody", "2026-12-01"));
+        let report = plan.audit_quality();
+        assert!(report.executable, "{:?}", report.issues);
+        assert_eq!(plan.tasks[1].owner.as_deref(), Some("procurement"));
+    }
+
+    #[test]
+    fn audit_blocks_low_confidence_side_effects() {
+        let mut plan = gate_plan(vec![gate_task(
+            "T1",
+            PlanActionType::Acquire,
+            PlanRisk::Medium,
+            &[],
+        )]);
+        plan.confidence = 0.4;
+        plan.assign_task("T1", "ops", "2026-12-01");
+        let report = plan.audit_quality();
+        assert!(!report.executable);
+        assert!(report.has_code("Q06"));
+        assert!(!report.has_code("Q01"));
+        assert!(report.min_confidence <= 0.4);
+
+        plan.confidence = 0.9;
+        plan.tasks[0].confidence = 0.5;
+        assert!(plan.audit_quality().has_code("Q06"));
+        plan.tasks[0].confidence = 0.9;
+        assert!(plan.audit_quality().executable);
+    }
+
+    #[test]
+    fn audit_requires_approval_for_irreversible_tasks_and_warns_shadow_mode() {
+        let mut plan = gate_plan(vec![gate_task(
+            "T1",
+            PlanActionType::Decide,
+            PlanRisk::High,
+            &[],
+        )]);
+        plan.assign_task("T1", "cio", "2026-12-01");
+        let report = plan.audit_quality();
+        assert!(!report.executable);
+        assert!(report.has_code("Q05"));
+        assert!(report.has_code("W01"));
+        assert_eq!(report.warnings().count(), 1);
+
+        plan.tasks[0].approval = true;
+        let report = plan.audit_quality();
+        assert!(report.executable, "{:?}", report.issues);
+        assert!(report.has_code("W01"));
+    }
+
+    #[test]
+    fn audit_blocks_depth_task_limit_and_cycles() {
+        let tasks: Vec<PathPlanTask> = (1..=5)
+            .map(|i| {
+                let mut task =
+                    gate_task(&format!("T{i}"), PlanActionType::Verify, PlanRisk::Low, &[]);
+                if i > 1 {
+                    task.depends_on = vec![format!("T{}", i - 1)];
+                }
+                task
+            })
+            .collect();
+        let report = gate_plan(tasks).audit_quality();
+        assert!(report.has_code("Q08"));
+        assert_eq!(report.max_depth, 5);
+
+        let many: Vec<PathPlanTask> = (1..=21)
+            .map(|i| gate_task(&format!("T{i}"), PlanActionType::Verify, PlanRisk::Low, &[]))
+            .collect();
+        assert!(gate_plan(many).audit_quality().has_code("Q07"));
+
+        let cyclic = vec![
+            gate_task("T1", PlanActionType::Verify, PlanRisk::Low, &["T2"]),
+            gate_task("T2", PlanActionType::Verify, PlanRisk::Low, &["T1"]),
+        ];
+        let report = gate_plan(cyclic).audit_quality();
+        assert!(report.has_code("Q09"));
+        assert!(!report.executable);
+        assert_eq!(report.max_depth, 0);
+    }
+
+    #[test]
+    fn audit_reports_missing_checks_dangling_deps_and_duplicates() {
+        let mut broken = gate_task("T1", PlanActionType::Query, PlanRisk::Low, &["T9"]);
+        broken.success_check = "  ".to_string();
+        broken.evidence_ref = String::new();
+        let duplicate = gate_task("T1", PlanActionType::Query, PlanRisk::Low, &[]);
+        let report = gate_plan(vec![broken, duplicate]).audit_quality();
+        for code in ["Q01", "Q02", "Q10", "Q11"] {
+            assert!(report.has_code(code), "missing {code}: {:?}", report.issues);
+        }
+        assert!(!report.executable);
+    }
+
+    #[test]
+    fn compiled_plan_stays_inexecutable_until_assignment() {
+        let (graph, path) = chain();
+        let mut plan = build_path_plan(&graph, &path);
+        assert!(!plan.audit_quality().executable);
+        assert!(plan.assign_task("T2", "engineer", "2026-12-01"));
+        assert!(
+            plan.audit_quality().executable,
+            "{:?}",
+            plan.audit_quality().issues
         );
     }
 }

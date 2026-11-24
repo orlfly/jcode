@@ -9,8 +9,10 @@ pub use engineering_ontology::{
 
 pub mod path_plan;
 pub use path_plan::{
-    PathPlan, PathPlanTask, PlanActionType, PlanExecutionReport, PlanRisk, PlanTaskObservation,
-    PlanTaskOutcome, PlanTaskState, PlanVerificationQuery, apply_plan_feedback, build_path_plan,
+    PLAN_DEPTH_LIMIT, PLAN_SIDE_EFFECT_CONFIDENCE_FLOOR, PLAN_TASK_LIMIT, PathPlan, PathPlanTask,
+    PlanActionType, PlanExecutionReport, PlanGateSeverity, PlanQualityIssue, PlanQualityReport,
+    PlanRisk, PlanTaskObservation, PlanTaskOutcome, PlanTaskState, PlanVerificationQuery,
+    apply_plan_feedback, build_path_plan,
 };
 
 pub mod path_diagnosis;
@@ -46,9 +48,7 @@ pub mod domain_fact;
 pub use domain_fact::{DomainFact, DomainFactMatch, DomainFactQuery, rank_domain_facts};
 
 pub mod reward;
-pub use reward::{
-    RewardSignals, RewardWeights, quality_penalty, quality_signal, shaped_reward,
-};
+pub use reward::{RewardSignals, RewardWeights, quality_penalty, quality_signal, shaped_reward};
 
 pub mod ontology_gate;
 pub use ontology_gate::{
@@ -67,31 +67,31 @@ pub use instance::{
     ProvenanceRecord, default_lifecycle_transition_table,
 };
 
+pub mod layered;
 pub mod memory_class;
 pub mod ontology;
-pub mod layered;
 pub use memory_class::{
     CORE_MEMORY_CLASS_IDS, core_class_for_category, core_memory_class, core_memory_classes,
     is_core_category, is_core_memory_class, strip_core_types,
 };
 pub use ontology::{
-    Activity, ActivityStep, ActivityTrigger, Condition, DEFAULT_ONTOLOGY_ID,
+    Activity, ActivityStep, ActivityTrigger, ArtifactKind, Condition, DEFAULT_ONTOLOGY_ID,
     DEFAULT_ONTOLOGY_VERSION, DecayPolicy, EVENT_CONTRADICT, EVENT_DEDUP, EVENT_FINALIZE,
     EVENT_LINK, EVENT_REMEMBER, EVENT_SUPERSEDE, EVENT_TAG, EVENT_TOPIC_CHANGE, EVENT_TURN_TICK,
     EVENT_UNTAG, EVENT_UPSERT, Effect, LINK_GOAL, LINK_PREFIXES, LINK_SKILL, LifecyclePolicy,
     LifecycleTransition, Ontology, OntologyType, PropertyDef, PropertyKind, REL_CONTRADICTS,
-    REL_DERIVED_FROM, REL_HAS_TAG, REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES,
-    RULE_CONTRADICT, RULE_DEDUP_REINFORCE, RULE_LINK, RULE_REJECT, RULE_REMEMBER, RULE_SUPERSEDE,
-    RULE_TAG, RULE_UNTAG, RULE_UPSERT, RULE_WRITE_RECONCILE, RelationshipDef, Rule, ScoringPolicy,
+    REL_DERIVED_FROM, REL_HAS_TAG, REL_IN_CLUSTER, REL_RELATES_TO, REL_SUPERSEDES, RULE_CONTRADICT,
+    RULE_DEDUP_REINFORCE, RULE_LINK, RULE_REJECT, RULE_REMEMBER, RULE_SUPERSEDE, RULE_TAG,
+    RULE_UNTAG, RULE_UPSERT, RULE_WRITE_RECONCILE, RelationshipDef, Rule, ScoringPolicy,
     TYPE_CONTRACT, TYPE_CORRECTION, TYPE_ENTITY, TYPE_ENV_FACT, TYPE_OBSERVATION, TYPE_PREFERENCE,
-    TYPE_PROCESS_RULE, TrustMultiplier, WeightRange, default_event_names, default_ontology,
-    is_link_id, validate_default_ontology, ArtifactKind, artifact_kind_for_id, artifact_kinds,
-    configure_artifact_kinds, default_artifact_kinds, register_artifact_kind,
+    TYPE_PROCESS_RULE, TrustMultiplier, WeightRange, artifact_kind_for_id, artifact_kinds,
+    configure_artifact_kinds, default_artifact_kinds, default_event_names, default_ontology,
+    is_link_id, register_artifact_kind, validate_default_ontology,
 };
 
 pub mod reconcile;
 pub use reconcile::{
-    MAX_RELATED, MIN_MEANINGFUL_MEMORY_LEN, RELATE_AT, REINFORCE_AT, ReconcileAction,
+    MAX_RELATED, MIN_MEANINGFUL_MEMORY_LEN, REINFORCE_AT, RELATE_AT, ReconcileAction,
     ReconcileOutcome, SUPERSEDE_AT, derive_subject_key, detect_conflict, is_admitted_tag,
     lexical_similarity, noise_reason, prepare_for_write, reconcile, reconcile_with_thresholds,
     same_subject, sanitize_tags,
@@ -124,10 +124,9 @@ pub use review::{
 
 pub mod migration;
 pub use migration::{
-    MigrationReport, MigrationState, MigrationStep, OntologyApplyReport, OntologyOp,
-    OntologyPatch, OntologySnapshot, SplitRule, TypePatch, apply_migrations, apply_patch,
-    classify_residual_type, describe_ontology, ontology_content_hash, reconcile_thresholds,
-    validate_ontology,
+    MigrationReport, MigrationState, MigrationStep, OntologyApplyReport, OntologyOp, OntologyPatch,
+    OntologySnapshot, SplitRule, TypePatch, apply_migrations, apply_patch, classify_residual_type,
+    describe_ontology, ontology_content_hash, reconcile_thresholds, validate_ontology,
 };
 
 pub mod validation;
@@ -1130,12 +1129,7 @@ fn format_entries_for_prompt_with_header(
             } else {
                 ""
             };
-            output.push_str(&format!(
-                "{}. {}{}\n",
-                idx + 1,
-                item.content.trim(),
-                badge
-            ));
+            output.push_str(&format!("{}. {}{}\n", idx + 1, item.content.trim(), badge));
             if include_updated_at_comments {
                 output.push_str(&format!(
                     "<!-- updated_at: {} -->\n",
@@ -1511,10 +1505,7 @@ pub mod ranking {
                         .with_effective_from(chrono::Utc::now() + chrono::Duration::days(1)),
                 ),
             );
-            let superseded = store.add(MemoryEntry::new(
-                MemoryCategory::Fact,
-                "superseded memory",
-            ));
+            let superseded = store.add(MemoryEntry::new(MemoryCategory::Fact, "superseded memory"));
             store.entries.iter_mut().for_each(|entry| {
                 if entry.id == superseded {
                     entry.active = false;
