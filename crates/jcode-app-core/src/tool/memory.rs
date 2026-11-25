@@ -2597,6 +2597,42 @@ impl MemoryTool {
                     )
                 };
                 out.push_str(&format!("\n- {code}: {reason}"));
+            } else {
+                let store = EngineeringStore::open_default()
+                    .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+                for from in froms {
+                    for to in tos {
+                        let report = match store.diagnose_path_gap(from, to, depth) {
+                            Ok(report) => report,
+                            Err(error) => {
+                                out.push_str(&format!(
+                                    "\n- {from} -> {to}: diagnosis unavailable ({error})"
+                                ));
+                                continue;
+                            }
+                        };
+                        let codes = if report.diagnosis.is_empty() {
+                            "E03".to_string()
+                        } else {
+                            report.diagnosis.join(",")
+                        };
+                        out.push_str(&format!("\n- {from} -> {to}: {codes}"));
+                        for action in &report.next_actions {
+                            out.push_str(&format!("\n  next: {action}"));
+                        }
+                        for candidate in &report.alignment_candidates {
+                            out.push_str(&format!(
+                                "\n  alignment hint: {} [{}] <-> {} [{}], class {}, score {:.2}",
+                                candidate.from_entity,
+                                candidate.from_session,
+                                candidate.to_entity,
+                                candidate.to_session,
+                                candidate.class,
+                                candidate.score
+                            ));
+                        }
+                    }
+                }
             }
             return Ok(ToolOutput::new(out));
         }
@@ -3847,6 +3883,62 @@ mod tests {
         assert!(output.output.contains("defines"), "{}", output.output);
         assert!(
             output.output.contains("plan: confidence"),
+            "{}",
+            output.output
+        );
+    }
+
+    #[tokio::test]
+    async fn path_action_reports_e09_alignment_hints_for_disjoint_sessions() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_FILE, CLASS_TASK, EngineeringEntity, EngineeringGraph,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+
+        let mut left = EngineeringGraph::new();
+        left.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a1", "auth.rs"));
+        left.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "login flow"));
+        store
+            .save_graph("session-left", Some("/repo"), &left)
+            .expect("save left");
+        let mut right = EngineeringGraph::new();
+        right.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b1", "auth.rs"));
+        right.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t2", "login flow"));
+        store
+            .save_graph("session-right", Some("/repo"), &right)
+            .expect("save right");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"file:a1",
+                    "to_id":"file:b1",
+                    "depth":4
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("no-path diagnosis");
+        assert!(
+            output.output.contains("No engineering path"),
+            "{}",
+            output.output
+        );
+        assert!(output.output.contains("E09"), "{}", output.output);
+        assert!(
+            output.output.contains("alignment hint: file:a1"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("completion_action=propose"),
             "{}",
             output.output
         );

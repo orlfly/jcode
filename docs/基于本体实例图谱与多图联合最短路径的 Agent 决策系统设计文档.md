@@ -1944,6 +1944,8 @@ LIMIT 5;
 
 诊断报告新增两个字段：missing_class（本体沉默/语义缺口/查询侧）与 llm_attribution（语义探针解释，可空）。查询侧缺失不进入补全阶梯的 LLM 提议环节，只改查询参数。
 
+**实现（工程图层）**：`EngineeringStore::diagnose_path_gap` 只用确定性探针，基于实体索引与 session 集合判定三种码：`E01`（锚点在任何工程图里都不存在）、`E09`（两锚点各自可解析但分属不同 session）、`E03`（同 session 存在但深度内无路径）。`E09` 额外返回只读的 `alignment_candidates`：同 class 且名称词项 Jaccard ≥0.55 的跨 session 实体对，按分数取前 3，不写任何图；`memory` 工具 `path` 无路径时输出 `next:` 与 `alignment hint:`，可直接接 `action=completion completion_action=propose`。`E04`–`E08`、`E10` 与 LLM 语义探针尚未接入工程图，此表其余行仍按设计待实现。
+
 #### 4.4.2 分层补全阶梯：LLM 参与边界与裁决强度
 
 补全按成本与风险从低到高排列。诊断码决定候选层级，不要求逐层执行；一旦得到通过校验的路径即停止。与 4.1.1 的四层参与模型对齐，每个补全层级都定义 LLM 的参与点与裁决规则：

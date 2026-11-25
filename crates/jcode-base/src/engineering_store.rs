@@ -64,6 +64,33 @@ pub struct EngineeringPathHit {
     pub quality: PathQuality,
 }
 
+/// One cross-session alignment hint for an E09 gap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineeringAlignmentCandidate {
+    pub from_entity: String,
+    pub to_entity: String,
+    pub from_session: String,
+    pub to_session: String,
+    pub class: String,
+    pub score: f32,
+}
+
+/// Structured diagnosis for a no-path engineering query (design 4.4.1/4.4.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineeringGapReport {
+    pub from_anchor: String,
+    pub to_anchor: String,
+    pub depth: usize,
+    /// Stable diagnosis codes: `E01`, `E03`, or `E09`.
+    pub diagnosis: Vec<String>,
+    pub from_sessions: Vec<String>,
+    pub to_sessions: Vec<String>,
+    pub shared_sessions: Vec<String>,
+    /// Read-only alignment hints. Nothing is written to any graph.
+    pub alignment_candidates: Vec<EngineeringAlignmentCandidate>,
+    pub next_actions: Vec<String>,
+}
+
 /// One session selected by the engineering retention policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineeringRetentionCandidate {
@@ -424,6 +451,184 @@ impl EngineeringStore {
             self.save_graph(session_id, working_dir.as_deref(), &graph)?;
         }
         Ok(removed)
+    }
+
+    /// Diagnose why an engineering path query returned nothing.
+    ///
+    /// This is read-only: it classifies the gap as an unresolved anchor (E01),
+    /// a cross-session alignment gap (E09), or a same-session connectivity/depth
+    /// gap (E03), and for E09 it ranks same-class cross-session entity pairs by
+    /// lexical overlap as alignment hints. Hints are never written.
+    pub fn diagnose_path_gap(
+        &self,
+        from_anchor: &str,
+        to_anchor: &str,
+        depth: usize,
+    ) -> Result<EngineeringGapReport> {
+        const MIN_ALIGNMENT_SCORE: f32 = 0.55;
+        const MAX_ALIGNMENT_CANDIDATES: usize = 3;
+
+        let from_rows = self.anchor_rows(from_anchor)?;
+        let to_rows = self.anchor_rows(to_anchor)?;
+        let from_sessions: Vec<String> = {
+            let mut sessions: Vec<String> = from_rows.iter().map(|row| row.0.clone()).collect();
+            sessions.sort();
+            sessions.dedup();
+            sessions
+        };
+        let to_sessions: Vec<String> = {
+            let mut sessions: Vec<String> = to_rows.iter().map(|row| row.0.clone()).collect();
+            sessions.sort();
+            sessions.dedup();
+            sessions
+        };
+        let shared_sessions: Vec<String> = from_sessions
+            .iter()
+            .filter(|session| to_sessions.contains(session))
+            .cloned()
+            .collect();
+
+        let mut diagnosis = Vec::new();
+        let mut next_actions = Vec::new();
+        if from_rows.is_empty() {
+            if !diagnosis.contains(&"E01".to_string()) {
+                diagnosis.push("E01".to_string());
+            }
+            next_actions.push(format!(
+                "E01: start anchor '{from_anchor}' is not in any engineering graph; check the id or recall it first"
+            ));
+        }
+        if to_rows.is_empty() {
+            if !diagnosis.contains(&"E01".to_string()) {
+                diagnosis.push("E01".to_string());
+            }
+            next_actions.push(format!(
+                "E01: goal anchor '{to_anchor}' is not in any engineering graph; check the id or recall it first"
+            ));
+        }
+
+        let mut alignment_candidates = Vec::new();
+        if diagnosis.is_empty() {
+            if shared_sessions.is_empty() {
+                diagnosis.push("E09".to_string());
+                next_actions.push(format!(
+                    "E09: anchors live in disjoint sessions ({} vs {}); propose a same_as alignment with action=completion completion_action=propose and evidence",
+                    from_sessions.join(", "),
+                    to_sessions.join(", ")
+                ));
+                let left = self.session_entities(&from_sessions)?;
+                let right = self.session_entities(&to_sessions)?;
+                let mut candidates = Vec::new();
+                for (left_session, left_id, left_class, left_name) in &left {
+                    for (right_session, right_id, right_class, right_name) in &right {
+                        if left_id == right_id || left_class != right_class {
+                            continue;
+                        }
+                        let score = lexical_overlap(left_name, right_name);
+                        if score < MIN_ALIGNMENT_SCORE {
+                            continue;
+                        }
+                        candidates.push(EngineeringAlignmentCandidate {
+                            from_entity: left_id.clone(),
+                            to_entity: right_id.clone(),
+                            from_session: left_session.clone(),
+                            to_session: right_session.clone(),
+                            class: left_class.clone(),
+                            score,
+                        });
+                    }
+                }
+                candidates.sort_by(|left, right| {
+                    right
+                        .score
+                        .total_cmp(&left.score)
+                        .then_with(|| left.from_entity.cmp(&right.from_entity))
+                        .then_with(|| left.to_entity.cmp(&right.to_entity))
+                });
+                candidates.truncate(MAX_ALIGNMENT_CANDIDATES);
+                alignment_candidates = candidates;
+            } else {
+                diagnosis.push("E03".to_string());
+                next_actions.push(format!(
+                    "E03: both anchors exist in session(s) {} but no path fits depth {depth}; raise depth, allow more relations, or propose a completion edge",
+                    shared_sessions.join(", ")
+                ));
+            }
+        }
+
+        Ok(EngineeringGapReport {
+            from_anchor: from_anchor.to_string(),
+            to_anchor: to_anchor.to_string(),
+            depth,
+            diagnosis,
+            from_sessions,
+            to_sessions,
+            shared_sessions,
+            alignment_candidates,
+            next_actions,
+        })
+    }
+
+    /// `(session_id, entity_id, class, name)` rows matching an id or display name.
+    fn anchor_rows(&self, anchor: &str) -> Result<Vec<(String, String, String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT session_id, entity_id, class, name
+                FROM engineering_entity_index
+                WHERE entity_id = ?1 OR name = ?1 COLLATE NOCASE
+                ORDER BY session_id, entity_id
+                "#,
+            )
+            .context("prepare anchor resolution")?;
+        let rows = statement
+            .query_map(params![anchor], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .context("query anchor resolution")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("read anchor row")?);
+        }
+        Ok(out)
+    }
+
+    /// All indexed entities for the given sessions, capped per session.
+    fn session_entities(
+        &self,
+        sessions: &[String],
+    ) -> Result<Vec<(String, String, String, String)>> {
+        const PER_SESSION_CAP: usize = 64;
+        let mut out = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT entity_id, class, name FROM engineering_entity_index \
+                 WHERE session_id = ?1 ORDER BY entity_id LIMIT ?2",
+            )
+            .context("prepare session entities")?;
+        for session in sessions {
+            let rows = statement
+                .query_map(params![session, PER_SESSION_CAP as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .context("query session entities")?;
+            for row in rows {
+                let (id, class, name) = row.context("read session entity")?;
+                out.push((session.clone(), id, class, name));
+            }
+        }
+        Ok(out)
     }
 
     /// List stored sessions, newest first.
@@ -971,6 +1176,23 @@ fn like_escape(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Token Jaccard overlap over alphanumeric words of length 3+.
+fn lexical_overlap(left: &str, right: &str) -> f32 {
+    let tokens = |text: &str| -> std::collections::HashSet<String> {
+        text.split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| token.len() >= 3)
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let shared = left.intersection(&right).count();
+    shared as f32 / left.union(&right).count() as f32
+}
+
 fn subgraph_around(
     graph: &EngineeringGraph,
     anchor_id: &str,
@@ -1029,8 +1251,8 @@ fn subgraph_around(
 mod tests {
     use super::*;
     use jcode_memory_types::engineering_ontology::{
-        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, EngineeringProvenance, REL_CAUSES, REL_DEFINES,
-        REL_MODIFIES,
+        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, CLASS_TASK, EngineeringProvenance, REL_CAUSES,
+        REL_DEFINES, REL_DEPENDS_ON, REL_MODIFIES,
     };
     use serde_json::json;
 
@@ -1474,6 +1696,64 @@ mod tests {
             store
                 .promote_completion_edge("session-completion", &report.accepted[0], missing)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn gap_diagnosis_classifies_unresolved_cross_session_and_depth_gaps() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+
+        let unresolved = store
+            .diagnose_path_gap("missing:from", "missing:to", 4)
+            .expect("diagnose unresolved");
+        assert_eq!(unresolved.diagnosis, vec!["E01".to_string()]);
+        assert_eq!(unresolved.next_actions.len(), 2);
+        assert!(unresolved.alignment_candidates.is_empty());
+
+        let mut chain = EngineeringGraph::new();
+        for id in ["task:a", "task:b", "task:c"] {
+            chain.insert_entity(EngineeringEntity::new(CLASS_TASK, id, id));
+        }
+        chain.insert_relation(EngineeringRelation::new("task:a", REL_DEPENDS_ON, "task:b"));
+        chain.insert_relation(EngineeringRelation::new("task:b", REL_DEPENDS_ON, "task:c"));
+        store
+            .save_graph("session-chain", Some("/repo"), &chain)
+            .expect("save chain");
+        let depth_gap = store
+            .diagnose_path_gap("task:a", "task:c", 1)
+            .expect("diagnose depth");
+        assert_eq!(depth_gap.diagnosis, vec!["E03".to_string()]);
+        assert_eq!(depth_gap.shared_sessions, vec!["session-chain".to_string()]);
+
+        let mut left = EngineeringGraph::new();
+        left.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a1", "auth.rs"));
+        left.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t1", "login flow"));
+        store
+            .save_graph("session-left", Some("/repo"), &left)
+            .expect("save left");
+        let mut right = EngineeringGraph::new();
+        right.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b1", "auth.rs"));
+        right.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:t2", "login flow"));
+        store
+            .save_graph("session-right", Some("/repo"), &right)
+            .expect("save right");
+
+        let alignment_gap = store
+            .diagnose_path_gap("file:a1", "file:b1", 4)
+            .expect("diagnose alignment");
+        assert_eq!(alignment_gap.diagnosis, vec!["E09".to_string()]);
+        assert_eq!(
+            alignment_gap.from_sessions,
+            vec!["session-left".to_string()]
+        );
+        assert_eq!(alignment_gap.to_sessions, vec!["session-right".to_string()]);
+        assert!(!alignment_gap.alignment_candidates.is_empty());
+        assert_eq!(alignment_gap.alignment_candidates[0].class, CLASS_FILE);
+        assert!((alignment_gap.alignment_candidates[0].score - 1.0).abs() < 1e-6);
+        assert!(
+            alignment_gap.next_actions[0].contains("completion_action=propose"),
+            "{:?}",
+            alignment_gap.next_actions
         );
     }
 }
