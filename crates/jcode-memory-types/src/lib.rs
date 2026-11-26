@@ -52,7 +52,10 @@ pub use grounding::{
 };
 
 pub mod waypoint;
-pub use waypoint::{BEAM_WIDTH, MAX_WAYPOINTS, WaypointCandidate, generate_waypoint_candidates};
+pub use waypoint::{
+    BEAM_WIDTH, MAX_FILTER_SUGGESTIONS, MAX_WAYPOINTS, WaypointCandidate, WaypointFilterSuggestion,
+    generate_waypoint_candidates,
+};
 
 pub mod path_pattern;
 pub use path_pattern::{PathDirection, PathOutputKind, PathPattern, pattern_for_intent};

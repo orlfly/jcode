@@ -8,13 +8,72 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engineering_ontology::{CLASS_WILDCARD, EngineeringOntology};
+use crate::engineering_ontology::{CLASS_WILDCARD, EngineeringOntology, PropertyValueKind};
 
 /// Maximum intermediate concepts per candidate path.
 pub const MAX_WAYPOINTS: usize = 3;
 /// Number of candidates kept after scoring.
 pub const BEAM_WIDTH: usize = 3;
 const MAX_EXPLORED_PATHS: usize = 2000;
+/// Maximum filter suggestions emitted per intermediate concept.
+pub const MAX_FILTER_SUGGESTIONS: usize = 4;
+
+/// One suggested attribute filter for an intermediate concept.
+///
+/// These are ontology declarations, not data-derived predicates: the caller
+/// still decides which filter to bind and to which value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaypointFilterSuggestion {
+    pub concept_id: String,
+    pub property: String,
+    pub kind: String,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn kind_name(kind: &PropertyValueKind) -> &'static str {
+    match kind {
+        PropertyValueKind::String => "string",
+        PropertyValueKind::Identifier => "identifier",
+        PropertyValueKind::Integer => "integer",
+        PropertyValueKind::Float => "float",
+        PropertyValueKind::Bool => "bool",
+        PropertyValueKind::DateTime => "date_time",
+        PropertyValueKind::Enum { .. } => "enum",
+        PropertyValueKind::Reference { .. } => "reference",
+        PropertyValueKind::Json => "json",
+    }
+}
+
+fn filter_suggestions(
+    ontology: &EngineeringOntology,
+    concepts: &[String],
+) -> Vec<WaypointFilterSuggestion> {
+    let mut suggestions = Vec::new();
+    for concept in concepts {
+        let Some(class) = ontology.classes.get(concept) else {
+            continue;
+        };
+        let mut properties: Vec<_> = class.properties.iter().collect();
+        properties.sort_by(|left, right| {
+            right
+                .required
+                .cmp(&left.required)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for property in properties.into_iter().take(MAX_FILTER_SUGGESTIONS) {
+            suggestions.push(WaypointFilterSuggestion {
+                concept_id: concept.clone(),
+                property: property.id.clone(),
+                kind: kind_name(&property.kind).to_string(),
+                required: property.required,
+                description: property.description.clone(),
+            });
+        }
+    }
+    suggestions
+}
 
 /// One scored concept path between two anchored concepts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +89,10 @@ pub struct WaypointCandidate {
     pub selectivity: f32,
     /// Average degree of intermediate concepts, normalized by the max degree.
     pub hub_penalty: f32,
+    /// Declared property filters that can narrow the instance search at each
+    /// waypoint. Suggestions only; no filter is bound automatically.
+    #[serde(default)]
+    pub filters: Vec<WaypointFilterSuggestion>,
 }
 
 impl WaypointCandidate {
@@ -79,6 +142,7 @@ fn degrees(adjacency: &BTreeMap<String, Vec<(String, String)>>) -> BTreeMap<Stri
 }
 
 fn score_path(
+    ontology: &EngineeringOntology,
     concepts: &[String],
     relations: &[String],
     degrees: &BTreeMap<String, usize>,
@@ -105,6 +169,7 @@ fn score_path(
         plausibility,
         selectivity,
         hub_penalty,
+        filters: filter_suggestions(ontology, &concepts[1..concepts.len().saturating_sub(1)]),
     }
 }
 
@@ -142,7 +207,9 @@ pub fn generate_waypoint_candidates(
         let current = concepts.last().cloned().unwrap_or_default();
         if current == goal {
             explored += 1;
-            candidates.push(score_path(&concepts, &relations, &degrees, max_degree));
+            candidates.push(score_path(
+                ontology, &concepts, &relations, &degrees, max_degree,
+            ));
             continue;
         }
         if relations.len() >= max_edges {
@@ -212,12 +279,53 @@ mod tests {
         assert_eq!(candidates.len(), 2, "{candidates:?}");
         assert_eq!(candidates[0].relations, vec!["direct".to_string()]);
         assert!(candidates[0].waypoints().is_empty());
+        assert!(candidates[0].filters.is_empty());
         assert_eq!(
             candidates[1].concepts,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(candidates[1].waypoints(), &["b".to_string()]);
         assert!(candidates[0].score > candidates[1].score);
+    }
+
+    #[test]
+    fn suggests_declared_property_filters_for_waypoints() {
+        use crate::engineering_ontology::{
+            BfoCategory, EngineeringClassDef, EngineeringPropertyDef, PropertyValueKind,
+        };
+
+        let mut ontology = EngineeringOntology::new("test", 1, "filter ontology");
+        let class = |id: &str| EngineeringClassDef::new(id, id, BfoCategory::IndependentContinuant);
+        let mid = class("mid")
+            .with_property(EngineeringPropertyDef::new(
+                "kind",
+                PropertyValueKind::String,
+                false,
+            ))
+            .with_property(EngineeringPropertyDef::new(
+                "name",
+                PropertyValueKind::String,
+                true,
+            ));
+        ontology = ontology
+            .with_class(class("a"))
+            .with_class(mid)
+            .with_class(class("goal"))
+            .with_relation(EngineeringRelationDef::new("r1", "r1", &["a"], &["mid"]))
+            .with_relation(EngineeringRelationDef::new("r2", "r2", &["mid"], &["goal"]));
+
+        let candidates = generate_waypoint_candidates(&ontology, "a", "goal");
+        let via_mid = candidates
+            .iter()
+            .find(|candidate| candidate.concepts == vec!["a", "mid", "goal"])
+            .expect("mid route");
+        assert_eq!(via_mid.filters.len(), 2);
+        assert_eq!(via_mid.filters[0].concept_id, "mid");
+        assert_eq!(via_mid.filters[0].property, "name");
+        assert!(via_mid.filters[0].required);
+        assert_eq!(via_mid.filters[0].kind, "string");
+        assert_eq!(via_mid.filters[1].property, "kind");
+        assert!(!via_mid.filters[1].required);
     }
 
     #[test]

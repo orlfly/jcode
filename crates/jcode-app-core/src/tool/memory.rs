@@ -4508,6 +4508,7 @@ mod tests {
         assert!(output.contains("\"grounding\""), "{output}");
         assert!(output.contains("\"grounded\": 2"), "{output}");
         assert!(output.contains("\"waypoint_candidates\""), "{output}");
+        assert!(output.contains("\"filters\""), "{output}");
         assert!(output.contains("\"defines\""), "{output}");
         assert!(output.contains("\"physical_plan\""), "{output}");
         assert!(output.contains("ontology_probe"), "{output}");
