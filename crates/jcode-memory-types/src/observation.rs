@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::engineering_ontology::{
     EngineeringGraph, EngineeringPath, EngineeringProvenance, EngineeringRelation,
 };
+use crate::path_plan::{PathPlan, PlanGateSeverity, PlanQualityIssue, PlanQualityReport};
 use crate::path_quality::{PathQuality, PathQualityFlag};
 
 /// One node in an observation.
@@ -236,6 +237,78 @@ pub fn with_diagnostics(
     observation
 }
 
+/// Audit a compiled plan against the observation it was built from.
+///
+/// The plan's own gates (Q00-Q12) still run first; observation findings are
+/// appended so a scheduler never executes a plan whose evidence was dropped or
+/// whose query was truncated:
+///
+/// - `Q19` blocking: the observation dropped edges (`O01`), so evidence is incomplete.
+/// - `Q20` warning: the query hit its budget (`E07`); results may be partial.
+/// - `Q21` warning: the observation carries low-provenance edges.
+/// - `Q22` warning: the observation carries stale edges.
+pub fn audit_observation_plan(plan: &PathPlan, observation: &Observation) -> PlanQualityReport {
+    let mut report = plan.audit_quality();
+    let mut push = |code: &str, severity: PlanGateSeverity, message: String| {
+        let issue = PlanQualityIssue {
+            code: code.to_string(),
+            severity,
+            task_id: None,
+            message,
+        };
+        if !report
+            .issues
+            .iter()
+            .any(|existing| existing.code == issue.code && existing.message == issue.message)
+        {
+            report.issues.push(issue);
+        }
+    };
+
+    for diagnostic in &observation.diagnostics {
+        match diagnostic.code.as_str() {
+            "O01" => push(
+                "Q19",
+                PlanGateSeverity::Blocking,
+                format!(
+                    "observation dropped edges: {}; rebuild the plan from a complete graph",
+                    diagnostic.message
+                ),
+            ),
+            "E07" => push(
+                "Q20",
+                PlanGateSeverity::Warning,
+                format!(
+                    "query budget truncated the observation: {}",
+                    diagnostic.message
+                ),
+            ),
+            _ => {}
+        }
+    }
+    if observation.has_quality(PathQualityFlag::LowProvenance) {
+        push(
+            "Q21",
+            PlanGateSeverity::Warning,
+            "observation has low-provenance edges; attach evidence before scheduling side effects"
+                .to_string(),
+        );
+    }
+    if observation.has_quality(PathQualityFlag::StaleEdge) {
+        push(
+            "Q22",
+            PlanGateSeverity::Warning,
+            "observation has stale edges; re-verify or refresh the graph".to_string(),
+        );
+    }
+
+    report.executable = !report
+        .issues
+        .iter()
+        .any(|issue| issue.severity == PlanGateSeverity::Blocking);
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +405,68 @@ mod tests {
         assert_eq!(observation.diagnostics[0].code, "O01");
         assert!(observation.diagnostics[0].message.contains("missing"));
         assert_eq!(observation.paths[0].nodes.len(), path.nodes.len());
+    }
+
+    fn plan_and_observation() -> (PathPlan, Observation) {
+        let graph = graph();
+        let path = path();
+        let plan = crate::path_plan::build_path_plan(&graph, &path);
+        let observation = observation_from_graph_paths(&graph, "engineering", &[path]);
+        (plan, observation)
+    }
+
+    #[test]
+    fn dropped_edges_block_the_plan() {
+        let (plan, mut observation) = plan_and_observation();
+        observation.diagnostics.push(ObservationDiagnostic {
+            code: "O01".to_string(),
+            message: "1 relation is missing".to_string(),
+            suggestion: None,
+        });
+        let report = audit_observation_plan(&plan, &observation);
+        assert!(report.has_code("Q19"), "{report:?}");
+        assert!(!report.executable);
+    }
+
+    #[test]
+    fn budget_truncation_is_a_warning_not_a_blocker() {
+        let (plan, mut observation) = plan_and_observation();
+        let base = plan.audit_quality();
+        observation.diagnostics.push(ObservationDiagnostic {
+            code: "E07".to_string(),
+            message: "budget exhausted".to_string(),
+            suggestion: None,
+        });
+        let report = audit_observation_plan(&plan, &observation);
+        assert!(report.has_code("Q20"), "{report:?}");
+        assert_eq!(report.executable, base.executable);
+    }
+
+    #[test]
+    fn observation_quality_flags_become_plan_warnings() {
+        let (plan, mut observation) = plan_and_observation();
+        observation
+            .quality
+            .flags
+            .push(PathQualityFlag::LowProvenance);
+        observation.quality.flags.push(PathQualityFlag::StaleEdge);
+        let report = audit_observation_plan(&plan, &observation);
+        assert!(report.has_code("Q21"), "{report:?}");
+        assert!(report.has_code("Q22"), "{report:?}");
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "Q21" && issue.severity == PlanGateSeverity::Blocking)
+        );
+    }
+
+    #[test]
+    fn clean_observation_keeps_the_plan_audit_unchanged() {
+        let (plan, observation) = plan_and_observation();
+        let base = plan.audit_quality();
+        let report = audit_observation_plan(&plan, &observation);
+        assert_eq!(report, base);
     }
 
     #[test]

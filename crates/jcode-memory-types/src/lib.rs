@@ -78,7 +78,8 @@ pub use task_normalization::{
 pub mod observation;
 pub use observation::{
     CostBreakdown, Observation, ObservationDiagnostic, ObservationEdge, ObservationNode,
-    ObservationPath, observation_from_graph_paths, observe_path, with_diagnostics,
+    ObservationPath, audit_observation_plan, observation_from_graph_paths, observe_path,
+    with_diagnostics,
 };
 
 pub mod decision;

@@ -2311,8 +2311,14 @@ T3 有资金与产能承诺，设为审批门禁；T4 修改资源分配，属�
 | Q11 | 任务 id 重复 | blocking |
 | Q12 | 副作用任务位于假设边下游且没有前置验证任务 | blocking |
 | W01 | 高风险任务建议先影子执行 | warning |
+| Q19 | 观测丢弃了边（O01），证据不完整 | blocking |
+| Q20 | 查询预算耗尽（E07），观测可能不完整 | warning |
+| Q21 | 观测含低 provenance 边 | warning |
+| Q22 | 观测含过期边 | warning |
 
 编译期不臆造责任人：`build_path_plan` 只把 `owner/due` 留空，副作用计划的 `executable` 必须由调用方用 `PathPlan::assign_task(task_id, owner, due)` 显式补齐后才为 true。`Q06` 与 4.5.1 的“置信度取最小值”一致，同时检查计划级与任务级置信度。
+
+**实现（S6 观测复核）**：`audit_observation_plan(plan, observation)` 先跑 Q00–Q12，再消费 S6 的 `Observation`：`O01`（边被丢弃）升级为 blocking `Q19`，`E07`（预算截断）记 warning `Q20`，`low_provenance`/`stale_edge` 质量标志分别记 warning `Q21`/`Q22`；`executable` 按最终 issue 集合重算，同一 code+message 不重复追加。边界：该函数目前是库级消费入口，`action=path` 还未把计划与观测一起渲染；`Q19` 直接阻断而不尝试用残缺观测拼计划，避免把缺边计划排进执行队列。
 
 **假设边（Q12）**：`EngineeringRelation.hypothesis`（serde 默认 false，旧图读入即断言边）标记补全阶梯产出的候选边；计划任务同步复制到 `PathPlanTask.hypothesis`。编译期对假设边做保守降级：模板本会产出副作用动作时改为 `verify`，并在 `warnings` 写明降级原因，路径顺序保证它先于下游任务。`Q12` 作为第二道兜底，检查每个副作用任务的传递前驱里是否存在 `verify`/`query` 任务；手工构造或外部导入的计划绕过编译器降级时仍会被拦。生产端目前只有 API（`EngineeringRelation::with_hypothesis`）；4.4.5 的补全边写回尚未实现，所以线上还不会自动产出假设边，这一点不当作已具备能力。
 
