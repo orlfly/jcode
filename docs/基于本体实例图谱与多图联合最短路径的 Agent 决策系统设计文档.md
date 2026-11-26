@@ -1533,6 +1533,8 @@ IR 的字段不是自由文本，而是由本体库快照生成的枚举和 JSON
 
 **S0 规范化**：拆分复合任务，消解指代与省略，统一时间、单位、项目编号和语言；保留原文 span 以便追溯。输出是规范化任务文本加对话上下文引用，不做任何图谱假设。
 
+**实现（S0 规范化）**：`jcode-memory-types::task_normalization` 提供 `normalize_task_text`，`memory` 工具 `action=compile task_text=...`（可选 `context_mentions`）输出 `NormalizedTask`；与 `task_frame` 同传时嵌在编译 payload 的 `normalized_task` 段。确定性能力：按 `；`/`;`/`然后`/`并且`/`同时`/`以及`/`另外`/` and then ` 拆分复合任务（保留至多 5 段，超出截断并警告）、折叠空白（含全角空格）、把 `毫秒/秒/分钟/小时/个工作日` 统一为 `ms/s/min/h/workdays`、用调用方给的上下文提及解析代词（取最近一条，每段最多一次），并记录 `segments/resolutions/substitutions` 的**原文字节 span**。检测语言（zh/en/unknown）。省略补全、日期解析、项目编号规范化与翻译未实现，输出固定带 `S0 is deterministic: ... not implemented` 警告；没有上下文提及时代词原样保留并报 `pronoun left unresolved`，不猜测指代对象。
+
 **S1 TaskFrame 抽取**：用带 JSON Schema 的 LLM 调用抽取意图、起止锚点、硬/软约束、成功判据、禁止项、图层范围与输出类型。TaskFrame 只描述“要什么”，不描述“怎么查”。
 
 ```json
@@ -1607,7 +1609,7 @@ PathQuery
 
 **S7 一致性校验与定向修复**：检查类型安全、约束保真、端点匹配、置信度阈值和假设边比例。校验失败返回结构化错误码，不直接重试整条查询；最多 2 次定向修复，仍失败则转 4.4 补全。修复记录写入审计日志，供质量评估归因。
 
-**实现（S1 契约）**：`jcode-memory-types::task_frame` 提供 `compile_task_frame_json`，`memory` 工具 `action=compile task_frame={...}` 走同一入口。它只做确定性的一半：校验 `intent`（attribution/impact/plan/compliance/alternative）、锚点 `role`+`mention`+`span`、`constraints`、`success_criteria`、`scope_hint`、`output_type`，未知字段与非法 scope hint 记入 `dropped_fields`/`warnings`，结构错误一次性返回全部错误以便定向修复。映射规则：start/target/waypoint mention 分别进 `PathQuery.start/goal/waypoints`；scope 取 `Project/Global/All`；intent 决定默认 objective 与 limit（归因与替代取 `max_confidence`+5，方案取 `min_cost`，影响 10，合规 3）。约束表达式不在本模块执行，逐条写入 `constraint deferred to S4/S6` 警告。S0 规范化与 S7 定向修复仍未实现；本层不调用 LLM，也不解析实体 ID（概念接地在 S2）。
+**实现（S1 契约）**：`jcode-memory-types::task_frame` 提供 `compile_task_frame_json`，`memory` 工具 `action=compile task_frame={...}` 走同一入口。它只做确定性的一半：校验 `intent`（attribution/impact/plan/compliance/alternative）、锚点 `role`+`mention`+`span`、`constraints`、`success_criteria`、`scope_hint`、`output_type`，未知字段与非法 scope hint 记入 `dropped_fields`/`warnings`，结构错误一次性返回全部错误以便定向修复。映射规则：start/target/waypoint mention 分别进 `PathQuery.start/goal/waypoints`；scope 取 `Project/Global/All`；intent 决定默认 objective 与 limit（归因与替代取 `max_confidence`+5，方案取 `min_cost`，影响 10，合规 3）。约束表达式不在本模块执行，逐条写入 `constraint deferred to S4/S6` 警告。S0 规范化与 S7 定向修复的确定性部分已由 `task_normalization` / `plan_validation` 覆盖（见对应实现段）；本层不调用 LLM，也不解析实体 ID（概念接地在 S2）。
 
 **实现（S2 概念接地）**：`jcode-memory-types::grounding` 提供 `ground_mention`/`ground_task_frame`，`action=compile task_frame` 的输出带 `grounding` 段。评分只有词法信号：精确匹配 1.0、token 包含 0.85、部分子串 0.55、名称/描述 token Jaccard 线性组合（上限 0.74）；按 0.75 接受、0.50–0.75 判 ambiguous、低于 0.50 判 unresolved，每条 mention 保留至多 5 个候选并记录触发信号。设计公式里的 embedding、type、context、recency 四项没有实现，ambiguous/unresolved 结果会显式带 `score is lexical-only` 警告；实例实体链接（别名索引 + ANN + 属性过滤）未实现，本层只接地到概念。歧义的二次裁决（由路径兼容性决定）仍未接线。
 

@@ -70,6 +70,13 @@ struct MemoryInput {
     /// For action=compile: model-filled TaskFrame JSON (stage S1).
     #[serde(default)]
     task_frame: Option<serde_json::Value>,
+    /// For action=compile: raw task text to normalize (stage S0).
+    #[serde(default)]
+    task_text: Option<String>,
+    /// For action=compile with task_text: antecedent mentions for pronoun
+    /// resolution, oldest first (stage S0).
+    #[serde(default)]
+    context_mentions: Option<Vec<String>>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -297,6 +304,15 @@ impl Tool for MemoryTool {
                 "task_frame": {
                     "type": "object",
                     "description": "For action=compile: model-filled TaskFrame JSON."
+                },
+                "task_text": {
+                    "type": "string",
+                    "description": "For action=compile: raw task text to normalize (stage S0)."
+                },
+                "context_mentions": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For action=compile with task_text: antecedent mentions, oldest first."
                 },
                 "id": {
                     "type": "string",
@@ -1890,6 +1906,21 @@ impl Tool for MemoryTool {
                 Ok(ToolOutput::new(out))
             }
             "compile" => {
+                let normalized_task = input.task_text.as_deref().map(|text| {
+                    crate::memory_types::normalize_task_text(
+                        text,
+                        input.context_mentions.as_deref().unwrap_or(&[]),
+                    )
+                });
+                if let Some(normalized) = normalized_task.as_ref()
+                    && input.task_frame.is_none()
+                    && input.query_json.is_none()
+                {
+                    return Ok(ToolOutput::new(format!(
+                        "Normalized task (S0):\n{}",
+                        serde_json::to_string_pretty(normalized)?
+                    )));
+                }
                 if let Some(value) = input.task_frame.as_ref() {
                     let audit_scope =
                         Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
@@ -1966,6 +1997,7 @@ impl Tool for MemoryTool {
                         "waypoint_candidates": waypoint_candidates,
                         "physical_plan": physical_plan,
                         "plan_validation": plan_validation,
+                        "normalized_task": normalized_task,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -4319,6 +4351,67 @@ mod tests {
         assert!(output.output.contains("concept:api"), "{}", output.output);
         assert!(output.output.contains("instance_of"), "{}", output.output);
         assert!(output.output.contains("has_instance"), "{}", output.output);
+    }
+
+    #[tokio::test]
+    async fn compile_action_normalizes_task_text_without_a_frame() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "task_text":"它是否依赖交付任务；然后评估 300 毫秒的影响",
+                    "context_mentions":["A 项目","芯片供应"]
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("normalize task text")
+            .output;
+        assert!(output.contains("Normalized task (S0)"), "{output}");
+        assert!(output.contains("芯片供应是否依赖交付任务"), "{output}");
+        assert!(output.contains("300 ms"), "{output}");
+        assert!(output.contains("\"resolutions\""), "{output}");
+        assert!(output.contains("\"substitutions\""), "{output}");
+        assert!(output.contains("\"language\": \"zh\""), "{output}");
+        assert!(
+            output.contains("ellipsis reconstruction"),
+            "warnings must name what S0 does not do: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compile_action_includes_normalized_task_with_a_frame() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "task_text":"它是否依赖交付任务",
+                    "context_mentions":["芯片供应"],
+                    "task_frame":{
+                        "intent":"attribution",
+                        "anchors":[
+                            {"role":"start","mention":"File"},
+                            {"role":"target","mention":"API"}
+                        ],
+                        "constraints":[{"expr":"relations defines","hard":true}]
+                    }
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("compile with normalization")
+            .output;
+        assert!(output.contains("Compiled TaskFrame"), "{output}");
+        assert!(output.contains("\"normalized_task\""), "{output}");
+        assert!(output.contains("芯片供应是否依赖交付任务"), "{output}");
     }
 
     #[tokio::test]

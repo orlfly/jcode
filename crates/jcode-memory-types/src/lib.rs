@@ -61,6 +61,12 @@ pub use plan_validation::{
     validate_and_repair, validate_physical_plan,
 };
 
+pub mod task_normalization;
+pub use task_normalization::{
+    MAX_NORMALIZED_SEGMENTS, NormalizedSegment, NormalizedTask, Resolution, Substitution,
+    normalize_task_text,
+};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
