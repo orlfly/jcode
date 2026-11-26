@@ -40,6 +40,80 @@ pub struct EngineeringSessionRecord {
     pub updated_at: String,
 }
 
+/// Maximum instance links returned per mention.
+pub const MAX_ENTITY_LINKS: usize = 5;
+
+/// One mention-to-instance link (deterministic lexical match).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineeringEntityLink {
+    pub session_id: String,
+    pub entity_id: String,
+    pub name: String,
+    pub class: String,
+    pub score: f32,
+    #[serde(default)]
+    pub signals: Vec<String>,
+}
+
+fn link_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() >= 3)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn score_entity(mention: &str, entity: &EngineeringEntity) -> Option<(f32, Vec<String>)> {
+    let mention_lower = mention.trim().to_lowercase();
+    if mention_lower.is_empty() {
+        return None;
+    }
+    let name_lower = entity.name.to_lowercase();
+    let id_lower = entity.id.to_lowercase();
+    if name_lower == mention_lower {
+        return Some((1.0, vec!["name exact".to_string()]));
+    }
+    let id_tail = id_lower.rsplit(':').next().unwrap_or(id_lower.as_str());
+    if id_lower == mention_lower || id_tail == mention_lower {
+        return Some((1.0, vec!["id exact".to_string()]));
+    }
+    if let Some(aliases) = entity.properties.get("aliases") {
+        let alias_hit = match aliases {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|alias| alias.to_lowercase() == mention_lower),
+            serde_json::Value::String(alias) => alias.to_lowercase() == mention_lower,
+            _ => false,
+        };
+        if alias_hit {
+            return Some((0.95, vec!["alias match".to_string()]));
+        }
+    }
+    let mention_tokens = link_tokens(&mention_lower);
+    let name_tokens = link_tokens(&name_lower);
+    if !mention_tokens.is_empty()
+        && !name_tokens.is_empty()
+        && (mention_tokens.is_subset(&name_tokens) || name_tokens.is_subset(&mention_tokens))
+    {
+        return Some((0.85, vec!["name token containment".to_string()]));
+    }
+    if mention_lower.len() >= 3 && id_tail.starts_with(&mention_lower) {
+        return Some((0.8, vec!["id prefix".to_string()]));
+    }
+    if !mention_tokens.is_empty() && !name_tokens.is_empty() {
+        let shared = mention_tokens.intersection(&name_tokens).count();
+        let union = mention_tokens.union(&name_tokens).count();
+        let overlap = shared as f32 / union as f32;
+        if overlap >= 0.5 {
+            return Some((
+                (0.5 + 0.25 * overlap).min(0.75),
+                vec![format!("name token overlap {overlap:.2}")],
+            ));
+        }
+    }
+    None
+}
+
 /// One anchored subgraph returned by [`EngineeringStore::recall_anchor`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineeringAnchorRecall {
@@ -835,6 +909,61 @@ impl EngineeringStore {
             out.push(row.context("read session row")?);
         }
         Ok(out)
+    }
+
+    /// Link a mention to concrete entities across stored session graphs.
+    ///
+    /// Deterministic lexical matching only: exact name/id, `aliases` property,
+    /// token containment, id prefix and name-token overlap. No embedding or
+    /// ANN lookup is applied, so results are ordered by lexical score and then
+    /// by name/session/id for stability.
+    pub fn link_entities(
+        &self,
+        mention: &str,
+        class_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EngineeringEntityLink>> {
+        if limit == 0 || mention.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_ENTITY_LINKS * 4);
+        let sessions = self.list_sessions(1024)?;
+        let mut links = Vec::new();
+        for session in sessions {
+            let Some(graph) = self.load_graph(&session.session_id)? else {
+                continue;
+            };
+            for entity in graph.entities.values() {
+                if entity.id == session.session_id && entity.class == CLASS_SESSION {
+                    continue;
+                }
+                if let Some(class_filter) = class_filter
+                    && entity.class != class_filter
+                {
+                    continue;
+                }
+                if let Some((score, signals)) = score_entity(mention, entity) {
+                    links.push(EngineeringEntityLink {
+                        session_id: session.session_id.clone(),
+                        entity_id: entity.id.clone(),
+                        name: entity.name.clone(),
+                        class: entity.class.clone(),
+                        score,
+                        signals,
+                    });
+                }
+            }
+        }
+        links.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+        });
+        links.truncate(limit);
+        Ok(links)
     }
 
     /// Delete one session graph. Returns whether a row existed.
@@ -2042,6 +2171,98 @@ mod tests {
             alignment_gap.next_actions[0].contains("completion_action=propose"),
             "{:?}",
             alignment_gap.next_actions
+        );
+    }
+
+    #[test]
+    fn links_mentions_to_entities_by_name_alias_and_class() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(
+            EngineeringEntity::new(CLASS_FILE, "file:src/lib.rs", "src/lib.rs")
+                .with_property("aliases", json!(["the main library", "lib"])),
+        );
+        graph.insert_entity(EngineeringEntity::new(
+            CLASS_COMMAND,
+            "command:cargo-test",
+            "cargo test",
+        ));
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:boom", "boom"));
+        store
+            .save_graph("session-link", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let exact = store
+            .link_entities("src/lib.rs", None, 5)
+            .expect("link exact");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].entity_id, "file:src/lib.rs");
+        assert!((exact[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(exact[0].signals, vec!["name exact".to_string()]);
+
+        let alias = store.link_entities("lib", None, 5).expect("link alias");
+        assert_eq!(alias[0].entity_id, "file:src/lib.rs");
+        assert!((alias[0].score - 0.95).abs() < 1e-6);
+        assert_eq!(alias[0].signals, vec!["alias match".to_string()]);
+
+        let token = store.link_entities("cargo", None, 5).expect("link token");
+        assert_eq!(token[0].entity_id, "command:cargo-test");
+        assert!((token[0].score - 0.85).abs() < 1e-6);
+
+        let filtered = store
+            .link_entities("boom", Some(CLASS_FILE), 5)
+            .expect("link filtered");
+        assert!(filtered.is_empty());
+        let unfiltered = store
+            .link_entities("boom", Some(CLASS_ERROR), 5)
+            .expect("link error class");
+        assert_eq!(unfiltered[0].entity_id, "error:boom");
+    }
+
+    #[test]
+    fn link_entities_orders_by_score_then_identity_and_respects_limit() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        for session in ["session-1", "session-2"] {
+            let mut graph = EngineeringGraph::new();
+            graph.insert_entity(EngineeringEntity::new(
+                CLASS_FILE,
+                "file:same.rs",
+                "same.rs",
+            ));
+            store
+                .save_graph(session, Some("/repo"), &graph)
+                .expect("save graph");
+        }
+        let links = store
+            .link_entities("same.rs", None, 1)
+            .expect("link limited");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].entity_id, "file:same.rs");
+
+        let all = store.link_entities("same.rs", None, 10).expect("link all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].session_id, "session-1");
+        assert_eq!(all[1].session_id, "session-2");
+        assert!(all[0].score >= all[1].score);
+    }
+
+    #[test]
+    fn link_entities_ignores_empty_mentions_and_zero_limits() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        store
+            .save_graph("session-empty", None, &sample_graph())
+            .expect("save graph");
+        assert!(
+            store
+                .link_entities("  ", None, 5)
+                .expect("blank")
+                .is_empty()
+        );
+        assert!(
+            store
+                .link_entities("src/lib.rs", None, 0)
+                .expect("zero")
+                .is_empty()
         );
     }
 }

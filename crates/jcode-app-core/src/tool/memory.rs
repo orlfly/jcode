@@ -1932,7 +1932,7 @@ impl Tool for MemoryTool {
                 if let Some(value) = input.task_frame.as_ref() {
                     let audit_scope =
                         Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
-                    let report = match crate::memory_types::task_frame::compile_task_frame_json(
+                    let mut report = match crate::memory_types::task_frame::compile_task_frame_json(
                         value,
                     ) {
                         Ok(report) => {
@@ -1961,6 +1961,27 @@ impl Tool for MemoryTool {
                         &mut grounding,
                         4,
                     );
+                    let entity_links = match EngineeringStore::open_default() {
+                        Ok(store) => {
+                            let mut map = serde_json::Map::new();
+                            for anchor in &report.frame.anchors {
+                                let links = store
+                                    .link_entities(&anchor.mention, None, 3)
+                                    .unwrap_or_default();
+                                map.insert(
+                                    anchor.mention.clone(),
+                                    serde_json::to_value(links)?,
+                                );
+                            }
+                            serde_json::Value::Object(map)
+                        }
+                        Err(error) => {
+                            report.warnings.push(format!(
+                                "entity link lookup unavailable: {error}"
+                            ));
+                            serde_json::Value::Object(serde_json::Map::new())
+                        }
+                    };
                     let start_concept = report
                         .frame
                         .anchors
@@ -2016,6 +2037,7 @@ impl Tool for MemoryTool {
                         "physical_plan": physical_plan,
                         "plan_validation": plan_validation,
                         "normalized_task": normalized_task,
+                        "entity_links": entity_links,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -4572,6 +4594,51 @@ mod tests {
         assert!(output.contains("Compiled TaskFrame"), "{output}");
         assert!(output.contains("\"normalized_task\""), "{output}");
         assert!(output.contains("芯片供应是否依赖交付任务"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn compile_action_links_anchor_mentions_to_stored_entities() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_FILE, EngineeringEntity, EngineeringGraph,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(
+            CLASS_FILE,
+            "file:src/lib.rs",
+            "src/lib.rs",
+        ));
+        store
+            .save_graph("session-links", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "task_frame":{
+                        "intent":"plan",
+                        "anchors":[
+                            {"role":"start","mention":"src/lib.rs"},
+                            {"role":"target","mention":"API"}
+                        ],
+                        "constraints":[]
+                    }
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("compile with entity links")
+            .output;
+        assert!(output.contains("\"entity_links\""), "{output}");
+        assert!(output.contains("file:src/lib.rs"), "{output}");
+        assert!(output.contains("session-links"), "{output}");
+        assert!(output.contains("name exact"), "{output}");
     }
 
     #[tokio::test]
