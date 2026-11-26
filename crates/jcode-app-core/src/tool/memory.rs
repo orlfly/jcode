@@ -1444,6 +1444,7 @@ impl Tool for MemoryTool {
                         include_plan,
                         &graph_kind,
                         include_ontology,
+                        query_budget_ms,
                     );
                 }
                 if graph_kind != "memory" {
@@ -2545,15 +2546,23 @@ impl MemoryTool {
         include_plan: bool,
         graph_kind: &str,
         include_ontology: bool,
+        query_budget_ms: Option<u64>,
     ) -> Result<ToolOutput> {
         if limit == 0 {
             return Ok(ToolOutput::new("No graph paths requested."));
         }
+        let deadline = query_budget_ms
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        let mut budget_exhausted = false;
         let allowed: Vec<&str> = relations.iter().map(String::as_str).collect();
         let mut hits = Vec::new();
         if graph_kind == "ontology" {
-            for from in froms {
+            'pairs: for from in froms {
                 for to in tos {
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        budget_exhausted = true;
+                        break 'pairs;
+                    }
                     hits.extend(
                         EngineeringStore::ontology_path_between_anchors(
                             from, to, depth, limit, &allowed,
@@ -2565,8 +2574,12 @@ impl MemoryTool {
         } else {
             let store = EngineeringStore::open_default()
                 .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
-            for from in froms {
+            'pairs: for from in froms {
                 for to in tos {
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        budget_exhausted = true;
+                        break 'pairs;
+                    }
                     hits.extend(
                         if include_ontology {
                             store.path_between_anchors_with_ontology(
@@ -2608,6 +2621,13 @@ impl MemoryTool {
                     "\n- relation allow-list: {} (unknown names match nothing)",
                     relations.join(", ")
                 ));
+            }
+            if budget_exhausted {
+                out.push_str(&format!(
+                    "\n- E07: query budget of {} ms exhausted before all anchor pairs were searched; increase query_budget_ms or narrow the anchors",
+                    query_budget_ms.unwrap_or(0)
+                ));
+                return Ok(ToolOutput::new(out));
             }
             if graph_kind == "ontology" {
                 let ontology =
@@ -2683,6 +2703,12 @@ impl MemoryTool {
             tos.join(", "),
             depth.clamp(1, 16)
         );
+        if budget_exhausted {
+            out.push_str(&format!(
+                "- warning: E07 query budget of {} ms exhausted; results may be partial\n",
+                query_budget_ms.unwrap_or(0)
+            ));
+        }
         let mut current_session = None;
         for (index, hit) in hits.iter().enumerate() {
             if graph_kind != "ontology"
@@ -4019,6 +4045,46 @@ mod tests {
             "{}",
             output.output
         );
+    }
+
+    #[tokio::test]
+    async fn path_action_reports_e07_for_engineering_budget() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_TASK, EngineeringEntity, EngineeringGraph, EngineeringRelation, REL_DEPENDS_ON,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:a", "a"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_TASK, "task:b", "b"));
+        graph.insert_relation(EngineeringRelation::new("task:a", REL_DEPENDS_ON, "task:b"));
+        store
+            .save_graph("session-budget", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let output = MemoryTool::new()
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"task:a",
+                    "to_id":"task:b",
+                    "depth":2,
+                    "query_budget_ms":0
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("budget path")
+            .output;
+        assert!(output.contains("No engineering path"), "{output}");
+        assert!(output.contains("E07"), "{output}");
+        assert!(output.contains("query_budget_ms"), "{output}");
+        assert!(!output.contains("E03"), "{output}");
+        assert!(!output.contains("E09"), "{output}");
     }
 
     #[tokio::test]
