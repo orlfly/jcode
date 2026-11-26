@@ -1948,10 +1948,15 @@ impl Tool for MemoryTool {
                         .first()
                         .map(|candidate| candidate.concepts.clone())
                         .unwrap_or_default();
-                    let physical_plan = crate::memory_types::compile_physical_plan(
+                    let compiled_plan = crate::memory_types::compile_physical_plan(
                         &report.path_query,
                         &concept_path,
                     );
+                    let (physical_plan, plan_validation) =
+                        crate::memory_types::validate_and_repair(
+                            &compiled_plan,
+                            &report.path_query,
+                        );
                     let payload = serde_json::json!({
                         "task_frame": report.frame,
                         "path_query": report.path_query,
@@ -1960,6 +1965,7 @@ impl Tool for MemoryTool {
                         "grounding": grounding,
                         "waypoint_candidates": waypoint_candidates,
                         "physical_plan": physical_plan,
+                        "plan_validation": plan_validation,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -1997,12 +2003,15 @@ impl Tool for MemoryTool {
                             ));
                         }
                     };
-                    let physical_plan =
+                    let compiled_plan =
                         crate::memory_types::compile_physical_plan(&report.query, &[]);
+                    let (physical_plan, plan_validation) =
+                        crate::memory_types::validate_and_repair(&compiled_plan, &report.query);
                     return Ok(ToolOutput::new(format!(
-                        "Compiled PathQuery from JSON:\n{}\nPhysical plan:\n{}",
+                        "Compiled PathQuery from JSON:\n{}\nPhysical plan:\n{}\nPlan validation:\n{}",
                         serde_json::to_string_pretty(&report)?,
-                        serde_json::to_string_pretty(&physical_plan)?
+                        serde_json::to_string_pretty(&physical_plan)?,
+                        serde_json::to_string_pretty(&plan_validation)?
                     )));
                 }
                 let text = input
@@ -4215,6 +4224,8 @@ mod tests {
         assert!(output.contains("\"physical_plan\""), "{output}");
         assert!(output.contains("ontology_probe"), "{output}");
         assert!(output.contains("instance_search"), "{output}");
+        assert!(output.contains("\"plan_validation\""), "{output}");
+        assert!(output.contains("\"valid\": true"), "{output}");
 
         let invalid = tool
             .execute(
@@ -4399,6 +4410,7 @@ mod tests {
             .output;
         assert!(output.contains("Compiled PathQuery from JSON"), "{output}");
         assert!(output.contains("Physical plan:"), "{output}");
+        assert!(output.contains("Plan validation:"), "{output}");
         assert!(output.contains("\"instance_search\""), "{output}");
         assert!(output.contains("\"depth\": 2"), "{output}");
         assert!(output.contains("\"defines\""), "{output}");

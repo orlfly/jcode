@@ -55,6 +55,12 @@ pub use waypoint::{BEAM_WIDTH, MAX_WAYPOINTS, WaypointCandidate, generate_waypoi
 pub mod physical_plan;
 pub use physical_plan::{PhysicalPlan, PlanStage, StageKind, compile_physical_plan};
 
+pub mod plan_validation;
+pub use plan_validation::{
+    MAX_PHYSICAL_DEPTH, MAX_REPAIR_ATTEMPTS, PlanAudit, PlanFinding, PlanRepair,
+    validate_and_repair, validate_physical_plan,
+};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
