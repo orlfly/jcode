@@ -67,6 +67,9 @@ struct MemoryInput {
     /// For action=compile: model-filled PathQuery JSON.
     #[serde(default)]
     query_json: Option<serde_json::Value>,
+    /// For action=compile: model-filled TaskFrame JSON (stage S1).
+    #[serde(default)]
+    task_frame: Option<serde_json::Value>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -290,6 +293,10 @@ impl Tool for MemoryTool {
                 "query_json": {
                     "type": "object",
                     "description": "For action=compile: model-filled PathQuery JSON."
+                },
+                "task_frame": {
+                    "type": "object",
+                    "description": "For action=compile: model-filled TaskFrame JSON."
                 },
                 "id": {
                     "type": "string",
@@ -1883,6 +1890,29 @@ impl Tool for MemoryTool {
                 Ok(ToolOutput::new(out))
             }
             "compile" => {
+                if let Some(value) = input.task_frame.as_ref() {
+                    let audit_scope =
+                        Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
+                    let report = match crate::memory_types::task_frame::compile_task_frame_json(
+                        value,
+                    ) {
+                        Ok(report) => {
+                            manager.record_compile_audit(audit_scope, true, Vec::new());
+                            report
+                        }
+                        Err(errors) => {
+                            manager.record_compile_audit(audit_scope, false, errors.clone());
+                            return Err(anyhow::anyhow!(
+                                "task frame compile failed: {}",
+                                errors.join("; ")
+                            ));
+                        }
+                    };
+                    return Ok(ToolOutput::new(format!(
+                        "Compiled TaskFrame + PathQuery:\n{}",
+                        serde_json::to_string_pretty(&report)?
+                    )));
+                }
                 if let Some(value) = input.query_json.as_ref() {
                     let audit_scope =
                         Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
@@ -4085,6 +4115,54 @@ mod tests {
         assert!(output.contains("query_budget_ms"), "{output}");
         assert!(!output.contains("E03"), "{output}");
         assert!(!output.contains("E09"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn compile_action_validates_task_frame_json() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "task_frame": {
+                        "task_id":"TASK-9",
+                        "intent":"attribution",
+                        "anchors":[
+                            {"role":"start","mention":"build failure"},
+                            {"role":"target","mention":"root cause"}
+                        ],
+                        "constraints":[{"expr":"within 2 weeks","hard":true}],
+                        "scope_hint":["global"],
+                        "output_type":"path_list"
+                    }
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("task frame compile")
+            .output;
+        assert!(
+            output.contains("Compiled TaskFrame + PathQuery"),
+            "{output}"
+        );
+        assert!(output.contains("\"attribution\""), "{output}");
+        assert!(output.contains("\"max_confidence\""), "{output}");
+        assert!(output.contains("deferred to S4/S6"), "{output}");
+        assert!(output.contains("\"limit\": 5"), "{output}");
+
+        let invalid = tool
+            .execute(
+                json!({
+                    "action":"compile",
+                    "task_frame": {"intent":"teleport","anchors":[]}
+                }),
+                test_ctx(None),
+            )
+            .await;
+        assert!(invalid.is_err(), "{invalid:?}");
     }
 
     #[tokio::test]

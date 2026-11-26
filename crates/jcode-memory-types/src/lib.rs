@@ -37,6 +37,12 @@ pub use path_query::{
     PathQueryScope, compile_path_query_json,
 };
 
+pub mod task_frame;
+pub use task_frame::{
+    TaskAnchor, TaskAnchorRole, TaskConstraint, TaskFrame, TaskFrameCompileReport, TaskIntent,
+    compile_task_frame_json,
+};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
