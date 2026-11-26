@@ -19,6 +19,7 @@ use jcode_memory_types::engineering_ontology::{
     CLASS_SESSION, EngineeringEntity, EngineeringGraph, EngineeringPath, EngineeringProvenance,
     EngineeringRelation, default_engineering_ontology,
 };
+use jcode_memory_types::grounding::ground_mention;
 use jcode_memory_types::{
     CompletionEdge, CompletionPromotionError, CompletionWriteReport, PathPlan, PathQuality,
     build_path_plan,
@@ -204,6 +205,13 @@ pub struct EngineeringGapReport {
     /// Relations of the diagnostic-only path found after relaxing depth or the
     /// relation allow-list. Empty when no relaxation recovers a path.
     pub path_relations: Vec<String>,
+    /// Best ontology concept for an unresolved (E01) anchor, used to tell the
+    /// caller which class they probably meant. Not applied to any query.
+    pub missing_class: Option<String>,
+    pub missing_class_score: Option<f32>,
+    /// Reserved for LLM attribution. Always `None`: the LLM semantic probe is
+    /// not implemented, so no attribution is claimed.
+    pub llm_attribution: Option<String>,
     pub next_actions: Vec<String>,
 }
 
@@ -666,6 +674,31 @@ impl EngineeringStore {
             }
         }
 
+        let mut missing_class = None;
+        let mut missing_class_score = None;
+        if diagnosis.iter().any(|code| code == "E01") {
+            let ontology = default_engineering_ontology();
+            for anchor in [from_anchor, to_anchor] {
+                if self.anchor_rows(anchor)?.is_empty() {
+                    let grounding = ground_mention(&ontology, anchor);
+                    if let Some(candidate) = grounding
+                        .accepted
+                        .clone()
+                        .or_else(|| grounding.candidates.first().cloned())
+                    {
+                        if missing_class.is_none() {
+                            missing_class = Some(candidate.concept_id.clone());
+                            missing_class_score = Some(candidate.score);
+                        }
+                        next_actions.push(format!(
+                            "E01: anchor '{anchor}' looks like concept '{}' (score {:.2}); ground the instance first, then retry",
+                            candidate.concept_id, candidate.score
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut alignment_candidates = Vec::new();
         let mut path_relations = Vec::new();
         if diagnosis.is_empty() {
@@ -816,6 +849,9 @@ impl EngineeringStore {
             shared_sessions,
             alignment_candidates,
             path_relations,
+            missing_class,
+            missing_class_score,
+            llm_attribution: None,
             next_actions,
         })
     }
@@ -2129,6 +2165,26 @@ mod tests {
             store
                 .promote_completion_edge("session-completion", &report.accepted[0], missing)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn gap_diagnosis_suggests_a_missing_class_for_unresolved_anchor() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let report = store
+            .diagnose_path_gap("Files", "missing:to", 4, &[])
+            .expect("diagnose unresolved mention");
+        assert!(report.diagnosis.contains(&"E01".to_string()), "{report:?}");
+        assert_eq!(report.missing_class.as_deref(), Some("file"), "{report:?}");
+        assert!(report.missing_class_score.unwrap_or(0.0) > 0.0);
+        assert!(report.llm_attribution.is_none());
+        assert!(
+            report
+                .next_actions
+                .iter()
+                .any(|action| action.contains("looks like concept")),
+            "{:?}",
+            report.next_actions
         );
     }
 

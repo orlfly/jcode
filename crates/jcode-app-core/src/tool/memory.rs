@@ -2991,6 +2991,13 @@ impl MemoryTool {
                         for action in &report.next_actions {
                             out.push_str(&format!("\n  next: {action}"));
                         }
+                        if let Some(class) = report.missing_class.as_deref() {
+                            out.push_str(&format!(
+                                "\n  missing class hint: {} (score {:.2}, suggestion only)",
+                                class,
+                                report.missing_class_score.unwrap_or(0.0)
+                            ));
+                        }
                         for candidate in &report.alignment_candidates {
                             out.push_str(&format!(
                                 "\n  alignment hint: {} [{}] <-> {} [{}], class {}, score {:.2}",
@@ -4184,6 +4191,31 @@ mod tests {
         assert!(audited.contains("\"audit\""), "{audited}");
         assert!(audited.contains("\"executable\""), "{audited}");
         assert!(audited.contains("\"path_index\""), "{audited}");
+    }
+
+    #[tokio::test]
+    async fn path_action_reports_missing_class_hint_for_unresolved_anchor() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"Files",
+                    "to_id":"missing:to",
+                    "depth":2
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("missing class hint")
+            .output;
+        assert!(output.contains("E01"), "{output}");
+        assert!(output.contains("missing class hint: file"), "{output}");
+        assert!(output.contains("suggestion only"), "{output}");
     }
 
     #[tokio::test]
