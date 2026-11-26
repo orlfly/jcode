@@ -509,21 +509,48 @@ impl EngineeringStore {
 
         let mut diagnosis = Vec::new();
         let mut next_actions = Vec::new();
+        let concept_graph = if from_rows.is_empty() || to_rows.is_empty() {
+            Some(EngineeringGraph::concept_graph(
+                &default_engineering_ontology(),
+            ))
+        } else {
+            None
+        };
         if from_rows.is_empty() {
-            if !diagnosis.contains(&"E01".to_string()) {
-                diagnosis.push("E01".to_string());
+            let is_concept = concept_graph
+                .as_ref()
+                .is_some_and(|graph| graph.resolve_concept_anchor(from_anchor).is_some());
+            let code = if is_concept { "E08" } else { "E01" };
+            if !diagnosis.contains(&code.to_string()) {
+                diagnosis.push(code.to_string());
             }
-            next_actions.push(format!(
-                "E01: start anchor '{from_anchor}' is not in any engineering graph; check the id or recall it first"
-            ));
+            if is_concept {
+                next_actions.push(format!(
+                    "E08: start anchor '{from_anchor}' is an ontology concept, not an engineering entity; re-run with graph=ontology"
+                ));
+            } else {
+                next_actions.push(format!(
+                    "E01: start anchor '{from_anchor}' is not in any engineering graph; check the id or recall it first"
+                ));
+            }
         }
         if to_rows.is_empty() {
-            if !diagnosis.contains(&"E01".to_string()) {
-                diagnosis.push("E01".to_string());
+            let is_concept = concept_graph
+                .as_ref()
+                .is_some_and(|graph| graph.resolve_concept_anchor(to_anchor).is_some());
+            let code = if is_concept { "E08" } else { "E01" };
+            if !diagnosis.contains(&code.to_string()) {
+                diagnosis.push(code.to_string());
             }
-            next_actions.push(format!(
-                "E01: goal anchor '{to_anchor}' is not in any engineering graph; check the id or recall it first"
-            ));
+            if is_concept {
+                next_actions.push(format!(
+                    "E08: goal anchor '{to_anchor}' is an ontology concept, not an engineering entity; re-run with graph=ontology"
+                ));
+            } else {
+                next_actions.push(format!(
+                    "E01: goal anchor '{to_anchor}' is not in any engineering graph; check the id or recall it first"
+                ));
+            }
         }
 
         let mut alignment_candidates = Vec::new();
@@ -1886,6 +1913,17 @@ mod tests {
         assert_eq!(unresolved.diagnosis, vec!["E01".to_string()]);
         assert_eq!(unresolved.next_actions.len(), 2);
         assert!(unresolved.alignment_candidates.is_empty());
+
+        let layer_gap = store
+            .diagnose_path_gap("File", "API", 4, &[])
+            .expect("diagnose wrong layer");
+        assert_eq!(layer_gap.diagnosis, vec!["E08".to_string()]);
+        assert_eq!(layer_gap.next_actions.len(), 2);
+        assert!(
+            layer_gap.next_actions[0].contains("graph=ontology"),
+            "{:?}",
+            layer_gap.next_actions
+        );
 
         let mut chain = EngineeringGraph::new();
         for id in ["task:a", "task:b", "task:c"] {
