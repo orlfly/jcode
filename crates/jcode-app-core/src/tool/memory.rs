@@ -2964,6 +2964,32 @@ impl MemoryTool {
                                 candidate.score
                             ));
                         }
+                        match store.shared_neighbor_candidates(from, to, 3) {
+                            Ok(candidates) => {
+                                for candidate in candidates {
+                                    out.push_str(&format!(
+                                        "\n  bridge candidate: {} --{}--> {} via {} (score {:.2}, evidence {})",
+                                        candidate.from_entity,
+                                        candidate.relation,
+                                        candidate.to_entity,
+                                        candidate.via_entity,
+                                        candidate.score,
+                                        candidate.evidence.join(", ")
+                                    ));
+                                    out.push_str(&format!(
+                                        "\n    next: action=completion completion_action=propose from_id={} to_id={} relation={} (candidate only; requires non-LLM evidence before promotion)",
+                                        candidate.from_entity,
+                                        candidate.to_entity,
+                                        candidate.relation
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                out.push_str(&format!(
+                                    "\n  bridge candidates: unavailable ({error})"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -4097,6 +4123,49 @@ mod tests {
         );
         assert!(observed.contains("\"quality\""), "{observed}");
         assert!(observed.contains("\"diagnostics\""), "{observed}");
+    }
+
+    #[tokio::test]
+    async fn path_action_reports_shared_neighbor_bridge_candidates() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_FILE, CLASS_SYMBOL, EngineeringEntity, EngineeringGraph, EngineeringRelation,
+            REL_DEFINES,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_SYMBOL, "symbol:c", "c"));
+        graph.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:a"));
+        graph.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:b"));
+        store
+            .save_graph("session-bridge", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let tool = MemoryTool::new();
+        let output = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"file:a",
+                    "to_id":"file:b",
+                    "depth":2
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("bridge candidates")
+            .output;
+        assert!(output.contains("No engineering path found"), "{output}");
+        assert!(output.contains("bridge candidate"), "{output}");
+        assert!(output.contains("via symbol:c"), "{output}");
+        assert!(output.contains("completion_action=propose"), "{output}");
+        assert!(output.contains("requires non-LLM evidence"), "{output}");
     }
 
     #[tokio::test]

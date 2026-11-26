@@ -114,6 +114,45 @@ fn score_entity(mention: &str, entity: &EngineeringEntity) -> Option<(f32, Vec<S
     None
 }
 
+/// Maximum deterministic L4 bridge candidates returned for one anchor pair.
+pub const MAX_BRIDGE_CANDIDATES: usize = 5;
+
+/// A shared-neighbour bridge candidate (design 4.4.2 L4, deterministic part).
+///
+/// This is a *candidate*, not an edge: it must go through the completion ladder
+/// and human review before anything is written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineeringBridgeCandidate {
+    pub session_id: String,
+    pub from_entity: String,
+    pub to_entity: String,
+    pub via_entity: String,
+    pub relation: String,
+    pub score: f32,
+    pub evidence: Vec<String>,
+}
+
+fn neighbours_of(graph: &EngineeringGraph, id: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for relation in graph.relations.values() {
+        if relation.from == id {
+            out.push((
+                relation.to.clone(),
+                relation.id.clone(),
+                relation.relation.clone(),
+            ));
+        } else if relation.to == id {
+            out.push((
+                relation.from.clone(),
+                relation.id.clone(),
+                relation.relation.clone(),
+            ));
+        }
+    }
+    out.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    out
+}
+
 /// One anchored subgraph returned by [`EngineeringStore::recall_anchor`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineeringAnchorRecall {
@@ -964,6 +1003,67 @@ impl EngineeringStore {
         });
         links.truncate(limit);
         Ok(links)
+    }
+
+    /// Propose bridge candidates between two entity ids that share a neighbour.
+    ///
+    /// Deterministic L4 shared-neighbour probe: for every common neighbour `w`
+    /// of `from_entity` and `to_entity`, emit a candidate relation from the
+    /// `from` side with the neighbour's relation name and both edge ids as
+    /// evidence. Candidates are hypotheses for the completion ladder, never
+    /// written edges.
+    pub fn shared_neighbor_candidates(
+        &self,
+        from_entity: &str,
+        to_entity: &str,
+        limit: usize,
+    ) -> Result<Vec<EngineeringBridgeCandidate>> {
+        if limit == 0 || from_entity == to_entity {
+            return Ok(Vec::new());
+        }
+        let mut candidates: Vec<EngineeringBridgeCandidate> = Vec::new();
+        for session in self.list_sessions(1024)? {
+            let Some(graph) = self.load_graph(&session.session_id)? else {
+                continue;
+            };
+            let from_neighbours = neighbours_of(&graph, from_entity);
+            let to_neighbours = neighbours_of(&graph, to_entity);
+            let mut seen = BTreeSet::new();
+            for (via, from_relation_id, relation) in &from_neighbours {
+                if via == from_entity || via == to_entity {
+                    continue;
+                }
+                let Some((_, to_relation_id, _)) = to_neighbours
+                    .iter()
+                    .find(|(neighbour, _, _)| neighbour == via)
+                else {
+                    continue;
+                };
+                if !seen.insert(via.clone()) {
+                    continue;
+                }
+                let degree = neighbours_of(&graph, via).len() as f32;
+                let score = 1.0 / (1.0 + degree);
+                candidates.push(EngineeringBridgeCandidate {
+                    session_id: session.session_id.clone(),
+                    from_entity: from_entity.to_string(),
+                    to_entity: to_entity.to_string(),
+                    via_entity: via.clone(),
+                    relation: relation.clone(),
+                    score,
+                    evidence: vec![from_relation_id.clone(), to_relation_id.clone()],
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.via_entity.cmp(&right.via_entity))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        candidates.truncate(limit.min(MAX_BRIDGE_CANDIDATES));
+        Ok(candidates)
     }
 
     /// Delete one session graph. Returns whether a row existed.
@@ -2244,6 +2344,84 @@ mod tests {
         assert_eq!(all[0].session_id, "session-1");
         assert_eq!(all[1].session_id, "session-2");
         assert!(all[0].score >= all[1].score);
+    }
+
+    #[test]
+    fn shared_neighbor_candidates_bridge_two_entities() {
+        use jcode_memory_types::engineering_ontology::CLASS_SYMBOL;
+
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_SYMBOL, "symbol:c", "c"));
+        graph.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:a"));
+        graph.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:b"));
+        store
+            .save_graph("session-bridge", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let candidates = store
+            .shared_neighbor_candidates("file:a", "file:b", 5)
+            .expect("bridge candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.via_entity, "symbol:c");
+        assert_eq!(candidate.relation, REL_DEFINES);
+        assert_eq!(candidate.evidence.len(), 2);
+        assert!((candidate.score - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(candidate.session_id, "session-bridge");
+
+        assert!(
+            store
+                .shared_neighbor_candidates("file:a", "file:a", 5)
+                .expect("same entity")
+                .is_empty()
+        );
+        assert!(
+            store
+                .shared_neighbor_candidates("file:a", "file:b", 0)
+                .expect("zero limit")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_neighbor_candidates_rank_lower_degree_bridges_higher() {
+        use jcode_memory_types::engineering_ontology::CLASS_SYMBOL;
+
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut sparse = EngineeringGraph::new();
+        sparse.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        sparse.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        sparse.insert_entity(EngineeringEntity::new(CLASS_SYMBOL, "symbol:c", "c"));
+        sparse.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:a"));
+        sparse.insert_relation(EngineeringRelation::new("symbol:c", REL_DEFINES, "file:b"));
+        store
+            .save_graph("session-sparse", Some("/repo"), &sparse)
+            .expect("save sparse");
+
+        let mut crowded = EngineeringGraph::new();
+        crowded.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        crowded.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        crowded.insert_entity(EngineeringEntity::new(CLASS_SYMBOL, "symbol:hub", "hub"));
+        for extra in ["file:e1", "file:e2"] {
+            crowded.insert_entity(EngineeringEntity::new(CLASS_FILE, extra, extra));
+        }
+        for target in ["file:a", "file:b", "file:e1", "file:e2"] {
+            crowded.insert_relation(EngineeringRelation::new("symbol:hub", REL_CONTAINS, target));
+        }
+        store
+            .save_graph("session-crowded", Some("/repo"), &crowded)
+            .expect("save crowded");
+
+        let candidates = store
+            .shared_neighbor_candidates("file:a", "file:b", 5)
+            .expect("bridge candidates");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].session_id, "session-sparse");
+        assert_eq!(candidates[1].session_id, "session-crowded");
+        assert!(candidates[0].score > candidates[1].score);
     }
 
     #[test]
