@@ -1912,12 +1912,45 @@ impl Tool for MemoryTool {
                         &crate::memory_types::engineering_ontology::default_engineering_ontology(),
                         &report.frame,
                     );
+                    let start_concept = report
+                        .frame
+                        .anchors
+                        .iter()
+                        .zip(grounding.anchors.iter())
+                        .find(|(anchor, _)| {
+                            anchor.role == crate::memory_types::TaskAnchorRole::Start
+                        })
+                        .and_then(|(_, anchor)| {
+                            anchor.accepted.as_ref().map(|c| c.concept_id.clone())
+                        });
+                    let goal_concept = report
+                        .frame
+                        .anchors
+                        .iter()
+                        .zip(grounding.anchors.iter())
+                        .find(|(anchor, _)| {
+                            anchor.role == crate::memory_types::TaskAnchorRole::Target
+                        })
+                        .and_then(|(_, anchor)| {
+                            anchor.accepted.as_ref().map(|c| c.concept_id.clone())
+                        });
+                    let waypoint_candidates = match (start_concept, goal_concept) {
+                        (Some(start), Some(goal)) => {
+                            crate::memory_types::generate_waypoint_candidates(
+                                &crate::memory_types::engineering_ontology::default_engineering_ontology(),
+                                &start,
+                                &goal,
+                            )
+                        }
+                        _ => Vec::new(),
+                    };
                     let payload = serde_json::json!({
                         "task_frame": report.frame,
                         "path_query": report.path_query,
                         "warnings": report.warnings,
                         "dropped_fields": report.dropped_fields,
                         "grounding": grounding,
+                        "waypoint_candidates": waypoint_candidates,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -4142,7 +4175,7 @@ mod tests {
                         "task_id":"TASK-9",
                         "intent":"attribution",
                         "anchors":[
-                            {"role":"start","mention":"build failure"},
+                            {"role":"start","mention":"File"},
                             {"role":"target","mention":"API"}
                         ],
                         "constraints":[{"expr":"within 2 weeks","hard":true}],
@@ -4165,6 +4198,8 @@ mod tests {
         assert!(output.contains("\"limit\": 5"), "{output}");
         assert!(output.contains("\"grounding\""), "{output}");
         assert!(output.contains("\"grounded\": 2"), "{output}");
+        assert!(output.contains("\"waypoint_candidates\""), "{output}");
+        assert!(output.contains("\"defines\""), "{output}");
 
         let invalid = tool
             .execute(

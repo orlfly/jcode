@@ -49,6 +49,9 @@ pub use grounding::{
     GROUNDING_MAX_CANDIDATES, GroundingStatus, MentionGrounding, ground_mention, ground_task_frame,
 };
 
+pub mod waypoint;
+pub use waypoint::{BEAM_WIDTH, MAX_WAYPOINTS, WaypointCandidate, generate_waypoint_candidates};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
