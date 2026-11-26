@@ -1944,6 +1944,14 @@ impl Tool for MemoryTool {
                         }
                         _ => Vec::new(),
                     };
+                    let concept_path: Vec<String> = waypoint_candidates
+                        .first()
+                        .map(|candidate| candidate.concepts.clone())
+                        .unwrap_or_default();
+                    let physical_plan = crate::memory_types::compile_physical_plan(
+                        &report.path_query,
+                        &concept_path,
+                    );
                     let payload = serde_json::json!({
                         "task_frame": report.frame,
                         "path_query": report.path_query,
@@ -1951,6 +1959,7 @@ impl Tool for MemoryTool {
                         "dropped_fields": report.dropped_fields,
                         "grounding": grounding,
                         "waypoint_candidates": waypoint_candidates,
+                        "physical_plan": physical_plan,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -1988,9 +1997,12 @@ impl Tool for MemoryTool {
                             ));
                         }
                     };
+                    let physical_plan =
+                        crate::memory_types::compile_physical_plan(&report.query, &[]);
                     return Ok(ToolOutput::new(format!(
-                        "Compiled PathQuery from JSON:\n{}",
-                        serde_json::to_string_pretty(&report)?
+                        "Compiled PathQuery from JSON:\n{}\nPhysical plan:\n{}",
+                        serde_json::to_string_pretty(&report)?,
+                        serde_json::to_string_pretty(&physical_plan)?
                     )));
                 }
                 let text = input
@@ -4200,6 +4212,9 @@ mod tests {
         assert!(output.contains("\"grounded\": 2"), "{output}");
         assert!(output.contains("\"waypoint_candidates\""), "{output}");
         assert!(output.contains("\"defines\""), "{output}");
+        assert!(output.contains("\"physical_plan\""), "{output}");
+        assert!(output.contains("ontology_probe"), "{output}");
+        assert!(output.contains("instance_search"), "{output}");
 
         let invalid = tool
             .execute(
@@ -4383,6 +4398,8 @@ mod tests {
             .expect("compile model JSON")
             .output;
         assert!(output.contains("Compiled PathQuery from JSON"), "{output}");
+        assert!(output.contains("Physical plan:"), "{output}");
+        assert!(output.contains("\"instance_search\""), "{output}");
         assert!(output.contains("\"depth\": 2"), "{output}");
         assert!(output.contains("\"defines\""), "{output}");
         assert!(

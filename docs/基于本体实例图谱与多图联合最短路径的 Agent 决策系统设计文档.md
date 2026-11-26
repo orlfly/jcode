@@ -1690,6 +1690,8 @@ A* 的可采纳性在语义图上无法严格保证，因此工程上采用有�
 
 **性能交付物：模板必须附索引（v1.16，实测）**：把四类模板（单跳、双跳 join、双向 UNION、变长递归）在 DBP15K 的 39 万条边上落地执行，与 Python 图引擎 **120/120 逐元素相等**，延迟 0.01–0.02 ms；但去掉 `(s,r)` 索引后双跳从 0.011 ms 涨到 **24.6 ms（2,223 倍）**，`EXPLAIN QUERY PLAN` 显示的是两次 `SEARCH ... USING INDEX`。因此 4.3.3 的交付物不是"模板集合"，而是**「模板 + 每个模板所需索引 + 索引失效告警」三件套**；新模板上线前必须跑一次执行计划检查，否则正确性没问题、性能会静默崩塌。
 
+**实现（S5 物理计划 IR）**：`jcode-memory-types::physical_plan` 提供 `compile_physical_plan`，`action=compile` 的 `query_json` 与 `task_frame` 两条入口都会输出 `physical_plan`（`task_frame` 取 S4 首个航点候选的概念链）。产物是**结构化阶段列表**而非 Cypher/nGQL 文本：`ontology_probe(concepts)` → `instance_search(anchors, depth, relations)` → `project_enrichment(scope, entities)` → `fusion(objective, limit, include_hypotheses, min_confidence)`，所有值放在参数 map 里由执行器绑定，因此不存在字符串拼接路径。尚未接地到实体 ID 的阶段标 `deferred: true` 并写明原因（`instance_search` 的锚点仍是 mention，`project_enrichment` 的实体来自实例搜索）；多起点/多终点只展开第一对并在 `note` 里显式提示，不静默丢锚点。约束缺省补 `depth=4`、`scope=project`、`objective=min_cost`、`limit=3`。本层不执行查询、不生成 DDL/索引，4.3.3 的「模板 + 索引 + 索引失效告警」三件套中后两件仍需在执行层落地。
+
 #### 4.3.4 LLM 输出契约与防注入
 
 LLM 输出必须满足以下契约，否则编译器拒绝执行：
