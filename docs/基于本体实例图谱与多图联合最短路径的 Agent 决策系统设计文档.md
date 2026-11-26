@@ -2067,7 +2067,9 @@ $$
 - `promote` 要求非 LLM 证据（`is_llm_source` 拦截 `llm:*`/`model:*`/`completion:llm` 且证据置信度 ≥0.7），晋升后 `hypothesis=false`、TTL 清除、旧来源压入 `derived_from`。
 - `completion_debt` 与假设边清单可从 `action=completion completion_action=list` 读取；工具写入/晋升都保留 session 的 `working_dir`。
 
-**尚未实现**：自动候选生成（L3 文档抽取、L4 近邻拼接对工程图的候选产出）仍未接线，当前由调用方显式 propose；4.6 看板尚未消费 `completion_debt`。
+**看板与治理**：`action=quality` 在内存图质量报告后追加「Engineering completion debt (recent 10 sessions)」段：逐 session 给出 `hypothesis/edge`、`debt`、`expiring within 7d`，`debt > 0.10`（`MAX_ENGINEERING_COMPLETION_DEBT`）时标记需治理，并提示 promote/purge/review。数据来自 `EngineeringStore::completion_debt_by_session`，只统计仍有待确认边的 session。
+
+**尚未实现**：自动候选生成（L3 文档抽取、L4 近邻拼接对工程图的候选产出）仍未接线，当前由调用方显式 propose。
 
 ```cypher
 MERGE (u:Entity {id: $uid})

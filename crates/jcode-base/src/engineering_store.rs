@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -93,6 +93,21 @@ pub struct EngineeringGapReport {
     pub path_relations: Vec<String>,
     pub next_actions: Vec<String>,
 }
+
+/// Completion debt for one engineering session (design 4.4.5/4.6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineeringCompletionDebt {
+    pub session_id: String,
+    pub working_dir: Option<String>,
+    pub edge_count: usize,
+    pub hypothesis_edges: usize,
+    pub debt: f32,
+    /// Hypothesis edges expiring within the next 7 days.
+    pub expiring_soon: usize,
+}
+
+/// Governance threshold from design 4.4.5: debt above this needs cleanup.
+pub const MAX_ENGINEERING_COMPLETION_DEBT: f32 = 0.10;
 
 /// One session selected by the engineering retention policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -663,6 +678,40 @@ impl EngineeringStore {
             path_relations,
             next_actions,
         })
+    }
+
+    /// Completion debt per session that still carries hypothesis edges.
+    ///
+    /// Sessions without pending candidates are omitted so the quality board
+    /// stays short; the scan itself is bounded by `limit` recent sessions.
+    pub fn completion_debt_by_session(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<EngineeringCompletionDebt>> {
+        let soon = Utc::now() + Duration::days(7);
+        let mut out = Vec::new();
+        for record in self.list_sessions(limit)? {
+            let Some(graph) = self.load_graph(&record.session_id)? else {
+                continue;
+            };
+            let hypothesis: Vec<&EngineeringRelation> = graph.hypothesis_edges();
+            if hypothesis.is_empty() {
+                continue;
+            }
+            let expiring_soon = hypothesis
+                .iter()
+                .filter(|edge| edge.valid_to.is_some_and(|until| until <= soon))
+                .count();
+            out.push(EngineeringCompletionDebt {
+                session_id: record.session_id,
+                working_dir: record.working_dir,
+                edge_count: graph.relations.len(),
+                hypothesis_edges: hypothesis.len(),
+                debt: graph.completion_debt(),
+                expiring_soon,
+            });
+        }
+        Ok(out)
     }
 
     /// `(session_id, entity_id, class, name)` rows matching an id or display name.
@@ -1776,6 +1825,16 @@ mod tests {
             jcode_memory_types::PlanActionType::Verify
         );
 
+        let debt_rows = store
+            .completion_debt_by_session(10)
+            .expect("completion debt");
+        assert_eq!(debt_rows.len(), 1, "{debt_rows:?}");
+        assert_eq!(debt_rows[0].session_id, "session-completion");
+        assert_eq!(debt_rows[0].hypothesis_edges, 1);
+        assert_eq!(debt_rows[0].edge_count, 3);
+        assert_eq!(debt_rows[0].expiring_soon, 0);
+        assert!(debt_rows[0].debt > MAX_ENGINEERING_COMPLETION_DEBT);
+
         let sessions = store.list_sessions(5).expect("sessions");
         assert_eq!(sessions[0].working_dir.as_deref(), Some("/repo"));
 
@@ -1801,6 +1860,12 @@ mod tests {
                 .has(jcode_memory_types::PathQualityFlag::HypothesizedEdge),
             "{:?}",
             asserted_hits[0].quality
+        );
+        assert!(
+            store
+                .completion_debt_by_session(10)
+                .expect("debt after promotion")
+                .is_empty()
         );
 
         let missing = EngineeringProvenance::new("human:review");

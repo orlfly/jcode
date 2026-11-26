@@ -1841,11 +1841,45 @@ impl Tool for MemoryTool {
             "quality" => {
                 let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
                 let report = manager.graph_quality(scope)?;
-                Ok(ToolOutput::new(format!(
+                let mut out = format!(
                     "Graph quality ({}):\n{}",
                     report.scope,
                     serde_json::to_string_pretty(&report)?
-                )))
+                );
+                let threshold =
+                    jcode_base::engineering_store::MAX_ENGINEERING_COMPLETION_DEBT;
+                match EngineeringStore::open_default()
+                    .and_then(|store| store.completion_debt_by_session(10))
+                {
+                    Ok(rows) => {
+                        out.push_str("\n\nEngineering completion debt (recent 10 sessions):");
+                        if rows.is_empty() {
+                            out.push_str("\n- none");
+                        }
+                        for row in rows {
+                            out.push_str(&format!(
+                                "\n- {} ({}): {}/{} hypothesis edge(s), debt {:.2}, expiring within 7d: {}",
+                                row.session_id,
+                                row.working_dir.as_deref().unwrap_or("-"),
+                                row.hypothesis_edges,
+                                row.edge_count,
+                                row.debt,
+                                row.expiring_soon
+                            ));
+                            if row.debt > threshold {
+                                out.push_str(&format!(
+                                    "\n  over threshold {threshold:.2}: promote, purge, or review the pending edges"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        out.push_str(&format!(
+                            "\n\nEngineering completion debt: unavailable ({error})"
+                        ));
+                    }
+                }
+                Ok(ToolOutput::new(out))
             }
             "compile" => {
                 if let Some(value) = input.query_json.as_ref() {
@@ -3850,6 +3884,49 @@ mod tests {
         assert!(!edge.hypothesis);
         assert_eq!(edge.provenance.source, "human:review");
         assert_eq!(reloaded.relations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quality_action_reports_engineering_completion_debt() {
+        use crate::memory_types::CompletionEdge;
+        use crate::memory_types::engineering_ontology::{
+            CLASS_CHANGE, CLASS_ERROR, EngineeringEntity, EngineeringGraph, EngineeringRelation,
+            REL_FIXES,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_CHANGE, "change:c1", "Patch"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_ERROR, "error:e1", "E0425"));
+        graph.insert_relation(EngineeringRelation::new("error:e1", REL_FIXES, "change:c1"));
+        store
+            .save_graph("session-debt", Some("/repo"), &graph)
+            .expect("save graph");
+        store
+            .write_completion_edges(
+                "session-debt",
+                &[CompletionEdge::new("change:c1", "uses", "error:e1", 0.8)
+                    .with_evidence("doc:review#p2")
+                    .with_source("llm:proposal")],
+                "tool",
+            )
+            .expect("write completion");
+
+        let output = MemoryTool::new()
+            .execute(
+                json!({"action":"quality","scope":"project"}),
+                test_ctx(None),
+            )
+            .await
+            .expect("quality")
+            .output;
+        assert!(output.contains("Engineering completion debt"), "{output}");
+        assert!(output.contains("session-debt"), "{output}");
+        assert!(output.contains("debt 0.50"), "{output}");
+        assert!(output.contains("over threshold 0.10"), "{output}");
     }
 
     #[tokio::test]
