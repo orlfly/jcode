@@ -113,6 +113,9 @@ struct MemoryInput {
     /// For engineering paths: join the ontology concept layer.
     #[serde(default)]
     include_ontology: Option<bool>,
+    /// For action=path: return the normalized S6 Observation JSON.
+    #[serde(default)]
+    observation: Option<bool>,
     /// For action=path: wall-clock budget for the query and L0 retries.
     #[serde(default)]
     query_budget_ms: Option<u64>,
@@ -363,6 +366,10 @@ impl Tool for MemoryTool {
                 "include_hypotheses": {
                     "type": "boolean",
                     "description": "For action=path: include pending shadow edges as hypotheses."
+                },
+                "observation": {
+                    "type": "boolean",
+                    "description": "Return the normalized S6 Observation JSON instead of rendered text."
                 },
                 "include_ontology": {
                     "type": "boolean",
@@ -1468,6 +1475,7 @@ impl Tool for MemoryTool {
                         &graph_kind,
                         include_ontology,
                         query_budget_ms,
+                        input.observation.unwrap_or(false),
                     );
                 }
                 if graph_kind != "memory" {
@@ -2674,6 +2682,7 @@ impl MemoryTool {
         graph_kind: &str,
         include_ontology: bool,
         query_budget_ms: Option<u64>,
+        observe: bool,
     ) -> Result<ToolOutput> {
         if limit == 0 {
             return Ok(ToolOutput::new("No graph paths requested."));
@@ -2730,6 +2739,117 @@ impl MemoryTool {
         let mut seen = std::collections::HashSet::new();
         hits.retain(|hit| seen.insert((hit.session_id.clone(), hit.path.nodes.clone())));
         hits.truncate(limit);
+
+        if observe {
+            let source = if graph_kind == "ontology" {
+                "ontology"
+            } else {
+                "engineering"
+            };
+            let mut observation = crate::memory_types::Observation::new(source);
+            if hits.is_empty() {
+                let (code, message) = if budget_exhausted {
+                    (
+                        "E07",
+                        format!(
+                            "query budget of {} ms exhausted before all anchor pairs were searched",
+                            query_budget_ms.unwrap_or(0)
+                        ),
+                    )
+                } else {
+                    (
+                        "O02",
+                        format!(
+                            "no path found from [{}] to [{}] within depth {}",
+                            froms.join(", "),
+                            tos.join(", "),
+                            depth.clamp(1, 16)
+                        ),
+                    )
+                };
+                observation
+                    .diagnostics
+                    .push(crate::memory_types::ObservationDiagnostic {
+                        code: code.to_string(),
+                        message,
+                        suggestion: Some(
+                            "run the 4.4 diagnosis or widen depth/relations".to_string(),
+                        ),
+                    });
+            } else if graph_kind == "ontology" {
+                let graph = crate::memory_types::EngineeringGraph::concept_graph(
+                    &crate::memory_types::engineering_ontology::default_engineering_ontology(),
+                );
+                let paths: Vec<_> = hits.iter().map(|hit| hit.path.clone()).collect();
+                observation =
+                    crate::memory_types::observation_from_graph_paths(&graph, source, &paths);
+            } else {
+                let store = EngineeringStore::open_default()
+                    .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
+                let mut cache: std::collections::HashMap<
+                    String,
+                    crate::memory_types::EngineeringGraph,
+                > = std::collections::HashMap::new();
+                for hit in &hits {
+                    if !cache.contains_key(&hit.session_id) {
+                        match store.load_graph(&hit.session_id) {
+                            Ok(Some(graph)) => {
+                                cache.insert(hit.session_id.clone(), graph);
+                            }
+                            Ok(None) => {
+                                observation
+                                    .diagnostics
+                                    .push(crate::memory_types::ObservationDiagnostic {
+                                    code: "O01".to_string(),
+                                    message: format!(
+                                        "session graph {} is missing; its path was dropped",
+                                        hit.session_id
+                                    ),
+                                    suggestion: Some(
+                                        "reload the session graph before consuming the observation"
+                                            .to_string(),
+                                    ),
+                                });
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(anyhow::anyhow!(
+                                    "load engineering graph {}: {error}",
+                                    hit.session_id
+                                ));
+                            }
+                        }
+                    }
+                    let Some(graph) = cache.get(&hit.session_id) else {
+                        continue;
+                    };
+                    let mut partial = crate::memory_types::observation_from_graph_paths(
+                        graph,
+                        source,
+                        std::slice::from_ref(&hit.path),
+                    );
+                    for path in &mut partial.paths {
+                        path.session_id = Some(hit.session_id.clone());
+                    }
+                    observation.merge(partial);
+                }
+            }
+            if budget_exhausted && !hits.is_empty() {
+                observation
+                    .diagnostics
+                    .push(crate::memory_types::ObservationDiagnostic {
+                        code: "E07".to_string(),
+                        message: format!(
+                            "query budget of {} ms exhausted; the observation may be partial",
+                            query_budget_ms.unwrap_or(0)
+                        ),
+                        suggestion: Some(
+                            "increase query_budget_ms or narrow the anchors".to_string(),
+                        ),
+                    });
+            }
+            return Ok(ToolOutput::new(serde_json::to_string_pretty(&observation)?));
+        }
 
         if hits.is_empty() {
             let layer = if graph_kind == "ontology" {
@@ -3915,6 +4035,36 @@ mod tests {
         );
         assert!(output.output.contains("gate Q03"), "{}", output.output);
         assert!(output.output.contains("owner: -"), "{}", output.output);
+
+        let observed = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"action:call-1",
+                    "to_id":"file:src/lib.rs",
+                    "relation_allow":["modifies"],
+                    "depth":2,
+                    "observation":true
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("engineering observation")
+            .output;
+        assert!(
+            observed.contains("\"source_graph\": \"engineering\""),
+            "{observed}"
+        );
+        assert!(observed.contains("\"cost_breakdown\""), "{observed}");
+        assert!(observed.contains("\"edges\""), "{observed}");
+        assert!(observed.contains("\"provenance\""), "{observed}");
+        assert!(
+            observed.contains("\"session_id\": \"session-path\""),
+            "{observed}"
+        );
+        assert!(observed.contains("\"quality\""), "{observed}");
+        assert!(observed.contains("\"diagnostics\""), "{observed}");
     }
 
     #[tokio::test]

@@ -67,6 +67,12 @@ pub use task_normalization::{
     normalize_task_text,
 };
 
+pub mod observation;
+pub use observation::{
+    CostBreakdown, Observation, ObservationDiagnostic, ObservationEdge, ObservationNode,
+    ObservationPath, observation_from_graph_paths, observe_path, with_diagnostics,
+};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 
