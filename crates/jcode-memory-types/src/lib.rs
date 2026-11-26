@@ -43,6 +43,12 @@ pub use task_frame::{
     compile_task_frame_json,
 };
 
+pub mod grounding;
+pub use grounding::{
+    ConceptCandidate, FrameGrounding, GROUNDING_ACCEPT_SCORE, GROUNDING_AMBIGUOUS_SCORE,
+    GROUNDING_MAX_CANDIDATES, GroundingStatus, MentionGrounding, ground_mention, ground_task_frame,
+};
+
 pub mod decision;
 pub use decision::{Decision, DecisionAction, DecisionSignals, select_next_action};
 

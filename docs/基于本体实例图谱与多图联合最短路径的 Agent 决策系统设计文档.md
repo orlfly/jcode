@@ -1607,7 +1607,9 @@ PathQuery
 
 **S7 一致性校验与定向修复**：检查类型安全、约束保真、端点匹配、置信度阈值和假设边比例。校验失败返回结构化错误码，不直接重试整条查询；最多 2 次定向修复，仍失败则转 4.4 补全。修复记录写入审计日志，供质量评估归因。
 
-**实现（S1 契约）**：`jcode-memory-types::task_frame` 提供 `compile_task_frame_json`，`memory` 工具 `action=compile task_frame={...}` 走同一入口。它只做确定性的一半：校验 `intent`（attribution/impact/plan/compliance/alternative）、锚点 `role`+`mention`+`span`、`constraints`、`success_criteria`、`scope_hint`、`output_type`，未知字段与非法 scope hint 记入 `dropped_fields`/`warnings`，结构错误一次性返回全部错误以便定向修复。映射规则：start/target/waypoint mention 分别进 `PathQuery.start/goal/waypoints`；scope 取 `Project/Global/All`；intent 决定默认 objective 与 limit（归因与替代取 `max_confidence`+5，方案取 `min_cost`，影响 10，合规 3）。约束表达式不在本模块执行，逐条写入 `constraint deferred to S4/S6` 警告。S0 规范化、S2 接地、S4 航点生成与 S7 定向修复仍未实现；本层不调用 LLM，也不解析实体 ID。
+**实现（S1 契约）**：`jcode-memory-types::task_frame` 提供 `compile_task_frame_json`，`memory` 工具 `action=compile task_frame={...}` 走同一入口。它只做确定性的一半：校验 `intent`（attribution/impact/plan/compliance/alternative）、锚点 `role`+`mention`+`span`、`constraints`、`success_criteria`、`scope_hint`、`output_type`，未知字段与非法 scope hint 记入 `dropped_fields`/`warnings`，结构错误一次性返回全部错误以便定向修复。映射规则：start/target/waypoint mention 分别进 `PathQuery.start/goal/waypoints`；scope 取 `Project/Global/All`；intent 决定默认 objective 与 limit（归因与替代取 `max_confidence`+5，方案取 `min_cost`，影响 10，合规 3）。约束表达式不在本模块执行，逐条写入 `constraint deferred to S4/S6` 警告。S0 规范化、S4 航点生成与 S7 定向修复仍未实现；本层不调用 LLM，也不解析实体 ID（概念接地在 S2）。
+
+**实现（S2 概念接地）**：`jcode-memory-types::grounding` 提供 `ground_mention`/`ground_task_frame`，`action=compile task_frame` 的输出带 `grounding` 段。评分只有词法信号：精确匹配 1.0、token 包含 0.85、部分子串 0.55、名称/描述 token Jaccard 线性组合（上限 0.74）；按 0.75 接受、0.50–0.75 判 ambiguous、低于 0.50 判 unresolved，每条 mention 保留至多 5 个候选并记录触发信号。设计公式里的 embedding、type、context、recency 四项没有实现，ambiguous/unresolved 结果会显式带 `score is lexical-only` 警告；实例实体链接（别名索引 + ANN + 属性过滤）未实现，本层只接地到概念。歧义的二次裁决（由路径兼容性决定）仍未接线。
 
 #### 4.3.3 物理查询模板
 

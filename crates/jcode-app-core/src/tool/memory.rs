@@ -1908,9 +1908,20 @@ impl Tool for MemoryTool {
                             ));
                         }
                     };
+                    let grounding = crate::memory_types::ground_task_frame(
+                        &crate::memory_types::engineering_ontology::default_engineering_ontology(),
+                        &report.frame,
+                    );
+                    let payload = serde_json::json!({
+                        "task_frame": report.frame,
+                        "path_query": report.path_query,
+                        "warnings": report.warnings,
+                        "dropped_fields": report.dropped_fields,
+                        "grounding": grounding,
+                    });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
-                        serde_json::to_string_pretty(&report)?
+                        serde_json::to_string_pretty(&payload)?
                     )));
                 }
                 if let Some(value) = input.query_json.as_ref() {
@@ -4132,7 +4143,7 @@ mod tests {
                         "intent":"attribution",
                         "anchors":[
                             {"role":"start","mention":"build failure"},
-                            {"role":"target","mention":"root cause"}
+                            {"role":"target","mention":"API"}
                         ],
                         "constraints":[{"expr":"within 2 weeks","hard":true}],
                         "scope_hint":["global"],
@@ -4152,6 +4163,8 @@ mod tests {
         assert!(output.contains("\"max_confidence\""), "{output}");
         assert!(output.contains("deferred to S4/S6"), "{output}");
         assert!(output.contains("\"limit\": 5"), "{output}");
+        assert!(output.contains("\"grounding\""), "{output}");
+        assert!(output.contains("\"grounded\": 2"), "{output}");
 
         let invalid = tool
             .execute(
