@@ -1947,9 +1947,19 @@ impl Tool for MemoryTool {
                             ));
                         }
                     };
-                    let grounding = crate::memory_types::ground_task_frame(
-                        &crate::memory_types::engineering_ontology::default_engineering_ontology(),
+                    let ontology =
+                        crate::memory_types::engineering_ontology::default_engineering_ontology();
+                    let mut grounding = crate::memory_types::ground_task_frame(
+                        &ontology,
                         &report.frame,
+                    );
+                    // S2 second pass (4.3.2): resolve ambiguous anchors by
+                    // concept-path compatibility with the other endpoint.
+                    crate::memory_types::grounding::resolve_frame_ambiguities(
+                        &ontology,
+                        &report.frame,
+                        &mut grounding,
+                        4,
                     );
                     let start_concept = report
                         .frame

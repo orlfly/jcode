@@ -45,8 +45,10 @@ pub use task_frame::{
 
 pub mod grounding;
 pub use grounding::{
-    ConceptCandidate, FrameGrounding, GROUNDING_ACCEPT_SCORE, GROUNDING_AMBIGUOUS_SCORE,
-    GROUNDING_MAX_CANDIDATES, GroundingStatus, MentionGrounding, ground_mention, ground_task_frame,
+    AmbiguityRejection, AmbiguityResolution, ConceptCandidate, FrameGrounding,
+    GROUNDING_ACCEPT_SCORE, GROUNDING_AMBIGUOUS_SCORE, GROUNDING_MAX_CANDIDATES, GroundingStatus,
+    MentionGrounding, disambiguate_by_concept_path, ground_mention, ground_task_frame,
+    resolve_frame_ambiguities,
 };
 
 pub mod waypoint;
