@@ -2602,7 +2602,7 @@ impl MemoryTool {
                     .map_err(|error| anyhow::anyhow!("open engineering graph store: {error}"))?;
                 for from in froms {
                     for to in tos {
-                        let report = match store.diagnose_path_gap(from, to, depth) {
+                        let report = match store.diagnose_path_gap(from, to, depth, &allowed) {
                             Ok(report) => report,
                             Err(error) => {
                                 out.push_str(&format!(

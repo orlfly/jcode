@@ -88,6 +88,9 @@ pub struct EngineeringGapReport {
     pub shared_sessions: Vec<String>,
     /// Read-only alignment hints. Nothing is written to any graph.
     pub alignment_candidates: Vec<EngineeringAlignmentCandidate>,
+    /// Relations of the diagnostic-only path found after relaxing depth or the
+    /// relation allow-list. Empty when no relaxation recovers a path.
+    pub path_relations: Vec<String>,
     pub next_actions: Vec<String>,
 }
 
@@ -464,6 +467,7 @@ impl EngineeringStore {
         from_anchor: &str,
         to_anchor: &str,
         depth: usize,
+        allowed_relations: &[&str],
     ) -> Result<EngineeringGapReport> {
         const MIN_ALIGNMENT_SCORE: f32 = 0.55;
         const MAX_ALIGNMENT_CANDIDATES: usize = 3;
@@ -508,6 +512,7 @@ impl EngineeringStore {
         }
 
         let mut alignment_candidates = Vec::new();
+        let mut path_relations = Vec::new();
         if diagnosis.is_empty() {
             if shared_sessions.is_empty() {
                 diagnosis.push("E09".to_string());
@@ -548,11 +553,83 @@ impl EngineeringStore {
                 candidates.truncate(MAX_ALIGNMENT_CANDIDATES);
                 alignment_candidates = candidates;
             } else {
-                diagnosis.push("E03".to_string());
-                next_actions.push(format!(
-                    "E03: both anchors exist in session(s) {} but no path fits depth {depth}; raise depth, allow more relations, or propose a completion edge",
-                    shared_sessions.join(", ")
-                ));
+                let probe_depth = (depth + 2).min(16);
+                let mut deeper: Option<Vec<String>> = None;
+                let mut unfiltered: Option<Vec<String>> = None;
+                for session in &shared_sessions {
+                    let Some(from_id) = from_rows
+                        .iter()
+                        .find(|row| &row.0 == session)
+                        .map(|row| row.1.as_str())
+                    else {
+                        continue;
+                    };
+                    let Some(to_id) = to_rows
+                        .iter()
+                        .find(|row| &row.0 == session)
+                        .map(|row| row.1.as_str())
+                    else {
+                        continue;
+                    };
+                    let Some(graph) = self.load_graph(session)? else {
+                        continue;
+                    };
+                    let relation_names = |path: &EngineeringPath| -> Vec<String> {
+                        let mut names: Vec<String> = Vec::new();
+                        for id in &path.relations {
+                            let name = graph
+                                .relation(id)
+                                .map(|relation| relation.relation.clone())
+                                .unwrap_or_else(|| id.clone());
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                        names
+                    };
+                    if deeper.is_none()
+                        && probe_depth > depth
+                        && let Some(path) = graph.weighted_shortest_path(
+                            from_id,
+                            to_id,
+                            probe_depth,
+                            allowed_relations,
+                        )
+                    {
+                        deeper = Some(relation_names(&path));
+                    }
+                    if unfiltered.is_none()
+                        && !allowed_relations.is_empty()
+                        && let Some(path) = graph.weighted_shortest_path(from_id, to_id, depth, &[])
+                    {
+                        unfiltered = Some(relation_names(&path));
+                    }
+                }
+
+                if let Some(relations) = unfiltered {
+                    diagnosis.push("E04".to_string());
+                    next_actions.push(format!(
+                        "E04: a path exists when relation_allow is relaxed; the route uses [{}]; re-run without the filter or allow those relations",
+                        relations.join(", ")
+                    ));
+                    path_relations = relations;
+                }
+                if let Some(relations) = deeper {
+                    diagnosis.push("E05".to_string());
+                    next_actions.push(format!(
+                        "E05: a path exists at depth {probe_depth}; raise depth to at least {probe_depth}"
+                    ));
+                    if path_relations.is_empty() {
+                        path_relations = relations;
+                    }
+                }
+                if diagnosis.is_empty() {
+                    diagnosis.push("E03".to_string());
+                    next_actions.push(format!(
+                        "E03: anchors exist in session(s) {} but no path exists within depth {probe_depth} even without a relation filter; propose a completion edge or check extraction",
+                        shared_sessions.join(", ")
+                    ));
+                }
             }
         }
 
@@ -565,6 +642,7 @@ impl EngineeringStore {
             to_sessions,
             shared_sessions,
             alignment_candidates,
+            path_relations,
             next_actions,
         })
     }
@@ -1252,7 +1330,7 @@ mod tests {
     use super::*;
     use jcode_memory_types::engineering_ontology::{
         CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, CLASS_TASK, EngineeringProvenance, REL_CAUSES,
-        REL_DEFINES, REL_DEPENDS_ON, REL_MODIFIES,
+        REL_DEFINES, REL_DEPENDS_ON, REL_MODIFIES, REL_TESTS,
     };
     use serde_json::json;
 
@@ -1704,7 +1782,7 @@ mod tests {
         let store = EngineeringStore::open_in_memory().expect("store");
 
         let unresolved = store
-            .diagnose_path_gap("missing:from", "missing:to", 4)
+            .diagnose_path_gap("missing:from", "missing:to", 4, &[])
             .expect("diagnose unresolved");
         assert_eq!(unresolved.diagnosis, vec!["E01".to_string()]);
         assert_eq!(unresolved.next_actions.len(), 2);
@@ -1720,10 +1798,44 @@ mod tests {
             .save_graph("session-chain", Some("/repo"), &chain)
             .expect("save chain");
         let depth_gap = store
-            .diagnose_path_gap("task:a", "task:c", 1)
+            .diagnose_path_gap("task:a", "task:c", 1, &[])
             .expect("diagnose depth");
-        assert_eq!(depth_gap.diagnosis, vec!["E03".to_string()]);
+        assert_eq!(depth_gap.diagnosis, vec!["E05".to_string()]);
         assert_eq!(depth_gap.shared_sessions, vec!["session-chain".to_string()]);
+        assert_eq!(depth_gap.path_relations, vec![REL_DEPENDS_ON.to_string()]);
+        assert!(
+            depth_gap.next_actions[0].contains("raise depth"),
+            "{:?}",
+            depth_gap.next_actions
+        );
+
+        let filtered_gap = store
+            .diagnose_path_gap("task:a", "task:c", 4, &[REL_TESTS])
+            .expect("diagnose filter");
+        assert!(
+            filtered_gap.diagnosis.contains(&"E04".to_string()),
+            "{:?}",
+            filtered_gap.diagnosis
+        );
+        assert_eq!(
+            filtered_gap.path_relations,
+            vec![REL_DEPENDS_ON.to_string()]
+        );
+
+        let mut split = EngineeringGraph::new();
+        for id in ["task:x", "task:y", "task:z", "task:w"] {
+            split.insert_entity(EngineeringEntity::new(CLASS_TASK, id, id));
+        }
+        split.insert_relation(EngineeringRelation::new("task:x", REL_DEPENDS_ON, "task:y"));
+        split.insert_relation(EngineeringRelation::new("task:z", REL_DEPENDS_ON, "task:w"));
+        store
+            .save_graph("session-split", Some("/repo"), &split)
+            .expect("save split");
+        let disconnected = store
+            .diagnose_path_gap("task:x", "task:w", 4, &[])
+            .expect("diagnose disconnected");
+        assert_eq!(disconnected.diagnosis, vec!["E03".to_string()]);
+        assert!(disconnected.path_relations.is_empty());
 
         let mut left = EngineeringGraph::new();
         left.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a1", "auth.rs"));
@@ -1739,7 +1851,7 @@ mod tests {
             .expect("save right");
 
         let alignment_gap = store
-            .diagnose_path_gap("file:a1", "file:b1", 4)
+            .diagnose_path_gap("file:a1", "file:b1", 4, &[])
             .expect("diagnose alignment");
         assert_eq!(alignment_gap.diagnosis, vec!["E09".to_string()]);
         assert_eq!(

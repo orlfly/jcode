@@ -1944,7 +1944,7 @@ LIMIT 5;
 
 诊断报告新增两个字段：missing_class（本体沉默/语义缺口/查询侧）与 llm_attribution（语义探针解释，可空）。查询侧缺失不进入补全阶梯的 LLM 提议环节，只改查询参数。
 
-**实现（工程图层）**：`EngineeringStore::diagnose_path_gap` 只用确定性探针，基于实体索引与 session 集合判定三种码：`E01`（锚点在任何工程图里都不存在）、`E09`（两锚点各自可解析但分属不同 session）、`E03`（同 session 存在但深度内无路径）。`E09` 额外返回只读的 `alignment_candidates`：同 class 且名称词项 Jaccard ≥0.55 的跨 session 实体对，按分数取前 3，不写任何图；`memory` 工具 `path` 无路径时输出 `next:` 与 `alignment hint:`，可直接接 `action=completion completion_action=propose`。`E04`–`E08`、`E10` 与 LLM 语义探针尚未接入工程图，此表其余行仍按设计待实现。
+**实现（工程图层）**：`EngineeringStore::diagnose_path_gap` 只用确定性探针，基于实体索引与 session 集合判定五种码：`E01`（锚点在任何工程图里都不存在）、`E09`（两锚点各自可解析但分属不同 session）、`E04`（去掉 `relation_allow` 后同深度可通达，返回实际用到的关系）、`E05`（放宽到 `depth+2` 后可通达，返回所需深度）、`E03`（上述放宽都不通）。`E09` 额外返回只读的 `alignment_candidates`：同 class 且名称词项 Jaccard ≥0.55 的跨 session 实体对，按分数取前 3，不写任何图；`memory` 工具 `path` 无路径时输出 `next:` 与 `alignment hint:`，可直接接 `action=completion completion_action=propose`。`E06`–`E08`、`E10` 与 LLM 语义探针尚未接入工程图，此表其余行仍按设计待实现。
 
 #### 4.4.2 分层补全阶梯：LLM 参与边界与裁决强度
 
