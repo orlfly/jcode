@@ -556,6 +556,7 @@ impl EngineeringStore {
                 let probe_depth = (depth + 2).min(16);
                 let mut deeper: Option<Vec<String>> = None;
                 let mut unfiltered: Option<Vec<String>> = None;
+                let mut inferred: Option<Vec<String>> = None;
                 for session in &shared_sessions {
                     let Some(from_id) = from_rows
                         .iter()
@@ -574,19 +575,6 @@ impl EngineeringStore {
                     let Some(graph) = self.load_graph(session)? else {
                         continue;
                     };
-                    let relation_names = |path: &EngineeringPath| -> Vec<String> {
-                        let mut names: Vec<String> = Vec::new();
-                        for id in &path.relations {
-                            let name = graph
-                                .relation(id)
-                                .map(|relation| relation.relation.clone())
-                                .unwrap_or_else(|| id.clone());
-                            if !names.contains(&name) {
-                                names.push(name);
-                            }
-                        }
-                        names
-                    };
                     if deeper.is_none()
                         && probe_depth > depth
                         && let Some(path) = graph.weighted_shortest_path(
@@ -596,13 +584,33 @@ impl EngineeringStore {
                             allowed_relations,
                         )
                     {
-                        deeper = Some(relation_names(&path));
+                        deeper = Some(path_relation_names(&graph, &path));
                     }
                     if unfiltered.is_none()
                         && !allowed_relations.is_empty()
                         && let Some(path) = graph.weighted_shortest_path(from_id, to_id, depth, &[])
                     {
-                        unfiltered = Some(relation_names(&path));
+                        unfiltered = Some(path_relation_names(&graph, &path));
+                    }
+                    if inferred.is_none() {
+                        let inferred_graph = graph.infer_relations(&default_engineering_ontology());
+                        if let Some(path) = inferred_graph.weighted_shortest_path(
+                            from_id,
+                            to_id,
+                            probe_depth,
+                            allowed_relations,
+                        ) {
+                            inferred = Some(path_relation_names(&inferred_graph, &path));
+                        } else if let Some(path) = graph.weighted_shortest_path(
+                            to_id,
+                            from_id,
+                            probe_depth,
+                            allowed_relations,
+                        ) {
+                            let mut relations = path_relation_names(&graph, &path);
+                            relations.push("reverse_direction".to_string());
+                            inferred = Some(relations);
+                        }
                     }
                 }
 
@@ -622,6 +630,16 @@ impl EngineeringStore {
                     if path_relations.is_empty() {
                         path_relations = relations;
                     }
+                }
+                if diagnosis.is_empty()
+                    && let Some(relations) = inferred
+                {
+                    diagnosis.push("E10".to_string());
+                    next_actions.push(format!(
+                        "E10: a path exists only with inferred inverse/sub-property edges or in the reverse direction [{}]; enable inference, allow the parent relation, or verify the edge direction",
+                        relations.join(", ")
+                    ));
+                    path_relations = relations;
                 }
                 if diagnosis.is_empty() {
                     diagnosis.push("E03".to_string());
@@ -1271,6 +1289,21 @@ fn lexical_overlap(left: &str, right: &str) -> f32 {
     shared as f32 / left.union(&right).count() as f32
 }
 
+/// Deduplicated relation names along one path, falling back to the edge id.
+fn path_relation_names(graph: &EngineeringGraph, path: &EngineeringPath) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for id in &path.relations {
+        let name = graph
+            .relation(id)
+            .map(|relation| relation.relation.clone())
+            .unwrap_or_else(|| id.clone());
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn subgraph_around(
     graph: &EngineeringGraph,
     anchor_id: &str,
@@ -1329,8 +1362,9 @@ fn subgraph_around(
 mod tests {
     use super::*;
     use jcode_memory_types::engineering_ontology::{
-        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, CLASS_TASK, EngineeringProvenance, REL_CAUSES,
-        REL_DEFINES, REL_DEPENDS_ON, REL_MODIFIES, REL_TESTS,
+        CLASS_COMMAND, CLASS_ERROR, CLASS_FILE, CLASS_SESSION, CLASS_TASK, EngineeringProvenance,
+        REL_CAUSES, REL_CONTAINS, REL_DEFINES, REL_DEPENDS_ON, REL_MODIFIES, REL_PART_OF,
+        REL_TESTS,
     };
     use serde_json::json;
 
@@ -1836,6 +1870,45 @@ mod tests {
             .expect("diagnose disconnected");
         assert_eq!(disconnected.diagnosis, vec!["E03".to_string()]);
         assert!(disconnected.path_relations.is_empty());
+
+        let reverse_gap = store
+            .diagnose_path_gap("task:c", "task:a", 4, &[])
+            .expect("diagnose reverse direction");
+        assert_eq!(reverse_gap.diagnosis, vec!["E10".to_string()]);
+        assert!(
+            reverse_gap
+                .path_relations
+                .contains(&"reverse_direction".to_string()),
+            "{:?}",
+            reverse_gap.path_relations
+        );
+        assert!(
+            reverse_gap.next_actions[0].contains("reverse direction"),
+            "{:?}",
+            reverse_gap.next_actions
+        );
+
+        let mut inverted = EngineeringGraph::new();
+        inverted.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:p1", "auth.rs"));
+        inverted.insert_entity(EngineeringEntity::new(CLASS_SESSION, "session:s1", "s1"));
+        inverted.insert_relation(EngineeringRelation::new(
+            "file:p1",
+            REL_PART_OF,
+            "session:s1",
+        ));
+        store
+            .save_graph("session-inverted", Some("/repo"), &inverted)
+            .expect("save inverted");
+        let inverse_gap = store
+            .diagnose_path_gap("session:s1", "file:p1", 4, &[REL_CONTAINS])
+            .expect("diagnose inverse");
+        assert_eq!(inverse_gap.diagnosis, vec!["E10".to_string()]);
+        assert_eq!(inverse_gap.path_relations, vec![REL_CONTAINS.to_string()]);
+        assert!(
+            inverse_gap.next_actions[0].contains("enable inference"),
+            "{:?}",
+            inverse_gap.next_actions
+        );
 
         let mut left = EngineeringGraph::new();
         left.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a1", "auth.rs"));
