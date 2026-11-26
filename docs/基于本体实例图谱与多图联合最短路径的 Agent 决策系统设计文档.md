@@ -1584,6 +1584,8 @@ $$
 
 该映射同时决定是否需要反向边、是否允许多路径、以及是否要做对比解释。例如归因任务必须保留多条候选原因，不能只返回一条最短路径。
 
+**实现（S3 意图到路径模式）**：`jcode-memory-types::path_pattern` 提供 `pattern_for_intent`，`action=compile task_frame` 输出 `path_pattern`。映射按表 4-2 落地为 `direction`（reverse/forward/existence/k_best）、`objective`、`output`（causal_path_set/impact_subgraph/action_plan/compliance_evidence/ranked_candidates）、`multi_path`、`needs_comparison`、`allow_reverse_edges`、`depth_hint` 与 `suggested_relations`；建议关系按本体声明过滤，缺失的数量写入 `notes`，不会给出编译器会拒绝的白名单项。边界：`PathObjective` 目前只有 `min_cost`/`max_confidence`，"最大覆盖"退化为 `max_confidence`；`allow_reverse_edges` 只是需求标注，引擎不执行反向遍历（`notes` 明确要求换锚点或依赖逆关系推断）；`needs_comparison` 尚未生成对比解释；建议关系也不自动注入查询，需调用方显式使用。
+
 **S4 航点生成**：不让 LLM 直接给出实体 ID。先在本体图上枚举候选概念路径，再由 LLM 重排并建议属性过滤。航点效用函数为：
 
 $$

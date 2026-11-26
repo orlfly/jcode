@@ -54,6 +54,9 @@ pub use grounding::{
 pub mod waypoint;
 pub use waypoint::{BEAM_WIDTH, MAX_WAYPOINTS, WaypointCandidate, generate_waypoint_candidates};
 
+pub mod path_pattern;
+pub use path_pattern::{PathDirection, PathOutputKind, PathPattern, pattern_for_intent};
+
 pub mod physical_plan;
 pub use physical_plan::{PhysicalPlan, PlanStage, StageKind, compile_physical_plan};
 

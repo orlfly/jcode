@@ -2018,6 +2018,10 @@ impl Tool for MemoryTool {
                         .first()
                         .map(|candidate| candidate.concepts.clone())
                         .unwrap_or_default();
+                    let path_pattern = crate::memory_types::path_pattern::pattern_for_intent(
+                        report.frame.intent,
+                        &ontology,
+                    );
                     let compiled_plan = crate::memory_types::compile_physical_plan(
                         &report.path_query,
                         &concept_path,
@@ -2038,6 +2042,7 @@ impl Tool for MemoryTool {
                         "plan_validation": plan_validation,
                         "normalized_task": normalized_task,
                         "entity_links": entity_links,
+                        "path_pattern": path_pattern,
                     });
                     return Ok(ToolOutput::new(format!(
                         "Compiled TaskFrame + PathQuery:\n{}",
@@ -4509,6 +4514,9 @@ mod tests {
         assert!(output.contains("instance_search"), "{output}");
         assert!(output.contains("\"plan_validation\""), "{output}");
         assert!(output.contains("\"valid\": true"), "{output}");
+        assert!(output.contains("\"path_pattern\""), "{output}");
+        assert!(output.contains("\"direction\": \"reverse\""), "{output}");
+        assert!(output.contains("\"causal_path_set\""), "{output}");
 
         let invalid = tool
             .execute(
