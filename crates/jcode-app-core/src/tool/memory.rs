@@ -2784,6 +2784,7 @@ impl MemoryTool {
                 "engineering"
             };
             let mut observation = crate::memory_types::Observation::new(source);
+            let mut plan_audits: Vec<serde_json::Value> = Vec::new();
             if hits.is_empty() {
                 let (code, message) = if budget_exhausted {
                     (
@@ -2818,6 +2819,20 @@ impl MemoryTool {
                     &crate::memory_types::engineering_ontology::default_engineering_ontology(),
                 );
                 let paths: Vec<_> = hits.iter().map(|hit| hit.path.clone()).collect();
+                for (index, hit) in hits.iter().enumerate() {
+                    let single = crate::memory_types::observation_from_graph_paths(
+                        &graph,
+                        source,
+                        std::slice::from_ref(&hit.path),
+                    );
+                    let audit = crate::memory_types::audit_observation_plan(&hit.plan, &single);
+                    plan_audits.push(serde_json::json!({
+                        "path_index": index,
+                        "session_id": &hit.session_id,
+                        "plan": &hit.plan,
+                        "audit": audit,
+                    }));
+                }
                 observation =
                     crate::memory_types::observation_from_graph_paths(&graph, source, &paths);
             } else {
@@ -2868,6 +2883,16 @@ impl MemoryTool {
                     for path in &mut partial.paths {
                         path.session_id = Some(hit.session_id.clone());
                     }
+                    if include_plan {
+                        let audit =
+                            crate::memory_types::audit_observation_plan(&hit.plan, &partial);
+                        plan_audits.push(serde_json::json!({
+                            "path_index": plan_audits.len(),
+                            "session_id": &hit.session_id,
+                            "plan": &hit.plan,
+                            "audit": audit,
+                        }));
+                    }
                     observation.merge(partial);
                 }
             }
@@ -2885,7 +2910,15 @@ impl MemoryTool {
                         ),
                     });
             }
-            return Ok(ToolOutput::new(serde_json::to_string_pretty(&observation)?));
+            let payload = if include_plan {
+                serde_json::json!({
+                    "observation": observation,
+                    "plans": plan_audits,
+                })
+            } else {
+                serde_json::json!(observation)
+            };
+            return Ok(ToolOutput::new(serde_json::to_string_pretty(&payload)?));
         }
 
         if hits.is_empty() {
@@ -4128,6 +4161,29 @@ mod tests {
         );
         assert!(observed.contains("\"quality\""), "{observed}");
         assert!(observed.contains("\"diagnostics\""), "{observed}");
+
+        let audited = tool
+            .execute(
+                json!({
+                    "action":"path",
+                    "graph":"engineering",
+                    "from_id":"action:call-1",
+                    "to_id":"file:src/lib.rs",
+                    "relation_allow":["modifies"],
+                    "depth":2,
+                    "observation":true,
+                    "plan":true
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("engineering observation with plan audit")
+            .output;
+        assert!(audited.contains("\"observation\""), "{audited}");
+        assert!(audited.contains("\"plans\""), "{audited}");
+        assert!(audited.contains("\"audit\""), "{audited}");
+        assert!(audited.contains("\"executable\""), "{audited}");
+        assert!(audited.contains("\"path_index\""), "{audited}");
     }
 
     #[tokio::test]
