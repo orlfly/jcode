@@ -1114,6 +1114,37 @@ impl EngineeringStore {
     /// explicit diagnostics (`O03`/`O02`) rather than silent empty output.
     pub fn execute_physical_plan(&self, plan: &PhysicalPlan, limit: usize) -> Result<Observation> {
         let mut observation = Observation::new("engineering");
+        if let Some(probe) = plan.stage(StageKind::OntologyProbe) {
+            let concepts: Vec<String> = probe
+                .parameters
+                .get("concepts")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            if concepts.len() >= 2 {
+                let ontology = default_engineering_ontology();
+                let graph = EngineeringGraph::concept_graph(&ontology);
+                let from = jcode_memory_types::engineering_ontology::concept_node_id(&concepts[0]);
+                let to = jcode_memory_types::engineering_ontology::concept_node_id(
+                    concepts.last().expect("non-empty concepts"),
+                );
+                let reachable = graph
+                    .shortest_path(&from, &to, concepts.len().max(2), &[])
+                    .is_some();
+                if !reachable {
+                    observation.diagnostics.push(ObservationDiagnostic {
+                        code: "O04".to_string(),
+                        message: format!(
+                            "concept path {} is not reachable in the ontology within {} hop(s); instance search still attempted",
+                            concepts.join(" -> "),
+                            concepts.len().max(2)
+                        ),
+                        suggestion: Some(
+                            "check the waypoint concepts or loosen the concept path".to_string(),
+                        ),
+                    });
+                }
+            }
+        }
         let Some(stage) = plan.stage(StageKind::InstanceSearch) else {
             observation.diagnostics.push(ObservationDiagnostic {
                 code: "O05".to_string(),
@@ -2358,6 +2389,37 @@ mod tests {
             .expect("execute no-path plan");
         assert_eq!(no_path.diagnostics[0].code, "O02");
         assert!(no_path.paths.is_empty());
+    }
+
+    #[test]
+    fn physical_plan_execution_reports_unreachable_concept_path() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_DEPENDS_ON, "file:b"));
+        store
+            .save_graph("session-probe", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let query = exec_query("a.rs", "b.rs", REL_DEPENDS_ON);
+        let plan = jcode_memory_types::compile_physical_plan(
+            &query,
+            &["file".to_string(), "no_such_class".to_string()],
+        );
+        let observation = store.execute_physical_plan(&plan, 3).expect("execute plan");
+        assert!(
+            observation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "O04"),
+            "{observation:?}"
+        );
+        assert_eq!(observation.paths.len(), 1);
+        assert_eq!(
+            observation.paths[0].session_id.as_deref(),
+            Some("session-probe")
+        );
     }
 
     #[test]
