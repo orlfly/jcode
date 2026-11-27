@@ -1919,6 +1919,33 @@ impl Tool for MemoryTool {
                         ));
                     }
                 }
+                match EngineeringStore::open_default().and_then(|store| {
+                    store.observation_audit_summary()
+                }) {
+                    Ok(summary) => {
+                        out.push_str("\n\nObservation plan gates (all recorded):");
+                        if summary.recorded == 0 {
+                            out.push_str("\n- none");
+                        } else {
+                            out.push_str(&format!(
+                                "\n- observations: {}, executable {}, blocked {} ({:.0}%)",
+                                summary.recorded,
+                                summary.executable,
+                                summary.blocked,
+                                summary.block_rate * 100.0
+                            ));
+                            out.push_str(&format!(
+                                "\n- Q19 {}, Q20 {}, Q21 {}, Q22 {}",
+                                summary.q19, summary.q20, summary.q21, summary.q22
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        out.push_str(&format!(
+                            "\n\nObservation plan gates: unavailable ({error})"
+                        ));
+                    }
+                }
                 Ok(ToolOutput::new(out))
             }
             "compile" => {
@@ -2101,6 +2128,8 @@ impl Tool for MemoryTool {
                             .map_err(|error| {
                                 anyhow::anyhow!("execute physical plan: {error}")
                             })?;
+                        let _ = store
+                            .record_observation_audit(&observation, observation.paths.len());
                         let payload = serde_json::json!({
                             "path_query": &report.query,
                             "physical_plan": physical_plan,
@@ -4437,6 +4466,18 @@ mod tests {
             )
             .expect("write completion");
 
+        let mut observation = crate::memory_types::Observation::new("engineering");
+        observation
+            .diagnostics
+            .push(crate::memory_types::ObservationDiagnostic {
+                code: "O01".to_string(),
+                message: "1 relation is missing".to_string(),
+                suggestion: None,
+            });
+        store
+            .record_observation_audit(&observation, 1)
+            .expect("record observation audit");
+
         let output = MemoryTool::new()
             .execute(
                 json!({"action":"quality","scope":"project"}),
@@ -4446,6 +4487,9 @@ mod tests {
             .expect("quality")
             .output;
         assert!(output.contains("Engineering completion debt"), "{output}");
+        assert!(output.contains("Observation plan gates"), "{output}");
+        assert!(output.contains("Q19 1"), "{output}");
+        assert!(output.contains("blocked 1 (100%)"), "{output}");
         assert!(output.contains("session-debt"), "{output}");
         assert!(output.contains("debt 0.50"), "{output}");
         assert!(output.contains("over threshold 0.10"), "{output}");

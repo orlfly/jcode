@@ -237,6 +237,47 @@ pub fn with_diagnostics(
     observation
 }
 
+/// Map observation diagnostics and quality flags to plan gate codes.
+///
+/// Shared by plan auditing and by stores that aggregate gate hit rates so the
+/// code-to-signal mapping stays in one place.
+pub fn observation_gates(observation: &Observation) -> Vec<(String, PlanGateSeverity, String)> {
+    let mut gates = Vec::new();
+    for diagnostic in &observation.diagnostics {
+        match diagnostic.code.as_str() {
+            "O01" => gates.push((
+                "Q19".to_string(),
+                PlanGateSeverity::Blocking,
+                format!("observation dropped edges: {}", diagnostic.message),
+            )),
+            "E07" => gates.push((
+                "Q20".to_string(),
+                PlanGateSeverity::Warning,
+                format!(
+                    "query budget truncated the observation: {}",
+                    diagnostic.message
+                ),
+            )),
+            _ => {}
+        }
+    }
+    if observation.has_quality(PathQualityFlag::LowProvenance) {
+        gates.push((
+            "Q21".to_string(),
+            PlanGateSeverity::Warning,
+            "observation has low-provenance edges".to_string(),
+        ));
+    }
+    if observation.has_quality(PathQualityFlag::StaleEdge) {
+        gates.push((
+            "Q22".to_string(),
+            PlanGateSeverity::Warning,
+            "observation has stale edges".to_string(),
+        ));
+    }
+    gates
+}
+
 /// Audit a compiled plan against the observation it was built from.
 ///
 /// The plan's own gates (Q00-Q12) still run first; observation findings are
@@ -264,44 +305,9 @@ pub fn audit_observation_plan(plan: &PathPlan, observation: &Observation) -> Pla
             report.issues.push(issue);
         }
     };
-
-    for diagnostic in &observation.diagnostics {
-        match diagnostic.code.as_str() {
-            "O01" => push(
-                "Q19",
-                PlanGateSeverity::Blocking,
-                format!(
-                    "observation dropped edges: {}; rebuild the plan from a complete graph",
-                    diagnostic.message
-                ),
-            ),
-            "E07" => push(
-                "Q20",
-                PlanGateSeverity::Warning,
-                format!(
-                    "query budget truncated the observation: {}",
-                    diagnostic.message
-                ),
-            ),
-            _ => {}
-        }
+    for (code, severity, message) in observation_gates(observation) {
+        push(&code, severity, message);
     }
-    if observation.has_quality(PathQualityFlag::LowProvenance) {
-        push(
-            "Q21",
-            PlanGateSeverity::Warning,
-            "observation has low-provenance edges; attach evidence before scheduling side effects"
-                .to_string(),
-        );
-    }
-    if observation.has_quality(PathQualityFlag::StaleEdge) {
-        push(
-            "Q22",
-            PlanGateSeverity::Warning,
-            "observation has stale edges; re-verify or refresh the graph".to_string(),
-        );
-    }
-
     report.executable = !report
         .issues
         .iter()

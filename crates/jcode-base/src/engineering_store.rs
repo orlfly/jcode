@@ -46,6 +46,20 @@ pub struct EngineeringSessionRecord {
 /// Maximum instance links returned per mention.
 pub const MAX_ENTITY_LINKS: usize = 5;
 
+/// Aggregated observation plan-gate hits (Q19-Q22).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineeringObservationAuditSummary {
+    pub recorded: u64,
+    pub executable: u64,
+    pub blocked: u64,
+    /// `blocked / recorded`, 0.0 when nothing was recorded.
+    pub block_rate: f32,
+    pub q19: u64,
+    pub q20: u64,
+    pub q21: u64,
+    pub q22: u64,
+}
+
 /// One mention-to-instance link (deterministic lexical match).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineeringEntityLink {
@@ -355,6 +369,18 @@ impl EngineeringStore {
                 );
                 CREATE INDEX IF NOT EXISTS engineering_entity_index_entity
                     ON engineering_entity_index(entity_id);
+                CREATE TABLE IF NOT EXISTS engineering_observation_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at TEXT NOT NULL,
+                    executable INTEGER NOT NULL,
+                    q19 INTEGER NOT NULL,
+                    q20 INTEGER NOT NULL,
+                    q21 INTEGER NOT NULL,
+                    q22 INTEGER NOT NULL,
+                    path_count INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS engineering_observation_audit_recorded
+                    ON engineering_observation_audit(recorded_at DESC);
                 "#,
             )
             .context("create engineering_graphs schema")?;
@@ -1262,6 +1288,76 @@ impl EngineeringStore {
             observation.merge(partial);
         }
         Ok(observation)
+    }
+
+    /// Persist one observation plan-gate audit row.
+    pub fn record_observation_audit(
+        &self,
+        observation: &Observation,
+        path_count: usize,
+    ) -> Result<()> {
+        let gates = jcode_memory_types::observation_gates(observation);
+        let has = |code: &str| gates.iter().any(|(gate, _, _)| gate == code);
+        let executable = !gates
+            .iter()
+            .any(|(_, severity, _)| *severity == jcode_memory_types::PlanGateSeverity::Blocking);
+        self.connection
+            .execute(
+                "INSERT INTO engineering_observation_audit \
+                 (recorded_at, executable, q19, q20, q21, q22, path_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    executable as i64,
+                    has("Q19") as i64,
+                    has("Q20") as i64,
+                    has("Q21") as i64,
+                    has("Q22") as i64,
+                    path_count as i64,
+                ],
+            )
+            .context("record observation audit")?;
+        Ok(())
+    }
+
+    /// Aggregate observation plan-gate hits.
+    pub fn observation_audit_summary(&self) -> Result<EngineeringObservationAuditSummary> {
+        let (recorded, executable, q19, q20, q21, q22): (i64, i64, i64, i64, i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(executable), 0), COALESCE(SUM(q19), 0), \
+                 COALESCE(SUM(q20), 0), COALESCE(SUM(q21), 0), COALESCE(SUM(q22), 0) \
+                 FROM engineering_observation_audit",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .context("aggregate observation audit")?;
+        let recorded = recorded.max(0) as u64;
+        let executable = executable.max(0) as u64;
+        let blocked = recorded.saturating_sub(executable);
+        Ok(EngineeringObservationAuditSummary {
+            recorded,
+            executable,
+            blocked,
+            block_rate: if recorded == 0 {
+                0.0
+            } else {
+                blocked as f32 / recorded as f32
+            },
+            q19: q19.max(0) as u64,
+            q20: q20.max(0) as u64,
+            q21: q21.max(0) as u64,
+            q22: q22.max(0) as u64,
+        })
     }
 
     /// Delete one session graph. Returns whether a row existed.
@@ -2654,6 +2750,45 @@ mod tests {
         assert_eq!(all[0].session_id, "session-1");
         assert_eq!(all[1].session_id, "session-2");
         assert!(all[0].score >= all[1].score);
+    }
+
+    #[test]
+    fn records_and_aggregates_observation_gates() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut blocked = Observation::new("engineering");
+        blocked
+            .diagnostics
+            .push(jcode_memory_types::ObservationDiagnostic {
+                code: "O01".to_string(),
+                message: "1 relation is missing".to_string(),
+                suggestion: None,
+            });
+        store
+            .record_observation_audit(&blocked, 1)
+            .expect("record blocked");
+        store
+            .record_observation_audit(&Observation::new("engineering"), 0)
+            .expect("record clean");
+
+        let summary = store
+            .observation_audit_summary()
+            .expect("observation summary");
+        assert_eq!(summary.recorded, 2);
+        assert_eq!(summary.executable, 1);
+        assert_eq!(summary.blocked, 1);
+        assert!((summary.block_rate - 0.5).abs() < 1e-6);
+        assert_eq!(summary.q19, 1);
+        assert_eq!(summary.q20, 0);
+        assert_eq!(summary.q21, 0);
+        assert_eq!(summary.q22, 0);
+    }
+
+    #[test]
+    fn empty_observation_summary_is_zeroed() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let summary = store.observation_audit_summary().expect("empty summary");
+        assert_eq!(summary.recorded, 0);
+        assert_eq!(summary.block_rate, 0.0);
     }
 
     #[test]
