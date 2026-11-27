@@ -20,6 +20,8 @@ use jcode_memory_types::engineering_ontology::{
     EngineeringRelation, default_engineering_ontology,
 };
 use jcode_memory_types::grounding::ground_mention;
+use jcode_memory_types::observation::{Observation, ObservationDiagnostic};
+use jcode_memory_types::physical_plan::{PhysicalPlan, StageKind};
 use jcode_memory_types::{
     CompletionEdge, CompletionPromotionError, CompletionWriteReport, PathPlan, PathQuality,
     build_path_plan,
@@ -1102,6 +1104,135 @@ impl EngineeringStore {
         Ok(candidates)
     }
 
+    /// Execute a compiled S5 physical plan against stored instance graphs and
+    /// return an S6 observation.
+    ///
+    /// Only the deterministic instance-search path is executed: anchors are
+    /// grounded to entity ids with [`EngineeringStore::link_entities`]
+    /// (score >= 0.8), then `path_between_anchors` runs with the plan's depth
+    /// and relation allow-list. Unresolved anchors and empty results become
+    /// explicit diagnostics (`O03`/`O02`) rather than silent empty output.
+    pub fn execute_physical_plan(&self, plan: &PhysicalPlan, limit: usize) -> Result<Observation> {
+        let mut observation = Observation::new("engineering");
+        let Some(stage) = plan.stage(StageKind::InstanceSearch) else {
+            observation.diagnostics.push(ObservationDiagnostic {
+                code: "O05".to_string(),
+                message: "physical plan has no instance_search stage".to_string(),
+                suggestion: Some("recompile the path query".to_string()),
+            });
+            return Ok(observation);
+        };
+        let anchors: Vec<String> = stage
+            .parameters
+            .get("anchors")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        if anchors.len() < 2 {
+            observation.diagnostics.push(ObservationDiagnostic {
+                code: "O03".to_string(),
+                message: "instance_search needs at least a start and a goal anchor".to_string(),
+                suggestion: Some("provide both endpoints in the path query".to_string()),
+            });
+            return Ok(observation);
+        }
+        let depth = stage
+            .parameters
+            .get("depth")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let relations: Vec<String> = stage
+            .parameters
+            .get("relations")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        let allowed: Vec<&str> = relations.iter().map(String::as_str).collect();
+
+        let mut resolved = Vec::new();
+        for mention in &anchors {
+            let links = self.link_entities(mention, None, 1)?;
+            match links.first() {
+                Some(link) if link.score >= 0.8 => resolved.push(link.entity_id.clone()),
+                _ => {
+                    observation.diagnostics.push(ObservationDiagnostic {
+                        code: "O03".to_string(),
+                        message: format!("anchor `{mention}` could not be grounded to an entity"),
+                        suggestion: Some(
+                            "link the mention to an entity id or seed the graph first".to_string(),
+                        ),
+                    });
+                    return Ok(observation);
+                }
+            }
+        }
+        let from = resolved.first().cloned().unwrap_or_default();
+        let to = resolved.last().cloned().unwrap_or_default();
+        let hits = self.path_between_anchors(&from, &to, depth, limit, &allowed)?;
+        if hits.is_empty() {
+            observation.diagnostics.push(ObservationDiagnostic {
+                code: "O02".to_string(),
+                message: format!(
+                    "no path from `{from}` to `{to}` within depth {depth} under the allowed relation list"
+                ),
+                suggestion: Some("run the 4.4 diagnosis or widen depth/relations".to_string()),
+            });
+            return Ok(observation);
+        }
+
+        let fusion_limit = plan
+            .stage(StageKind::Fusion)
+            .and_then(|stage| stage.parameters.get("limit"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(limit)
+            .clamp(1, 20);
+        let min_confidence = plan
+            .stage(StageKind::Fusion)
+            .and_then(|stage| stage.parameters.get("min_confidence"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+
+        let mut cache: BTreeMap<String, EngineeringGraph> = BTreeMap::new();
+        for hit in hits
+            .into_iter()
+            .filter(|hit| hit.path.confidence >= min_confidence)
+            .take(fusion_limit)
+        {
+            if !cache.contains_key(&hit.session_id) {
+                match self.load_graph(&hit.session_id)? {
+                    Some(graph) => {
+                        cache.insert(hit.session_id.clone(), graph);
+                    }
+                    None => {
+                        observation.diagnostics.push(ObservationDiagnostic {
+                            code: "O01".to_string(),
+                            message: format!(
+                                "session graph {} is missing; its path was dropped",
+                                hit.session_id
+                            ),
+                            suggestion: Some("reload the session graph".to_string()),
+                        });
+                        continue;
+                    }
+                }
+            }
+            let Some(graph) = cache.get(&hit.session_id) else {
+                continue;
+            };
+            let mut partial = jcode_memory_types::observation_from_graph_paths(
+                graph,
+                "engineering",
+                std::slice::from_ref(&hit.path),
+            );
+            for path in &mut partial.paths {
+                path.session_id = Some(hit.session_id.clone());
+            }
+            observation.merge(partial);
+        }
+        Ok(observation)
+    }
+
     /// Delete one session graph. Returns whether a row existed.
     pub fn delete_graph(&self, session_id: &str) -> Result<bool> {
         let transaction = self
@@ -2166,6 +2297,67 @@ mod tests {
                 .promote_completion_edge("session-completion", &report.accepted[0], missing)
                 .is_err()
         );
+    }
+
+    fn exec_query(from: &str, to: &str, relation: &str) -> jcode_memory_types::PathQuery {
+        jcode_memory_types::PathQuery {
+            start: vec![from.to_string()],
+            goal: vec![to.to_string()],
+            waypoints: Vec::new(),
+            graph: None,
+            constraints: jcode_memory_types::PathQueryConstraints {
+                relations: vec![relation.to_string()],
+                depth: Some(3),
+                ..jcode_memory_types::PathQueryConstraints::default()
+            },
+        }
+    }
+
+    #[test]
+    fn executes_compiled_plans_into_observations() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_DEPENDS_ON, "file:b"));
+        store
+            .save_graph("session-exec", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let query = exec_query("a.rs", "b.rs", REL_DEPENDS_ON);
+        let plan = jcode_memory_types::compile_physical_plan(&query, &[]);
+        let observation = store.execute_physical_plan(&plan, 3).expect("execute plan");
+        assert!(observation.diagnostics.is_empty(), "{observation:?}");
+        assert_eq!(observation.paths.len(), 1);
+        let path = &observation.paths[0];
+        assert_eq!(path.session_id.as_deref(), Some("session-exec"));
+        assert_eq!(path.nodes[0].id, "file:a");
+        assert_eq!(path.nodes[1].id, "file:b");
+        assert_eq!(path.edges[0].relation, REL_DEPENDS_ON);
+    }
+
+    #[test]
+    fn physical_plan_execution_reports_unresolved_and_missing_paths() {
+        let store = EngineeringStore::open_in_memory().expect("store");
+        let query = exec_query("a.rs", "b.rs", REL_DEPENDS_ON);
+        let plan = jcode_memory_types::compile_physical_plan(&query, &[]);
+        let unresolved = store
+            .execute_physical_plan(&plan, 3)
+            .expect("execute unresolved plan");
+        assert_eq!(unresolved.diagnostics[0].code, "O03");
+        assert!(unresolved.paths.is_empty());
+
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        store
+            .save_graph("session-no-path", Some("/repo"), &graph)
+            .expect("save graph");
+        let no_path = store
+            .execute_physical_plan(&plan, 3)
+            .expect("execute no-path plan");
+        assert_eq!(no_path.diagnostics[0].code, "O02");
+        assert!(no_path.paths.is_empty());
     }
 
     #[test]

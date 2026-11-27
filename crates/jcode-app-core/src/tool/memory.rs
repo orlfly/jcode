@@ -70,6 +70,10 @@ struct MemoryInput {
     /// For action=compile: model-filled TaskFrame JSON (stage S1).
     #[serde(default)]
     task_frame: Option<serde_json::Value>,
+    /// For action=compile query_json: execute the compiled plan and return an
+    /// S6 observation.
+    #[serde(default)]
+    execute: Option<bool>,
     /// For action=compile: raw task text to normalize (stage S0).
     #[serde(default)]
     task_text: Option<String>,
@@ -307,6 +311,10 @@ impl Tool for MemoryTool {
                 "task_frame": {
                     "type": "object",
                     "description": "For action=compile: model-filled TaskFrame JSON."
+                },
+                "execute": {
+                    "type": "boolean",
+                    "description": "For action=compile query_json: execute the compiled plan and return an S6 observation."
                 },
                 "task_text": {
                     "type": "string",
@@ -2084,6 +2092,23 @@ impl Tool for MemoryTool {
                         crate::memory_types::compile_physical_plan(&report.query, &[]);
                     let (physical_plan, plan_validation) =
                         crate::memory_types::validate_and_repair(&compiled_plan, &report.query);
+                    if input.execute.unwrap_or(false) {
+                        let store = EngineeringStore::open_default().map_err(|error| {
+                            anyhow::anyhow!("open engineering graph store: {error}")
+                        })?;
+                        let observation = store
+                            .execute_physical_plan(&physical_plan, 5)
+                            .map_err(|error| {
+                                anyhow::anyhow!("execute physical plan: {error}")
+                            })?;
+                        let payload = serde_json::json!({
+                            "path_query": &report.query,
+                            "physical_plan": physical_plan,
+                            "plan_validation": plan_validation,
+                            "observation": observation,
+                        });
+                        return Ok(ToolOutput::new(serde_json::to_string_pretty(&payload)?));
+                    }
                     return Ok(ToolOutput::new(format!(
                         "Compiled PathQuery from JSON:\n{}\nPhysical plan:\n{}\nPlan validation:\n{}",
                         serde_json::to_string_pretty(&report)?,
@@ -4865,6 +4890,51 @@ mod tests {
             "{quality}"
         );
         assert!(quality.contains("Q13"), "{quality}");
+    }
+
+    #[tokio::test]
+    async fn compile_action_executes_query_json_into_observation() {
+        use crate::memory_types::engineering_ontology::{
+            CLASS_FILE, EngineeringEntity, EngineeringGraph, EngineeringRelation, REL_DEPENDS_ON,
+        };
+
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let store = EngineeringStore::open_default().expect("store");
+        let mut graph = EngineeringGraph::new();
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:a", "a.rs"));
+        graph.insert_entity(EngineeringEntity::new(CLASS_FILE, "file:b", "b.rs"));
+        graph.insert_relation(EngineeringRelation::new("file:a", REL_DEPENDS_ON, "file:b"));
+        store
+            .save_graph("session-exec", Some("/repo"), &graph)
+            .expect("save graph");
+
+        let output = MemoryTool::new()
+            .execute(
+                json!({
+                    "action":"compile",
+                    "execute":true,
+                    "query_json":{
+                        "from":"a.rs",
+                        "to":"b.rs",
+                        "graph":"engineering",
+                        "constraints":{
+                            "relations":[REL_DEPENDS_ON],
+                            "max_depth":3
+                        }
+                    }
+                }),
+                test_ctx(None),
+            )
+            .await
+            .expect("execute query json")
+            .output;
+        assert!(output.contains("\"observation\""), "{output}");
+        assert!(output.contains("file:a"), "{output}");
+        assert!(output.contains("session-exec"), "{output}");
+        assert!(output.contains("\"edges\""), "{output}");
+        assert!(output.contains("\"cost_breakdown\""), "{output}");
     }
 
     #[tokio::test]
