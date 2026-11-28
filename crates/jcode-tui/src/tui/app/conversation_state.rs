@@ -761,6 +761,12 @@ impl App {
         self.tool_output_scan_index = self.local_transcript_message_count();
 
         if repaired > 0 {
+            // Same documented invalidation as the daemon path: the inserted
+            // tool_result changes an already cached turn prefix.
+            crate::cache_invalidation::record(
+                "missing tool output repair",
+                format!("{repaired} missing tool result(s) inserted into history"),
+            );
             self.reseed_compaction_from_provider_messages();
             let _ = self.session.save();
         }

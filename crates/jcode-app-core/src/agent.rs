@@ -1505,6 +1505,13 @@ impl Agent {
         self.tool_output_scan_index = self.session.messages.len();
 
         if repaired > 0 {
+            // Inserting a tool_result into an earlier turn rewrites the cached
+            // prefix. Document the cause so clients attribute it as an expected
+            // refresh instead of raising an unexplained harness-bug alarm.
+            crate::cache_invalidation::record(
+                "missing tool output repair",
+                format!("{repaired} missing tool result(s) inserted into history"),
+            );
             self.persist_session_best_effort("missing tool-output repair");
             self.cache_tracker.reset();
             self.kv_cache_monitor.reset();

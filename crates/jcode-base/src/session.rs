@@ -1521,6 +1521,12 @@ request in this new forked session, using the inherited conversation only as con
             target_total_chars,
         );
         if stripped > 0 {
+            // Replacing images rewrites earlier turns, so the cached prefix is
+            // gone by design. Attribute it instead of raising a harness alarm.
+            crate::cache_invalidation::record(
+                "image pruning",
+                format!("{stripped} oversized image(s) replaced to fit the provider request limit"),
+            );
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }

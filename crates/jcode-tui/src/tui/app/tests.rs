@@ -214,6 +214,41 @@ fn kv_cache_signature_ignores_non_transmitted_message_metadata() {
 }
 
 #[test]
+fn missing_tool_output_repair_records_documented_cache_invalidation() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = AppRuntimeMode::RemoteClient;
+    crate::cache_invalidation::clear_for_tests();
+    let since = Instant::now();
+    app.messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-cache-repair".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+            thought_signature: None,
+        }]
+        .into(),
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    app.tool_output_scan_index = 0;
+    app.tool_result_ids.clear();
+
+    let repaired = app.repair_missing_tool_outputs();
+    assert_eq!(repaired, 1);
+    let cause = crate::cache_invalidation::most_recent_since(since)
+        .expect("repair must document the cache invalidation it causes");
+    assert_eq!(cause.source, "missing tool output repair");
+    assert!(
+        cause.detail.contains("1 missing tool result"),
+        "{}",
+        cause.detail
+    );
+    crate::cache_invalidation::clear_for_tests();
+}
+
+#[test]
 fn cold_cache_warning_is_persisted_when_starting_next_request() {
     let mut app = create_test_app();
     app.is_remote = true;
